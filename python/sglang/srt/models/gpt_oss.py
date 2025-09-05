@@ -748,13 +748,33 @@ class GptOssForCausalLM(nn.Module):
             self.quant_config.get_name() if self.quant_config is not None else None
         )
         if quant_config_name != "mxfp4":
-            self._load_normal_weights(
+            self._load_weights_normal(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
         else:
             self._load_weights_mxfp4(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
+    
+    def _load_weights_normal(self, weights, is_nextn, weight_name_mapping):
+        experts_weights = []
+        other_weights = []
+
+        for name, weight in weights:
+            if (
+                ".experts" in name
+            ):
+                experts_weights.append((name, weight))
+            else:
+                other_weights.append((name, weight))
+        
+        experts_loaded_params = self._load_normal_experts_weights(experts_weights)
+        self._load_normal_weights(
+            other_weights,
+            is_nextn=is_nextn,
+            weight_name_mapping=weight_name_mapping,
+            other_loaded_param_names=experts_loaded_params,
+        )
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         mxfp4_weights = []
@@ -777,6 +797,108 @@ class GptOssForCausalLM(nn.Module):
             weight_name_mapping=weight_name_mapping,
             other_loaded_param_names=mxfp4_loaded_params,
         )
+    
+    def _load_normal_experts_weights(self, weights):
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        moe_tp_rank = get_moe_tensor_parallel_rank()
+        moe_tp_size = get_moe_tensor_parallel_world_size()
+        moe_ep_rank = get_moe_expert_parallel_rank()
+        moe_ep_size = get_moe_expert_parallel_world_size()
+    
+        intermediate_size = self.config.intermediate_size
+        per_moe_tp_rk_intermediate_size = math.ceil(
+            intermediate_size // moe_tp_size
+        )
+
+        assert self.config.num_local_experts % moe_ep_size == 0
+        moe_num_global_experts = self.config.num_local_experts
+        moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+
+        moe_tp_rank_start = moe_tp_rank * per_moe_tp_rk_intermediate_size
+        moe_tp_rank_end = min(
+            (moe_tp_rank + 1) * per_moe_tp_rk_intermediate_size, intermediate_size
+        )
+    
+        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
+
+        for name, weight in weights:
+            weight = weight.cuda()
+
+            def load_new_weight(new_name, narrow_weight):
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    narrow_weight,
+                    weight_name=new_name,
+                    shard_id=None,
+                    expert_id=None,
+                )
+                loaded_params.add(new_name)
+
+            # logger.info(f"Yes, we are loading weight {name}")
+
+            if "gate_up_proj_bias" in name:
+                new_name = name.replace("gate_up_proj_bias", "w13_weight_bias")
+
+                narrow_weight = weight[
+                    moe_ep_rank_start:moe_ep_rank_end,
+                    2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
+                ]
+
+                load_new_weight(new_name, narrow_weight)
+            
+            elif "down_proj_bias" in name:
+                new_name = name.replace("down_proj_bias", "w2_weight_bias")
+                narrow_weight = weight[moe_ep_rank_start:moe_ep_rank_end, ...]
+
+                if moe_tp_rank != 0:
+                    narrow_weight = torch.zeros_like(narrow_weight)
+                
+                load_new_weight(new_name, narrow_weight)
+
+            elif "gate_up_proj" in name:
+                # Handle MLP gate and up projection weights
+                new_name = name.replace("gate_up_proj", "w13_weight")
+
+                # the weight is stored with a transposed format, we need to transpose it...
+                weight = weight.transpose(-2, -1)
+                # weight = weight.view(
+                #     moe_num_global_experts, 2 * intermediate_size, -1,
+                # ).contiguous()
+
+                narrow_weight = weight[
+                    moe_ep_rank_start:moe_ep_rank_end,
+                    2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
+                    ...,
+                ]
+                # logger.info(f"Weight shape {weight.shape}; Narrow weight shape {narrow_weight.shape}")
+
+                load_new_weight(new_name, narrow_weight)
+
+            elif "down_proj" in name:
+                new_name = name.replace("down_proj", "w2_weight")
+
+                # the weight is stored with a transposed format, we need to transpose it...
+                weight = weight.transpose(-2, -1)
+
+                narrow_weight = weight[
+                    moe_ep_rank_start:moe_ep_rank_end,
+                    ...,
+                    moe_tp_rank_start: moe_tp_rank_end,
+                ]
+
+                load_new_weight(new_name, narrow_weight)
+            
+            else:
+                raise ValueError(f"Exists unloaded experts weight: {name}")
+            
+        assert len(loaded_params) == len(weights)
+
+        return loaded_params
 
     def _load_mxfp4_experts_weights(self, weights):
 
