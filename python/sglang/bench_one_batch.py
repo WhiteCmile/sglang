@@ -327,6 +327,16 @@ def _save_profile_trace_results(profiler, filename):
         )
     )
 
+    # ztl specific
+    profiling_table_filename = filename.replace(".json.gz", "")
+    with open(os.path.abspath(profiling_table_filename), "w") as f:
+        print (
+            profiler.key_averages(group_by_input_shape=True).table(
+                sort_by="self_cpu_time_total"
+            ),
+            file=f,
+        )
+
 
 def correctness_test(
     server_args,
@@ -476,7 +486,7 @@ def latency_test_run_once(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
-        if profile and i == output_len / 2:
+        if profile and i == output_len / 2 + 3:
             profiler.stop()
             profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
             _save_profile_trace_results(profiler, profile_filename)

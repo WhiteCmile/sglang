@@ -15,7 +15,7 @@ from typing import List, Optional
 
 import requests
 
-PARENT_FOLDER = "/tmp/sglang-profile"
+PARENT_FOLDER = os.getenv("SGLANG_TORCH_PROFILER_DIR", "tmp/sglang-profile")
 
 
 def _run_profile(

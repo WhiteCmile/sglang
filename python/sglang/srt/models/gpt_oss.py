@@ -467,20 +467,23 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+        with torch.profiler.record_function("prepare_attn"):
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        with torch.profiler.record_function("self_attn"):
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        with torch.profiler.record_function("prepare_mlp"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -488,15 +491,17 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        with torch.profiler.record_function("mlp"):
+            hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
 
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+        with torch.profiler.record_function("after_mlp_communication"):
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+            if not should_allreduce_fusion:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -839,7 +844,7 @@ class GptOssForCausalLM(nn.Module):
                 )
                 loaded_params.add(new_name)
 
-            # logger.info(f"Yes, we are loading weight {name}")
+            logger.debug(f"Yes, we are loading weight {name}")
 
             if "gate_up_proj_bias" in name:
                 new_name = name.replace("gate_up_proj_bias", "w13_weight_bias")

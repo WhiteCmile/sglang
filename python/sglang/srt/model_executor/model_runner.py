@@ -1773,6 +1773,7 @@ class ModelRunner:
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+        can_run_cuda_graph = False
         if can_run_cuda_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
