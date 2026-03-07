@@ -36,7 +36,12 @@ During `EAGLEWorker.verify()`:
 
 Output filename pattern:
 
-- `verify_expert_topk_00000000.pt`
+- `verify_expert_topk_tp{rank}_{index}.pt`
+
+Examples:
+
+- `verify_expert_topk_tp0_00000000.pt`
+- `verify_expert_topk_tp7_00000042.pt`
 
 ## Dumped Payload Structure
 
@@ -81,6 +86,41 @@ python3 scripts/playground/read_verify_expert_topk.py \
   --input-dir /tmp/deepseek_verify_expert_topk \
   --max-files 20
 ```
+
+### Real-data feeder script
+
+- `scripts/playground/feed_real_data_for_verify.py`
+
+Feed local JSON/JSONL prompts:
+
+```bash
+python3 scripts/playground/feed_real_data_for_verify.py \
+  --base-url http://127.0.0.1:30000/v1 \
+  --dataset-source local \
+  --dataset-path /path/to/real_dataset.jsonl \
+  --num-batches 100 \
+  --batch-size 8 \
+  --max-concurrency 8 \
+  --max-tokens 128
+```
+
+Feed from HuggingFace UltraChat:
+
+```bash
+python3 scripts/playground/feed_real_data_for_verify.py \
+  --base-url http://127.0.0.1:30000/v1 \
+  --dataset-source ultrachat \
+  --num-batches 100 \
+  --batch-size 8 \
+  --max-concurrency 8 \
+  --max-tokens 128
+```
+
+## Multi-Batch Semantics
+
+- One `.pt` file corresponds to one **target verify forward pass**.
+- Under concurrent traffic, a verify forward may contain requests from multiple client-side batches.
+- Use `bid`, `forward_pass_id`, and `verify_tree_meta` inside each file for offline alignment.
 
 ## Scope Notes
 

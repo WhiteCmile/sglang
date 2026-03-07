@@ -825,7 +825,7 @@ class EAGLEWorker(TpModelWorker):
         }
         path = (
             self.verify_expert_topk_output_dir
-            / f"verify_expert_topk_{self.verify_expert_topk_record_index:08d}.pt"
+            / f"verify_expert_topk_tp{self.tp_rank}_{self.verify_expert_topk_record_index:08d}.pt"
         )
         torch.save(payload, path)
         self.verify_expert_topk_record_index += 1
