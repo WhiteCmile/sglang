@@ -726,15 +726,19 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records.clear()
 
     def dump(self, output_mode: _OutputMode):
-        assert output_mode == "file"
         output = dict(
             records=self._records,
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
-        _dump_to_file(
-            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
-        )
+        if output_mode == "file":
+            _dump_to_file(
+                f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
+            )
+        elif output_mode == "object":
+            return output
+        else:
+            raise NotImplementedError
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):

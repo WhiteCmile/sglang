@@ -178,6 +178,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_verify_expert_topk_output_dir: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -592,6 +593,22 @@ class ServerArgs:
             self.expert_distribution_recorder_mode is None
         ):
             self.expert_distribution_recorder_mode = "stat"
+
+        if self.speculative_verify_expert_topk_output_dir is not None:
+            if self.expert_distribution_recorder_mode is None:
+                self.expert_distribution_recorder_mode = "per_token"
+                logger.warning(
+                    "speculative_verify_expert_topk_output_dir is set. "
+                    "expert_distribution_recorder_mode is automatically set to per_token."
+                )
+            elif self.expert_distribution_recorder_mode not in (
+                "per_token",
+                "per_pass",
+            ):
+                raise ValueError(
+                    "speculative_verify_expert_topk_output_dir requires "
+                    "expert_distribution_recorder_mode to be per_token or per_pass."
+                )
 
         if self.expert_distribution_recorder_buffer_size is None:
             if (x := self.eplb_rebalance_num_iterations) is not None:
@@ -1468,6 +1485,15 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-verify-expert-topk-output-dir",
+            type=str,
+            help=(
+                "If set, dump top-k expert ids for each target verify forward of "
+                "speculative decoding into this directory."
+            ),
+            default=ServerArgs.speculative_verify_expert_topk_output_dir,
         )
 
         # Expert parallelism

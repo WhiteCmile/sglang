@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -12,6 +13,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     patch_tensor_parallel_group,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
@@ -86,6 +88,12 @@ class EAGLEWorker(TpModelWorker):
         self.device = server_args.device
         self.target_worker = target_worker
         self.page_size = server_args.page_size
+        self.verify_expert_topk_output_dir = (
+            Path(server_args.speculative_verify_expert_topk_output_dir)
+            if server_args.speculative_verify_expert_topk_output_dir is not None
+            else None
+        )
+        self.verify_expert_topk_record_index = 0
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -178,6 +186,9 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        if self.verify_expert_topk_output_dir is not None:
+            self.verify_expert_topk_output_dir.mkdir(parents=True, exist_ok=True)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -721,12 +732,21 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
+        recorder = None
+        if self.verify_expert_topk_output_dir is not None:
+            recorder = get_global_expert_distribution_recorder()
+            if not recorder.recording:
+                recorder.start_record()
+
         # Forward
         logits_output, _, can_run_cuda_graph = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, skip_sample=True
             )
         )
+
+        if recorder is not None:
+            self._dump_verify_expert_topk(spec_info, model_worker_batch.bid, recorder)
 
         vocab_mask = None
         if batch.has_grammar:
@@ -775,6 +795,40 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
+
+    def _dump_verify_expert_topk(
+        self, spec_info: EagleVerifyInput, bid: int, recorder
+    ) -> None:
+        output = recorder.dump_record(output_mode="object")
+        records = output.get("records", [])
+        if len(records) == 0:
+            logger.warning(
+                "No expert distribution record captured for target verify bid=%s", bid
+            )
+            return
+
+        payload = {
+            "record_index": self.verify_expert_topk_record_index,
+            "bid": bid,
+            "forward_pass_id": records[-1]["forward_pass_id"],
+            "records": records,
+            "verify_tree_meta": {
+                "draft_token": spec_info.draft_token.detach().cpu(),
+                "positions": spec_info.positions.detach().cpu(),
+                "retrive_index": spec_info.retrive_index.detach().cpu(),
+                "retrive_next_token": spec_info.retrive_next_token.detach().cpu(),
+                "retrive_next_sibling": spec_info.retrive_next_sibling.detach().cpu(),
+                "draft_token_num": spec_info.draft_token_num,
+                "spec_steps": spec_info.spec_steps,
+                "topk": spec_info.topk,
+            },
+        }
+        path = (
+            self.verify_expert_topk_output_dir
+            / f"verify_expert_topk_{self.verify_expert_topk_record_index:08d}.pt"
+        )
+        torch.save(payload, path)
+        self.verify_expert_topk_record_index += 1
 
     def add_logprob_values(
         self,
