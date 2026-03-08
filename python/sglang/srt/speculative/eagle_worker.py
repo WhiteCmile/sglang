@@ -735,66 +735,74 @@ class EAGLEWorker(TpModelWorker):
         recorder = None
         if self.verify_expert_topk_output_dir is not None:
             recorder = get_global_expert_distribution_recorder()
-            if not recorder.recording:
-                recorder.start_record()
+            # Keep a strict per-verify recording window.
+            if recorder.recording:
+                recorder.stop_record()
+            recorder.start_record()
 
-        # Forward
-        logits_output, _, can_run_cuda_graph = (
-            self.target_worker.forward_batch_generation(
-                model_worker_batch, skip_sample=True
-            )
-        )
-
-        if recorder is not None:
-            self._dump_verify_expert_topk(spec_info, model_worker_batch.bid, recorder)
-
-        vocab_mask = None
-        if batch.has_grammar:
-            # Generate the logit mask for structured output.
-            # Overlap the CPU operations for bitmask generation with the forward pass.
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
-                spec_info,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
-                draft_tokens_cpu,
-                batch.sampling_info.vocab_size,
+        try:
+            # Forward
+            logits_output, _, can_run_cuda_graph = (
+                self.target_worker.forward_batch_generation(
+                    model_worker_batch, skip_sample=True
+                )
             )
 
-            if vocab_mask is not None:
-                assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
-                # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
-                # and will be applied to produce wrong results
-                batch.sampling_info.vocab_mask = None
+            if recorder is not None:
+                self._dump_verify_expert_topk(spec_info, model_worker_batch.bid, recorder)
 
-        self._detect_nan_if_needed(logits_output)
-        spec_info.hidden_states = logits_output.hidden_states
-        res: EagleVerifyOutput = spec_info.verify(
-            batch,
-            logits_output,
-            self.token_to_kv_pool_allocator,
-            self.page_size,
-            vocab_mask,
-        )
+            vocab_mask = None
+            if batch.has_grammar:
+                # Generate the logit mask for structured output.
+                # Overlap the CPU operations for bitmask generation with the forward pass.
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    spec_info,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
 
-        # Post process based on verified outputs.
-        # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
-        ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+                if vocab_mask is not None:
+                    assert spec_info.grammar is not None
+                    vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+                    # and will be applied to produce wrong results
+                    batch.sampling_info.vocab_mask = None
 
-        if batch.return_logprob:
-            self.add_logprob_values(batch, res, logits_output)
+            self._detect_nan_if_needed(logits_output)
+            spec_info.hidden_states = logits_output.hidden_states
+            res: EagleVerifyOutput = spec_info.verify(
+                batch,
+                logits_output,
+                self.token_to_kv_pool_allocator,
+                self.page_size,
+                vocab_mask,
+            )
 
-        # Prepare the batch for the next draft forwards.
-        batch.forward_mode = (
-            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
-        )
-        batch.spec_info = res.draft_input
+            # Post process based on verified outputs.
+            # Pick indices that we care (accepted)
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accepted_indices
+            ]
+            logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+            if batch.return_logprob:
+                self.add_logprob_values(batch, res, logits_output)
+
+            # Prepare the batch for the next draft forwards.
+            batch.forward_mode = (
+                ForwardMode.DECODE
+                if not batch.forward_mode.is_idle()
+                else ForwardMode.IDLE
+            )
+            batch.spec_info = res.draft_input
+
+            return logits_output, res, model_worker_batch, can_run_cuda_graph
+        finally:
+            if recorder is not None and recorder.recording:
+                recorder.stop_record()
 
     def _dump_verify_expert_topk(
         self, spec_info: EagleVerifyInput, bid: int, recorder

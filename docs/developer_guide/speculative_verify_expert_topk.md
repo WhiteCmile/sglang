@@ -30,8 +30,10 @@ This enables in-process access to per-forward captured data instead of only writ
 
 During `EAGLEWorker.verify()`:
 
+- a strict recorder window is opened only for this verify call (`stop -> start`);
 - the target forward is recorded;
 - recorder output is immediately dumped to a `.pt` file;
+- recorder is always stopped in `finally`, so non-verify forwards are excluded;
 - verify tree metadata is saved together with expert records.
 
 Output filename pattern:
@@ -121,6 +123,12 @@ python3 scripts/playground/feed_real_data_for_verify.py \
 - One `.pt` file corresponds to one **target verify forward pass**.
 - Under concurrent traffic, a verify forward may contain requests from multiple client-side batches.
 - Use `bid`, `forward_pass_id`, and `verify_tree_meta` inside each file for offline alignment.
+
+## Verify-Only Capture Semantics
+
+- Recorder lifetime is scoped to each `EAGLEWorker.verify()` call.
+- Non-verify passes (for example prefill/decode between verify calls) are not expected to be captured.
+- This avoids mixed windows where `records` could include unrelated forwards.
 
 ## Scope Notes
 
