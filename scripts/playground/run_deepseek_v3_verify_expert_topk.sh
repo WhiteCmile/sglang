@@ -7,7 +7,8 @@ set -euo pipefail
 #   bash scripts/playground/run_deepseek_v3_verify_expert_topk.sh
 
 : "${DEEPSEEK_PATH:?Please set DEEPSEEK_PATH}"
-EXPERT_OUT_DIR="${EXPERT_OUT_DIR:-/tmp/deepseek_verify_expert_topk}"
+# EXPERT_OUT_DIR="${EXPERT_OUT_DIR:-/tmp/deepseek_verify_expert_topk}"
+EXPERT_OUT_DIR="${experiments/data/verify_expert_topk/deepseek_v3}"
 PORT="${PORT:-30001}"
 HOST="${HOST:-127.0.0.1}"
 TP_SIZE="${TP_SIZE:-8}"
