@@ -8,9 +8,9 @@ set -euo pipefail
 
 : "${DEEPSEEK_PATH:?Please set DEEPSEEK_PATH}"
 EXPERT_OUT_DIR="${EXPERT_OUT_DIR:-/tmp/deepseek_verify_expert_topk}"
-PORT="${PORT:-30000}"
+PORT="${PORT:-30001}"
 HOST="${HOST:-127.0.0.1}"
-TP_SIZE="${TP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-8}"
 
 mkdir -p "${EXPERT_OUT_DIR}"
 echo "DEEPSEEK_PATH=${DEEPSEEK_PATH}"

@@ -97,7 +97,7 @@ Feed local JSON/JSONL prompts:
 
 ```bash
 python3 scripts/playground/feed_real_data_for_verify.py \
-  --base-url http://127.0.0.1:30000/v1 \
+  --base-url http://127.0.0.1:30001/v1 \
   --dataset-source local \
   --dataset-path /path/to/real_dataset.jsonl \
   --num-batches 100 \
@@ -110,7 +110,7 @@ Feed from HuggingFace UltraChat:
 
 ```bash
 python3 scripts/playground/feed_real_data_for_verify.py \
-  --base-url http://127.0.0.1:30000/v1 \
+  --base-url http://127.0.0.1:30001/v1 \
   --dataset-source ultrachat \
   --num-batches 100 \
   --batch-size 8 \

@@ -196,7 +196,7 @@ def main() -> None:
     parser.add_argument(
         "--base-url",
         type=str,
-        default="http://127.0.0.1:30000/v1",
+        default="http://127.0.0.1:30001/v1",
         help="OpenAI-compatible base URL.",
     )
     parser.add_argument("--model", type=str, default="default")
@@ -210,10 +210,10 @@ def main() -> None:
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default="",
+        default="experiments/data/sharegpt.json",
         help="Path to local json/jsonl dataset when dataset-source=local.",
     )
-    parser.add_argument("--num-batches", type=int, default=50)
+    parser.add_argument("--num-batches", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=128)
