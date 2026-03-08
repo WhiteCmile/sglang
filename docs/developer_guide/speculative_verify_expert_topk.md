@@ -127,3 +127,21 @@ python3 scripts/playground/feed_real_data_for_verify.py \
 - This change only captures and saves routing data.
 - No in-engine similarity computation is added.
 - Intended workflow: capture online, analyze offline.
+
+## Hotfix: Dynamic Top-K Width
+
+### Background
+
+In some DeepSeek runs, `topk_ids.shape[1]` can be larger than 8 (for example 9 in certain routing configurations).  
+The original per-token recorder implementation used a fixed top-k buffer width of 8, which could cause shape mismatch errors during assignment.
+
+### Fix
+
+The per-token detail gatherer now:
+
+- starts from a default top-k buffer width;
+- dynamically expands the last dimension when a larger `topk_ids.shape[1]` is observed;
+- tracks the max observed top-k width in the current pass;
+- trims output tensors to the observed width at `collect()` time.
+
+This keeps backward compatibility while preventing runtime crashes caused by fixed-width assumptions.
