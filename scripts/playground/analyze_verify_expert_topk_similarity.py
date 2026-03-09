@@ -156,6 +156,7 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
                             "file": path.name,
                             "bid": obj.get("bid"),
                             "forward_pass_id": obj.get("forward_pass_id"),
+                            "request_id": int(request_id),
                             "layer": int(layer_idx),
                             "depth": int(depth),
                             "parent_slot": int(parent_slot),
@@ -210,6 +211,33 @@ def summarize_by_file_layer(rows: Sequence[Dict]) -> List[Dict]:
     return summary_rows
 
 
+def summarize_by_file_request(rows: Sequence[Dict]) -> List[Dict]:
+    by_key: Dict[Tuple[str, int, int, int], List[Dict]] = defaultdict(list)
+    for row in rows:
+        by_key[
+            (row["file"], row["bid"], row["forward_pass_id"], row["request_id"])
+        ].append(row)
+
+    summary_rows = []
+    for (file_name, bid, forward_pass_id, request_id), group in sorted(by_key.items()):
+        mean_inter = sum(float(x["inter_over_token_expert_count"]) for x in group) / len(
+            group
+        )
+        mean_union = sum(float(x["inter_over_union"]) for x in group) / len(group)
+        summary_rows.append(
+            {
+                "file": file_name,
+                "bid": bid,
+                "forward_pass_id": forward_pass_id,
+                "request_id": int(request_id),
+                "num_groups": int(len(group)),
+                "avg_inter_over_token_expert_count": float(mean_inter),
+                "avg_inter_over_union": float(mean_union),
+            }
+        )
+    return summary_rows
+
+
 def maybe_write_csv(path: Path, rows: Sequence[Dict]) -> None:
     if not rows:
         return
@@ -244,7 +272,22 @@ def main() -> None:
         "--output-csv",
         type=Path,
         default=None,
-        help="Optional path to write per-file, per-layer aggregated metrics.",
+        help="Optional path to write csv results.",
+    )
+    parser.add_argument(
+        "--csv-final-only",
+        action="store_true",
+        default=True,
+        help=(
+            "Write only final request-level average similarity rows to csv "
+            "(default: on)."
+        ),
+    )
+    parser.add_argument(
+        "--csv-include-groups",
+        dest="csv_final_only",
+        action="store_false",
+        help="Write per-group rows (request, depth, parent) to csv instead.",
     )
     args = parser.parse_args()
 
@@ -266,6 +309,7 @@ def main() -> None:
         return
 
     summary_rows = summarize_by_file_layer(all_rows)
+    request_summary_rows = summarize_by_file_request(all_rows)
     print(
         "file bid forward_pass_id layer num_groups "
         "weighted(inter/token_expert_count) weighted(inter/union)"
@@ -277,10 +321,20 @@ def main() -> None:
             f"{row['weighted_inter_over_token_expert_count']:34.6f} "
             f"{row['weighted_inter_over_union']:21.6f}"
         )
+    print("")
+    print("file bid forward_pass_id request_id num_groups avg(inter/token_expert_count)")
+    for row in request_summary_rows:
+        print(
+            f"{row['file']} {row['bid']} {row['forward_pass_id']} "
+            f"{row['request_id']:10d} {row['num_groups']:9d} "
+            f"{row['avg_inter_over_token_expert_count']:33.6f}"
+        )
 
     if args.output_csv is not None:
-        maybe_write_csv(args.output_csv, summary_rows)
-        print(f"Wrote aggregated rows to {args.output_csv}")
+        rows_to_write = request_summary_rows if args.csv_final_only else all_rows
+        maybe_write_csv(args.output_csv, rows_to_write)
+        mode = "request-level averages" if args.csv_final_only else "group rows"
+        print(f"Wrote {mode} to {args.output_csv}")
 
 
 if __name__ == "__main__":

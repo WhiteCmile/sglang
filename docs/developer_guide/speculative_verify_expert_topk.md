@@ -116,6 +116,11 @@ python3 scripts/playground/analyze_verify_expert_topk_similarity.py \
   --output-csv /tmp/verify_expert_similarity.csv
 ```
 
+CSV output behavior:
+
+- default (`--csv-final-only`): write final **request-level** averages per `.pt` file;
+- `--csv-include-groups`: write per-group rows (`request, depth, parent_slot`) instead.
+
 ### Real-data feeder script
 
 - `scripts/playground/feed_real_data_for_verify.py`
