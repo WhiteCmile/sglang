@@ -143,9 +143,11 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
 
                     inter = set.intersection(*expert_sets)
                     union = set.union(*expert_sets)
-                    total_picks = sum(len(s) for s in expert_sets)
-                    inter_over_total_picks = (
-                        (len(inter) / total_picks) if total_picks else 0.0
+                    experts_per_token = max(len(s) for s in expert_sets)
+                    inter_over_token_expert_count = (
+                        (len(inter) / experts_per_token)
+                        if experts_per_token > 0
+                        else 0.0
                     )
                     inter_over_union = (len(inter) / len(union)) if union else 0.0
 
@@ -159,9 +161,11 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
                             "parent_slot": int(parent_slot),
                             "num_tokens": int(len(expert_sets)),
                             "intersection_size": int(len(inter)),
+                            "experts_per_token": int(experts_per_token),
                             "union_size": int(len(union)),
-                            "total_picks": int(total_picks),
-                            "inter_over_total_picks": float(inter_over_total_picks),
+                            "inter_over_token_expert_count": float(
+                                inter_over_token_expert_count
+                            ),
                             "inter_over_union": float(inter_over_union),
                         }
                     )
@@ -178,7 +182,7 @@ def summarize_by_file_layer(rows: Sequence[Dict]) -> List[Dict]:
     summary_rows = []
     for (file_name, bid, forward_pass_id, layer), group in sorted(by_key.items()):
         sum_intersection = sum(int(x["intersection_size"]) for x in group)
-        sum_total_picks = sum(int(x["total_picks"]) for x in group)
+        sum_experts_per_token = sum(int(x["experts_per_token"]) for x in group)
         sum_union = sum(int(x["union_size"]) for x in group)
         sum_num_tokens = sum(int(x["num_tokens"]) for x in group)
         summary_rows.append(
@@ -190,11 +194,11 @@ def summarize_by_file_layer(rows: Sequence[Dict]) -> List[Dict]:
                 "num_groups": int(len(group)),
                 "sum_num_tokens": int(sum_num_tokens),
                 "sum_intersection_size": int(sum_intersection),
-                "sum_total_picks": int(sum_total_picks),
+                "sum_experts_per_token": int(sum_experts_per_token),
                 "sum_union_size": int(sum_union),
-                "weighted_inter_over_total_picks": (
-                    float(sum_intersection / sum_total_picks)
-                    if sum_total_picks > 0
+                "weighted_inter_over_token_expert_count": (
+                    float(sum_intersection / sum_experts_per_token)
+                    if sum_experts_per_token > 0
                     else 0.0
                 ),
                 "weighted_inter_over_union": (
@@ -263,13 +267,14 @@ def main() -> None:
 
     summary_rows = summarize_by_file_layer(all_rows)
     print(
-        "file bid forward_pass_id layer num_groups weighted(inter/total_picks) "
-        "weighted(inter/union)"
+        "file bid forward_pass_id layer num_groups "
+        "weighted(inter/token_expert_count) weighted(inter/union)"
     )
     for row in summary_rows:
         print(
             f"{row['file']} {row['bid']} {row['forward_pass_id']} {row['layer']:5d} "
-            f"{row['num_groups']:9d} {row['weighted_inter_over_total_picks']:27.6f} "
+            f"{row['num_groups']:9d} "
+            f"{row['weighted_inter_over_token_expert_count']:34.6f} "
             f"{row['weighted_inter_over_union']:21.6f}"
         )
 
