@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Analyze verify expert-topk dumps by draft-tree depth and MoE layer."""
+
+import argparse
+import csv
+from collections import defaultdict
+from pathlib import Path
+from statistics import mean
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+import torch
+
+
+def iter_dump_files(input_dir: Path) -> Iterable[Path]:
+    return sorted(input_dir.glob("verify_expert_topk_*.pt"))
+
+
+def _to_1d_long_tensor(x) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().reshape(-1).to(torch.long)
+    return torch.tensor(x, dtype=torch.long).reshape(-1)
+
+
+def compute_depth_of_tokens(positions: torch.Tensor, draft_token_num: int) -> torch.Tensor:
+    """Compute per-token tree depth from flattened positions.
+
+    The flattened token order is expected to be per-request contiguous with stride
+    `draft_token_num`.
+    """
+    n = positions.numel()
+    if draft_token_num <= 0:
+        raise ValueError(f"Invalid draft_token_num={draft_token_num}")
+    if n % draft_token_num != 0:
+        raise ValueError(
+            f"positions length ({n}) is not divisible by draft_token_num ({draft_token_num})"
+        )
+
+    bs = n // draft_token_num
+    pos_2d = positions.view(bs, draft_token_num)
+    base = pos_2d.min(dim=1, keepdim=True).values
+    return (pos_2d - base).reshape(-1).to(torch.long)
+
+
+def _token_expert_set(topk_ids_for_token: torch.Tensor) -> set:
+    experts = topk_ids_for_token[topk_ids_for_token >= 0].tolist()
+    return set(int(x) for x in experts)
+
+
+def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
+    obj = torch.load(path, map_location="cpu")
+    records = obj.get("records", [])
+    verify_tree_meta = obj.get("verify_tree_meta", {})
+
+    if not records:
+        return []
+
+    rec = records[-1]
+    topk_ids_of_layer = rec.get("topk_ids_of_layer")
+    if not isinstance(topk_ids_of_layer, torch.Tensor) or topk_ids_of_layer.dim() != 3:
+        return []
+
+    positions = _to_1d_long_tensor(verify_tree_meta.get("positions", []))
+    draft_token = _to_1d_long_tensor(verify_tree_meta.get("draft_token", []))
+    draft_token_num = int(verify_tree_meta.get("draft_token_num", 0))
+
+    num_layers, num_tokens, _ = topk_ids_of_layer.shape
+    if positions.numel() != num_tokens:
+        return []
+    if draft_token.numel() != num_tokens:
+        draft_token = torch.full((num_tokens,), 0, dtype=torch.long)
+
+    depths = compute_depth_of_tokens(positions, draft_token_num)
+    valid_token_mask = draft_token >= 0
+
+    rows = []
+    for layer_idx in range(num_layers):
+        topk_of_layer = topk_ids_of_layer[layer_idx]  # [num_tokens, topk]
+        for depth in torch.unique(depths).tolist():
+            depth_mask = (depths == depth) & valid_token_mask
+            token_indices = torch.nonzero(depth_mask, as_tuple=False).reshape(-1)
+            if token_indices.numel() < min_tokens_per_group:
+                continue
+
+            expert_sets: List[set] = []
+            for token_idx in token_indices.tolist():
+                s = _token_expert_set(topk_of_layer[token_idx])
+                if s:
+                    expert_sets.append(s)
+
+            if len(expert_sets) < min_tokens_per_group:
+                continue
+
+            inter = set.intersection(*expert_sets)
+            union = set.union(*expert_sets)
+            total_picks = sum(len(s) for s in expert_sets)
+            inter_over_total_picks = (len(inter) / total_picks) if total_picks else 0.0
+            inter_over_union = (len(inter) / len(union)) if union else 0.0
+
+            rows.append(
+                {
+                    "file": path.name,
+                    "bid": obj.get("bid"),
+                    "forward_pass_id": obj.get("forward_pass_id"),
+                    "layer": int(layer_idx),
+                    "depth": int(depth),
+                    "num_tokens": int(len(expert_sets)),
+                    "intersection_size": int(len(inter)),
+                    "union_size": int(len(union)),
+                    "total_picks": int(total_picks),
+                    "inter_over_total_picks": float(inter_over_total_picks),
+                    "inter_over_union": float(inter_over_union),
+                }
+            )
+    return rows
+
+
+def summarize(rows: Sequence[Dict]) -> List[Tuple[int, int, int, float, float]]:
+    by_key: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+    for row in rows:
+        by_key[(row["layer"], row["depth"])].append(row)
+
+    out = []
+    for (layer, depth), group in sorted(by_key.items()):
+        out.append(
+            (
+                layer,
+                depth,
+                len(group),
+                mean(x["inter_over_total_picks"] for x in group),
+                mean(x["inter_over_union"] for x in group),
+            )
+        )
+    return out
+
+
+def maybe_write_csv(path: Path, rows: Sequence[Dict]) -> None:
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        required=True,
+        help="Directory containing verify_expert_topk_*.pt files.",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=0,
+        help="Maximum files to analyze. 0 means all.",
+    )
+    parser.add_argument(
+        "--min-tokens-per-group",
+        type=int,
+        default=2,
+        help="Minimum token count for a (layer, depth) group.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        help="Optional path to write per-file, per-layer, per-depth metrics.",
+    )
+    args = parser.parse_args()
+
+    files = list(iter_dump_files(args.input_dir))
+    if args.max_files > 0:
+        files = files[: args.max_files]
+
+    if not files:
+        print(f"No files found in {args.input_dir}")
+        return
+
+    all_rows: List[Dict] = []
+    for p in files:
+        all_rows.extend(analyze_file(p, args.min_tokens_per_group))
+
+    print(f"Analyzed files: {len(files)}")
+    print(f"Valid (file, layer, depth) groups: {len(all_rows)}")
+    if not all_rows:
+        return
+
+    summary = summarize(all_rows)
+    print("layer depth groups mean(inter/total_picks) mean(inter/union)")
+    for layer, depth, groups, m1, m2 in summary:
+        print(f"{layer:5d} {depth:5d} {groups:6d} {m1:22.6f} {m2:17.6f}")
+
+    if args.output_csv is not None:
+        maybe_write_csv(args.output_csv, all_rows)
+        print(f"Wrote detailed rows to {args.output_csv}")
+
+
+if __name__ == "__main__":
+    main()

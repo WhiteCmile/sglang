@@ -89,6 +89,26 @@ python3 scripts/playground/read_verify_expert_topk.py \
   --max-files 20
 ```
 
+### Offline similarity analysis by tree depth
+
+- `scripts/playground/analyze_verify_expert_topk_similarity.py`
+
+Compute expert-routing similarity for each `(moe_layer, tree_depth)` group:
+
+- primary metric: `intersection_size / total_picks`  
+  where `total_picks = sum(len(expert_set_of_token))` across tokens in this depth;
+- reference metric: `intersection_size / union_size`.
+
+Example:
+
+```bash
+python3 scripts/playground/analyze_verify_expert_topk_similarity.py \
+  --input-dir /tmp/deepseek_verify_expert_topk \
+  --max-files 200 \
+  --min-tokens-per-group 2 \
+  --output-csv /tmp/verify_expert_similarity.csv
+```
+
 ### Real-data feeder script
 
 - `scripts/playground/feed_real_data_for_verify.py`
