@@ -8,7 +8,7 @@ set -euo pipefail
 
 : "${DEEPSEEK_PATH:?Please set DEEPSEEK_PATH}"
 # EXPERT_OUT_DIR="${EXPERT_OUT_DIR:-/tmp/deepseek_verify_expert_topk}"
-EXPERT_OUT_DIR="${experiments/data/verify_expert_topk/deepseek_v3}"
+EXPERT_OUT_DIR="experiments/data/verify_expert_topk/deepseek_v3"
 PORT="${PORT:-30001}"
 HOST="${HOST:-127.0.0.1}"
 TP_SIZE="${TP_SIZE:-8}"
