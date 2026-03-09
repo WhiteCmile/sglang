@@ -754,8 +754,9 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records.clear()
 
     def dump(self, output_mode: _OutputMode):
+        import copy
         output = dict(
-            records=self._records,
+            records=copy.deepcopy(self._records),
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
