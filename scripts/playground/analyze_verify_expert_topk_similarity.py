@@ -5,7 +5,6 @@ import argparse
 import csv
 from collections import defaultdict
 from pathlib import Path
-from statistics import mean
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
@@ -71,66 +70,96 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
 
     depths = compute_depth_of_tokens(positions, draft_token_num)
     valid_token_mask = draft_token >= 0
+    num_tokens_total = positions.numel()
+    if draft_token_num <= 0:
+        return []
+    bs = num_tokens_total // draft_token_num
 
     rows = []
     for layer_idx in range(num_layers):
         topk_of_layer = topk_ids_of_layer[layer_idx]  # [num_tokens, topk]
-        for depth in torch.unique(depths).tolist():
-            depth_mask = (depths == depth) & valid_token_mask
-            token_indices = torch.nonzero(depth_mask, as_tuple=False).reshape(-1)
-            if token_indices.numel() < min_tokens_per_group:
-                continue
+        for request_id in range(bs):
+            st = request_id * draft_token_num
+            ed = st + draft_token_num
+            token_mask_base = torch.zeros(num_tokens_total, dtype=torch.bool)
+            token_mask_base[st:ed] = True
+            for depth in torch.unique(depths).tolist():
+                depth_mask = (depths == depth) & valid_token_mask & token_mask_base
+                token_indices = torch.nonzero(depth_mask, as_tuple=False).reshape(-1)
+                if token_indices.numel() < min_tokens_per_group:
+                    continue
 
-            expert_sets: List[set] = []
-            for token_idx in token_indices.tolist():
-                s = _token_expert_set(topk_of_layer[token_idx])
-                if s:
-                    expert_sets.append(s)
+                expert_sets: List[set] = []
+                for token_idx in token_indices.tolist():
+                    s = _token_expert_set(topk_of_layer[token_idx])
+                    if s:
+                        expert_sets.append(s)
 
-            if len(expert_sets) < min_tokens_per_group:
-                continue
+                if len(expert_sets) < min_tokens_per_group:
+                    continue
 
-            inter = set.intersection(*expert_sets)
-            union = set.union(*expert_sets)
-            total_picks = sum(len(s) for s in expert_sets)
-            inter_over_total_picks = (len(inter) / total_picks) if total_picks else 0.0
-            inter_over_union = (len(inter) / len(union)) if union else 0.0
+                inter = set.intersection(*expert_sets)
+                union = set.union(*expert_sets)
+                total_picks = sum(len(s) for s in expert_sets)
+                inter_over_total_picks = (
+                    (len(inter) / total_picks) if total_picks else 0.0
+                )
+                inter_over_union = (len(inter) / len(union)) if union else 0.0
 
-            rows.append(
-                {
-                    "file": path.name,
-                    "bid": obj.get("bid"),
-                    "forward_pass_id": obj.get("forward_pass_id"),
-                    "layer": int(layer_idx),
-                    "depth": int(depth),
-                    "num_tokens": int(len(expert_sets)),
-                    "intersection_size": int(len(inter)),
-                    "union_size": int(len(union)),
-                    "total_picks": int(total_picks),
-                    "inter_over_total_picks": float(inter_over_total_picks),
-                    "inter_over_union": float(inter_over_union),
-                }
-            )
+                rows.append(
+                    {
+                        "file": path.name,
+                        "bid": obj.get("bid"),
+                        "forward_pass_id": obj.get("forward_pass_id"),
+                        "layer": int(layer_idx),
+                        "depth": int(depth),
+                        "num_tokens": int(len(expert_sets)),
+                        "intersection_size": int(len(inter)),
+                        "union_size": int(len(union)),
+                        "total_picks": int(total_picks),
+                        "inter_over_total_picks": float(inter_over_total_picks),
+                        "inter_over_union": float(inter_over_union),
+                    }
+                )
     return rows
 
 
-def summarize(rows: Sequence[Dict]) -> List[Tuple[int, int, int, float, float]]:
-    by_key: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+def summarize_by_file_layer(rows: Sequence[Dict]) -> List[Dict]:
+    by_key: Dict[Tuple[str, int, int, int], List[Dict]] = defaultdict(list)
     for row in rows:
-        by_key[(row["layer"], row["depth"])].append(row)
-
-    out = []
-    for (layer, depth), group in sorted(by_key.items()):
-        out.append(
-            (
-                layer,
-                depth,
-                len(group),
-                mean(x["inter_over_total_picks"] for x in group),
-                mean(x["inter_over_union"] for x in group),
-            )
+        by_key[(row["file"], row["bid"], row["forward_pass_id"], row["layer"])].append(
+            row
         )
-    return out
+
+    summary_rows = []
+    for (file_name, bid, forward_pass_id, layer), group in sorted(by_key.items()):
+        sum_intersection = sum(int(x["intersection_size"]) for x in group)
+        sum_total_picks = sum(int(x["total_picks"]) for x in group)
+        sum_union = sum(int(x["union_size"]) for x in group)
+        sum_num_tokens = sum(int(x["num_tokens"]) for x in group)
+        summary_rows.append(
+            {
+                "file": file_name,
+                "bid": bid,
+                "forward_pass_id": forward_pass_id,
+                "layer": int(layer),
+                "num_groups": int(len(group)),
+                "sum_num_tokens": int(sum_num_tokens),
+                "sum_intersection_size": int(sum_intersection),
+                "sum_total_picks": int(sum_total_picks),
+                "sum_union_size": int(sum_union),
+                "weighted_inter_over_total_picks": (
+                    float(sum_intersection / sum_total_picks)
+                    if sum_total_picks > 0
+                    else 0.0
+                ),
+                "weighted_inter_over_union": (
+                    float(sum_intersection / sum_union) if sum_union > 0 else 0.0
+                ),
+            }
+        )
+
+    return summary_rows
 
 
 def maybe_write_csv(path: Path, rows: Sequence[Dict]) -> None:
@@ -167,7 +196,7 @@ def main() -> None:
         "--output-csv",
         type=Path,
         default=None,
-        help="Optional path to write per-file, per-layer, per-depth metrics.",
+        help="Optional path to write per-file, per-layer aggregated metrics.",
     )
     args = parser.parse_args()
 
@@ -184,18 +213,25 @@ def main() -> None:
         all_rows.extend(analyze_file(p, args.min_tokens_per_group))
 
     print(f"Analyzed files: {len(files)}")
-    print(f"Valid (file, layer, depth) groups: {len(all_rows)}")
+    print(f"Valid (file, layer, request, depth) groups: {len(all_rows)}")
     if not all_rows:
         return
 
-    summary = summarize(all_rows)
-    print("layer depth groups mean(inter/total_picks) mean(inter/union)")
-    for layer, depth, groups, m1, m2 in summary:
-        print(f"{layer:5d} {depth:5d} {groups:6d} {m1:22.6f} {m2:17.6f}")
+    summary_rows = summarize_by_file_layer(all_rows)
+    print(
+        "file bid forward_pass_id layer num_groups weighted(inter/total_picks) "
+        "weighted(inter/union)"
+    )
+    for row in summary_rows:
+        print(
+            f"{row['file']} {row['bid']} {row['forward_pass_id']} {row['layer']:5d} "
+            f"{row['num_groups']:9d} {row['weighted_inter_over_total_picks']:27.6f} "
+            f"{row['weighted_inter_over_union']:21.6f}"
+        )
 
     if args.output_csv is not None:
-        maybe_write_csv(args.output_csv, all_rows)
-        print(f"Wrote detailed rows to {args.output_csv}")
+        maybe_write_csv(args.output_csv, summary_rows)
+        print(f"Wrote aggregated rows to {args.output_csv}")
 
 
 if __name__ == "__main__":

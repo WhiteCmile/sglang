@@ -99,6 +99,12 @@ Compute expert-routing similarity for each `(moe_layer, tree_depth)` group:
   where `total_picks = sum(len(expert_set_of_token))` across tokens in this depth;
 - reference metric: `intersection_size / union_size`.
 
+The script groups by `(request, depth)` first, then aggregates to `(file, layer)`
+with weighted averages:
+
+- `weighted_inter_over_total_picks = sum(intersection_size) / sum(total_picks)`
+- `weighted_inter_over_union = sum(intersection_size) / sum(union_size)`
+
 Example:
 
 ```bash
