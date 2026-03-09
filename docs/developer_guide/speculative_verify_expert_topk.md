@@ -59,6 +59,7 @@ Each file contains:
   - `retrive_index`
   - `retrive_next_token`
   - `retrive_next_sibling`
+  - `parent_index`
   - `draft_token_num`
   - `spec_steps`
   - `topk`
@@ -99,7 +100,7 @@ Compute expert-routing similarity for each `(moe_layer, tree_depth)` group:
   where `total_picks = sum(len(expert_set_of_token))` across tokens in this depth;
 - reference metric: `intersection_size / union_size`.
 
-The script groups by `(request, depth)` first, then aggregates to `(file, layer)`
+The script groups by `(request, depth, parent_slot)` first, then aggregates to `(file, layer)`
 with weighted averages:
 
 - `weighted_inter_over_total_picks = sum(intersection_size) / sum(total_picks)`

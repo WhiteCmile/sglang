@@ -815,6 +815,11 @@ class EAGLEWorker(TpModelWorker):
             )
             return
 
+        parent_index = self._build_parent_index(
+            spec_info.retrive_next_token.detach().cpu(),
+            spec_info.retrive_next_sibling.detach().cpu(),
+        )
+
         payload = {
             "record_index": self.verify_expert_topk_record_index,
             "bid": bid,
@@ -826,6 +831,7 @@ class EAGLEWorker(TpModelWorker):
                 "retrive_index": spec_info.retrive_index.detach().cpu(),
                 "retrive_next_token": spec_info.retrive_next_token.detach().cpu(),
                 "retrive_next_sibling": spec_info.retrive_next_sibling.detach().cpu(),
+                "parent_index": parent_index,
                 "draft_token_num": spec_info.draft_token_num,
                 "spec_steps": spec_info.spec_steps,
                 "topk": spec_info.topk,
@@ -837,6 +843,36 @@ class EAGLEWorker(TpModelWorker):
         )
         torch.save(payload, path)
         self.verify_expert_topk_record_index += 1
+
+    @staticmethod
+    def _build_parent_index(
+        retrive_next_token: torch.Tensor, retrive_next_sibling: torch.Tensor
+    ) -> torch.Tensor:
+        """Reconstruct parent slot index from child/sibling adjacency.
+
+        Both inputs are expected to be shaped as [bs, draft_token_num] and contain
+        local slot indices in [0, draft_token_num), with -1 for null.
+        """
+        assert retrive_next_token.dim() == 2
+        assert retrive_next_sibling.shape == retrive_next_token.shape
+
+        bs, draft_token_num = retrive_next_token.shape
+        parent_index = torch.full_like(retrive_next_token, -1)
+
+        for b in range(bs):
+            for p in range(draft_token_num):
+                child = int(retrive_next_token[b, p].item())
+                steps = 0
+                while 0 <= child < draft_token_num:
+                    if parent_index[b, child] == -1:
+                        parent_index[b, child] = p
+                    child = int(retrive_next_sibling[b, child].item())
+                    steps += 1
+                    if steps > draft_token_num:
+                        # Guard against malformed loops in sibling links.
+                        break
+
+        return parent_index
 
     def add_logprob_values(
         self,

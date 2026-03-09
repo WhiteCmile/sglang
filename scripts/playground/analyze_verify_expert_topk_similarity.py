@@ -45,6 +45,28 @@ def _token_expert_set(topk_ids_for_token: torch.Tensor) -> set:
     return set(int(x) for x in experts)
 
 
+def _build_parent_index_from_retrieve(
+    retrive_next_token: torch.Tensor, retrive_next_sibling: torch.Tensor
+) -> torch.Tensor:
+    assert retrive_next_token.dim() == 2
+    assert retrive_next_sibling.shape == retrive_next_token.shape
+
+    bs, draft_token_num = retrive_next_token.shape
+    parent_index = torch.full_like(retrive_next_token, -1)
+    for b in range(bs):
+        for p in range(draft_token_num):
+            child = int(retrive_next_token[b, p].item())
+            steps = 0
+            while 0 <= child < draft_token_num:
+                if parent_index[b, child] == -1:
+                    parent_index[b, child] = p
+                child = int(retrive_next_sibling[b, child].item())
+                steps += 1
+                if steps > draft_token_num:
+                    break
+    return parent_index
+
+
 def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
     obj = torch.load(path, map_location="cpu")
     records = obj.get("records", [])
@@ -74,6 +96,19 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
     if draft_token_num <= 0:
         return []
     bs = num_tokens_total // draft_token_num
+    parent_index = verify_tree_meta.get("parent_index")
+    if parent_index is not None:
+        parent_index = _to_1d_long_tensor(parent_index).view(bs, draft_token_num)
+    else:
+        retrive_next_token = verify_tree_meta.get("retrive_next_token")
+        retrive_next_sibling = verify_tree_meta.get("retrive_next_sibling")
+        if retrive_next_token is None or retrive_next_sibling is None:
+            return []
+        parent_index = _build_parent_index_from_retrieve(
+            _to_1d_long_tensor(retrive_next_token).view(bs, draft_token_num),
+            _to_1d_long_tensor(retrive_next_sibling).view(bs, draft_token_num),
+        )
+    parent_index_flat = parent_index.reshape(-1)
 
     rows = []
     for layer_idx in range(num_layers):
@@ -84,43 +119,52 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
             token_mask_base = torch.zeros(num_tokens_total, dtype=torch.bool)
             token_mask_base[st:ed] = True
             for depth in torch.unique(depths).tolist():
-                depth_mask = (depths == depth) & valid_token_mask & token_mask_base
-                token_indices = torch.nonzero(depth_mask, as_tuple=False).reshape(-1)
-                if token_indices.numel() < min_tokens_per_group:
+                depth_mask = (
+                    (depths == depth) & valid_token_mask & token_mask_base
+                )  # request + depth
+                depth_indices = torch.nonzero(depth_mask, as_tuple=False).reshape(-1)
+                if depth_indices.numel() == 0:
                     continue
 
-                expert_sets: List[set] = []
-                for token_idx in token_indices.tolist():
-                    s = _token_expert_set(topk_of_layer[token_idx])
-                    if s:
-                        expert_sets.append(s)
+                for parent_slot in torch.unique(parent_index_flat[depth_indices]).tolist():
+                    parent_mask = depth_mask & (parent_index_flat == parent_slot)
+                    token_indices = torch.nonzero(parent_mask, as_tuple=False).reshape(-1)
+                    if token_indices.numel() < min_tokens_per_group:
+                        continue
 
-                if len(expert_sets) < min_tokens_per_group:
-                    continue
+                    expert_sets: List[set] = []
+                    for token_idx in token_indices.tolist():
+                        s = _token_expert_set(topk_of_layer[token_idx])
+                        if s:
+                            expert_sets.append(s)
 
-                inter = set.intersection(*expert_sets)
-                union = set.union(*expert_sets)
-                total_picks = sum(len(s) for s in expert_sets)
-                inter_over_total_picks = (
-                    (len(inter) / total_picks) if total_picks else 0.0
-                )
-                inter_over_union = (len(inter) / len(union)) if union else 0.0
+                    if len(expert_sets) < min_tokens_per_group:
+                        continue
 
-                rows.append(
-                    {
-                        "file": path.name,
-                        "bid": obj.get("bid"),
-                        "forward_pass_id": obj.get("forward_pass_id"),
-                        "layer": int(layer_idx),
-                        "depth": int(depth),
-                        "num_tokens": int(len(expert_sets)),
-                        "intersection_size": int(len(inter)),
-                        "union_size": int(len(union)),
-                        "total_picks": int(total_picks),
-                        "inter_over_total_picks": float(inter_over_total_picks),
-                        "inter_over_union": float(inter_over_union),
-                    }
-                )
+                    inter = set.intersection(*expert_sets)
+                    union = set.union(*expert_sets)
+                    total_picks = sum(len(s) for s in expert_sets)
+                    inter_over_total_picks = (
+                        (len(inter) / total_picks) if total_picks else 0.0
+                    )
+                    inter_over_union = (len(inter) / len(union)) if union else 0.0
+
+                    rows.append(
+                        {
+                            "file": path.name,
+                            "bid": obj.get("bid"),
+                            "forward_pass_id": obj.get("forward_pass_id"),
+                            "layer": int(layer_idx),
+                            "depth": int(depth),
+                            "parent_slot": int(parent_slot),
+                            "num_tokens": int(len(expert_sets)),
+                            "intersection_size": int(len(inter)),
+                            "union_size": int(len(union)),
+                            "total_picks": int(total_picks),
+                            "inter_over_total_picks": float(inter_over_total_picks),
+                            "inter_over_union": float(inter_over_union),
+                        }
+                    )
     return rows
 
 
@@ -213,7 +257,7 @@ def main() -> None:
         all_rows.extend(analyze_file(p, args.min_tokens_per_group))
 
     print(f"Analyzed files: {len(files)}")
-    print(f"Valid (file, layer, request, depth) groups: {len(all_rows)}")
+    print(f"Valid (file, layer, request, depth, parent) groups: {len(all_rows)}")
     if not all_rows:
         return
 
