@@ -486,6 +486,7 @@ class ServerArgs:
     speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
+    speculative_verify_expert_topk_output_dir: Optional[str] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -2638,6 +2639,25 @@ class ServerArgs:
                 )
 
     def _handle_expert_distribution_metrics(self):
+        if (
+            self.speculative_verify_expert_topk_output_dir is not None
+            and self.expert_distribution_recorder_mode is None
+        ):
+            self.expert_distribution_recorder_mode = "per_token"
+            logger.warning(
+                "Speculative verify expert topk output is enabled. "
+                "The expert_distribution_recorder_mode is automatically set to per_token."
+            )
+        if (
+            self.speculative_verify_expert_topk_output_dir is not None
+            and self.expert_distribution_recorder_mode is not None
+            and self.expert_distribution_recorder_mode not in ["per_token", "per_pass"]
+        ):
+            raise ValueError(
+                "speculative_verify_expert_topk_output_dir requires "
+                "expert_distribution_recorder_mode to be per_token or per_pass."
+            )
+
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
         ):
@@ -4419,6 +4439,12 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in eagle2 each step.",
             default=ServerArgs.speculative_eagle_topk,
+        )
+        parser.add_argument(
+            "--speculative-verify-expert-topk-output-dir",
+            type=str,
+            default=ServerArgs.speculative_verify_expert_topk_output_dir,
+            help="Output directory for dumping verify expert-topk records.",
         )
         parser.add_argument(
             "--speculative-num-draft-tokens",

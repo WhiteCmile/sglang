@@ -1,10 +1,12 @@
 import logging
 import time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
@@ -99,6 +101,12 @@ class EAGLEWorker(TpModelWorker):
         self.device = server_args.device
         self.target_worker = target_worker
         self.page_size = server_args.page_size
+        self.verify_expert_topk_output_dir = (
+            Path(server_args.speculative_verify_expert_topk_output_dir)
+            if server_args.speculative_verify_expert_topk_output_dir is not None
+            else None
+        )
+        self.verify_expert_topk_record_index = 0
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -210,6 +218,8 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        if self.verify_expert_topk_output_dir is not None:
+            self.verify_expert_topk_output_dir.mkdir(parents=True, exist_ok=True)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -721,14 +731,28 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
-        # Forward
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
-        logits_output, can_run_cuda_graph = (
-            batch_result.logits_output,
-            batch_result.can_run_cuda_graph,
-        )
+        recorder = None
+        if self.verify_expert_topk_output_dir is not None:
+            recorder = get_global_expert_distribution_recorder()
+            # Keep a strict per-verify recording window.
+            if recorder.recording:
+                recorder.stop_record()
+            recorder.start_record()
+
+        try:
+            # Forward
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+            logits_output, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.can_run_cuda_graph,
+            )
+            if recorder is not None:
+                self._dump_verify_expert_topk(spec_info, model_worker_batch.bid, recorder)
+        finally:
+            if recorder is not None and recorder.recording:
+                recorder.stop_record()
 
         vocab_mask = None
         if batch.has_grammar:
@@ -787,6 +811,68 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
+
+    def _dump_verify_expert_topk(
+        self, spec_info: EagleVerifyInput, bid: int, recorder
+    ) -> None:
+        output = recorder.dump_record(output_mode="object")
+        records = output.get("records", [])
+        if len(records) == 0:
+            logger.warning(
+                "No expert distribution record captured for target verify bid=%s", bid
+            )
+            return
+
+        parent_index = self._build_parent_index(
+            spec_info.retrive_next_token.detach().cpu(),
+            spec_info.retrive_next_sibling.detach().cpu(),
+        )
+
+        payload = {
+            "record_index": self.verify_expert_topk_record_index,
+            "bid": bid,
+            "forward_pass_id": records[-1]["forward_pass_id"],
+            "records": records,
+            "verify_tree_meta": {
+                "draft_token": spec_info.draft_token.detach().cpu(),
+                "positions": spec_info.positions.detach().cpu(),
+                "retrive_index": spec_info.retrive_index.detach().cpu(),
+                "retrive_next_token": spec_info.retrive_next_token.detach().cpu(),
+                "retrive_next_sibling": spec_info.retrive_next_sibling.detach().cpu(),
+                "parent_index": parent_index,
+                "draft_token_num": spec_info.draft_token_num,
+                "spec_steps": spec_info.spec_steps,
+                "topk": spec_info.topk,
+            },
+        }
+        path = (
+            self.verify_expert_topk_output_dir
+            / f"verify_expert_topk_tp{self.tp_rank}_{self.verify_expert_topk_record_index:08d}.pt"
+        )
+        torch.save(payload, path)
+        self.verify_expert_topk_record_index += 1
+
+    @staticmethod
+    def _build_parent_index(
+        retrive_next_token: torch.Tensor, retrive_next_sibling: torch.Tensor
+    ) -> torch.Tensor:
+        """Reconstruct parent slot index from child/sibling adjacency."""
+        assert retrive_next_token.dim() == 2
+        assert retrive_next_sibling.shape == retrive_next_token.shape
+
+        bs, draft_token_num = retrive_next_token.shape
+        parent_index = torch.full_like(retrive_next_token, -1)
+        for b in range(bs):
+            for p in range(draft_token_num):
+                child = int(retrive_next_token[b, p].item())
+                steps = 0
+                while 0 <= child < draft_token_num:
+                    parent_index[b, child] = p
+                    child = int(retrive_next_sibling[b, child].item())
+                    steps += 1
+                    if steps > draft_token_num:
+                        break
+        return parent_index
 
     def _mamba_verify_update(
         self,
