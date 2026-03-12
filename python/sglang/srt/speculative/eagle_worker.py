@@ -749,7 +749,10 @@ class EAGLEWorker(TpModelWorker):
                 batch_result.can_run_cuda_graph,
             )
             if recorder is not None:
-                self._dump_verify_expert_topk(spec_info, model_worker_batch.bid, recorder)
+                bid = getattr(model_worker_batch, "bid", None)
+                if bid is None:
+                    bid = getattr(batch, "bid", None)
+                self._dump_verify_expert_topk(spec_info, bid, recorder)
         finally:
             if recorder is not None and recorder.recording:
                 recorder.stop_record()
@@ -813,7 +816,7 @@ class EAGLEWorker(TpModelWorker):
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
     def _dump_verify_expert_topk(
-        self, spec_info: EagleVerifyInput, bid: int, recorder
+        self, spec_info: EagleVerifyInput, bid: Optional[int], recorder
     ) -> None:
         output = recorder.dump_record(output_mode="object")
         records = output.get("records", [])
