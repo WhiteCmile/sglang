@@ -360,8 +360,8 @@ class _SinglePassGatherer(ABC):
 
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
-    # DeepSeek V3 has this value; should generalize later
-    _TOP_K_NUM = 8
+    # Start with a conservative default and grow dynamically when needed.
+    _DEFAULT_TOP_K_NUM = 8
 
     def __init__(
         self,
@@ -376,11 +376,12 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
                 server_args.chunked_prefill_size * 8,
-                self._TOP_K_NUM,
+                self._DEFAULT_TOP_K_NUM,
             ),
             dtype=torch.int32,
             device=server_args.device,
         )
+        self._max_observed_topk_num = 0
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
             not server_args.enable_two_batch_overlap
@@ -399,9 +400,32 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        assert topk_ids.dim() == 2, f"Expected topk_ids to be 2D, got {topk_ids.shape=}"
+        required_topk_num = topk_ids.shape[1]
+        self._max_observed_topk_num = max(self._max_observed_topk_num, required_topk_num)
+        self._ensure_topk_capacity(required_topk_num)
         self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
             topk_ids
         )
+
+    def _ensure_topk_capacity(self, required_topk_num: int) -> None:
+        curr_topk_num = self._topk_ids_of_layer.shape[2]
+        if required_topk_num <= curr_topk_num:
+            return
+
+        new_topk_num = max(required_topk_num, curr_topk_num * 2)
+        new_tensor = torch.full(
+            (
+                self._topk_ids_of_layer.shape[0],
+                self._topk_ids_of_layer.shape[1],
+                new_topk_num,
+            ),
+            -1,
+            dtype=self._topk_ids_of_layer.dtype,
+            device=self._topk_ids_of_layer.device,
+        )
+        new_tensor[:, :, :curr_topk_num] = self._topk_ids_of_layer
+        self._topk_ids_of_layer = new_tensor
 
     def on_deepep_dispatch_normal(
         self,
@@ -422,22 +446,25 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def reset(self):
         self._topk_ids_of_layer[...] = -1
+        self._max_observed_topk_num = 0
         self._misc_objects.clear()
         self._metadata = None
 
     def collect(self) -> Dict:
         num_tokens = len(self._metadata["input_ids"])
+        topk_num = self._max_observed_topk_num or self._topk_ids_of_layer.shape[2]
+        topk_ids_of_layer = self._topk_ids_of_layer[:, :num_tokens, :topk_num]
 
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
             num_layers=self._expert_location_metadata.num_layers,
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
-            _topk_ids_of_layer=self._topk_ids_of_layer,
+            _topk_ids_of_layer=topk_ids_of_layer,
         )
 
         return dict(
             **self._metadata,
-            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
+            topk_ids_of_layer=topk_ids_of_layer.clone().cpu(),
             misc_objects=self._misc_objects,
             global_physical_count=global_physical_count,
         )
