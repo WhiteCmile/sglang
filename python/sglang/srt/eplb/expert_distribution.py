@@ -400,6 +400,13 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if not (0 <= layer_idx < self._expert_location_metadata.num_layers):
+            logger.warning(
+                "Skip invalid layer_idx=%s in detail gatherer (num_layers=%s)",
+                layer_idx,
+                self._expert_location_metadata.num_layers,
+            )
+            return
         assert topk_ids.dim() == 2, f"Expected topk_ids to be 2D, got {topk_ids.shape=}"
         required_topk_num = topk_ids.shape[1]
         self._max_observed_topk_num = max(self._max_observed_topk_num, required_topk_num)
@@ -540,8 +547,15 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if not (0 <= layer_idx < self._expert_location_metadata.num_layers):
+            logger.warning(
+                "Skip invalid layer_idx=%s in select-experts gatherer (num_layers=%s)",
+                layer_idx,
+                self._expert_location_metadata.num_layers,
+            )
+            return
         topk_ids = topk_ids.flatten()
-        mask = topk_ids != -1
+        mask = (topk_ids >= 0) & (topk_ids < self._data.shape[1])
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
@@ -598,7 +612,9 @@ def _convert_per_token_to_global_physical_count(
     _topk_ids_of_layer: torch.Tensor,
 ) -> torch.Tensor:
     topk_ids_layer_major = _topk_ids_of_layer[:, :num_tokens, :].reshape(num_layers, -1)
-    mask = topk_ids_layer_major != -1
+    mask = (topk_ids_layer_major >= 0) & (
+        topk_ids_layer_major < num_physical_experts
+    )
 
     index = topk_ids_layer_major.masked_fill(~mask, 0).long()
     src = mask.int()
