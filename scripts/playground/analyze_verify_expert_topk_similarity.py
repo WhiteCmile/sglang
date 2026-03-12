@@ -71,7 +71,21 @@ def _build_parent_index_from_retrieve(
     return parent_index
 
 
-def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
+def _layer_key(
+    file_name: str, bid, forward_pass_id, layer: int
+) -> Tuple[str, object, object, int]:
+    return (file_name, bid, forward_pass_id, int(layer))
+
+
+def _request_key(
+    file_name: str, bid, forward_pass_id, request_id: int
+) -> Tuple[str, object, object, int]:
+    return (file_name, bid, forward_pass_id, int(request_id))
+
+
+def analyze_file(
+    path: Path, min_tokens_per_group: int, collect_group_rows: bool
+) -> Tuple[List[Dict], Dict, Dict, int]:
     obj = torch.load(path, map_location="cpu")
     records = obj.get("records", [])
     verify_tree_meta = obj.get("verify_tree_meta", {})
@@ -82,7 +96,24 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
     positions = _to_1d_long_tensor(verify_tree_meta.get("positions", []))
     draft_token = _to_1d_long_tensor(verify_tree_meta.get("draft_token", []))
     draft_token_num = int(verify_tree_meta.get("draft_token_num", 0))
-    rows = []
+    group_rows: List[Dict] = []
+    layer_acc: Dict[Tuple[str, object, object, int], Dict] = defaultdict(
+        lambda: {
+            "num_groups": 0,
+            "sum_num_tokens": 0,
+            "sum_intersection_size": 0,
+            "sum_experts_per_token": 0,
+            "sum_union_size": 0,
+        }
+    )
+    request_acc: Dict[Tuple[str, object, object, int], Dict] = defaultdict(
+        lambda: {
+            "num_groups": 0,
+            "sum_inter_over_token_expert_count": 0.0,
+            "sum_inter_over_union": 0.0,
+        }
+    )
+    valid_group_count = 0
     for rec in records:
         topk_ids_of_layer = rec.get("topk_ids_of_layer")
         if (
@@ -164,25 +195,108 @@ def analyze_file(path: Path, min_tokens_per_group: int) -> List[Dict]:
                         )
                         inter_over_union = (len(inter) / len(union)) if union else 0.0
 
-                        rows.append(
-                            {
-                                "file": path.name,
-                                "bid": obj.get("bid"),
-                                "forward_pass_id": forward_pass_id,
-                                "request_id": int(request_id),
-                                "layer": int(layer_idx),
-                                "depth": int(depth),
-                                "parent_slot": int(parent_slot),
-                                "num_tokens": int(len(expert_sets)),
-                                "intersection_size": int(len(inter)),
-                                "experts_per_token": int(experts_per_token),
-                                "union_size": int(len(union)),
-                                "inter_over_token_expert_count": float(
-                                    inter_over_token_expert_count
-                                ),
-                                "inter_over_union": float(inter_over_union),
-                            }
+                        valid_group_count += 1
+                        file_name = path.name
+                        bid = obj.get("bid")
+                        intersection_size = int(len(inter))
+                        union_size = int(len(union))
+                        experts_per_token_i = int(experts_per_token)
+                        num_tokens_i = int(len(expert_sets))
+
+                        lk = _layer_key(file_name, bid, forward_pass_id, int(layer_idx))
+                        lacc = layer_acc[lk]
+                        lacc["num_groups"] += 1
+                        lacc["sum_num_tokens"] += num_tokens_i
+                        lacc["sum_intersection_size"] += intersection_size
+                        lacc["sum_experts_per_token"] += experts_per_token_i
+                        lacc["sum_union_size"] += union_size
+
+                        rk = _request_key(
+                            file_name, bid, forward_pass_id, int(request_id)
                         )
+                        racc = request_acc[rk]
+                        racc["num_groups"] += 1
+                        racc["sum_inter_over_token_expert_count"] += float(
+                            inter_over_token_expert_count
+                        )
+                        racc["sum_inter_over_union"] += float(inter_over_union)
+
+                        if collect_group_rows:
+                            group_rows.append(
+                                {
+                                    "file": file_name,
+                                    "bid": bid,
+                                    "forward_pass_id": forward_pass_id,
+                                    "request_id": int(request_id),
+                                    "layer": int(layer_idx),
+                                    "depth": int(depth),
+                                    "parent_slot": int(parent_slot),
+                                    "num_tokens": num_tokens_i,
+                                    "intersection_size": intersection_size,
+                                    "experts_per_token": experts_per_token_i,
+                                    "union_size": union_size,
+                                    "inter_over_token_expert_count": float(
+                                        inter_over_token_expert_count
+                                    ),
+                                    "inter_over_union": float(inter_over_union),
+                                }
+                            )
+    return group_rows, layer_acc, request_acc, valid_group_count
+
+
+def layer_acc_to_rows(layer_acc: Dict) -> List[Dict]:
+    rows: List[Dict] = []
+    for (file_name, bid, forward_pass_id, layer), acc in sorted(layer_acc.items()):
+        sum_intersection = int(acc["sum_intersection_size"])
+        sum_experts_per_token = int(acc["sum_experts_per_token"])
+        sum_union = int(acc["sum_union_size"])
+        rows.append(
+            {
+                "file": file_name,
+                "bid": bid,
+                "forward_pass_id": forward_pass_id,
+                "layer": int(layer),
+                "num_groups": int(acc["num_groups"]),
+                "sum_num_tokens": int(acc["sum_num_tokens"]),
+                "sum_intersection_size": sum_intersection,
+                "sum_experts_per_token": sum_experts_per_token,
+                "sum_union_size": sum_union,
+                "weighted_inter_over_token_expert_count": (
+                    float(sum_intersection / sum_experts_per_token)
+                    if sum_experts_per_token > 0
+                    else 0.0
+                ),
+                "weighted_inter_over_union": (
+                    float(sum_intersection / sum_union) if sum_union > 0 else 0.0
+                ),
+            }
+        )
+    return rows
+
+
+def request_acc_to_rows(request_acc: Dict) -> List[Dict]:
+    rows: List[Dict] = []
+    for (file_name, bid, forward_pass_id, request_id), acc in sorted(request_acc.items()):
+        num_groups = int(acc["num_groups"])
+        rows.append(
+            {
+                "file": file_name,
+                "bid": bid,
+                "forward_pass_id": forward_pass_id,
+                "request_id": int(request_id),
+                "num_groups": num_groups,
+                "avg_inter_over_token_expert_count": (
+                    float(acc["sum_inter_over_token_expert_count"] / num_groups)
+                    if num_groups > 0
+                    else 0.0
+                ),
+                "avg_inter_over_union": (
+                    float(acc["sum_inter_over_union"] / num_groups)
+                    if num_groups > 0
+                    else 0.0
+                ),
+            }
+        )
     return rows
 
 
@@ -325,11 +439,29 @@ def analyze_files(
     min_tokens_per_group: int,
     num_workers: int,
     show_progress: bool,
-) -> List[Dict]:
+    collect_group_rows: bool,
+) -> Tuple[List[Dict], List[Dict], List[Dict], int]:
     all_rows: List[Dict] = []
+    layer_acc: Dict[Tuple[str, object, object, int], Dict] = defaultdict(
+        lambda: {
+            "num_groups": 0,
+            "sum_num_tokens": 0,
+            "sum_intersection_size": 0,
+            "sum_experts_per_token": 0,
+            "sum_union_size": 0,
+        }
+    )
+    request_acc: Dict[Tuple[str, object, object, int], Dict] = defaultdict(
+        lambda: {
+            "num_groups": 0,
+            "sum_inter_over_token_expert_count": 0.0,
+            "sum_inter_over_union": 0.0,
+        }
+    )
+    total_groups = 0
     total = len(files)
     if total == 0:
-        return all_rows
+        return all_rows, [], [], 0
 
     start = time.perf_counter()
     completed = 0
@@ -344,7 +476,7 @@ def analyze_files(
         msg = (
             f"\rProgress: {completed}/{total} "
             f"({(completed / total) * 100:5.1f}%) "
-            f"rows={len(all_rows)} "
+            f"groups={total_groups} "
             f"speed={speed:5.2f} files/s "
             f"eta={_format_duration(eta)}"
         )
@@ -356,22 +488,71 @@ def analyze_files(
     workers = _resolve_num_workers(num_workers)
     if workers == 1:
         for path in files:
-            all_rows.extend(analyze_file(path, min_tokens_per_group))
+            file_rows, file_layer_acc, file_request_acc, file_groups = analyze_file(
+                path, min_tokens_per_group, collect_group_rows=collect_group_rows
+            )
+            if collect_group_rows:
+                all_rows.extend(file_rows)
+            for k, v in file_layer_acc.items():
+                dst = layer_acc[k]
+                dst["num_groups"] += int(v["num_groups"])
+                dst["sum_num_tokens"] += int(v["sum_num_tokens"])
+                dst["sum_intersection_size"] += int(v["sum_intersection_size"])
+                dst["sum_experts_per_token"] += int(v["sum_experts_per_token"])
+                dst["sum_union_size"] += int(v["sum_union_size"])
+            for k, v in file_request_acc.items():
+                dst = request_acc[k]
+                dst["num_groups"] += int(v["num_groups"])
+                dst["sum_inter_over_token_expert_count"] += float(
+                    v["sum_inter_over_token_expert_count"]
+                )
+                dst["sum_inter_over_union"] += float(v["sum_inter_over_union"])
+            total_groups += int(file_groups)
             completed += 1
             print_progress()
         print_progress(force_newline=True)
-        return all_rows
+        return (
+            all_rows,
+            layer_acc_to_rows(layer_acc),
+            request_acc_to_rows(request_acc),
+            total_groups,
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         fut_to_path = {
-            executor.submit(analyze_file, p, min_tokens_per_group): p for p in files
+            executor.submit(
+                analyze_file, p, min_tokens_per_group, collect_group_rows
+            ): p
+            for p in files
         }
         for fut in concurrent.futures.as_completed(fut_to_path):
-            all_rows.extend(fut.result())
+            file_rows, file_layer_acc, file_request_acc, file_groups = fut.result()
+            if collect_group_rows:
+                all_rows.extend(file_rows)
+            for k, v in file_layer_acc.items():
+                dst = layer_acc[k]
+                dst["num_groups"] += int(v["num_groups"])
+                dst["sum_num_tokens"] += int(v["sum_num_tokens"])
+                dst["sum_intersection_size"] += int(v["sum_intersection_size"])
+                dst["sum_experts_per_token"] += int(v["sum_experts_per_token"])
+                dst["sum_union_size"] += int(v["sum_union_size"])
+            for k, v in file_request_acc.items():
+                dst = request_acc[k]
+                dst["num_groups"] += int(v["num_groups"])
+                dst["sum_inter_over_token_expert_count"] += float(
+                    v["sum_inter_over_token_expert_count"]
+                )
+                dst["sum_inter_over_union"] += float(v["sum_inter_over_union"])
+            total_groups += int(file_groups)
             completed += 1
             print_progress()
     print_progress(force_newline=True)
-    return all_rows
+    return (
+        all_rows,
+        layer_acc_to_rows(layer_acc),
+        request_acc_to_rows(request_acc),
+        total_groups,
+    )
 
 
 def main() -> None:
@@ -450,20 +631,19 @@ def main() -> None:
         print(f"No files found in {args.input_dir}")
         return
 
-    all_rows = analyze_files(
+    all_rows, summary_rows, request_summary_rows, total_groups = analyze_files(
         files=files,
         min_tokens_per_group=args.min_tokens_per_group,
         num_workers=args.num_workers,
         show_progress=not args.no_progress,
+        collect_group_rows=not args.csv_final_only,
     )
 
     print(f"Analyzed files: {len(files)}")
-    print(f"Valid (file, layer, request, depth, parent) groups: {len(all_rows)}")
-    if not all_rows:
+    print(f"Valid (file, layer, request, depth, parent) groups: {total_groups}")
+    if not request_summary_rows:
         return
 
-    summary_rows = summarize_by_file_layer(all_rows)
-    request_summary_rows = summarize_by_file_request(all_rows)
     global_stats = summarize_global_request_stats(request_summary_rows)
     print(f"Layer summary rows: {len(summary_rows)}")
     print(f"Request summary rows: {len(request_summary_rows)}")
