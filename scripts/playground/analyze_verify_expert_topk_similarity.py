@@ -572,6 +572,7 @@ def main() -> None:
     parser.add_argument(
         "--all-files",
         action="store_true",
+        default=True,
         help="Analyze all files in input-dir. Overrides --max-files.",
     )
     parser.add_argument(
@@ -626,6 +627,10 @@ def main() -> None:
     files = list(iter_dump_files(args.input_dir))
     if not args.all_files and args.max_files > 0:
         files = files[: args.max_files]
+    
+    if args.all_files:
+        assert len(files) % 8 == 0, "Expected number of file must be divided by the number of tp ranks"
+        files = files[: len(files) // 8]
 
     if not files:
         print(f"No files found in {args.input_dir}")
