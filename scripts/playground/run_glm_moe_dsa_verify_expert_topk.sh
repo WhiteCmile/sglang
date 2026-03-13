@@ -28,5 +28,7 @@ python3 -m sglang.launch_server \
   --speculative-eagle-topk 4 \
   --speculative-num-draft-tokens 16 \
   --disable-cuda-graph \
-  --attention-backend flashinfer \
+  --attention-backend fa3 \
+  --prefill-attention-backend fa3 \
+  --decode-attention-backend fa3 \
   --speculative-verify-expert-topk-output-dir "${EXPERT_OUT_DIR}"
