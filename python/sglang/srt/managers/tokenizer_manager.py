@@ -1883,6 +1883,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
             total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
+            total_verify_steps = (
+                recv_obj.spec_verify_ct[i] * self.server_args.speculative_num_steps
+            )
 
             # Calculate per-request acceptance rate and average acceptance length.
             if total_draft_tokens > 0:
@@ -1894,6 +1897,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+            if total_verify_steps > 0:
+                meta_info["spec_accept_rate_per_step"] = (
+                    accepted_tokens / total_verify_steps
+                )
+            if total_draft_tokens > 0:
+                meta_info["spec_accept_rate_per_draft_token"] = (
+                    accepted_tokens / total_draft_tokens
+                )
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (

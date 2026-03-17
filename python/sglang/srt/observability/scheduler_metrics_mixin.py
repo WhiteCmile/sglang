@@ -102,9 +102,11 @@ class SchedulerMetricsMixin:
 
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
+        self.spec_num_accepted_draft_tokens = 0
         self.spec_num_forward_ct = 0
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_accepted_draft_tokens = 0
         self.spec_total_num_forward_ct = 0
 
         # For PD disaggregation
@@ -172,6 +174,7 @@ class SchedulerMetricsMixin:
 
     def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
+        self.spec_num_accepted_draft_tokens += num_accepted_tokens
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
 
@@ -179,8 +182,10 @@ class SchedulerMetricsMixin:
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.spec_num_accepted_tokens = 0
+        self.spec_num_accepted_draft_tokens = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_accepted_draft_tokens = 0
         self.spec_total_num_forward_ct = 0
 
     def report_prefill_stats(
@@ -445,9 +450,20 @@ class SchedulerMetricsMixin:
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
+            spec_accept_rate_per_step = 0
+            spec_accept_rate_per_draft_token = 0
         else:
             spec_accept_length = (
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
+            )
+            accepted_draft_tokens = self.spec_num_accepted_draft_tokens
+            total_verify_steps = self.spec_num_forward_ct * (
+                self.server_args.speculative_num_steps or 0
+            )
+            spec_accept_rate_per_step = (
+                accepted_draft_tokens / total_verify_steps
+                if total_verify_steps > 0
+                else 0
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
             draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
@@ -461,10 +477,27 @@ class SchedulerMetricsMixin:
                 if total_draft_tokens > 0
                 else 0
             )
+            draft_guess_tokens = max(
+                (self.server_args.speculative_num_draft_tokens or 1) - 1, 0
+            )
+            total_draft_guess_tokens = self.spec_num_forward_ct * draft_guess_tokens
+            spec_accept_rate_per_draft_token = (
+                accepted_draft_tokens / total_draft_guess_tokens
+                if total_draft_guess_tokens > 0
+                else 0
+            )
             self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
+            self.spec_total_num_accepted_draft_tokens += accepted_draft_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            self.spec_num_accepted_tokens = 0
+            self.spec_num_accepted_draft_tokens = 0
+            self.spec_num_forward_ct = 0
+            msg += (
+                f"accept len: {spec_accept_length:.2f}, "
+                f"accept rate: {spec_accept_rate:.2f}, "
+                f"accept rate/step: {spec_accept_rate_per_step:.2f}, "
+                f"accept rate/draft-token: {spec_accept_rate_per_draft_token:.2f}, "
+            )
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -523,6 +556,10 @@ class SchedulerMetricsMixin:
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.spec_accept_rate_per_step = spec_accept_rate_per_step
+            self.stats.spec_accept_rate_per_draft_token = (
+                spec_accept_rate_per_draft_token
+            )
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -774,6 +811,10 @@ class SchedulerMetricsMixin:
                         / self.spec_total_num_forward_ct
                     ),
                     accept_rate=self.stats.spec_accept_rate,
+                    accept_rate_per_step=self.stats.spec_accept_rate_per_step,
+                    accept_rate_per_draft_token=(
+                        self.stats.spec_accept_rate_per_draft_token
+                    ),
                 )
 
         lora = None

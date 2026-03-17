@@ -1837,6 +1837,17 @@ class SpeculativeMetrics:
     accept_rate: float = field(
         metadata={"metric": ("gauge", "Speculative acceptance rate")}
     )
+    accept_rate_per_step: float = field(
+        metadata={"metric": ("gauge", "Accepted draft tokens per speculative step")}
+    )
+    accept_rate_per_draft_token: float = field(
+        metadata={
+            "metric": (
+                "gauge",
+                "Accepted draft tokens divided by total draft tokens proposed",
+            )
+        }
+    )
 
 
 @dataclass
