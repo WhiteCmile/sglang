@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import json
+import math
 import random
 import statistics
 import time
@@ -167,6 +168,21 @@ def _format_ratio(values: List[float]) -> str:
     )
 
 
+def _extract_finite_float(meta_info: Dict[str, Any], key: str) -> Optional[float]:
+    value = meta_info.get(key)
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value):
+        return None
+    return value
+
+
 async def run(args: argparse.Namespace) -> None:
     if args.dataset_source == "local":
         prompts = _load_local_dataset(Path(args.dataset_path))
@@ -195,6 +211,8 @@ async def run(args: argparse.Namespace) -> None:
         total_ok = 0
         total_fail = 0
         missing_meta = 0
+        invalid_ratio_meta = 0
+        first_invalid_meta_info: Optional[Dict[str, Any]] = None
         latencies: List[float] = []
         spec_accept_rate_values: List[float] = []
         spec_accept_rate_per_step_values: List[float] = []
@@ -239,17 +257,34 @@ async def run(args: argparse.Namespace) -> None:
                     continue
                 batch_meta += 1
 
-                value = meta_info.get("spec_accept_rate")
-                if isinstance(value, (int, float)):
-                    spec_accept_rate_values.append(float(value))
+                ratio_keys = (
+                    "spec_accept_rate",
+                    "spec_accept_rate_per_step",
+                    "spec_accept_rate_per_draft_token",
+                )
+                has_invalid_ratio = any(
+                    key in meta_info
+                    and _extract_finite_float(meta_info, key) is None
+                    for key in ratio_keys
+                )
+                if has_invalid_ratio:
+                    invalid_ratio_meta += 1
+                    if first_invalid_meta_info is None:
+                        first_invalid_meta_info = meta_info
 
-                value = meta_info.get("spec_accept_rate_per_step")
-                if isinstance(value, (int, float)):
-                    spec_accept_rate_per_step_values.append(float(value))
+                value = _extract_finite_float(meta_info, "spec_accept_rate")
+                if value is not None:
+                    spec_accept_rate_values.append(value)
 
-                value = meta_info.get("spec_accept_rate_per_draft_token")
-                if isinstance(value, (int, float)):
-                    spec_accept_rate_per_draft_token_values.append(float(value))
+                value = _extract_finite_float(meta_info, "spec_accept_rate_per_step")
+                if value is not None:
+                    spec_accept_rate_per_step_values.append(value)
+
+                value = _extract_finite_float(
+                    meta_info, "spec_accept_rate_per_draft_token"
+                )
+                if value is not None:
+                    spec_accept_rate_per_draft_token_values.append(value)
 
             avg_latency = sum(result["latency"] for result in results) / len(results)
             print(
@@ -260,11 +295,13 @@ async def run(args: argparse.Namespace) -> None:
         if latencies:
             print(
                 f"done total_ok={total_ok} total_fail={total_fail} "
-                f"missing_meta={missing_meta} avg_ok_latency={sum(latencies)/len(latencies):.3f}s"
+                f"missing_meta={missing_meta} invalid_ratio_meta={invalid_ratio_meta} "
+                f"avg_ok_latency={sum(latencies)/len(latencies):.3f}s"
             )
         else:
             print(
-                f"done total_ok={total_ok} total_fail={total_fail} missing_meta={missing_meta}"
+                f"done total_ok={total_ok} total_fail={total_fail} "
+                f"missing_meta={missing_meta} invalid_ratio_meta={invalid_ratio_meta}"
             )
 
         print("spec_accept_rate:", _format_ratio(spec_accept_rate_values))
@@ -276,12 +313,18 @@ async def run(args: argparse.Namespace) -> None:
             "spec_accept_rate_per_draft_token:",
             _format_ratio(spec_accept_rate_per_draft_token_values),
         )
+        if first_invalid_meta_info is not None:
+            print(
+                "first_invalid_meta_info:",
+                json.dumps(first_invalid_meta_info, ensure_ascii=False, sort_keys=True),
+            )
 
         if args.output_json:
             summary = {
                 "total_ok": total_ok,
                 "total_fail": total_fail,
                 "missing_meta": missing_meta,
+                "invalid_ratio_meta": invalid_ratio_meta,
                 "spec_accept_rate": spec_accept_rate_values,
                 "spec_accept_rate_per_step": spec_accept_rate_per_step_values,
                 "spec_accept_rate_per_draft_token": (
