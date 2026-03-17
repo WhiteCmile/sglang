@@ -6,12 +6,15 @@ import logging
 import os
 import random
 import socket
+import ssl
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
+import warnings
 import weakref
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
@@ -24,6 +27,8 @@ import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +123,19 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
             )
 
 
+def normalize_base_url(host: str, port: int) -> str:
+    if host.startswith("http://") or host.startswith("https://"):
+        warnings.warn(
+            f"Including the scheme in --host ('{host}') is deprecated. "
+            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    else:
+        host = f"http://{host}"
+    return f"{host}:{port}"
+
+
 class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
@@ -155,7 +173,15 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            if sys.version_info >= (3, 13):
+                # Python 3.13+: Use SSL context (cafile removed)
+                if verify and isinstance(verify, str):
+                    context = ssl.create_default_context(cafile=verify)
+                else:
+                    context = ssl.create_default_context()
+                resp = urllib.request.urlopen(req, data=data, context=context)
+            else:
+                resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
@@ -347,10 +373,8 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
-
-    return is_in_ci()
+def is_in_ci() -> bool:
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 def print_highlight(html_content: str):
@@ -385,6 +409,61 @@ def reserve_port(host, start=30000, end=40000):
     raise RuntimeError("No free port available.")
 
 
+def _prebind_listening_socket(host: str, port: int) -> socket.socket:
+    """
+    Create and bind a server socket to reserve the port before model loading.
+
+    This prevents port conflicts that could occur if another process (e.g., a
+    subprocess spawned during model loading) binds to the same port before the
+    HTTP server starts. By binding early, we ensure the port is available and
+    reserved for the HTTP server. The socket is intentionally not put into
+    listening mode here to avoid accepting probe connections before uvicorn is
+    ready to serve requests.
+
+    Args:
+        host: The host address to bind to.
+        port: The port number to bind to.
+
+    Returns:
+        A bound socket object.
+
+    Raises:
+        RuntimeError: If the port is already in use or permission is denied.
+    """
+    import errno
+
+    from sglang.srt.utils.network import NetworkAddress
+
+    # Determine socket family based on address type
+    na = NetworkAddress(host or "0.0.0.0", port)
+    sock = socket.socket(family=na.family, type=socket.SOCK_STREAM)
+    # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        sock.bind(na.to_bind_tuple())
+        sock.set_inheritable(True)
+        logger.info(f"Successfully reserved port {port} on host '{na.host}'")
+    except OSError as e:
+        sock.close()
+        if e.errno == errno.EADDRINUSE:
+            raise RuntimeError(
+                f"Port {port} is already in use on host '{na.host}'. "
+                f"Please choose a different port with --port or stop the process using this port. "
+                f"You can find the process using: lsof -i :{port} or netstat -tlnp | grep {port}"
+            ) from e
+        elif e.errno == errno.EACCES:
+            raise RuntimeError(
+                f"Permission denied when trying to bind to port {port}. "
+                f"Ports below 1024 require root/sudo privileges. "
+                f"Consider using a port >= 1024 (e.g., --port 8000) or run with sudo."
+            ) from e
+        else:
+            raise RuntimeError(f"Failed to bind to {na}: {e}") from e
+
+    return sock
+
+
 def release_port(lock_socket):
     """
     Release the reserved port by closing the lock socket.
@@ -398,10 +477,28 @@ def release_port(lock_socket):
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return its process handle.
+    Supports leading KEY=VALUE env vars (e.g. "VAR=1 python script.py") so that
+    notebook/CI commands work without requiring shell=True.
     """
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+    env = os.environ.copy()
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if "=" in part and not part.startswith("-") and not part.startswith("/"):
+            key, _, value = part.partition("=")
+            if key and value is not None and key.replace("_", "").isalnum():
+                env[key] = value
+                i += 1
+                continue
+        break
+    parts = parts[i:]
+    if not parts:
+        raise ValueError(
+            "Command contains only environment variable assignments, no executable"
+        )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
@@ -436,46 +533,125 @@ def terminate_process(process):
         release_port(lock_socket)
 
 
-def wait_for_server(base_url: str, timeout: int = None) -> None:
+def _raise_if_process_exited(process: Optional[Any]) -> None:
+    if process is None:
+        return
+
+    if hasattr(process, "poll"):
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"Server process exited with code {return_code}")
+        return
+
+    if hasattr(process, "is_alive") and not process.is_alive():
+        return_code = getattr(process, "exitcode", None)
+        if return_code is None:
+            raise RuntimeError("Server process exited")
+        raise RuntimeError(f"Server process exited with code {return_code}")
+
+
+def _is_wait_timeout(start_time: float, timeout: Optional[int]) -> bool:
+    if timeout is None:
+        return False
+    return time.perf_counter() - start_time > timeout
+
+
+def wait_for_http_ready(
+    url: str,
+    timeout: Optional[int] = None,
+    process: Optional[Any] = None,
+    headers: Optional[dict] = None,
+    request_timeout: int = 5,
+) -> None:
+    """Wait for an HTTP endpoint to return status 200."""
+    start_time = time.perf_counter()
+    while True:
+        _raise_if_process_exited(process)
+        try:
+            response = requests.get(url, headers=headers, timeout=request_timeout)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException:
+            _raise_if_process_exited(process)
+
+        if _is_wait_timeout(start_time, timeout):
+            raise TimeoutError(
+                f"Endpoint {url} did not become ready within timeout period"
+            )
+        time.sleep(1)
+
+
+def wait_for_server(
+    base_url: str,
+    timeout: int = None,
+    process: Optional[subprocess.Popen] = None,
+) -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
-        base_url: The base URL of the server
+        base_url: The base URL of the server.
         timeout: Maximum time to wait in seconds. None means wait forever.
+        process: Optional server process used for early-exit checks.
     """
-    start_time = time.perf_counter()
-    while True:
-        try:
-            response = requests.get(
-                f"{base_url}/v1/models",
-                headers={"Authorization": "Bearer None"},
-            )
-            if response.status_code == 200:
-                time.sleep(5)
-                print_highlight(
-                    """\n
-                    NOTE: Typically, the server runs in a separate terminal.
-                    In this notebook, we run the server and notebook code together, so their outputs are combined.
-                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-                    """
-                )
-                break
-
-            if timeout and time.perf_counter() - start_time > timeout:
-                raise TimeoutError("Server did not become ready within timeout period")
-        except requests.exceptions.RequestException:
-            time.sleep(1)
+    wait_for_http_ready(
+        url=f"{base_url}/v1/models",
+        timeout=timeout,
+        process=process,
+        headers={"Authorization": "Bearer None"},
+    )
+    time.sleep(5)
+    print_highlight("""\n
+        NOTE: Typically, the server runs in a separate terminal.
+        In this notebook, we run the server and notebook code together, so their outputs are combined.
+        To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+        To reduce the log length, we set the log level to warning for the server, the default log level is info.
+        We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
+        """)
 
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        self._mapping = mapping
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
+        self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
+        return self
 
     def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
             if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
                 return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
 

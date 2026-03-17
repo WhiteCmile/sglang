@@ -2,11 +2,12 @@
 
 import os
 import unittest
-from typing import List, Optional
+from typing import List
 from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlFileManager,
@@ -31,8 +32,22 @@ class TestNixlUnified(unittest.TestCase):
         # Create instances
         self.file_manager = NixlFileManager(self.test_dir)
         self.registration = NixlRegistration(self.mock_agent)
+
+        # Create storage config for testing
+        self.storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=2,
+            is_mla_model=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+        )
+
         try:
-            self.hicache = HiCacheNixl(file_path=self.test_dir, plugin="POSIX")
+            self.hicache = HiCacheNixl(
+                storage_config=self.storage_config,
+                file_path=self.test_dir,
+                plugin="POSIX",
+            )
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
@@ -109,7 +124,7 @@ class TestNixlUnified(unittest.TestCase):
 
         # Test get
         retrieved2 = self.hicache.get(key, dst_addr, dst_len)
-        self.assertTrue(retrieved2 == None)
+        self.assertTrue(retrieved2 is None)
         self.verify_tensors_equal(value, dst_tensor2)
 
     def test_batch_set_get(self):
@@ -144,7 +159,7 @@ class TestNixlUnified(unittest.TestCase):
 
         # Test batch get
         retrieved2 = self.hicache.batch_get(keys, dst_addrs, dst_lens)
-        self.assertTrue(all(ret == None for ret in retrieved2))
+        self.assertTrue(all(ret is None for ret in retrieved2))
         self.verify_tensor_lists_equal(values, dst_tensors2)
 
     def test_mixed_operations(self):

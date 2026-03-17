@@ -2,12 +2,13 @@ from functools import lru_cache
 from typing import Optional, Union
 
 import torch
-import torch.nn as nn
 
 try:
     from sgl_kernel import flash_ops
 except:
-    raise ImportError("Can not import sgl_kernel. Please check your installation.")
+    raise ImportError(
+        "Can not import FA3 in sgl_kernel. Please check your installation."
+    )
 
 
 @lru_cache(maxsize=1)
@@ -39,7 +40,7 @@ def flash_attn_with_kvcache(
     qv=None,
     rotary_cos=None,
     rotary_sin=None,
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
@@ -53,6 +54,7 @@ def flash_attn_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    attention_chunk: Optional[int] = None,
     softcap=0.0,  # 0.0 means deactivated
     rotary_interleaved=True,
     scheduler_metadata=None,
@@ -61,6 +63,9 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    score_mod=None,
+    aux_tensors=None,
+    ver=3,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -130,6 +135,7 @@ def flash_attn_with_kvcache(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: Optional[int]. If not None, splits the query into chunks of this size to save memory.
         softcap: float. Anything > 0 activates softcapping attention.
         rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
             If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
@@ -140,6 +146,8 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        score_mod [optional]: A callable that takes the attention scores and applies a modification.
+        aux_tensors [optional]: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -147,6 +155,7 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:
@@ -173,6 +182,7 @@ def flash_attn_with_kvcache(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
+    attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -202,6 +212,7 @@ def flash_attn_with_kvcache(
         causal,
         window_size[0],
         window_size[1],
+        attention_chunk,
         softcap,
         rotary_interleaved,
         scheduler_metadata,
@@ -220,10 +231,11 @@ def flash_attn_varlen_func(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
     seqused_q=None,
     seqused_k=None,
+    page_table=None,
     softmax_scale=None,
     causal=False,
     qv=None,
@@ -231,22 +243,32 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     window_size=(-1, -1),
+    attention_chunk=0,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    score_mod=None,
+    aux_tensors=None,
+    ver=3,
 ):
+
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
+    # FA3 requires max_seqlen_q and max_seqlen_k
+    if max_seqlen_q is None or max_seqlen_k is None:
+        raise ValueError("max_seqlen_q and max_seqlen_k are required for FA3")
+
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
+    attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -276,6 +298,7 @@ def flash_attn_varlen_func(
         causal,
         window_size[0],
         window_size[1],
+        attention_chunk,
         softcap,
         is_rotary_interleaved=False,
         scheduler_metadata=None,
