@@ -118,18 +118,28 @@ def _extract_meta_info(payload: Any) -> Optional[Dict[str, Any]]:
 async def _send_one(
     session: aiohttp.ClientSession,
     url: str,
+    api_mode: str,
     model: str,
     prompt: str,
     max_tokens: int,
     temperature: float,
     timeout_s: float,
 ) -> Dict[str, Any]:
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
+    if api_mode == "native":
+        payload = {
+            "text": prompt,
+            "sampling_params": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+            },
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
     t0 = time.perf_counter()
     async with session.post(url, json=payload, timeout=timeout_s) as resp:
         text = await resp.text()
@@ -183,6 +193,15 @@ def _extract_finite_float(meta_info: Dict[str, Any], key: str) -> Optional[float
     return value
 
 
+def _build_request_url(base_url: str, api_mode: str) -> str:
+    normalized = base_url.rstrip("/")
+    if api_mode == "native":
+        if normalized.endswith("/v1"):
+            normalized = normalized[: -len("/v1")]
+        return normalized + "/generate"
+    return normalized + "/chat/completions"
+
+
 async def run(args: argparse.Namespace) -> None:
     if args.dataset_source == "local":
         prompts = _load_local_dataset(Path(args.dataset_path))
@@ -197,10 +216,11 @@ async def run(args: argparse.Namespace) -> None:
     else:
         prompts = prompts[:need]
 
-    url = args.base_url.rstrip("/") + "/chat/completions"
+    url = _build_request_url(args.base_url, args.api_mode)
     print(f"Sending to {url}")
     print(
-        f"dataset_source={args.dataset_source} total_prompts={len(prompts)} "
+        f"api_mode={args.api_mode} dataset_source={args.dataset_source} "
+        f"total_prompts={len(prompts)} "
         f"num_batches={args.num_batches} batch_size={args.batch_size}"
     )
 
@@ -225,6 +245,7 @@ async def run(args: argparse.Namespace) -> None:
                 _send_one(
                     session=session,
                     url=url,
+                    api_mode=args.api_mode,
                     model=args.model,
                     prompt=prompt,
                     max_tokens=args.max_tokens,
@@ -345,8 +366,15 @@ def main() -> None:
     parser.add_argument(
         "--base-url",
         type=str,
-        default="http://127.0.0.1:30001/v1",
-        help="OpenAI-compatible base URL.",
+        default="http://127.0.0.1:30001",
+        help="Server base URL. Native mode uses /generate, OpenAI mode uses /v1/chat/completions.",
+    )
+    parser.add_argument(
+        "--api-mode",
+        type=str,
+        choices=["native", "openai-chat"],
+        default="native",
+        help="Use native /generate or OpenAI-compatible /v1/chat/completions.",
     )
     parser.add_argument("--model", type=str, default="default")
     parser.add_argument(
