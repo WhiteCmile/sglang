@@ -37,6 +37,11 @@ class DFlashVerifyInput(SpecInput):
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    # Optional algorithm-specific auxiliary input. FLASHMTP's draft forward
+    # consumes one concatenated multi-layer target pivot per request. Keeping
+    # it on the shared linear-chain schema lets the generic decode CUDA Graph
+    # runner provide a stable capture buffer for it.
+    hidden_states: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).

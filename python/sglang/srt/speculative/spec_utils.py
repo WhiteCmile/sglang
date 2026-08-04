@@ -255,7 +255,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
+    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through
+    # FutureMap. FLASHMTP does: its next draft step consumes the accepted
+    # target-token pivot.
     # TODO(lsyin): also skip when step == 1.
     if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
@@ -981,7 +983,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             server_args.mamba_track_interval,
             server_args.max_speculative_num_draft_tokens,
         )
-    if batch.spec_algorithm.is_dflash_family():
+    if batch.spec_algorithm.uses_block_verify_reservation():
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

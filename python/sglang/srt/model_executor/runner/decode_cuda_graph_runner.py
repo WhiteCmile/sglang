@@ -378,6 +378,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
+        self.flashmtp_pivot_hidden = None
+        if (
+            self.model_runner.is_draft_worker
+            and self.model_runner.spec_algorithm.is_flashmtp()
+        ):
+            target_layer_ids = getattr(
+                self.model_runner.model, "target_layer_ids", None
+            )
+            if not target_layer_ids:
+                raise ValueError(
+                    "FLASHMTP draft CUDA Graph requires model.target_layer_ids."
+                )
+            pivot_width = len(target_layer_ids) * int(
+                self.model_runner.model_config.hidden_size
+            )
+            self.flashmtp_pivot_hidden = torch.zeros(
+                (self.max_bs, pivot_width),
+                dtype=self.model_runner.model_config.dtype,
+                device=self.device,
+            )
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -972,7 +992,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash_family()
+                    self.model_runner.spec_algorithm.uses_linear_chain_verify()
                     and self.model_runner.is_draft_worker
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
@@ -1089,13 +1109,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
                 not is_ragged
-                and self.model_runner.spec_algorithm.is_dflash_family()
+                and self.model_runner.spec_algorithm.uses_linear_chain_verify()
                 and self.model_runner.is_draft_worker
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
+            self._load_flashmtp_pivot_hidden(
+                forward_batch, raw_bs=self.raw_bs, padded_bs=self.bs
+            )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1129,7 +1152,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     max_num_tokens / self.captured_req_width
                     if self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
-                    or self.model_runner.spec_algorithm.is_dflash_family()
+                    or self.model_runner.spec_algorithm.uses_linear_chain_verify()
                     else max_num_tokens
                 )
                 bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -1151,11 +1174,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             not is_ragged
-            and self.model_runner.spec_algorithm.is_dflash_family()
+            and self.model_runner.spec_algorithm.uses_linear_chain_verify()
             and self.model_runner.is_draft_worker
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+        self._load_flashmtp_pivot_hidden(
+            forward_batch, raw_bs=raw_bs, padded_bs=bs
+        )
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         if self.enable_two_batch_overlap:
@@ -1203,6 +1229,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_size_key, stream_idx, variant_label
         )
 
+    def _load_flashmtp_pivot_hidden(
+        self, forward_batch: ForwardBatch, *, raw_bs: int, padded_bs: int
+    ) -> None:
+        """Copy runtime FlashMTP pivots into the graph-stable capture buffer."""
+        if self.flashmtp_pivot_hidden is None:
+            return
+        hidden_states = getattr(forward_batch.spec_info, "hidden_states", None)
+        if hidden_states is None:
+            raise ValueError(
+                "FLASHMTP draft CUDA Graph replay requires pivot hidden states."
+            )
+        expected_width = int(self.flashmtp_pivot_hidden.shape[1])
+        if hidden_states.ndim != 2 or tuple(hidden_states.shape) != (
+            raw_bs,
+            expected_width,
+        ):
+            raise ValueError(
+                "FLASHMTP draft pivot shape mismatch for CUDA Graph replay: "
+                f"expected {(raw_bs, expected_width)}, got {tuple(hidden_states.shape)}."
+            )
+        self.flashmtp_pivot_hidden[:raw_bs].copy_(hidden_states)
+        if padded_bs > raw_bs:
+            self.flashmtp_pivot_hidden[raw_bs:padded_bs].zero_()
+
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid
 
@@ -1221,7 +1271,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # snapshot, so plain DECODE and block-draft TARGET_VERIFY qualify.
         publish_read_done = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
-            and self.model_runner.spec_algorithm.is_dflash_family()
+            and self.model_runner.spec_algorithm.uses_linear_chain_verify()
         )
         # Exception: breakable-graph verify replays (captured forward metadata)
         # re-read req_to_token *during* replay, so the pre-replay snapshot is
@@ -1325,7 +1375,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=self.model_runner.dtype,
                     device=self.model_runner.device,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash_family():
+        elif self.model_runner.spec_algorithm.uses_linear_chain_verify():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,
@@ -1352,6 +1402,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
             )
+            if (
+                self.model_runner.is_draft_worker
+                and self.model_runner.spec_algorithm.is_flashmtp()
+            ):
+                if self.flashmtp_pivot_hidden is None:
+                    raise RuntimeError(
+                        "FLASHMTP draft CUDA Graph pivot buffer was not initialized."
+                    )
+                batch_size = num_tokens // self.captured_req_width
+                spec_info.hidden_states = self.flashmtp_pivot_hidden[:batch_size]
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

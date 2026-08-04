@@ -21,6 +21,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    flashmtp_use_aux_hidden_state: bool = False
+    flashmtp_target_layer_ids: Any = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -38,6 +40,13 @@ def resolve_spec_aux_hidden_state_config(
         is_draft_worker=is_draft_worker,
     )
     _resolve_dflash_aux_hidden_state(
+        config=config,
+        server_args=server_args,
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
+    _resolve_flashmtp_aux_hidden_state(
         config=config,
         server_args=server_args,
         model_config=model_config,
@@ -163,3 +172,48 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+
+
+def _resolve_flashmtp_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
+    if not spec_algorithm.is_flashmtp() or is_draft_worker:
+        return
+
+    from sglang.srt.speculative.flashmtp_utils import (
+        parse_flashmtp_draft_config,
+    )
+
+    draft_model_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=server_args.speculative_draft_model_path,
+        model_revision=server_args.speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    flash_config = parse_flashmtp_draft_config(
+        draft_hf_config=draft_model_config.hf_config
+    )
+    target_architectures = list(
+        getattr(model_config.hf_config, "architectures", None) or []
+    )
+    if target_architectures[:1] != ["Qwen3ForCausalLM"]:
+        raise NotImplementedError(
+            "SGLang FlashMTP currently supports only a dense Qwen3 target; "
+            f"got architectures={target_architectures}."
+        )
+    target_num_layers = int(
+        getattr(model_config.hf_text_config, "num_hidden_layers", 0)
+    )
+    if target_num_layers != flash_config.num_target_layers:
+        raise ValueError(
+            "FlashMTP target layer count mismatch: "
+            f"target={target_num_layers}, checkpoint={flash_config.num_target_layers}."
+        )
+
+    config.flashmtp_use_aux_hidden_state = True
+    config.flashmtp_target_layer_ids = list(flash_config.target_layer_ids)

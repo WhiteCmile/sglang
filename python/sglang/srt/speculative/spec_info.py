@@ -38,6 +38,7 @@ class SpeculativeAlgorithm(Enum):
     DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
+    FLASHMTP = auto()
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     NGRAM = auto()
@@ -112,11 +113,20 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_flashmtp(self) -> bool:
+        return self == SpeculativeAlgorithm.FLASHMTP
+
     def is_dspark(self) -> bool:
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
         return self.is_dflash() or self.is_dspark()
+
+    def uses_linear_chain_verify(self) -> bool:
+        return self.is_dflash_family() or self.is_flashmtp()
+
+    def uses_block_verify_reservation(self) -> bool:
+        return self.uses_linear_chain_verify()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -125,7 +135,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash_family()
+        return self.uses_linear_chain_verify()
 
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
@@ -139,13 +149,17 @@ class SpeculativeAlgorithm(Enum):
         # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
-        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or self.uses_linear_chain_verify()
+        )
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
         per-topk page rounding; see get_alloc_len_per_decode."""
-        return not self.is_ngram()
+        return not (self.is_ngram() or self.is_flashmtp())
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
@@ -210,6 +224,10 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_flashmtp():
+            from sglang.srt.arg_groups.speculative_hook import _handle_flashmtp
+
+            _handle_flashmtp(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
@@ -258,6 +276,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_flashmtp():
+            from sglang.srt.speculative.flashmtp_worker_v2 import FlashMTPWorkerV2
+
+            return FlashMTPWorkerV2
 
         if self.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
@@ -408,7 +431,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash_family():
+    elif spec_algorithm.uses_linear_chain_verify():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

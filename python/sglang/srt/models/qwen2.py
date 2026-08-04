@@ -429,6 +429,16 @@ class Qwen2Model(nn.Module):
             )
         else:
             if hidden_states.shape[0] != 0:
+                # ``layers_to_capture`` uses the HF/vLLM boundary convention:
+                # 0 is the embedding output and k + 1 is the output of layer k.
+                # The loop above captures each boundary before the next layer,
+                # so the final boundary must be captured explicitly.
+                if self.end_layer in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:

@@ -267,6 +267,112 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_flashmtp(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("FLASHMTP speculative decoding currently supports CUDA only.")
+    if server_args.dtype not in ("auto", "bfloat16"):
+        raise ValueError(
+            "FLASHMTP currently supports only bfloat16 model execution; "
+            f"got --dtype={server_args.dtype!r}."
+        )
+    if resolved_view(server_args).enable_dp_attention:
+        raise ValueError("FLASHMTP currently does not support DP attention.")
+    if server_args.pp_size != 1:
+        raise ValueError("FLASHMTP currently requires pp_size == 1.")
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "FLASHMTP requires --speculative-draft-model-path."
+        )
+
+    # FlashMTP drafts one parallel block. The block contains one slot-0 bonus
+    # token and block_size - 1 proposed tokens.
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "FLASHMTP only supports speculative_num_steps == 1; overriding %s.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(server_args.speculative_eagle_topk) != 1:
+        logger.warning(
+            "FLASHMTP only supports speculative_eagle_topk == 1; overriding %s.",
+            server_args.speculative_eagle_topk,
+        )
+        server_args.speculative_eagle_topk = 1
+
+    explicit_block_size = server_args.speculative_flashmtp_block_size
+    if explicit_block_size is not None:
+        explicit_block_size = int(explicit_block_size)
+        if explicit_block_size < 2:
+            raise ValueError(
+                "FLASHMTP block size includes the bonus token and must be >= 2, "
+                f"got {explicit_block_size}."
+            )
+        if (
+            server_args.speculative_num_draft_tokens is not None
+            and int(server_args.speculative_num_draft_tokens)
+            != explicit_block_size
+        ):
+            raise ValueError(
+                "--speculative-num-draft-tokens and "
+                "--speculative-flashmtp-block-size must match for FLASHMTP."
+            )
+        server_args.speculative_num_draft_tokens = explicit_block_size
+
+    from sglang.srt.speculative.flashmtp_utils import (
+        parse_flashmtp_draft_config,
+    )
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=json.loads(server_args.json_model_override_args),
+    )
+    flash_config = parse_flashmtp_draft_config(
+        draft_hf_config=draft_hf_config
+    )
+    if server_args.speculative_num_draft_tokens is None:
+        server_args.speculative_num_draft_tokens = flash_config.block_size
+    elif int(server_args.speculative_num_draft_tokens) > flash_config.block_size:
+        raise ValueError(
+            "FLASHMTP runtime block size cannot exceed the checkpoint block_size: "
+            f"runtime={server_args.speculative_num_draft_tokens}, "
+            f"checkpoint={flash_config.block_size}."
+        )
+    elif int(server_args.speculative_num_draft_tokens) < 2:
+        raise ValueError(
+            "FLASHMTP speculative_num_draft_tokens is the total verify block "
+            "and must be >= 2."
+        )
+
+    if server_args.speculative_draft_window_size is not None:
+        raise ValueError(
+            "FLASHMTP has no draft KV cache and does not support "
+            "--speculative-draft-window-size."
+        )
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for FLASHMTP speculative "
+            "decoding. You can override it explicitly."
+        )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled for FLASHMTP speculative decoding."
+        )
+
+
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.dspark_components.dspark_config import (
         checkpoint_bundles_dspark_draft,

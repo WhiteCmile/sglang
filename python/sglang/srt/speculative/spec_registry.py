@@ -77,10 +77,19 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_flashmtp(self) -> bool:
+        return False
+
     def is_dspark(self) -> bool:
         return False
 
     def is_dflash_family(self) -> bool:
+        return False
+
+    def uses_linear_chain_verify(self) -> bool:
+        return False
+
+    def uses_block_verify_reservation(self) -> bool:
         return False
 
     def is_standalone(self) -> bool:

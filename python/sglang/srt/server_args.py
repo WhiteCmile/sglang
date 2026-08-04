@@ -1994,7 +1994,9 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
+        "NGRAM, DFLASH, DSPARK, FLASHMTP. Or any name registered via "
+        "`SpeculativeAlgorithm.register`.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2036,6 +2038,12 @@ class ServerArgs:
     speculative_dflash_block_size: A[
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        NS("spec"),
+    ] = None
+    speculative_flashmtp_block_size: A[
+        Optional[int],
+        "FLASHMTP only. Total verify block size, including the slot-0 bonus token. "
+        "Alias of --speculative-num-draft-tokens for FLASHMTP.",
         NS("spec"),
     ] = None
     speculative_dspark_block_size: A[

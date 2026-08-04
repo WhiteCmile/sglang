@@ -265,19 +265,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Hidden-state capture mode cases:
         # - Breakable EAGLE draft: LAST.
         # - Breakable EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
+        # - FLASHMTP target: LAST (one pivot per request).
+        # - Return-hidden-states or DFLASH/DSPARK: FULL.
         # - Otherwise: NULL.
         is_breakable_eagle = (
             self.prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
         )
-        needs_full_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash_family()
-        )
-        if is_breakable_eagle and model_runner.is_draft_worker:
+        if (
+            is_breakable_eagle and model_runner.is_draft_worker
+        ) or model_runner.spec_algorithm.is_flashmtp():
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or needs_full_hidden_states:
+        elif (
+            is_breakable_eagle
+            or model_runner.server_args.enable_return_hidden_states
+            or model_runner.spec_algorithm.is_dflash_family()
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
             self.capture_hidden_mode = CaptureHiddenMode.NULL
