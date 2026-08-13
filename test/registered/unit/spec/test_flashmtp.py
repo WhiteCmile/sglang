@@ -7,7 +7,12 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from sglang.srt.models.flashmtp import FlashMTPAttention, FlashMTPDecoderLayer
+from sglang.srt.models.flashmtp import (
+    FlashMTPAttention,
+    FlashMTPDecoderLayer,
+    FlashMTPDraftModel,
+    FlashMTPMarkovHead,
+)
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.speculative.flashmtp_utils import (
     gather_flashmtp_next_pivot,
@@ -37,6 +42,119 @@ def test_flashmtp_block_size_includes_bonus_token():
     config = parse_flashmtp_draft_config(draft_hf_config=_config())
     assert config.block_size == 16
     assert config.num_proposed_tokens == 15
+    assert config.draft_block_len == 16
+    assert config.markov_head_type == "none"
+    assert config.markov_output_mode == "additive"
+
+
+def test_flashmtp_v2_config_and_left_shift():
+    config = parse_flashmtp_draft_config(
+        draft_hf_config=_config(
+            left_shift=True,
+            markov_head_type="rnn",
+            markov_output_mode="direct",
+            markov_rank=512,
+        )
+    )
+    assert config.left_shift
+    assert config.draft_block_len == 15
+    assert config.num_proposed_tokens == 15
+    assert config.markov_head_type == "rnn"
+    assert config.markov_output_mode == "direct"
+    assert config.markov_rank == 512
+
+
+def test_flashmtp_v2_rejects_invalid_markov_config():
+    with pytest.raises(ValueError, match="requires a Markov head"):
+        parse_flashmtp_draft_config(
+            draft_hf_config=_config(markov_output_mode="direct")
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        parse_flashmtp_draft_config(
+            draft_hf_config=_config(markov_head_type="rnn", markov_rank=0)
+        )
+
+
+def test_flashmtp_v2_rnn_direct_sampler_matches_reference():
+    torch.manual_seed(7)
+    head = FlashMTPMarkovHead(vocab_size=13, hidden_size=5, markov_rank=3)
+    hidden = torch.randn(2, 4, 5)
+    anchors = torch.tensor([2, 9])
+
+    expected = []
+    state = torch.zeros(2, 3)
+    previous = anchors
+    projected_hidden = head.hidden_proj(hidden)
+    for position in range(4):
+        previous_embedding = head.prev_token_embedding(previous)
+        gate_raw, candidate_raw = head.state_proj(
+            torch.cat([state, previous_embedding], dim=-1)
+        ).chunk(2, dim=-1)
+        gate = torch.sigmoid(gate_raw)
+        state = gate * state + (1 - gate) * torch.tanh(candidate_raw)
+        serial = torch.tanh(head.state_out_proj(state))
+        fuse_gate = torch.sigmoid(
+            head.hidden_fuse_gate_proj(
+                torch.cat([serial, projected_hidden[:, position]], dim=-1)
+            )
+        )
+        latent = fuse_gate * serial + (1 - fuse_gate) * projected_hidden[:, position]
+        previous = torch.argmax(head.output_proj(latent), dim=-1)
+        expected.append(previous)
+
+    actual = head.sample_block_tokens(
+        hidden_states=hidden, first_prev_token_ids=anchors
+    )
+    torch.testing.assert_close(actual, torch.stack(expected, dim=1))
+
+
+def test_flashmtp_v2_rnn_easy_direct_sampler_matches_reference():
+    torch.manual_seed(11)
+    head = FlashMTPMarkovHead(
+        vocab_size=13, hidden_size=5, markov_rank=3, head_type="rnn_easy"
+    )
+    hidden = torch.randn(2, 4, 5)
+    anchors = torch.tensor([2, 9])
+
+    expected = []
+    state = torch.zeros(2, 3)
+    previous = anchors
+    projected_hidden = head.hidden_proj(hidden)
+    for position in range(4):
+        previous_embedding = head.prev_token_embedding(previous)
+        gate_raw, candidate_raw = head.state_proj(
+            torch.cat([state, previous_embedding], dim=-1)
+        ).chunk(2, dim=-1)
+        gate = torch.sigmoid(gate_raw)
+        state = gate * state + (1 - gate) * torch.tanh(candidate_raw)
+        assert head.state_hidden_mlp is not None
+        latent = head.state_hidden_mlp(
+            torch.cat([state, projected_hidden[:, position]], dim=-1)
+        )
+        previous = torch.argmax(head.output_proj(latent), dim=-1)
+        expected.append(previous)
+
+    actual = head.sample_block_tokens(
+        hidden_states=hidden, first_prev_token_ids=anchors
+    )
+    torch.testing.assert_close(actual, torch.stack(expected, dim=1))
+
+
+@pytest.mark.parametrize(
+    ("left_shift", "draft_block_len", "expected"),
+    [
+        (False, 4, [[1, 2, 3], [5, 6, 7]]),
+        (True, 3, [[0, 1, 2], [3, 4, 5]]),
+    ],
+)
+def test_flashmtp_prediction_hidden_alignment(left_shift, draft_block_len, expected):
+    model = FlashMTPDraftModel.__new__(FlashMTPDraftModel)
+    nn.Module.__init__(model)
+    model.block_size = 4
+    model.left_shift = left_shift
+    hidden = torch.arange(2 * draft_block_len).view(2, draft_block_len, 1)
+    actual = model.prediction_hidden(hidden).squeeze(-1)
+    torch.testing.assert_close(actual, torch.tensor(expected))
 
 
 def test_flashmtp_rejects_unsupported_modes():

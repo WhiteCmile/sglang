@@ -1548,9 +1548,12 @@ class ModelRunner:
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
                 category = (
-                    "target_verify"
-                    if forward_batch.forward_mode.is_target_verify()
-                    else "extend"
+                    forward_batch.device_timer_category
+                    or (
+                        "target_verify"
+                        if forward_batch.forward_mode.is_target_verify()
+                        else "extend"
+                    )
                 )
                 # TODO: the timing here is too broad -- it also includes
                 # load_batch time. Move it into the prefill cuda graph runner

@@ -49,6 +49,31 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip
 logger = logging.getLogger(__name__)
 
 
+class _FlashMTPMarkovDraftSampler:
+    """Capture-safe wrapper for FlashMTP v2's serial Markov sampler."""
+
+    def __init__(
+        self, *, draft_model, draft_block_len: int, num_proposals: int, max_bs: int
+    ):
+        self.draft_model = draft_model
+        self.draft_block_len = int(draft_block_len)
+        self.num_proposals = int(num_proposals)
+        device = next(draft_model.parameters()).device
+        self.out = torch.empty(
+            (int(max_bs) * self.num_proposals,), dtype=torch.int64, device=device
+        )
+
+    def __call__(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> None:
+        batch_size = hidden_states.shape[0] // self.draft_block_len
+        block_hidden = hidden_states.view(batch_size, self.draft_block_len, -1)
+        anchors = input_ids.view(batch_size, self.draft_block_len)[:, 0]
+        sampled = self.draft_model.sample_draft_tokens(
+            block_hidden=block_hidden,
+            first_prev_token_ids=anchors,
+        )
+        self.out[: batch_size * self.num_proposals].copy_(sampled.reshape(-1))
+
+
 class FlashMTPWorkerV2(DFlashWorkerV2):
     """FlashMTP V2 worker.
 
@@ -97,6 +122,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         self.block_size = int(server_args.speculative_num_draft_tokens)
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1
+        self._draft_block_len = (
+            self.block_size - 1 if flash_config.left_shift else self.block_size
+        )
         self._mask_token_id = int(flash_config.mask_token_id)
         self._num_pivot_layers = len(flash_config.target_layer_ids)
 
@@ -136,7 +164,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         self._draft_block_end_buf: torch.Tensor | None = None
         self._draft_seq_lens_cpu_buf: torch.Tensor | None = None
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=self.block_size, device=self.device
+            draft_token_num=self._draft_block_len, device=self.device
         )
 
         # Buffers consumed by inherited vocab-parallel sampling helpers.
@@ -172,6 +200,25 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 self._num_pivot_layers,
                 self._mask_token_id,
             )
+
+    def _maybe_build_draft_sampler(self):
+        if getattr(self.draft_model, "markov_head", None) is None:
+            if bool(getattr(self.draft_model, "left_shift", False)):
+                if self.ps.tp_rank == 0:
+                    logger.info(
+                        "FLASHMTP left-shift target LM head kept eager; the "
+                        "legacy graph sampler assumes an anchor-inclusive draft block."
+                    )
+                return None
+            return super()._maybe_build_draft_sampler()
+        if self.ps.tp_rank == 0:
+            logger.info("FLASHMTP v2 Markov head folded into the draft cuda graph.")
+        return _FlashMTPMarkovDraftSampler(
+            draft_model=self.draft_model,
+            draft_block_len=self._draft_block_len,
+            num_proposals=self.num_proposed_tokens,
+            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+        )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (
@@ -380,12 +427,19 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if getattr(self.draft_model, "markov_head", None) is None and (
+            lm_head is None or not hasattr(lm_head, "weight")
+        ):
             raise RuntimeError(
                 "FLASHMTP requires the target model's vocabulary-parallel lm_head."
             )
-        input_embeds = embed_module(block_ids).reshape(batch_size * self.block_size, -1)
-        local_positions = self._draft_local_positions_buf[:batch_size].reshape(-1)
+        draft_block_ids = block_ids[:, : self._draft_block_len]
+        input_embeds = embed_module(draft_block_ids).reshape(
+            batch_size * self._draft_block_len, -1
+        )
+        local_positions = self._draft_local_positions_buf[
+            :batch_size, : self._draft_block_len
+        ].reshape(-1)
 
         # DFlashVerifyInput is the existing generic fixed-width linear-chain
         # schema used by attention/runner plumbing. Its hidden_states attribute
@@ -403,15 +457,18 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=batch_size,
-            input_ids=block_ids.reshape(-1),
+            input_ids=draft_block_ids.reshape(-1),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=prefix_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=verify_out_cache_loc_2d[:, : self._draft_block_len].reshape(
+                -1
+            ),
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=draft_seq_lens_cpu,
             positions=local_positions,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.FLASHMTP,
+            device_timer_category="flashmtp_draft",
             spec_info=draft_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
@@ -425,13 +482,20 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             draft_hidden = draft_out.logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("FLASHMTP draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(batch_size, self.block_size, -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    batch_size * self.num_proposed_tokens, -1
-                ),
-                lm_head=lm_head,
-            ).view(batch_size, self.num_proposed_tokens)
+            draft_hidden = draft_hidden.view(batch_size, self._draft_block_len, -1)
+            if getattr(self.draft_model, "markov_head", None) is not None:
+                draft_next = self.draft_model.sample_draft_tokens(
+                    block_hidden=draft_hidden,
+                    first_prev_token_ids=draft_block_ids[:, 0],
+                )
+            else:
+                prediction_hidden = self.draft_model.prediction_hidden(draft_hidden)
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=prediction_hidden.reshape(
+                        batch_size * self.num_proposed_tokens, -1
+                    ),
+                    lm_head=lm_head,
+                ).view(batch_size, self.num_proposed_tokens)
 
         candidates = self._draft_block_tokens_buf[:batch_size]
         candidates[:, 0].copy_(block_ids[:, 0])

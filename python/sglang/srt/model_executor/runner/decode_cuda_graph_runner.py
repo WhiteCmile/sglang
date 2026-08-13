@@ -1264,7 +1264,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         timer_ctx = device_timer_ctx(
-            self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
+            self.model_runner.device_timer,
+            forward_batch.device_timer_category
+            or forward_batch.forward_mode.name.lower(),
         )
         # Publish a read-done event for the WAR barrier: a cuda-graph forward
         # finishes its shared req_to_token / SWA reads at this pre-replay

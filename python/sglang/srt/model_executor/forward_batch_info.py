@@ -449,6 +449,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
+    # Optional observability label for forwards that reuse a generic mode.
+    # FlashMTP's draft pass is represented as TARGET_VERIFY for attention
+    # plumbing, but must remain distinguishable from the target verify pass in
+    # device-time metrics.
+    device_timer_category: Optional[str] = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
     # Whether to return pooled hidden states (pre-head transformer output)

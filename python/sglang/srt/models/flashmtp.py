@@ -291,8 +291,104 @@ class FlashMTPDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class FlashMTPMarkovHead(nn.Module):
+    """FlashMTP v2's low-rank recurrent direct-output head.
+
+    The module is intentionally replicated across draft TP ranks.  Its parameter
+    names and math match the reference checkpoint, while the transformer remains
+    tensor parallel as before.
+    """
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        markov_rank: int,
+        head_type: str = "rnn",
+    ) -> None:
+        super().__init__()
+        self.head_type = str(head_type).lower()
+        if self.head_type not in {"rnn", "rnn_easy"}:
+            raise ValueError(
+                "FlashMTPMarkovHead supports only 'rnn' and 'rnn_easy', "
+                f"got {self.head_type!r}."
+            )
+        self.markov_rank = int(markov_rank)
+        self.prev_token_embedding = nn.Embedding(vocab_size, self.markov_rank)
+        self.output_proj = nn.Linear(self.markov_rank, vocab_size, bias=False)
+        self.state_proj = nn.Linear(2 * self.markov_rank, 2 * self.markov_rank)
+        self.hidden_proj = nn.Linear(hidden_size, self.markov_rank, bias=False)
+        if self.head_type == "rnn":
+            self.hidden_fuse_gate_proj = nn.Linear(
+                2 * self.markov_rank, self.markov_rank
+            )
+            self.state_out_proj = nn.Linear(
+                self.markov_rank, self.markov_rank, bias=False
+            )
+            self.state_hidden_mlp = None
+        else:
+            self.hidden_fuse_gate_proj = None
+            self.state_out_proj = None
+            self.state_hidden_mlp = nn.Linear(
+                2 * self.markov_rank, self.markov_rank
+            )
+
+    def sample_block_tokens(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        first_prev_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Greedily sample a block left-to-right with per-block zero state."""
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                "FlashMTP Markov hidden states must be [batch, positions, hidden], "
+                f"got {tuple(hidden_states.shape)}."
+            )
+        batch_size, prediction_length, _ = hidden_states.shape
+        hidden_latents = self.hidden_proj(hidden_states)
+        state = hidden_states.new_zeros(batch_size, self.markov_rank)
+        previous_ids = first_prev_token_ids.long()
+        sampled: list[torch.Tensor] = []
+        for position in range(prediction_length):
+            previous_embedding = self.prev_token_embedding(previous_ids)
+            gate_raw, candidate_raw = self.state_proj(
+                torch.cat([state, previous_embedding], dim=-1)
+            ).chunk(2, dim=-1)
+            gate = torch.sigmoid(gate_raw)
+            state = gate * state + (1.0 - gate) * torch.tanh(candidate_raw)
+            if self.head_type == "rnn_easy":
+                assert self.state_hidden_mlp is not None
+                latent = self.state_hidden_mlp(
+                    torch.cat([state, hidden_latents[:, position]], dim=-1)
+                )
+            else:
+                assert self.state_out_proj is not None
+                assert self.hidden_fuse_gate_proj is not None
+                serial_latent = torch.tanh(self.state_out_proj(state))
+                fuse_gate = torch.sigmoid(
+                    self.hidden_fuse_gate_proj(
+                        torch.cat(
+                            [serial_latent, hidden_latents[:, position]], dim=-1
+                        )
+                    )
+                )
+                latent = (
+                    fuse_gate * serial_latent
+                    + (1.0 - fuse_gate) * hidden_latents[:, position]
+                )
+            previous_ids = torch.argmax(self.output_proj(latent), dim=-1)
+            sampled.append(previous_ids)
+        if not sampled:
+            return torch.empty(
+                (batch_size, 0), dtype=torch.long, device=hidden_states.device
+            )
+        return torch.stack(sampled, dim=1)
+
+
 class FlashMTPDraftModel(nn.Module):
-    """FlashMTP draft model without embedding, LM head, or KV cache."""
+    """FlashMTP draft model without embedding or KV cache."""
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -319,6 +415,29 @@ class FlashMTPDraftModel(nn.Module):
         self.norm = RMSNorm(hidden_size, eps=eps)
         self.block_size = self.flash_config.block_size
         self.target_layer_ids = self.flash_config.target_layer_ids
+        self.left_shift = self.flash_config.left_shift
+        self.markov_head_type = self.flash_config.markov_head_type
+        self.markov_output_mode = self.flash_config.markov_output_mode
+        self.markov_rank = self.flash_config.markov_rank
+        if self.markov_head_type == "none":
+            self.markov_head = None
+        elif (
+            self.markov_head_type in {"rnn", "rnn_easy"}
+            and self.markov_output_mode == "direct"
+        ):
+            self.markov_head = FlashMTPMarkovHead(
+                vocab_size=int(config.vocab_size),
+                hidden_size=hidden_size,
+                markov_rank=self.markov_rank,
+                head_type=self.markov_head_type,
+            )
+        else:
+            raise NotImplementedError(
+                "SGLang FlashMTP v2 currently supports the deployed "
+                "markov_head_type='rnn' or 'rnn_easy' with "
+                "markov_output_mode='direct'; "
+                f"got {self.markov_head_type!r}/{self.markov_output_mode!r}."
+            )
         # Keep the depth ids at a stable device address. Constructing this
         # tensor inside forward allocates during warmup/capture and makes the
         # FlashMTP draft forward unsuitable for CUDA Graph replay.
@@ -384,6 +503,28 @@ class FlashMTPDraftModel(nn.Module):
             hidden_states=hidden_states.reshape(batch_size * query_len, -1),
         )
 
+    @property
+    def draft_block_len(self) -> int:
+        return self.block_size - 1 if self.left_shift else self.block_size
+
+    def prediction_hidden(self, block_hidden: torch.Tensor) -> torch.Tensor:
+        """Select proposal-aligned hidden slots for legacy and left-shift models."""
+        hidden = block_hidden[:, -self.draft_block_len :, :]
+        return hidden if self.left_shift else hidden[:, 1:, :]
+
+    def sample_draft_tokens(
+        self,
+        *,
+        block_hidden: torch.Tensor,
+        first_prev_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.markov_head is None:
+            raise RuntimeError("FlashMTP checkpoint has no Markov head.")
+        return self.markov_head.sample_block_tokens(
+            hidden_states=self.prediction_hidden(block_hidden),
+            first_prev_token_ids=first_prev_token_ids,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -424,6 +565,15 @@ class FlashMTPDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
+
+        if self.markov_head is not None:
+            required = {name for name in params_dict if name.startswith("markov_head.")}
+            missing = sorted(required - loaded_params)
+            if missing:
+                raise ValueError(
+                    "FlashMTP v2 checkpoint is missing Markov-head weights: "
+                    + ", ".join(missing)
+                )
 
         return loaded_params
 

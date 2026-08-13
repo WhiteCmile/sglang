@@ -44,10 +44,19 @@ class FlashMTPDraftConfig:
     mask_token_id: int
     pivot_fuse_mode: str
     local_position: bool
+    left_shift: bool
+    markov_head_type: str
+    markov_output_mode: str
+    markov_rank: int
 
     @property
     def num_proposed_tokens(self) -> int:
         return self.block_size - 1
+
+    @property
+    def draft_block_len(self) -> int:
+        """Number of slots evaluated by the parallel draft backbone."""
+        return self.block_size - 1 if self.left_shift else self.block_size
 
 
 def gather_flashmtp_next_pivot(
@@ -141,6 +150,37 @@ def parse_flashmtp_draft_config(*, draft_hf_config: Any) -> FlashMTPDraftConfig:
             "SGLang FlashMTP currently supports only local_position=true."
         )
 
+    left_shift = bool(flashmtp_config.get("left_shift", False))
+    markov_head_type = str(flashmtp_config.get("markov_head_type", "none")).lower()
+    markov_output_mode = str(
+        flashmtp_config.get("markov_output_mode", "additive")
+    ).lower()
+    try:
+        configured_markov_rank = int(flashmtp_config.get("markov_rank", 0))
+    except Exception as exc:
+        raise ValueError(
+            "FlashMTP flashmtp_config.markov_rank must be an integer."
+        ) from exc
+    supported_markov_heads = {"none", "vanilla", "gated", "rnn", "rnn_easy", "mlp"}
+    if markov_head_type not in supported_markov_heads:
+        raise ValueError(
+            "Unknown FlashMTP markov_head_type="
+            f"{markov_head_type!r}; expected one of {sorted(supported_markov_heads)}."
+        )
+    if markov_output_mode not in {"additive", "direct"}:
+        raise ValueError(
+            "Unknown FlashMTP markov_output_mode="
+            f"{markov_output_mode!r}; expected 'additive' or 'direct'."
+        )
+    markov_rank = configured_markov_rank if markov_head_type != "none" else 0
+    if markov_head_type != "none" and markov_rank <= 0:
+        raise ValueError(
+            "FlashMTP markov_rank must be positive when a Markov head is enabled, "
+            f"got {markov_rank}."
+        )
+    if markov_head_type == "none" and markov_output_mode == "direct":
+        raise ValueError("FlashMTP markov_output_mode='direct' requires a Markov head.")
+
     model_type = _cfg_get(draft_hf_config, "model_type", None)
     if model_type is not None and str(model_type) != "qwen3":
         raise NotImplementedError(
@@ -162,4 +202,8 @@ def parse_flashmtp_draft_config(*, draft_hf_config: Any) -> FlashMTPDraftConfig:
         mask_token_id=int(mask_token_id),
         pivot_fuse_mode=pivot_fuse_mode,
         local_position=local_position,
+        left_shift=left_shift,
+        markov_head_type=markov_head_type,
+        markov_output_mode=markov_output_mode,
+        markov_rank=markov_rank,
     )

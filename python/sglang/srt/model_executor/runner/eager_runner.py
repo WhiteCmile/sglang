@@ -293,9 +293,12 @@ class EagerRunner(BaseRunner):
             forward_batch.attn_cp_metadata = None
 
         category = (
-            "target_verify"
-            if forward_batch.forward_mode.is_target_verify()
-            else "extend"
+            forward_batch.device_timer_category
+            or (
+                "target_verify"
+                if forward_batch.forward_mode.is_target_verify()
+                else "extend"
+            )
         )
         with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
