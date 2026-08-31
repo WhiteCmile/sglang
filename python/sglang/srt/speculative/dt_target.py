@@ -2987,8 +2987,15 @@ class DTTargetController:
         events: list[tuple[str, str, object]] = []
         payload = None
         read_start_ns = time.monotonic_ns()
-        if disposition.ready_transfer_ids:
-            if batch.buffer is None or batch.buffer.transport != "mmap":
+        if disposition.ready_transfer_ids and batch.buffer is None:
+            raise ValueError("ready DT results must carry a published buffer")
+        # A published result buffer is owned by Target until PullDone, even if
+        # local timeout/cancel processing made every entry stale before this
+        # batch was consumed.  Read and validate the published range whenever
+        # a buffer is present so ownership release is independent of the
+        # ledger's ready classification.
+        if batch.buffer is not None:
+            if batch.buffer.transport != "mmap":
                 raise ValueError("DT V1 Target supports only mmap result buffers")
             store = self._result_stores.get(batch.buffer.uri)
             if store is None:
@@ -3069,7 +3076,7 @@ class DTTargetController:
                 events.append(("failed", entry.transfer_id, error))
                 self._ledger.finish(entry.transfer_id)
 
-        if disposition.ready_transfer_ids:
+        if batch.buffer is not None:
             pull_done = PullDone(
                 protocol_version=PROTOCOL_VERSION,
                 target_instance_id=self.instance_id,
