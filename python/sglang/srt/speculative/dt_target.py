@@ -2974,12 +2974,47 @@ class DTTargetController:
         return received_ns, source_age_ns
 
     def _consume_result_batch(self, batch) -> list[tuple[str, str, object]]:
+        cleanup_failed_after_error = False
+        try:
+            return self._consume_result_batch_body(batch)
+        except BaseException:
+            cleanup_failed_after_error = True
+            raise
+        finally:
+            if batch.buffer is not None:
+                try:
+                    self._enqueue_pull_done(batch)
+                except BaseException:
+                    if cleanup_failed_after_error:
+                        logger.exception(
+                            "failed to enqueue PullDone while preserving result "
+                            "batch error"
+                        )
+                    else:
+                        raise
+
+    def _enqueue_pull_done(self, batch) -> None:
         from dt_protocol import (
             PROTOCOL_VERSION,
             PULL_DONE,
             PullDone,
             pull_done_id,
         )
+
+        pull_done = PullDone(
+            protocol_version=PROTOCOL_VERSION,
+            target_instance_id=self.instance_id,
+            draft_instance_id=batch.draft_instance_id,
+            buffer_id=batch.buffer.buffer_id,
+            generation=batch.buffer.generation,
+            row_offset=batch.row_offset,
+            row_count=batch.row_count,
+            completed_ns=time.monotonic_ns(),
+        )
+        self._reliable_outbox().add(PULL_DONE, pull_done_id(pull_done), pull_done)
+        self._flush_reliable_outbox()
+
+    def _consume_result_batch_body(self, batch) -> list[tuple[str, str, object]]:
         from dt_transport import MmapSlotStore
 
         receive_start_ns = time.monotonic_ns()
@@ -3076,21 +3111,6 @@ class DTTargetController:
                 events.append(("failed", entry.transfer_id, error))
                 self._ledger.finish(entry.transfer_id)
 
-        if batch.buffer is not None:
-            pull_done = PullDone(
-                protocol_version=PROTOCOL_VERSION,
-                target_instance_id=self.instance_id,
-                draft_instance_id=batch.draft_instance_id,
-                buffer_id=batch.buffer.buffer_id,
-                generation=batch.buffer.generation,
-                row_offset=batch.row_offset,
-                row_count=batch.row_count,
-                completed_ns=time.monotonic_ns(),
-            )
-            self._reliable_outbox().add(
-                PULL_DONE, pull_done_id(pull_done), pull_done
-            )
-            self._flush_reliable_outbox()
         waits = [
             receive_start_ns - self._parked[transfer_id].parked_ns
             for transfer_id in disposition.ready_transfer_ids
