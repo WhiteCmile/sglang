@@ -141,11 +141,33 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         device: torch.device,
         grid: Sequence[int],
         graph_num_tokens_floor: int = 0,
+        verify_lens_host: Optional[torch.Tensor] = None,
     ) -> RaggedVerifyLayout:
         verify_lens_list = [int(v) for v in verify_lens_cpu]
         total_verify_tokens = sum(verify_lens_list)
         bucket_input = max(total_verify_tokens, graph_num_tokens_floor)
         graph_num_tokens = round_up_grid(total=bucket_input, grid=grid)
+
+        if verify_lens_host is not None:
+            if verify_lens_host.device.type != "cpu":
+                raise ValueError("verify_lens_host must be a CPU tensor")
+            if verify_lens_host.dtype != torch.int32:
+                raise ValueError("verify_lens_host must have dtype torch.int32")
+            if verify_lens_host.numel() != len(verify_lens_list):
+                raise ValueError(
+                    "verify_lens_host size does not match verify_lens_cpu"
+                )
+            verify_lens = verify_lens_host.to(
+                device=device,
+                dtype=torch.int32,
+                non_blocking=verify_lens_host.is_pinned(),
+            )
+            return cls._assemble_device(
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                verify_lens_cpu=verify_lens_list,
+                total_verify_tokens=total_verify_tokens,
+            )
 
         return cls._assemble(
             verify_lens_cpu=verify_lens_list,

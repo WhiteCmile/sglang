@@ -285,6 +285,59 @@ def _handle_flashmtp(server_args: ServerArgs) -> None:
         raise ValueError(
             "FLASHMTP requires --speculative-draft-model-path."
         )
+    if server_args.draft_target_disaggregation_role is not None:
+        if server_args.draft_target_disaggregation_role != "target":
+            raise ValueError(
+                "the SGLang Draft process is not wired yet; "
+                "--draft-target-disaggregation-role currently accepts only target"
+            )
+        if server_args.dp_size != 1:
+            raise ValueError(
+                "disaggregated FLASHMTP V1 requires dp_size == 1; multiple "
+                "Scheduler processes do not share DT request ownership"
+            )
+        if (
+            not server_args.disable_overlap_schedule
+            and not server_args.draft_target_overlap_schedule
+        ):
+            raise ValueError(
+                "disaggregated FLASHMTP Target overlap requires the explicit "
+                "--draft-target-overlap-schedule opt-in"
+            )
+        if (
+            server_args.disable_overlap_schedule
+            and server_args.draft_target_overlap_schedule
+        ):
+            raise ValueError(
+                "--draft-target-overlap-schedule is incompatible with "
+                "--disable-overlap-schedule"
+            )
+        missing = [
+            flag
+            for flag, value in (
+                (
+                    "--draft-target-coordinator-endpoint",
+                    server_args.draft_target_coordinator_endpoint,
+                ),
+                ("--draft-target-instance-id", server_args.draft_target_instance_id),
+                ("--draft-target-profile-id", server_args.draft_target_profile_id),
+                (
+                    "--draft-target-feature-schema-id",
+                    server_args.draft_target_feature_schema_id,
+                ),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "disaggregated FLASHMTP Target requires " + ", ".join(missing)
+            )
+        if server_args.draft_target_round_timeout_ms <= 0:
+            raise ValueError("--draft-target-round-timeout-ms must be positive")
+        if server_args.draft_target_registration_timeout_s <= 0:
+            raise ValueError(
+                "--draft-target-registration-timeout-s must be positive"
+            )
 
     # FlashMTP drafts one parallel block. The block contains one slot-0 bonus
     # token and block_size - 1 proposed tokens.

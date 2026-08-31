@@ -242,6 +242,32 @@ class RadixAttention(nn.Module):
                 mha_companion_layers is not None
                 and mha_companion_layers[self.layer_id] is self
             )
+            # BCG normally puts both the KV-cache store and FlashAttention in
+            # the eager break below.  Backends with a capture-safe store can
+            # move just that store into the preceding graph segment, leaving
+            # the data-dependent attention metadata / kernel eager.  During
+            # replay the segment therefore publishes K/V on the same stream
+            # immediately before the attention break, while the eager backend
+            # call must skip its duplicate store.
+            if (
+                is_in_breakable_cuda_graph()
+                and save_kv_cache
+                and key_value_num_tokens is None
+            ):
+                capture_kv_store = getattr(
+                    get_attn_backend(),
+                    "capture_kv_store_for_breakable_graph",
+                    None,
+                )
+                if capture_kv_store is not None and capture_kv_store(
+                    k,
+                    v,
+                    self,
+                    forward_batch,
+                    use_mha_companion=use_mha_companion,
+                    **kwargs,
+                ):
+                    save_kv_cache = False
             if is_in_breakable_cuda_graph():
                 op = (
                     breakable_unified_attention_with_output_and_lse
@@ -536,11 +562,29 @@ def unified_sparse_attention_with_output(
     return
 
 
-breakable_unified_attention_with_output = eager_on_graph(True)(
-    unified_attention_with_output
+def _make_breakable_unified_attention(*, return_lse: bool):
+    """Build the eager attention break used by Breakable CUDA Graph.
+
+    ``unified_attention_with_output*`` are custom ops because TC-piecewise
+    needs a graph boundary that Dynamo can see.  BCG already creates that
+    boundary with :func:`eager_on_graph`, so replaying the custom-op wrapper
+    only pays the torch.library dispatcher cost once per transformer layer.
+    Call the shared implementation directly on the BCG path instead.
+    """
+
+    def direct_impl(*args, **kwargs):
+        return _unified_attention_with_output_impl(
+            *args, return_lse=return_lse, **kwargs
+        )
+
+    return eager_on_graph(True)(direct_impl)
+
+
+breakable_unified_attention_with_output = _make_breakable_unified_attention(
+    return_lse=False
 )
-breakable_unified_attention_with_output_and_lse = eager_on_graph(True)(
-    unified_attention_with_output_and_lse
+breakable_unified_attention_with_output_and_lse = (
+    _make_breakable_unified_attention(return_lse=True)
 )
 
 

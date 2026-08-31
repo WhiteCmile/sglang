@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import replace
 
 import torch
+
+try:
+    from dt_profile import emit as profile_emit
+except ImportError:  # Standalone SGLang use does not require dt-runtime.
+
+    def profile_emit(*_args, **_kwargs) -> None:
+        return None
+
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildRaggedVerifyWindow,
+    ScatterCompactToStrided,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -35,9 +49,32 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    DsparkVerifyEpilogue,
+    VocabParallelGreedySelector,
+    verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.flashmtp_shared import (
+    adaptive_verify_enabled,
+    graph_tier_padding_enabled,
+    pinned_verify_metadata_enabled,
+    plan_ragged_execution_tier,
+    ragged_epilogue_capacity,
+    ragged_verify_enabled,
+    read_adaptive_thresholds,
+    reclaim_ragged_graph_padding,
+    select_adaptive_verify_lens,
+    shared_optimizations_enabled,
+    validate_component_dependencies,
+    vocab_parallel_greedy_enabled,
+)
 from sglang.srt.speculative.flashmtp_utils import (
     gather_flashmtp_next_pivot,
     parse_flashmtp_draft_config,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    ragged_verify_compact_enabled,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -45,6 +82,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +91,13 @@ class _FlashMTPMarkovDraftSampler:
     """Capture-safe wrapper for FlashMTP v2's serial Markov sampler."""
 
     def __init__(
-        self, *, draft_model, draft_block_len: int, num_proposals: int, max_bs: int
+        self,
+        *,
+        draft_model,
+        draft_block_len: int,
+        num_proposals: int,
+        max_bs: int,
+        adaptive_thresholds: tuple[float, ...] | None = None,
     ):
         self.draft_model = draft_model
         self.draft_block_len = int(draft_block_len)
@@ -62,15 +106,39 @@ class _FlashMTPMarkovDraftSampler:
         self.out = torch.empty(
             (int(max_bs) * self.num_proposals,), dtype=torch.int64, device=device
         )
+        self.adaptive_thresholds = (
+            torch.tensor(adaptive_thresholds, dtype=torch.float32, device=device)
+            if adaptive_thresholds is not None
+            else None
+        )
+        self.verify_lens_out = (
+            torch.empty((int(max_bs),), dtype=torch.int32, device=device)
+            if adaptive_thresholds is not None
+            else None
+        )
 
     def __call__(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> None:
         batch_size = hidden_states.shape[0] // self.draft_block_len
         block_hidden = hidden_states.view(batch_size, self.draft_block_len, -1)
         anchors = input_ids.view(batch_size, self.draft_block_len)[:, 0]
-        sampled = self.draft_model.sample_draft_tokens(
-            block_hidden=block_hidden,
-            first_prev_token_ids=anchors,
-        )
+        if self.adaptive_thresholds is None:
+            sampled = self.draft_model.sample_draft_tokens(
+                block_hidden=block_hidden,
+                first_prev_token_ids=anchors,
+            )
+        else:
+            sampled, margins = self.draft_model.sample_draft_tokens_with_margin(
+                block_hidden=block_hidden,
+                first_prev_token_ids=anchors,
+            )
+            assert self.verify_lens_out is not None
+            self.verify_lens_out[:batch_size].copy_(
+                select_adaptive_verify_lens(
+                    margins,
+                    threshold=self.adaptive_thresholds,
+                    block_size=self.num_proposals + 1,
+                )
+            )
         self.out[: batch_size * self.num_proposals].copy_(sampled.reshape(-1))
 
 
@@ -190,15 +258,101 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         self._out_tokens_bufs: list[torch.Tensor] = []
         self._new_seq_lens_bufs: list[torch.Tensor] = []
 
+        # Keep the historical all-on bundle, but expose its legal components
+        # for matched ablation.  DT transport/lifecycle flags remain separate.
+        validate_component_dependencies()
+        self._shared_optimizations = shared_optimizations_enabled()
+        self._ragged_verify = ragged_verify_enabled()
+        self._adaptive_verify = adaptive_verify_enabled()
+        self._pinned_verify_metadata = pinned_verify_metadata_enabled()
+        self._vocab_parallel_greedy = vocab_parallel_greedy_enabled()
+        self._shared_adaptive_thresholds = read_adaptive_thresholds(
+            proposal_count=self.num_proposed_tokens
+        )
+        self._shared_adaptive_min_batch = int(
+            os.environ.get("SGLANG_FLASHMTP_ADAPTIVE_MIN_BATCH", "24")
+        )
+        if self._shared_adaptive_min_batch <= 0:
+            raise ValueError("SGLANG_FLASHMTP_ADAPTIVE_MIN_BATCH must be positive")
+        self._adaptive_fill_graph_padding = graph_tier_padding_enabled()
+        self._adaptive_graph_tier_offset = 0
+        self._single_load_verify_graph = False
+        self._verify_lens_cpu_buf: torch.Tensor | None = None
+        self._verify_lens_cpu_cap = 0
+
+        if self._ragged_verify:
+            if not ragged_verify_compact_enabled():
+                raise ValueError(
+                    "FlashMTP ragged verify requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=compact"
+                )
+        greedy_selector = None
+        if self._vocab_parallel_greedy:
+            if server_args.disable_cuda_graph or not is_cuda():
+                raise ValueError(
+                    "FlashMTP vocab-parallel greedy currently requires "
+                    "CUDA graph verify"
+                )
+            target_model = self.model_runner.model
+            lm_head = getattr(target_model, "lm_head", None)
+            if lm_head is None or not hasattr(lm_head, "weight"):
+                raise ValueError(
+                    "FlashMTP vocab-parallel greedy requires target lm_head"
+                )
+            if not torch.is_floating_point(lm_head.weight):
+                raise ValueError(
+                    "FlashMTP vocab-parallel greedy does not support a "
+                    "quantized lm_head"
+                )
+            shard = getattr(lm_head, "shard_indices", None)
+            if shard is None or int(shard.num_added_elements) != 0:
+                raise ValueError(
+                    "FlashMTP vocab-parallel greedy requires contiguous "
+                    "base-vocabulary shard metadata"
+                )
+            tp_group = self.model_runner.tp_group
+            greedy_selector = VocabParallelGreedySelector(
+                max_tokens=ragged_epilogue_capacity(server_args) * self.block_size,
+                num_org=int(shard.num_org_elements),
+                org_vocab_start=int(shard.org_vocab_start_index),
+                value_dtype=torch.float32,
+                device=self.device,
+                tp_group=tp_group if int(tp_group.world_size) > 1 else None,
+            )
+        if (
+            self._ragged_verify
+            and not server_args.disable_cuda_graph
+            and is_cuda()
+        ):
+            self._ragged_verify_epilogue = DsparkVerifyEpilogue(
+                max_bs=ragged_epilogue_capacity(server_args),
+                verify_num_draft_tokens=self.block_size,
+                device=self.device,
+                greedy_selector=greedy_selector,
+            )
+            self.model_runner.capture_tail_hooks.append(
+                self._ragged_verify_epilogue.capture_hook
+            )
+        else:
+            self._ragged_verify_epilogue = None
+
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized FLASHMTP draft runner. model=%s, block_size=%d, "
-                "num_proposed_tokens=%d, pivot_layers=%d, mask_token_id=%d",
+                "num_proposed_tokens=%d, pivot_layers=%d, mask_token_id=%d, "
+                "shared_optimizations=%s, ragged=%s, adaptive=%s, pinned=%s, "
+                "vocab_greedy=%s, graph_padding=%s",
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.num_proposed_tokens,
                 self._num_pivot_layers,
                 self._mask_token_id,
+                self._shared_optimizations,
+                self._ragged_verify,
+                self._adaptive_verify,
+                self._pinned_verify_metadata,
+                self._vocab_parallel_greedy,
+                self._adaptive_fill_graph_padding,
             )
 
     def _maybe_build_draft_sampler(self):
@@ -218,6 +372,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             draft_block_len=self._draft_block_len,
             num_proposals=self.num_proposed_tokens,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            adaptive_thresholds=self._shared_adaptive_thresholds,
         )
 
     def init_cuda_graphs(self):
@@ -295,6 +450,48 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             self._draft_local_positions_buf = self._draft_local_positions.expand(
                 cap, -1
             ).contiguous()
+
+    def _stage_verify_lens_cpu(
+        self, verify_lens: torch.Tensor | None, *, batch_size: int
+    ) -> torch.Tensor:
+        """Materialize ragged widths, optionally through pinned host storage.
+
+        CUDA graph tier selection is a host decision, so the small D2H result
+        must become visible before verify preparation.  ``verify_lens=None``
+        represents the legal fixed-width ragged-preparation ablation.
+        """
+        if verify_lens is None and not self._pinned_verify_metadata:
+            return torch.full(
+                (batch_size,), self.block_size, dtype=torch.int32, device="cpu"
+            )
+        if verify_lens is not None and (
+            self._adaptive_verify and batch_size < self._shared_adaptive_min_batch
+        ):
+            verify_lens = torch.full_like(
+                verify_lens[:batch_size],
+                self.block_size,
+                dtype=torch.int32,
+            )
+        elif verify_lens is not None:
+            verify_lens = verify_lens[:batch_size].to(torch.int32)
+        if verify_lens is not None and not self._pinned_verify_metadata:
+            return verify_lens.to(device="cpu", dtype=torch.int32)
+        if self._verify_lens_cpu_cap < batch_size or self._verify_lens_cpu_buf is None:
+            capacity = max(batch_size, 32, self._verify_lens_cpu_cap * 2)
+            self._verify_lens_cpu_buf = torch.empty(
+                (capacity,),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=is_pin_memory_available(self.device),
+            )
+            self._verify_lens_cpu_cap = capacity
+        staged = self._verify_lens_cpu_buf[:batch_size]
+        if verify_lens is None:
+            staged.fill_(self.block_size)
+        else:
+            staged.copy_(verify_lens, non_blocking=True)
+            torch.get_device_module(self.device).current_stream().synchronize()
+        return staged
 
     def forward_batch_generation(
         self,
@@ -474,20 +671,41 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        verify_lens_device = None
         if self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : batch_size * self.num_proposed_tokens
             ].view(batch_size, self.num_proposed_tokens)
+            if self._adaptive_verify:
+                verify_lens_device = self._draft_sampler.verify_lens_out
+                if verify_lens_device is None:
+                    raise RuntimeError(
+                        "adaptive FlashMTP graph sampler did not publish verify lengths"
+                    )
         else:
             draft_hidden = draft_out.logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("FLASHMTP draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(batch_size, self._draft_block_len, -1)
             if getattr(self.draft_model, "markov_head", None) is not None:
-                draft_next = self.draft_model.sample_draft_tokens(
-                    block_hidden=draft_hidden,
-                    first_prev_token_ids=draft_block_ids[:, 0],
-                )
+                if self._adaptive_verify:
+                    draft_next, margins = (
+                        self.draft_model.sample_draft_tokens_with_margin(
+                            block_hidden=draft_hidden,
+                            first_prev_token_ids=draft_block_ids[:, 0],
+                        )
+                    )
+                    assert self._shared_adaptive_thresholds is not None
+                    verify_lens_device = select_adaptive_verify_lens(
+                        margins,
+                        threshold=self._shared_adaptive_thresholds,
+                        block_size=self.block_size,
+                    )
+                else:
+                    draft_next = self.draft_model.sample_draft_tokens(
+                        block_hidden=draft_hidden,
+                        first_prev_token_ids=draft_block_ids[:, 0],
+                    )
             else:
                 prediction_hidden = self.draft_model.prediction_hidden(draft_hidden)
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
@@ -500,6 +718,328 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         candidates = self._draft_block_tokens_buf[:batch_size]
         candidates[:, 0].copy_(block_ids[:, 0])
         candidates[:, 1:].copy_(draft_next)
+        if self._ragged_verify:
+            sampling_info = batch.sampling_info
+            if not (
+                not batch.has_grammar
+                and sampling_info is not None
+                and sampling_info.is_all_greedy
+                and verify_logits_adjustments_are_noop(sampling_info)
+            ):
+                raise RuntimeError(
+                    "FlashMTP ragged verify requires adjustment-free "
+                    "greedy decoding without grammar constraints"
+                )
+            if self._adaptive_verify and verify_lens_device is None:
+                raise RuntimeError(
+                    "adaptive FlashMTP verify requires Markov confidence"
+                )
+            draft_input.verify_lens_cpu = self._stage_verify_lens_cpu(
+                verify_lens_device, batch_size=batch_size
+            )
+            return self._verify_candidates_ragged(
+                batch=batch,
+                draft_input=draft_input,
+                candidates=candidates,
+                prefix_lens=prefix_lens,
+                on_publish=on_publish,
+            )
+        return self._verify_candidates(
+            batch=batch,
+            draft_input=draft_input,
+            candidates=candidates,
+            prefix_lens=prefix_lens,
+            target_positions_2d=target_positions_2d,
+            verify_out_cache_loc=verify_out_cache_loc,
+            on_publish=on_publish,
+            grammar_barrier=grammar_barrier,
+        )
+
+    def _verify_candidates_ragged(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        candidates: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """Run the topology-neutral compact/adaptive Target verify path."""
+        prepare_start_ns = time.monotonic_ns()
+        batch_size = int(candidates.shape[0])
+        verify_lens_cpu_tensor = draft_input.verify_lens_cpu
+        if verify_lens_cpu_tensor is None:
+            raise RuntimeError("shared adaptive verify is missing verify lengths")
+        verify_lens_cpu = [int(value) for value in verify_lens_cpu_tensor.tolist()]
+        if len(verify_lens_cpu) != batch_size:
+            raise ValueError(
+                "adaptive verify length batch mismatch: "
+                f"got {len(verify_lens_cpu)}, expected {batch_size}"
+            )
+        if not verify_lens_cpu or not (
+            1 <= min(verify_lens_cpu) <= max(verify_lens_cpu) <= self.block_size
+        ):
+            raise ValueError(
+                f"adaptive verify lengths must be in [1, {self.block_size}]"
+            )
+        validate_done_ns = time.monotonic_ns()
+
+        graph_runner = self.model_runner.decode_cuda_graph_runner
+        total_verify_tokens = sum(verify_lens_cpu)
+        capture_grid = (
+            graph_runner.capture_num_tokens
+            if graph_runner is not None and graph_runner.capture_num_tokens
+            else []
+        )
+        graph_num_tokens, execution_grid, graph_tier_available = (
+            plan_ragged_execution_tier(
+                total_verify_tokens=total_verify_tokens,
+                max_verify_tokens=batch_size * self.block_size,
+                capture_grid=list(capture_grid),
+                tier_offset=self._adaptive_graph_tier_offset,
+                batch_size=batch_size,
+                max_graph_rows=(graph_runner.max_bs if graph_runner is not None else 0),
+            )
+        )
+        original_total_verify_tokens = total_verify_tokens
+        if (
+            graph_tier_available
+            and self._adaptive_fill_graph_padding
+            and total_verify_tokens < graph_num_tokens
+        ):
+            verify_lens_cpu = reclaim_ragged_graph_padding(
+                verify_lens_cpu,
+                block_size=self.block_size,
+                graph_num_tokens=graph_num_tokens,
+            )
+            total_verify_tokens = sum(verify_lens_cpu)
+            verify_lens_cpu_tensor = torch.tensor(
+                verify_lens_cpu,
+                dtype=torch.int32,
+                pin_memory=is_pin_memory_available(self.device),
+            )
+        tier_plan_done_ns = time.monotonic_ns()
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=verify_lens_cpu,
+            device=self.device,
+            grid=execution_grid,
+            graph_num_tokens_floor=graph_num_tokens,
+            verify_lens_host=verify_lens_cpu_tensor,
+        )
+        layout_done_ns = time.monotonic_ns()
+        if self.ps.tp_rank == 0:
+            profile_emit(
+                "target_ragged_verify_batch",
+                instance_id=f"baseline-{getattr(self.server_args, 'port', 0)}",
+                topology="baseline",
+                batch_size=batch_size,
+                total_verify_tokens=total_verify_tokens,
+                graph_num_tokens=layout.graph_num_tokens,
+                verify_lens=verify_lens_cpu,
+                reclaimed_padding_tokens=(
+                    total_verify_tokens - original_total_verify_tokens
+                ),
+                graph_tier_offset=self._adaptive_graph_tier_offset,
+                graph_tier_available=graph_tier_available,
+            )
+
+        ragged_window = BuildRaggedVerifyWindow.execute(
+            batch=batch,
+            layout=layout,
+            draft_block_ids=candidates[:, : self.num_proposed_tokens],
+            draft_tokens=candidates[:, 1:],
+            bs=batch_size,
+            device=self.device,
+            verify_num_draft_tokens=self.block_size,
+            model_runner=self.model_runner,
+        )
+        window_done_ns = time.monotonic_ns()
+        verify_input = DFlashVerifyInput(
+            draft_token=ragged_window.verify_ids,
+            positions=ragged_window.positions,
+            draft_token_num=self.block_size,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=layout,
+        )
+        batch.out_cache_loc = ragged_window.verify_cache_loc
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_sum_backup = batch.seq_lens_sum
+        if seq_lens_cpu_backup is not None:
+            batch.seq_lens_cpu = seq_lens_cpu_backup + verify_lens_cpu_tensor.to(
+                dtype=seq_lens_cpu_backup.dtype
+            )
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+        epilogue = self._ragged_verify_epilogue
+        if epilogue is not None:
+            epilogue.begin_step(layout.verify_lens, armed=False)
+            epilogue.draft_tokens_buf[: batch_size * self.num_proposed_tokens].copy_(
+                candidates[:, 1:].reshape(-1)
+            )
+        epilogue_prepare_done_ns = time.monotonic_ns()
+        verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
+            batch,
+            self.target_worker,
+            defer_cuda_graph_load=self._single_load_verify_graph,
+        )
+        forward_prepare_done_ns = time.monotonic_ns()
+        batch.seq_lens_cpu = seq_lens_cpu_backup
+        batch.seq_lens_sum = seq_lens_sum_backup
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=(
+                not self._single_load_verify_graph or not can_run_cuda_graph
+            ),
+        )
+        forward_submit_done_ns = time.monotonic_ns()
+        if self.ps.tp_rank == 0:
+            profile_emit(
+                "target_ragged_verify_forward",
+                instance_id=f"baseline-{getattr(self.server_args, 'port', 0)}",
+                topology="baseline",
+                batch_size=batch_size,
+                total_verify_tokens=total_verify_tokens,
+                graph_num_tokens=layout.graph_num_tokens,
+                can_run_cuda_graph=target_out.can_run_cuda_graph,
+                validate_ns=validate_done_ns - prepare_start_ns,
+                tier_plan_ns=tier_plan_done_ns - validate_done_ns,
+                layout_ns=layout_done_ns - tier_plan_done_ns,
+                window_ns=window_done_ns - layout_done_ns,
+                epilogue_prepare_ns=epilogue_prepare_done_ns - window_done_ns,
+                forward_prepare_ns=forward_prepare_done_ns - epilogue_prepare_done_ns,
+                forward_submit_ns=forward_submit_done_ns - forward_prepare_done_ns,
+                total_prepare_ns=forward_submit_done_ns - prepare_start_ns,
+            )
+        logits_output = target_out.logits_output
+
+        epilogue_ran = target_out.can_run_cuda_graph
+        if (
+            epilogue is not None
+            and epilogue.uses_vocab_parallel_greedy
+            and not epilogue_ran
+        ):
+            epilogue(
+                compact_logits=logits_output.next_token_logits,
+                compact_hidden=logits_output.hidden_states,
+                input_ids=verify_forward_batch.input_ids,
+                seq_lens=verify_forward_batch.seq_lens,
+                req_pool_indices=verify_forward_batch.req_pool_indices,
+                bs=batch_size,
+            )
+            epilogue_ran = True
+
+        if epilogue_ran:
+            if epilogue is None:
+                raise RuntimeError(
+                    "ragged CUDA graph replay requires a persistent verify epilogue"
+                )
+            accept_outs = epilogue.read_accept(batch_size)
+            commit_lens = accept_outs.commit_lens.clone()
+            accept_len = commit_lens.to(torch.int64) - 1
+            bonus = accept_outs.bonus.clone()
+            out_tokens = accept_outs.out_tokens.clone()
+            new_seq_lens = accept_outs.new_seq_lens.clone()
+            if epilogue.uses_vocab_parallel_greedy:
+                logits_output.next_token_logits = None
+            else:
+                strided_logits = epilogue.strided_logits
+                assert strided_logits is not None
+                logits_output.next_token_logits = strided_logits[
+                    : batch_size * self.block_size
+                ]
+            packed_hidden = epilogue.strided_hidden
+            assert packed_hidden is not None
+            packed_hidden = packed_hidden[: batch_size * self.block_size]
+        else:
+            logits_output.next_token_logits = ScatterCompactToStrided.execute(
+                compact=logits_output.next_token_logits,
+                layout=layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=self.block_size,
+            )
+            compact_hidden = logits_output.hidden_states
+            if compact_hidden is None:
+                raise RuntimeError(
+                    "FLASHMTP ragged verify requires target auxiliary hidden states"
+                )
+            packed_hidden = ScatterCompactToStrided.execute(
+                compact=compact_hidden,
+                layout=layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=self.block_size,
+            )
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                batch_size, self.block_size
+            )
+            accept_len, _ = compute_dflash_correct_drafts_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+            )
+            accept_len = torch.minimum(
+                accept_len, layout.verify_lens.to(torch.int64) - 1
+            )
+            bonus = target_predict.gather(1, accept_len[:, None]).view(-1)
+            commit_lens = accept_len.to(torch.int32) + 1
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            out_tokens = torch.empty(
+                (batch_size, self.block_size),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            out_tokens[:, : self.num_proposed_tokens].copy_(candidates[:, 1:])
+            out_tokens[:, self.num_proposed_tokens].fill_(0)
+            out_tokens.scatter_(1, accept_len[:, None], bonus[:, None])
+
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        next_pivot = gather_flashmtp_next_pivot(
+            packed_hidden=packed_hidden,
+            accept_len=accept_len,
+            block_size=self.block_size,
+        )
+        logits_output.hidden_states = None
+        next_input = self._make_next_input(
+            bonus_tokens=bonus,
+            new_seq_lens=new_seq_lens,
+            pivot_hidden=next_pivot,
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=out_tokens.reshape(-1),
+            accept_lens=commit_lens,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
+            next_draft_input=next_input,
+            speculative_num_draft_tokens=self.block_size,
+            new_seq_lens=new_seq_lens,
+        )
+
+    def _verify_candidates(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        candidates: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        target_positions_2d: torch.Tensor,
+        verify_out_cache_loc: torch.Tensor,
+        on_publish=None,
+        grammar_barrier=None,
+    ) -> GenerationBatchResult:
+        """Verify a caller-provided FlashMTP candidate block on the target.
+
+        Keeping this boundary independent of the local draft forward lets the
+        disaggregated Target worker reuse the exact same acceptance, KV commit,
+        grammar, and next-pivot path.
+        """
+        batch_size = int(candidates.shape[0])
+        if tuple(candidates.shape) != (batch_size, self.block_size):
+            raise ValueError(
+                "FLASHMTP candidate shape mismatch: "
+                f"expected [bs, {self.block_size}], got {tuple(candidates.shape)}"
+            )
         grammar_tree = (
             GrammarTree.from_linear_chain(candidates) if batch.has_grammar else None
         )

@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 from collections import deque
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional
 
 import torch
 
 
-def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
+def device_timer_ctx(timer: DeviceTimer | None, category: str):
     """Timing context for one forward segment; no-op when the timer is absent.
 
     A segment that skips this stays out of the fwd_occupancy numerator while
@@ -19,15 +21,27 @@ def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
 
 class DeviceTimer:
     def __init__(self, reporter: Callable):
-        self._intervals: Deque[_TimingInterval] = deque()
-        self._reporters: List[Callable] = [reporter]
+        self._intervals: deque[_TimingInterval] = deque()
+        self._reporters: list[Callable] = [reporter]
+        self._gap_reporters: list[Callable] = []
+        self._previous_interval: _TimingInterval | None = None
         self._in_wrap = False
 
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
 
+    def add_gap_reporter(self, reporter: Callable):
+        """Report the device-stream gap before each completed interval.
+
+        Unlike subtracting asynchronously reported wall-clock timestamps, the
+        elapsed time between the previous end event and the current start event
+        is measured entirely on the CUDA stream.  Nothing is recorded unless a
+        consumer explicitly registers a gap reporter.
+        """
+        self._gap_reporters.append(reporter)
+
     @contextmanager
-    def wrap(self, metadata: Dict):
+    def wrap(self, metadata: dict):
         # Not re-entrant: a nested wrap would end the wrong interval and leave
         # an un-ended one at the head of the queue for _report() to trip over.
         assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
@@ -48,9 +62,22 @@ class DeviceTimer:
                 break
 
             self._intervals.popleft()
+            previous = self._previous_interval
+            if previous is not None and self._gap_reporters:
+                gap = max(
+                    0.0,
+                    previous.end_event.elapsed_time(interval.start_event) / 1000.0,
+                )
+                gap_metadata = {
+                    "previous_category": previous.metadata.get("category", ""),
+                    "category": interval.metadata.get("category", ""),
+                }
+                for reporter in self._gap_reporters:
+                    reporter(t=gap, **gap_metadata)
             elapsed = interval.elapsed_time() / 1000.0
             for reporter in self._reporters:
                 reporter(t=elapsed, **interval.metadata)
+            self._previous_interval = interval
 
 
 class GapTimer(DeviceTimer):
@@ -63,10 +90,10 @@ class GapTimer(DeviceTimer):
 
     def __init__(self, reporter: Callable):
         super().__init__(reporter)
-        self._pending: Optional[_TimingInterval] = None
+        self._pending: _TimingInterval | None = None
 
     @contextmanager
-    def wrap(self, metadata: Dict):
+    def wrap(self, metadata: dict):
         if self._pending is not None:
             self._pending.end(metadata=metadata)
             self._intervals.append(self._pending)
@@ -85,8 +112,8 @@ class GapTimer(DeviceTimer):
 @dataclass
 class _TimingInterval:
     start_event: torch.cuda.Event
-    end_event: Optional[torch.cuda.Event] = None
-    metadata: Optional[Dict] = None
+    end_event: torch.cuda.Event | None = None
+    metadata: dict | None = None
 
     @staticmethod
     def create():
@@ -94,7 +121,7 @@ class _TimingInterval:
         start_event.record()
         return _TimingInterval(start_event=start_event)
 
-    def end(self, metadata: Dict):
+    def end(self, metadata: dict):
         end_event = torch.cuda.Event(enable_timing=True)
         end_event.record()
 

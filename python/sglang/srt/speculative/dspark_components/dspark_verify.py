@@ -4,13 +4,13 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
+    accept_greedy_predictions_triton,
     accept_greedy_triton,
     finalize_accept_lens_triton,
 )
@@ -434,7 +434,6 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
@@ -450,8 +449,94 @@ class AcceptOuts(msgspec.Struct):
     out_tokens: torch.Tensor
 
 
-class DsparkVerifyEpilogue:
+class VocabParallelGreedySelector:
+    """Capture-safe global argmax over rank-local contiguous vocab shards."""
 
+    def __init__(
+        self,
+        *,
+        max_tokens: int,
+        num_org: int,
+        org_vocab_start: int,
+        value_dtype: torch.dtype,
+        device,
+        tp_group=None,
+    ) -> None:
+        self.max_tokens = int(max_tokens)
+        self.num_org = int(num_org)
+        self.org_vocab_start = int(org_vocab_start)
+        self.tp_group = tp_group
+        self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
+        self.value_dtype = value_dtype
+        self.out = torch.empty((self.max_tokens,), dtype=torch.int64, device=device)
+        self.local_max = torch.empty(
+            (self.max_tokens,), dtype=value_dtype, device=device
+        )
+        self.local_arg = torch.empty(
+            (self.max_tokens,), dtype=torch.int64, device=device
+        )
+        if self.tp_size > 1:
+            self.gathered_max = torch.empty(
+                (self.tp_size * self.max_tokens,),
+                dtype=value_dtype,
+                device=device,
+            )
+            self.gathered_ids = torch.empty(
+                (self.tp_size * self.max_tokens,),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.best_rank = torch.empty(
+                (1, self.max_tokens), dtype=torch.int64, device=device
+            )
+            self.selected_ids = torch.empty(
+                (1, self.max_tokens), dtype=torch.int64, device=device
+            )
+
+    def __call__(self, local_logits: torch.Tensor) -> torch.Tensor:
+        if local_logits.ndim != 2:
+            raise ValueError("vocab-parallel greedy logits must be rank-2")
+        num_tokens = int(local_logits.shape[0])
+        if num_tokens > self.max_tokens:
+            raise ValueError(
+                "vocab-parallel greedy token count exceeds persistent capacity"
+            )
+        if self.num_org <= 0 or self.num_org > int(local_logits.shape[1]):
+            raise ValueError("invalid local base-vocab extent for greedy selection")
+        if local_logits.dtype != self.value_dtype:
+            raise ValueError(
+                "vocab-parallel greedy logits dtype differs from persistent buffers"
+            )
+
+        local_max = self.local_max[:num_tokens]
+        local_arg = self.local_arg[:num_tokens]
+        torch.max(
+            local_logits[:, : self.num_org],
+            dim=-1,
+            out=(local_max, local_arg),
+        )
+        if self.org_vocab_start:
+            local_arg.add_(self.org_vocab_start)
+        if self.tp_size == 1:
+            self.out[:num_tokens].copy_(local_arg)
+            return self.out[:num_tokens]
+
+        gathered_size = self.tp_size * num_tokens
+        gathered_max = self.gathered_max[:gathered_size]
+        gathered_ids = self.gathered_ids[:gathered_size]
+        self.tp_group.all_gather_into_tensor(gathered_max, local_max)
+        self.tp_group.all_gather_into_tensor(gathered_ids, local_arg)
+        gathered_max = gathered_max.view(self.tp_size, num_tokens)
+        gathered_ids = gathered_ids.view(self.tp_size, num_tokens)
+        best_rank = self.best_rank[:, :num_tokens]
+        torch.argmax(gathered_max, dim=0, out=best_rank[0])
+        selected_ids = self.selected_ids[:, :num_tokens]
+        torch.gather(gathered_ids, 0, best_rank, out=selected_ids)
+        self.out[:num_tokens].copy_(selected_ids.view(-1))
+        return self.out[:num_tokens]
+
+
+class DsparkVerifyEpilogue:
     def __init__(
         self,
         *,
@@ -459,11 +544,13 @@ class DsparkVerifyEpilogue:
         verify_num_draft_tokens: int,
         device,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        greedy_selector: Optional[VocabParallelGreedySelector] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        self.greedy_selector = greedy_selector
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
@@ -488,7 +575,16 @@ class DsparkVerifyEpilogue:
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
         self.strided_logits: Optional[torch.Tensor] = None
+        self.strided_predictions = (
+            torch.empty((self.max_bs * self.stride,), dtype=torch.int64, device=device)
+            if greedy_selector is not None
+            else None
+        )
         self.strided_hidden: Optional[torch.Tensor] = None
+
+    @property
+    def uses_vocab_parallel_greedy(self) -> bool:
+        return self.greedy_selector is not None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -565,7 +661,8 @@ class DsparkVerifyEpilogue:
         req_pool_indices: torch.Tensor,
         bs: int,
     ) -> None:
-        self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
+        if self.greedy_selector is None:
+            self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
@@ -576,13 +673,23 @@ class DsparkVerifyEpilogue:
             )
 
     def _scatter(self, compact_logits, compact_hidden, verify_lens, bs: int) -> None:
-        scatter_compact_to_strided_into(
-            compact=compact_logits,
-            verify_lens=verify_lens,
-            out=self.strided_logits[: bs * self.stride],
-            stride=self.stride,
-            fill_value=0.0,
-        )
+        if self.greedy_selector is None:
+            scatter_compact_to_strided_into(
+                compact=compact_logits,
+                verify_lens=verify_lens,
+                out=self.strided_logits[: bs * self.stride],
+                stride=self.stride,
+                fill_value=0.0,
+            )
+        else:
+            compact_predictions = self.greedy_selector(compact_logits)
+            scatter_compact_to_strided_into(
+                compact=compact_predictions.view(-1, 1),
+                verify_lens=verify_lens,
+                out=self.strided_predictions[: bs * self.stride].view(-1, 1),
+                stride=self.stride,
+                fill_value=0,
+            )
         scatter_compact_to_strided_into(
             compact=compact_hidden,
             verify_lens=verify_lens,
@@ -602,12 +709,21 @@ class DsparkVerifyEpilogue:
             stride=self.stride,
             fill_value=0,
         )
-        correct_len, bonus, cap_trim_lens = accept_greedy_triton(
-            candidates=candidates.view(bs, self.stride),
-            target_logits=self.strided_logits[: bs * self.stride],
-            verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=verify_lens,
-        )
+        if self.greedy_selector is None:
+            correct_len, bonus, cap_trim_lens = accept_greedy_triton(
+                candidates=candidates.view(bs, self.stride),
+                target_logits=self.strided_logits[: bs * self.stride],
+                verify_num_draft_tokens=self.stride,
+                cutoff_verify_lens=verify_lens,
+            )
+        else:
+            correct_len, bonus, cap_trim_lens = accept_greedy_predictions_triton(
+                candidates=candidates.view(bs, self.stride),
+                target_predict=self.strided_predictions[: bs * self.stride].view(
+                    bs, self.stride
+                ),
+                cutoff_verify_lens=verify_lens,
+            )
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

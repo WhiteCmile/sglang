@@ -2046,6 +2046,154 @@ class ServerArgs:
         "Alias of --speculative-num-draft-tokens for FLASHMTP.",
         NS("spec"),
     ] = None
+    draft_target_disaggregation_role: A[
+        Optional[Literal["target", "draft"]],
+        "Experimental Draft-Target disaggregation process role. The target "
+        "role loads only the target model and receives FlashMTP candidates "
+        "from the shared Draft Coordinator.",
+        NS("spec"),
+    ] = None
+    draft_target_coordinator_endpoint: A[
+        Optional[str],
+        "Target-facing Draft Coordinator ZMQ endpoint.",
+        NS("spec"),
+    ] = None
+    draft_target_instance_id: A[
+        Optional[str],
+        "Stable instance id used by the Draft-Target control protocol.",
+        NS("spec"),
+    ] = None
+    draft_target_profile_id: A[
+        Optional[str],
+        "Draft profile id used by this Draft-Target instance.",
+        NS("spec"),
+    ] = None
+    draft_target_feature_schema_id: A[
+        Optional[str],
+        "Feature schema id for Draft-Target pivot descriptors.",
+        NS("spec"),
+    ] = None
+    draft_target_data_dir: A[
+        str,
+        "Directory for single-node Draft-Target mmap slot files.",
+        NS("spec"),
+    ] = "/dev/shm"
+    draft_target_round_timeout_ms: A[
+        int,
+        "Deadline in milliseconds for one remote Draft round.",
+        NS("spec"),
+    ] = 10_000
+    draft_target_ready_batch_wait_ms: A[
+        float,
+        "Maximum time in milliseconds to coalesce ready remote Draft rows "
+        "before building a Target verify batch.",
+        NS("spec"),
+    ] = 0.0
+    draft_target_ready_batch_threshold: A[
+        int,
+        "Build a Target verify batch immediately after this many remote Draft "
+        "rows are ready; smaller batches wait for the bounded coalescing window.",
+        NS("spec"),
+    ] = 32
+    draft_target_prefill_batch_wait_ms: A[
+        float,
+        "Maximum time in milliseconds to defer a fresh prefill while remote "
+        "verify work is active so replacement requests enter as one batch.",
+        NS("spec"),
+    ] = 0.0
+    draft_target_prefill_batch_threshold: A[
+        int,
+        "Run a deferred Draft-Target prefill immediately after this many fresh "
+        "requests are waiting.",
+        NS("spec"),
+    ] = 1
+    draft_target_direct_pinned_mmap_export: A[
+        bool,
+        "Register the Target source-slot mmap as pinned host memory and copy "
+        "pivot rows directly from GPU into their final slot payloads.",
+        NS("spec"),
+    ] = False
+    draft_target_overlap_schedule: A[
+        bool,
+        "Allow the experimental Draft-Target controller to run on SGLang's "
+        "overlap scheduler. This is gated separately from the generic overlap "
+        "setting because the controller must preserve its WAIT_DRAFT boundary.",
+        NS("spec"),
+    ] = False
+    draft_target_overlap_result_defer_ms: A[
+        float,
+        "Maximum time to keep a just-launched Draft-Target result pending while "
+        "polling for another ready pipeline lane. Zero preserves the generic "
+        "overlap scheduler behavior.",
+        NS("spec"),
+    ] = 0.0
+    draft_target_full_wave: A[
+        bool,
+        "Verify a Draft-Target wave only after every parked row is ready, while "
+        "using the wait interval to admit replacement prefills.",
+        NS("spec"),
+    ] = False
+    draft_target_full_wave_refill_wait_ms: A[
+        float,
+        "Maximum time to wait for replacement requests before releasing an "
+        "otherwise complete Draft-Target wave.",
+        NS("spec"),
+    ] = 0.0
+    draft_target_pipeline_lanes: A[
+        int,
+        "Number of persistent full-wave lanes used to overlap Target verify "
+        "with remote Draft execution.",
+        NS("spec"),
+    ] = 1
+    draft_target_pipeline_lane_weights: A[
+        Optional[str],
+        "Optional comma-separated positive integer weights for persistent "
+        "Draft-Target pipeline lanes. For example, 3,1 assigns new requests "
+        "to two lanes in an approximately 3:1 ratio. Omit for equal lanes.",
+        NS("spec"),
+    ] = None
+    draft_target_pipeline_lane_slack: A[
+        int,
+        "Maximum number of lagging live rows that a persistent Draft-Target "
+        "pipeline lane may carry into its next wave instead of blocking an "
+        "otherwise ready verify batch. Zero requires a complete lane.",
+        NS("spec"),
+    ] = 0
+    draft_target_pipeline_idle_slack: A[
+        int,
+        "Optional larger lane slack used only after the previous Target CUDA "
+        "result is complete and the GPU would otherwise be idle. Zero disables "
+        "the idle-only relaxation.",
+        NS("spec"),
+    ] = 0
+    draft_target_pipeline_cross_lane_fill_threshold: A[
+        int,
+        "When a persistent Draft-Target lane is complete, move already-ready "
+        "rows from other lanes into it up to this batch size. Ownership moves "
+        "with the rows so later waves remain balanced. Zero disables it.",
+        NS("spec"),
+    ] = 0
+    draft_target_pipeline_lane_collapse_threshold: A[
+        int,
+        "Collapse persistent Draft-Target lanes into one full wave when the "
+        "total number of live rows is at or below this threshold. This avoids "
+        "fragmented lane launches during the drain tail. Zero disables it.",
+        NS("spec"),
+    ] = 0
+    draft_target_pipeline_lane_tail_merge_threshold: A[
+        int,
+        "After total live Draft-Target rows have first exceeded this threshold, "
+        "launch a complete persistent lane together with every other remotely "
+        "ready row once the count falls back to or below the threshold. The "
+        "high-watermark guard keeps startup ramp-up separate from drain-tail "
+        "fragmentation. Zero disables it.",
+        NS("spec"),
+    ] = 0
+    draft_target_registration_timeout_s: A[
+        float,
+        "Startup registration timeout for the shared Draft Coordinator.",
+        NS("spec"),
+    ] = 10.0
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

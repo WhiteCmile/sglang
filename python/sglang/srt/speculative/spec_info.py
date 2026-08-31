@@ -141,7 +141,7 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        return self.is_dspark() or self.is_flashmtp()
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
@@ -278,6 +278,12 @@ class SpeculativeAlgorithm(Enum):
             return DFlashWorkerV2
 
         if self.is_flashmtp():
+            if server_args.draft_target_disaggregation_role == "target":
+                from sglang.srt.speculative.flashmtp_target_worker_v2 import (
+                    FlashMTPDisaggregatedTargetWorkerV2,
+                )
+
+                return FlashMTPDisaggregatedTargetWorkerV2
             from sglang.srt.speculative.flashmtp_worker_v2 import FlashMTPWorkerV2
 
             return FlashMTPWorkerV2

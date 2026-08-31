@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: BaseTpWorker,
+    draft_worker: BaseTpWorker | None,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
@@ -63,10 +63,15 @@ def get_draft_kv_pool(
         return None
 
     # V2 workers nest the draft runner under `.draft_worker`.
+    # Target-only speculative workers deliberately keep that slot empty.
+    nested_draft_worker = getattr(draft_worker, "draft_worker", None)
+    if nested_draft_worker is None:
+        return None
+
     if server_args.enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+        draft_runner = nested_draft_worker.draft_runner_list[0]
     else:
-        draft_runner = draft_worker.draft_worker.draft_runner
+        draft_runner = nested_draft_worker.draft_runner
     return draft_runner.token_to_kv_pool
 
 
