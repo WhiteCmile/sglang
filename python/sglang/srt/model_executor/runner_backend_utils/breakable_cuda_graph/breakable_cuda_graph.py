@@ -23,9 +23,7 @@ buffers to keep break-point tensors at stable addresses.
 """
 
 import logging
-import os
 import threading
-import time
 from contextvars import ContextVar
 from typing import Any, Callable
 
@@ -42,8 +40,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
-
-_PROFILE_REPLAY = os.environ.get("SGLANG_DT_PROFILE_BCG_REPLAY", "0") == "1"
 
 _is_xpu = is_xpu()
 
@@ -274,33 +270,16 @@ class BreakableCUDAGraph:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
-        self.last_segment_submit_ns = -1
-        self.last_break_submit_ns = -1
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
-        segment_submit_ns = 0
-        break_submit_ns = 0
         try:
             for i, seg in enumerate(self._segments):
-                if _PROFILE_REPLAY:
-                    start_ns = time.monotonic_ns()
-                    seg.replay()
-                    segment_submit_ns += time.monotonic_ns() - start_ns
-                else:
-                    seg.replay()
+                seg.replay()
                 if i < len(self._break_fns):
-                    if _PROFILE_REPLAY:
-                        start_ns = time.monotonic_ns()
-                        self._break_fns[i]()
-                        break_submit_ns += time.monotonic_ns() - start_ns
-                    else:
-                        self._break_fns[i]()
+                    self._break_fns[i]()
         finally:
-            if _PROFILE_REPLAY:
-                self.last_segment_submit_ns = segment_submit_ns
-                self.last_break_submit_ns = break_submit_ns
             _current_stream_var.reset(token)
 
     def _append_segment(self, graph, needs_instantiate: bool) -> None:

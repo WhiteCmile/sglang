@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 import tempfile
 import time
 from collections import defaultdict
@@ -110,7 +109,6 @@ class SchedulerMetricsReporter:
             self.metrics_collector_context.enable_kv_cache_events
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
-        self._install_baseline_profile_device_timer()
         self._install_device_timer_on_runners()
 
     def _init_metrics(
@@ -195,60 +193,6 @@ class SchedulerMetricsReporter:
                     dw.draft_runner.device_timer = timer
                 for r in getattr(dw, "draft_runner_list", []):
                     r.device_timer = timer
-
-    def _install_baseline_profile_device_timer(self) -> None:
-        """Emit co-located GPU phases with the same timer used by DT traces.
-
-        The DT Target controller installs its own instance-aware reporters.
-        Co-located FlashMTP has no controller, so without this hook a profiled
-        B0 run pays the CUDA-event timing cost but produces no JSONL at all.
-        Restrict emission to TP rank zero to avoid duplicate trace lanes.
-        """
-        if (
-            not os.environ.get("DT_PROFILE_DIR")
-            or self.tp_rank != 0
-            or self.forward_pass_device_timer is None
-            or getattr(self.scheduler, "dt_target_controller", None) is not None
-        ):
-            return
-        try:
-            from dt_profile import emit as profile_emit
-        except ImportError:
-            logger.warning(
-                "DT_PROFILE_DIR is set but dt_profile is unavailable; "
-                "baseline GPU phases will not be written"
-            )
-            return
-
-        instance_id = f"baseline-{getattr(self.scheduler.server_args, 'port', 0)}"
-
-        def report_gpu_phase(*, t: float, category: str, **_fields) -> None:
-            profile_emit(
-                "target_gpu_phase",
-                instance_id=instance_id,
-                topology="baseline",
-                phase=category,
-                gpu_ns=round(t * 1_000_000_000),
-            )
-
-        def report_gpu_gap(
-            *,
-            t: float,
-            previous_category: str,
-            category: str,
-            **_fields,
-        ) -> None:
-            profile_emit(
-                "target_gpu_gap",
-                instance_id=instance_id,
-                topology="baseline",
-                previous_phase=previous_category,
-                phase=category,
-                gpu_gap_ns=round(t * 1_000_000_000),
-            )
-
-        self.forward_pass_device_timer.add_reporter(report_gpu_phase)
-        self.forward_pass_device_timer.add_gap_reporter(report_gpu_gap)
 
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""

@@ -334,16 +334,13 @@ class FlashMTPMarkovHead(nn.Module):
                 2 * self.markov_rank, self.markov_rank
             )
 
-    def _sample_block_tokens(
+    def sample_block_tokens(
         self,
         *,
         hidden_states: torch.Tensor,
         first_prev_token_ids: torch.Tensor,
-        confidence_mode: str | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Greedily sample a block, optionally retaining confidence values."""
-        if confidence_mode not in (None, "margin", "top1", "top1_trace"):
-            raise ValueError(f"unsupported confidence mode: {confidence_mode!r}")
+    ) -> torch.Tensor:
+        """Greedily sample a block left-to-right with per-block zero state."""
         if hidden_states.ndim != 3:
             raise ValueError(
                 "FlashMTP Markov hidden states must be [batch, positions, hidden], "
@@ -354,7 +351,6 @@ class FlashMTPMarkovHead(nn.Module):
         state = hidden_states.new_zeros(batch_size, self.markov_rank)
         previous_ids = first_prev_token_ids.long()
         sampled: list[torch.Tensor] = []
-        confidence_values: list[torch.Tensor] = []
         for position in range(prediction_length):
             previous_embedding = self.prev_token_embedding(previous_ids)
             gate_raw, candidate_raw = self.state_proj(
@@ -382,99 +378,13 @@ class FlashMTPMarkovHead(nn.Module):
                     fuse_gate * serial_latent
                     + (1.0 - fuse_gate) * hidden_latents[:, position]
                 )
-            logits = self.output_proj(latent)
-            # Candidate IDs are part of the decoding semantics.  Confidence
-            # instrumentation must never replace torch.argmax's deterministic
-            # tie handling with torch.topk's different tied-index ordering.
-            previous_ids = torch.argmax(logits, dim=-1)
-            if confidence_mode in ("margin", "top1_trace"):
-                top2_values = torch.topk(logits, k=2, dim=-1).values
-                confidence_values.append(
-                    top2_values[:, 0] - top2_values[:, 1]
-                    if confidence_mode == "margin"
-                    else top2_values[:, 0]
-                )
-            elif confidence_mode == "top1":
-                confidence_values.append(
-                    logits.gather(1, previous_ids[:, None]).squeeze(1)
-                )
+            previous_ids = torch.argmax(self.output_proj(latent), dim=-1)
             sampled.append(previous_ids)
         if not sampled:
-            tokens = torch.empty(
+            return torch.empty(
                 (batch_size, 0), dtype=torch.long, device=hidden_states.device
             )
-            empty_confidence = (
-                hidden_states.new_empty((batch_size, 0))
-                if confidence_mode is not None
-                else None
-            )
-            return tokens, empty_confidence
-        tokens = torch.stack(sampled, dim=1)
-        return (
-            tokens,
-            torch.stack(confidence_values, dim=1)
-            if confidence_mode is not None
-            else None,
-        )
-
-    def sample_block_tokens(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Greedily sample a block left-to-right with per-block zero state."""
-        tokens, _ = self._sample_block_tokens(
-            hidden_states=hidden_states,
-            first_prev_token_ids=first_prev_token_ids,
-            confidence_mode=None,
-        )
-        return tokens
-
-    def sample_block_tokens_with_margin(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return greedy tokens and their per-position top-1/top-2 logit margin."""
-        tokens, margins = self._sample_block_tokens(
-            hidden_states=hidden_states,
-            first_prev_token_ids=first_prev_token_ids,
-            confidence_mode="margin",
-        )
-        assert margins is not None
-        return tokens, margins
-
-    def sample_block_tokens_with_top1(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return greedy tokens and their per-position top-1 logit value."""
-        tokens, top1_values = self._sample_block_tokens(
-            hidden_states=hidden_states,
-            first_prev_token_ids=first_prev_token_ids,
-            confidence_mode="top1",
-        )
-        assert top1_values is not None
-        return tokens, top1_values
-
-    def sample_block_tokens_with_top1_trace(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return argmax-selected tokens and top-1 values for trace comparison."""
-        tokens, top1_values = self._sample_block_tokens(
-            hidden_states=hidden_states,
-            first_prev_token_ids=first_prev_token_ids,
-            confidence_mode="top1_trace",
-        )
-        assert top1_values is not None
-        return tokens, top1_values
+        return torch.stack(sampled, dim=1)
 
 
 class FlashMTPDraftModel(nn.Module):
@@ -611,45 +521,6 @@ class FlashMTPDraftModel(nn.Module):
         if self.markov_head is None:
             raise RuntimeError("FlashMTP checkpoint has no Markov head.")
         return self.markov_head.sample_block_tokens(
-            hidden_states=self.prediction_hidden(block_hidden),
-            first_prev_token_ids=first_prev_token_ids,
-        )
-
-    def sample_draft_tokens_with_margin(
-        self,
-        *,
-        block_hidden: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.markov_head is None:
-            raise RuntimeError("FlashMTP checkpoint has no Markov head.")
-        return self.markov_head.sample_block_tokens_with_margin(
-            hidden_states=self.prediction_hidden(block_hidden),
-            first_prev_token_ids=first_prev_token_ids,
-        )
-
-    def sample_draft_tokens_with_top1(
-        self,
-        *,
-        block_hidden: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.markov_head is None:
-            raise RuntimeError("FlashMTP checkpoint has no Markov head.")
-        return self.markov_head.sample_block_tokens_with_top1(
-            hidden_states=self.prediction_hidden(block_hidden),
-            first_prev_token_ids=first_prev_token_ids,
-        )
-
-    def sample_draft_tokens_with_top1_trace(
-        self,
-        *,
-        block_hidden: torch.Tensor,
-        first_prev_token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.markov_head is None:
-            raise RuntimeError("FlashMTP checkpoint has no Markov head.")
-        return self.markov_head.sample_block_tokens_with_top1_trace(
             hidden_states=self.prediction_hidden(block_hidden),
             first_prev_token_ids=first_prev_token_ids,
         )

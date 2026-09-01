@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
@@ -43,12 +44,6 @@ class DFlashDraftInputV2(SpecInput):
     # Populated only by a disaggregated Target after remote Draft completion.
     # Shape: [bs, block_size], including the slot-0 bonus token.
     draft_tokens: Optional[torch.Tensor] = None
-    # Optional per-request Target verify widths. Kept on CPU so the compact
-    # CUDA-graph tier can be selected without a device synchronization.
-    verify_lens_cpu: Optional[torch.Tensor] = None
-    # Optional rank-only hint for assigning one already-paid graph-padding
-    # token.  It follows the same row order as verify_lens_cpu.
-    padding_priorities_cpu: Optional[torch.Tensor] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -234,22 +229,6 @@ class DFlashDraftInputV2(SpecInput):
                 ]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
-        if self.verify_lens_cpu is not None:
-            if new_indices_cpu is not None:
-                self.verify_lens_cpu = self.verify_lens_cpu[new_indices_cpu]
-            else:
-                self.verify_lens_cpu = self.verify_lens_cpu[new_indices.cpu()]
-
-        if self.padding_priorities_cpu is not None:
-            if new_indices_cpu is not None:
-                self.padding_priorities_cpu = self.padding_priorities_cpu[
-                    new_indices_cpu
-                ]
-            else:
-                self.padding_priorities_cpu = self.padding_priorities_cpu[
-                    new_indices.cpu()
-                ]
-
         # ``future_indices`` only replaces the relay-owned bonus/hidden state.
         # Remote DFLASH candidates are batch-owned and must follow every
         # scheduler filter even while the relay is pending.
@@ -276,34 +255,6 @@ class DFlashDraftInputV2(SpecInput):
         elif spec_info.reserved_seq_lens_cpu is not None:
             self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
             self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
-
-        if self.verify_lens_cpu is None and spec_info.verify_lens_cpu is not None:
-            raise ValueError("cannot merge fixed and ragged DFLASH draft inputs")
-        if self.verify_lens_cpu is not None and spec_info.verify_lens_cpu is None:
-            raise ValueError("cannot merge ragged and fixed DFLASH draft inputs")
-        if self.verify_lens_cpu is not None:
-            self.verify_lens_cpu = torch.cat(
-                [self.verify_lens_cpu, spec_info.verify_lens_cpu], dim=0
-            )
-
-        if (
-            self.padding_priorities_cpu is None
-            and spec_info.padding_priorities_cpu is not None
-        ):
-            raise ValueError("cannot merge unranked and ranked DFLASH draft inputs")
-        if (
-            self.padding_priorities_cpu is not None
-            and spec_info.padding_priorities_cpu is None
-        ):
-            raise ValueError("cannot merge ranked and unranked DFLASH draft inputs")
-        if self.padding_priorities_cpu is not None:
-            self.padding_priorities_cpu = torch.cat(
-                [
-                    self.padding_priorities_cpu,
-                    spec_info.padding_priorities_cpu,
-                ],
-                dim=0,
-            )
 
         # ``draft_tokens`` are not published through FutureMap.  Merge them
         # before the future-indices fast path so candidates stay row-aligned

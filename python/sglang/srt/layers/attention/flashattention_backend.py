@@ -13,7 +13,6 @@ from sglang.kernels.ops.attention.metadata import (
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
@@ -34,7 +33,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
-from sglang.srt.utils import get_bool_env_var, get_compiler_backend
+from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
@@ -312,23 +311,6 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.use_mla
         )
 
-        # Experimental BCG optimization for the dense FA3/NHD path.  The
-        # layer wrapper calls capture_kv_store_for_breakable_graph before the
-        # eager attention boundary, so the store kernel becomes part of the
-        # preceding graph segment and is not submitted from Python per layer.
-        self.capture_kv_store_in_breakable_graph = get_bool_env_var(
-            "SGLANG_DT_BCG_CAPTURE_KV_STORE"
-        )
-
-        # Target verify reuses one attention geometry across every transformer
-        # layer.  FA3 otherwise launches prepare_varlen_num_blocks from every
-        # layer when num_splits=0.  Keep this experimental until an end-to-end
-        # DT A/B proves that replacing those per-layer prepares with one
-        # replay-side prepare improves the complete pipeline.
-        self.precompute_verify_scheduler_metadata = get_bool_env_var(
-            "SGLANG_DT_PRECOMPUTE_VERIFY_SCHEDULER_METADATA"
-        )
-
         # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
         # attention modes can change live cache_seqlens/num_splits across ranks.
         # A stale precomputed buffer can lead to an OOB read in the split-KV
@@ -338,78 +320,8 @@ class FlashAttentionBackend(AttentionBackend):
             _should_disable_scheduler_metadata_precompute(server_args)
         )
 
-    def capture_kv_store_for_breakable_graph(
-        self,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        *,
-        use_mha_companion: bool = False,
-        **kwargs,
-    ) -> bool:
-        """Capture the simple dense-MHA KV write ahead of a BCG eager break.
-
-        Return ``True`` only after issuing the write.  The caller then invokes
-        ``forward_extend(..., save_kv_cache=False)`` for attention, avoiding a
-        duplicate eager store.  This is deliberately narrower than the full
-        ``forward_extend`` write matrix: every unsupported layout or auxiliary
-        input keeps the established eager path.
-
-        BCG pads ``out_cache_loc`` with zero.  The CUDA ``store_cache`` kernel
-        reserves and skips slot zero, so captured dummy rows are harmless.  We
-        require that exact fused kernel below; fallback tensor indexing would
-        write dummy K/V into slot zero instead.
-        """
-        pool = self.token_to_kv_pool
-        metadata = self.forward_metadata
-        if (
-            not self.capture_kv_store_in_breakable_graph
-            or k is None
-            or v is None
-            or layer.is_cross_attention
-            or use_mha_companion
-            or self.use_mla
-            or self.fa_skip_kv_cache
-            or self.attn_cp_size != 1
-            or self.use_sliding_window_kv_pool
-            or self.page_size != 1
-            or metadata is None
-            or metadata.swa_out_cache_loc is not None
-            or forward_batch.out_cache_loc is None
-            or forward_batch.out_cache_loc.shape[0] != k.shape[0]
-            or k.shape[0] != v.shape[0]
-            or getattr(pool, "kv_cache_layout", None) != "nhd"
-            or getattr(pool, "use_hnd", False)
-            or getattr(pool, "is_quantized_kv_cache", True)
-            or pool.store_dtype != pool.dtype
-            or any(value is not None for value in kwargs.values())
-        ):
-            return False
-
-        row_bytes = pool.row_dim * pool.store_dtype.itemsize
-        v_row_bytes = pool.v_row_dim * pool.store_dtype.itemsize
-        if not can_use_store_cache(row_bytes, v_row_bytes):
-            return False
-
-        pool.set_kv_buffer(
-            layer,
-            KVWriteLoc(forward_batch.out_cache_loc),
-            k,
-            v,
-            layer.k_scale,
-            layer.v_scale,
-        )
-        return True
-
     def _compute_scheduler_metadata(
-        self,
-        batch_size,
-        max_seq_len_k,
-        cache_seqlens,
-        cu_seqlens_q,
-        *,
-        max_seq_len_q=1,
+        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
         """Compute FA3 scheduler metadata for decode.
 
@@ -423,7 +335,7 @@ class FlashAttentionBackend(AttentionBackend):
         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
         return self._get_scheduler_metadata(
             batch_size=batch_size,
-            max_seqlen_q=max_seq_len_q,
+            max_seqlen_q=1,
             max_seqlen_k=max_seq_len_k,
             num_heads=self.num_attention_heads,
             num_heads_k=self.num_kv_heads,
@@ -436,53 +348,6 @@ class FlashAttentionBackend(AttentionBackend):
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
-
-    def _prepare_verify_scheduler_metadata_in_graph(
-        self,
-        metadata: FlashAttentionMetadata,
-        *,
-        batch_size: int,
-    ) -> None:
-        """Record one FA3 split-schedule prepare before all verify layers."""
-        if (
-            not self.precompute_verify_scheduler_metadata
-            or self.topk > 1
-        ):
-            return
-        sched = self._compute_scheduler_metadata(
-            batch_size,
-            self.max_context_len,
-            metadata.cache_seqlens_int32,
-            metadata.cu_seqlens_q,
-            max_seq_len_q=metadata.max_seq_len_q,
-        )
-        if sched is not None:
-            # This hook runs inside graph capture.  The returned tensor has a
-            # graph-stable address, and its prepare kernel re-executes on every
-            # replay before the transformer layers consume it.
-            metadata.scheduler_metadata = sched
-
-    @staticmethod
-    def _select_scheduler_metadata(
-        metadata: FlashAttentionMetadata,
-        *,
-        is_swa_layer: bool,
-        use_cascade_attn: bool,
-        use_local_attn: bool = False,
-        is_cross_attention: bool = False,
-        pa_swa_active: bool = False,
-    ) -> Optional[torch.Tensor]:
-        """Return a precomputed FA3 schedule only for matching geometry."""
-        if (
-            metadata.scheduler_metadata is None
-            or is_swa_layer
-            or use_cascade_attn
-            or use_local_attn
-            or is_cross_attention
-            or pa_swa_active
-        ):
-            return None
-        return metadata.scheduler_metadata
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -507,13 +372,6 @@ class FlashAttentionBackend(AttentionBackend):
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        if forward_batch.forward_mode.is_target_verify() and self.topk <= 1:
-            self._prepare_verify_scheduler_metadata_in_graph(
-                self.target_verify_metadata[forward_batch.batch_size],
-                batch_size=forward_batch.batch_size,
-            )
-            return
-
         # Single-CG has no Python between steps, so one capturable kernel updates
         # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
@@ -1568,17 +1426,6 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                # Target verify uses the extend/prefill attention path.  Reuse
-                # the replay-side schedule here as well as in forward_decode;
-                # otherwise FA3 rebuilds the identical split schedule in all
-                # transformer layers despite metadata being precomputed.
-                sched_meta = self._select_scheduler_metadata(
-                    metadata,
-                    is_swa_layer=is_swa_layer,
-                    use_cascade_attn=use_cascade_attn,
-                    use_local_attn=use_local_attn,
-                    is_cross_attention=layer.is_cross_attention,
-                )
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1596,7 +1443,6 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
                     **kwargs,
                 )
 
@@ -2044,12 +1890,14 @@ class FlashAttentionBackend(AttentionBackend):
                 # Default: single-token self-attention
                 # Use precomputed scheduler_metadata when available and applicable.
                 # scheduler_metadata is only valid for non-SWA, non-cascade decode.
-                sched_meta = self._select_scheduler_metadata(
-                    metadata,
-                    is_swa_layer=is_swa_layer,
-                    use_cascade_attn=use_cascade_attn,
-                    pa_swa_active=pa_swa_active,
-                )
+                sched_meta = None
+                if (
+                    metadata.scheduler_metadata is not None
+                    and not is_swa_layer
+                    and not use_cascade_attn
+                    and not pa_swa_active
+                ):
+                    sched_meta = metadata.scheduler_metadata
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -2939,9 +2787,9 @@ class FlashAttentionBackend(AttentionBackend):
                         (seq_lens + self.speculative_num_draft_tokens)
                     )
 
-                # Page table and the verify scheduler metadata are both built
-                # on-device.  The latter is captured once before all attention
-                # layers by init_forward_metadata_in_graph.
+                # Page table built on-device (self-guards on cache_seqlens);
+                # max_seq_len_k left unset -- unread here (scheduler_metadata is
+                # normal-decode-only).
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )

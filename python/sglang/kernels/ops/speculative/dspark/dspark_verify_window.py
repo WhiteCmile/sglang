@@ -129,81 +129,31 @@ def build_ragged_verify_window(
 
 @triton.jit
 def _ragged_finalize_kernel(
-    qo_indptr_ptr,
+    req_ptr,
+    within_ptr,
     prefix_ptr,
-    req_pool_indices_ptr,
-    req_to_token_ptr,
-    draft_block_ids_ptr,
-    draft_tokens_ptr,
+    cache_ptr,
     pos_out_ptr,
     cache_out_ptr,
-    ids_out_ptr,
     bs,
     n,
-    pool_len: tl.constexpr,
-    block_ids_stride: tl.constexpr,
-    draft_tokens_stride: tl.constexpr,
-    draft_tokens_col_stride: tl.constexpr,
+    real_len,
     BLOCK: tl.constexpr,
-    NBITS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
-
-    # qo_indptr is already built for attention metadata.  Search it directly
-    # instead of materializing req/within twice (once for positions/cache and
-    # again for candidate ids).  This also lets the same kernel gather cache
-    # locations from req_to_token without an intermediate packed tensor.
-    real_len = tl.load(qo_indptr_ptr + bs)
-    lo = tl.zeros([BLOCK], dtype=tl.int32)
-    hi = tl.full([BLOCK], bs, dtype=tl.int32)
-    for _ in range(NBITS):
-        mid = (lo + hi) // 2
-        active = lo < hi
-        row_end = tl.load(
-            qo_indptr_ptr + tl.minimum(mid + 1, bs), mask=mask, other=0
-        )
-        go_right = row_end <= offs
-        lo = tl.where(active & go_right, mid + 1, lo)
-        hi = tl.where(active & (~go_right), mid, hi)
-    req = lo
-    valid = mask & (offs < real_len)
+    req = tl.load(req_ptr + offs, mask=mask, other=0)
+    within = tl.load(within_ptr + offs, mask=mask, other=0)
+    valid = req < bs
     safe_req = tl.minimum(req, bs - 1)
-    row_start = tl.load(qo_indptr_ptr + safe_req, mask=mask, other=0)
-    within = tl.where(valid, offs - row_start, 0)
     prefix = tl.load(prefix_ptr + safe_req, mask=mask, other=0)
     pos = tl.where(valid, prefix + within, 0)
-
-    req_pool_index = tl.load(
-        req_pool_indices_ptr + safe_req, mask=valid, other=0
-    )
-    cl = tl.load(
-        req_to_token_ptr + req_pool_index * pool_len + prefix + within,
-        mask=valid,
-        other=0,
-    )
+    lmask = mask & (offs < real_len)
+    cl = tl.load(cache_ptr + offs, mask=lmask, other=0)
     cl = tl.where(valid, cl, 0)
-
-    anchor = tl.load(
-        draft_block_ids_ptr + safe_req * block_ids_stride,
-        mask=valid,
-        other=0,
-    )
-    draft_col = tl.maximum(within - 1, 0)
-    draft = tl.load(
-        draft_tokens_ptr
-        + safe_req * draft_tokens_stride
-        + draft_col * draft_tokens_col_stride,
-        mask=valid,
-        other=0,
-    )
-    verify_id = tl.where(within == 0, anchor, draft)
-    verify_id = tl.where(valid, verify_id, 0)
-
     tl.store(pos_out_ptr + offs, pos, mask=mask)
     tl.store(cache_out_ptr + offs, cl, mask=mask)
-    tl.store(ids_out_ptr + offs, verify_id.to(tl.int64), mask=mask)
 
 
 def build_ragged_verify_window_triton(
@@ -220,33 +170,44 @@ def build_ragged_verify_window_triton(
     prefix_lens = batch.seq_lens
     verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
     padded_total = layout.graph_num_tokens
+
+    req_id, within, _valid = compact_row_index_triton(
+        verify_lens=verify_lens, padded_total=padded_total, device=device
+    )
+    real_cache_loc = assign_extend_cache_locs_func(
+        req_pool_indices=batch.req_pool_indices,
+        req_to_token=model_runner.req_to_token_pool.req_to_token,
+        start_offset=prefix_lens,
+        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
+        batch_size=bs,
+        draft_token_num=verify_num_draft_tokens,
+        device=device,
+    )
     prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
     positions = torch.empty(padded_total, dtype=torch.int64, device=device)
-    verify_cache_loc = torch.empty(padded_total, dtype=torch.int64, device=device)
-    verify_ids = torch.empty(padded_total, dtype=torch.int64, device=device)
-    qo_indptr = layout.qo_indptr_device.contiguous()
-    req_pool_indices = batch.req_pool_indices.contiguous()
-    req_to_token = model_runner.req_to_token_pool.req_to_token
+    verify_cache_loc = torch.empty(
+        padded_total, dtype=real_cache_loc.dtype, device=device
+    )
     BLOCK = 256
     grid = (triton.cdiv(padded_total, BLOCK),)
     _ragged_finalize_kernel[grid](
-        qo_indptr,
+        req_id,
+        within,
         prefix_i64,
-        req_pool_indices,
-        req_to_token,
-        draft_block_ids,
-        draft_tokens,
+        real_cache_loc,
         positions,
         verify_cache_loc,
-        verify_ids,
         bs,
         padded_total,
-        pool_len=req_to_token.shape[1],
-        block_ids_stride=draft_block_ids.stride(0),
-        draft_tokens_stride=draft_tokens.stride(0),
-        draft_tokens_col_stride=draft_tokens.stride(1),
+        real_cache_loc.shape[0],
         BLOCK=BLOCK,
-        NBITS=_SEARCH_NBITS,
+    )
+
+    verify_ids = compact_verify_ids_triton(
+        draft_block_ids=draft_block_ids,
+        draft_tokens=draft_tokens,
+        layout=layout,
+        device=device,
     )
     return RaggedVerifyWindow(
         positions=positions,

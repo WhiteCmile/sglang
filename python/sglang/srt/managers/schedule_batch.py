@@ -1863,21 +1863,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
 
-    # DT mixed-phase execution keeps the two scheduler-level result domains
-    # separate while presenting one variable-length EXTEND to the model.  The
-    # prefill rows always precede the verify rows in the packed forward.
-    dt_mixed_prefill_batch: Optional["ScheduleBatch"] = None
-    dt_mixed_verify_batch: Optional["ScheduleBatch"] = None
-    dt_mixed_prefill_bs: int = 0
-    dt_mixed_prefill_num_tokens: int = 0
-    dt_mixed_verify_lens_cpu: Optional[torch.Tensor] = None
-    # Composite mode co-schedules the two logical phases but preserves their
-    # phase-specific model forwards (prefill graph, then verify graph).
-    dt_mixed_composite: bool = False
-    # A disaggregated Target batch can borrow pinned/device metadata slots.
-    # Ownership follows merge/mixed-batch composition and remains reserved
-    # until the overlap result snapshot is consumed.
-    dt_ready_metadata_slots: tuple[int, ...] = ()
     # For split prefill
     split_index: int = 0
     split_prefill_finished: bool = False
@@ -1974,16 +1959,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
-
-    # Keep one logits row per input token instead of pruning EXTEND to the
-    # final token of each request.  DT mixed-phase uses these rows to split a
-    # single model forward back into prefill sampling and speculative verify.
-    capture_all_logits: bool = False
-    # Optional token-row gather applied before the LM head.  DT mixed-phase
-    # keeps only one prefill row per request plus every compact verify row, so
-    # the combined EXTEND remains compatible with the shared graph logits
-    # buffer instead of materializing prompt-token logits.
-    logits_select_index: Optional[torch.Tensor] = None
 
     # Has grammar
     has_grammar: bool = False
@@ -2623,114 +2598,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
-    def mix_with_dt_verify(
-        self, verify_batch: ScheduleBatch, *, composite: bool = False
-    ) -> None:
-        """Pack replacement prefill and READY_VERIFY rows into one EXTEND.
-
-        Unlike generic mixed chunking, speculative verify contributes a
-        variable-length candidate chain rather than one decode token.  Keep
-        logical sub-batches for result processing and defer verify token/cache
-        materialization to the DT Target worker.
-        """
-        if not self.forward_mode.is_extend() or not verify_batch.forward_mode.is_decode():
-            raise ValueError("DT mixed-phase requires EXTEND prefill and DECODE verify")
-        if self.spec_info is not None:
-            raise ValueError("DT mixed-phase prefill must not carry speculative state")
-        verify_spec = verify_batch.spec_info
-        if verify_spec is None or getattr(verify_spec, "draft_tokens", None) is None:
-            raise ValueError("DT mixed-phase verify batch is missing remote candidates")
-
-        prefill_bs = self.batch_size()
-        verify_bs = verify_batch.batch_size()
-        if prefill_bs == 0 or verify_bs == 0:
-            raise ValueError("DT mixed-phase requires both prefill and verify rows")
-
-        verify_lens_cpu = getattr(verify_spec, "verify_lens_cpu", None)
-        if verify_lens_cpu is None:
-            block_size = int(get_server_args().speculative_num_draft_tokens)
-            verify_lens_cpu = torch.full(
-                (verify_bs,), block_size, dtype=torch.int32, device="cpu"
-            )
-        elif verify_lens_cpu.numel() != verify_bs:
-            raise ValueError("DT mixed-phase verify length batch mismatch")
-
-        # Snapshot the logical result batches before rebinding this object into
-        # the packed forward.  copy() intentionally retains only fields used by
-        # result processing; the full verify batch is also needed by the worker
-        # to build its KV window.
-        if composite:
-            # The composite worker needs a forward-capable prefill snapshot,
-            # not just the result-processing subset returned by copy().  Make
-            # the sampling state forward-only before merge_batch mutates the
-            # original SamplingBatchInfo in place.
-            self.dt_mixed_prefill_batch = dataclasses.replace(
-                self,
-                reqs=self.reqs[:],
-                extend_lens=self.extend_lens[:],
-                prefix_lens=self.prefix_lens[:],
-                sampling_info=(
-                    self.sampling_info.copy_for_forward()
-                    if self.sampling_info is not None
-                    else None
-                ),
-            )
-        else:
-            self.dt_mixed_prefill_batch = self.copy()
-        self.dt_mixed_verify_batch = verify_batch
-        self.dt_mixed_prefill_bs = prefill_bs
-        self.dt_mixed_prefill_num_tokens = int(self.extend_num_tokens)
-        self.dt_mixed_verify_lens_cpu = verify_lens_cpu
-        self.dt_mixed_composite = composite
-        self.dt_ready_metadata_slots += verify_batch.dt_ready_metadata_slots
-        verify_batch.dt_ready_metadata_slots = ()
-
-        verify_prefix_cpu = verify_batch.seq_lens_cpu.to(torch.int64)
-        verify_lens_i64_cpu = verify_lens_cpu.to(torch.int64)
-        verify_total_cpu = verify_prefix_cpu + verify_lens_i64_cpu
-        verify_total = verify_batch.seq_lens + verify_lens_cpu.to(
-            device=self.device, dtype=verify_batch.seq_lens.dtype, non_blocking=True
-        )
-
-        # Every row is a variable-length causal extension.  Keep the generic
-        # EXTEND mode so attention backends and the prefill CUDA-graph runner
-        # use their established ragged-prefix contract; logical result
-        # splitting is carried by the dt_mixed_* metadata above.
-        self.forward_mode = ForwardMode.EXTEND
-        self.capture_all_logits = True
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, verify_batch.req_pool_indices]
-        )
-        self.req_pool_indices_cpu = torch.cat(
-            [self.req_pool_indices_cpu, verify_batch.req_pool_indices_cpu]
-        )
-        self.seq_lens = torch.cat([self.seq_lens, verify_total])
-        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, verify_total_cpu])
-        self.orig_seq_lens = torch.cat(
-            [self.orig_seq_lens, verify_total.to(dtype=self.orig_seq_lens.dtype)]
-        )
-        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
-        self.prefix_lens = self.prefix_lens + verify_prefix_cpu.tolist()
-        verify_lens = verify_lens_i64_cpu.tolist()
-        self.extend_lens = self.extend_lens + verify_lens
-        self.extend_logprob_start_lens = self.extend_logprob_start_lens + [0] * verify_bs
-        self.extend_num_tokens += sum(verify_lens)
-
-        # The worker appends compact verify ids/cache locations after prefill
-        # H2D staging has resolved.  Keeping spec_info=None here prevents the
-        # generic FutureMap resolver from treating first-time prefill rows as a
-        # prior speculative iteration.
-        self.spec_info = None
-        self.sampling_info.merge_batch(verify_batch.sampling_info)
-        self.reqs = self.reqs + verify_batch.reqs
-        self.decoding_reqs = verify_batch.reqs
-        self.return_logprob = False
-        self.return_hidden_states = False
-        self.is_prefill_only = False
-        self.has_grammar = False
-        if self.multimodal_inputs is not None:
-            self.multimodal_inputs = self.multimodal_inputs + [None] * verify_bs
-
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
@@ -3190,8 +3057,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
-        self.dt_ready_metadata_slots += other.dt_ready_metadata_slots
-        other.dt_ready_metadata_slots = ()
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
@@ -3231,15 +3096,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             extend_num_tokens=self.extend_num_tokens,
-            capture_all_logits=self.capture_all_logits,
-            logits_select_index=self.logits_select_index,
-            dt_mixed_prefill_batch=self.dt_mixed_prefill_batch,
-            dt_mixed_verify_batch=self.dt_mixed_verify_batch,
-            dt_mixed_prefill_bs=self.dt_mixed_prefill_bs,
-            dt_mixed_prefill_num_tokens=self.dt_mixed_prefill_num_tokens,
-            dt_mixed_verify_lens_cpu=self.dt_mixed_verify_lens_cpu,
-            dt_mixed_composite=self.dt_mixed_composite,
-            dt_ready_metadata_slots=self.dt_ready_metadata_slots,
         )
 
     def maybe_evict_swa(self):

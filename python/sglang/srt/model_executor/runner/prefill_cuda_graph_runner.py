@@ -40,7 +40,6 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
@@ -532,8 +531,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return self.prefill_backend_name in (Backend.BREAKABLE, Backend.FULL)
 
     def _prefill_logits_buffer_rows(self, forward_batch: ForwardBatch) -> int:
-        if forward_batch.logits_select_index is not None:
-            return int(forward_batch.logits_select_index.numel())
         if not forward_batch.return_logprob:
             return forward_batch.batch_size
         assert (
@@ -1419,8 +1416,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            capture_all_logits=forward_batch.capture_all_logits,
-            logits_select_index=forward_batch.logits_select_index,
             num_token_non_padded=num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
@@ -1502,11 +1497,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly.
         full_path = self._is_full_backend
         ie_idx = self._input_embeds_arg_idx
-        body_replay_submit_ns = 0
 
         def replay_layer_forward(*args, **layer_kwargs):
-            nonlocal body_replay_submit_ns
-            replay_start_ns = time.monotonic_ns()
             # The captured body graph reads activations from the static
             # input_embeds slot. The outer model.forward (run eagerly)
             # passes the live embeddings into layer_model.forward as the
@@ -1524,15 +1516,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
-            for name in (
-                "dt_bcg_segment_submit_ns",
-                "dt_bcg_break_submit_ns",
-                "dt_bcg_segment_count",
-                "dt_bcg_break_count",
-            ):
-                if hasattr(static_forward_batch, name):
-                    setattr(forward_batch, name, getattr(static_forward_batch, name))
-            body_replay_submit_ns += time.monotonic_ns() - replay_start_ns
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
@@ -1542,24 +1525,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = forward_batch if full_path else static_forward_batch
         try:
-            outer_forward_start_ns = time.monotonic_ns()
             with self._prefill_forward_context(
                 static_forward_batch,
                 num_tokens=static_num_tokens,
                 raw_num_tokens=raw_num_tokens,
             ):
-                output = self.model_runner.model.forward(
+                return self.model_runner.model.forward(
                     tail_batch.input_ids,
                     tail_batch.positions,
                     tail_batch,
                     **kwargs,
                 )
-            outer_forward_submit_ns = time.monotonic_ns() - outer_forward_start_ns
-            forward_batch.dt_prefill_body_replay_submit_ns = body_replay_submit_ns
-            forward_batch.dt_prefill_eager_tail_submit_ns = (
-                outer_forward_submit_ns - body_replay_submit_ns
-            )
-            return output
         finally:
             self.layer_model.forward = original_layer_forward
 
@@ -1582,7 +1558,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _trim_logits_output(
-        self, output: LogitsProcessorOutput, forward_batch: ForwardBatch
+        self, output: LogitsProcessorOutput
     ) -> LogitsProcessorOutput:
         # Preserve mm_input_embeds for speculative decoding.
         mm_input_embeds = None
@@ -1591,11 +1567,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and output.mm_input_embeds is not None
         ):
             mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
-        logits_rows = (
-            int(forward_batch.logits_select_index.numel())
-            if forward_batch.logits_select_index is not None
-            else (self.raw_bs if self._is_full_backend else self.raw_num_tokens)
-        )
+        logits_rows = self.raw_bs if self._is_full_backend else self.raw_num_tokens
         return LogitsProcessorOutput(
             next_token_logits=(
                 output.next_token_logits[:logits_rows]
@@ -1616,10 +1588,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _finalize_execute_output(
-        self, output, forward_batch: ForwardBatch
+        self, output
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         if isinstance(output, LogitsProcessorOutput):
-            return self._trim_logits_output(output, forward_batch)
+            return self._trim_logits_output(output)
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
@@ -1630,10 +1602,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        execute_start_ns = time.monotonic_ns()
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
-            load_batch_submit_done_ns = time.monotonic_ns()
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
@@ -1657,14 +1627,4 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
-            finalized = self._finalize_execute_output(output, forward_batch)
-            execute_done_ns = time.monotonic_ns()
-            forward_batch.dt_prefill_graph_load_submit_ns = (
-                load_batch_submit_done_ns - execute_start_ns
-            )
-            forward_batch.dt_prefill_graph_finalize_submit_ns = (
-                execute_done_ns - load_batch_submit_done_ns
-                - getattr(forward_batch, "dt_prefill_body_replay_submit_ns", 0)
-                - getattr(forward_batch, "dt_prefill_eager_tail_submit_ns", 0)
-            )
-            return finalized
+            return self._finalize_execute_output(output)

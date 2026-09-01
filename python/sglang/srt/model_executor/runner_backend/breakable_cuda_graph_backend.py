@@ -244,15 +244,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        graph = self._graphs[shape_key]
-        graph.replay()
-        if graph.last_segment_submit_ns >= 0:
-            static_forward_batch.dt_bcg_segment_submit_ns = (
-                graph.last_segment_submit_ns
-            )
-            static_forward_batch.dt_bcg_break_submit_ns = graph.last_break_submit_ns
-            static_forward_batch.dt_bcg_segment_count = len(graph._segments)
-            static_forward_batch.dt_bcg_break_count = len(graph._break_fns)
+        self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

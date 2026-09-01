@@ -15,11 +15,12 @@
 
 import dataclasses
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from torch import nn
+
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
@@ -51,14 +52,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.speculative.flashmtp_shared import vocab_parallel_greedy_enabled
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
 )
-from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -209,8 +208,6 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
-    capture_all_logits: bool = False
-    logits_select_index: Optional[torch.Tensor] = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -285,8 +282,6 @@ class LogitsMetadata:
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
-            capture_all_logits=forward_batch.capture_all_logits,
-            logits_select_index=forward_batch.logits_select_index,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -381,10 +376,6 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_server_args().enable_mis
         self.rl_on_policy_target = get_server_args().rl_on_policy_target
-        self._dt_vocab_parallel_greedy = (
-            vocab_parallel_greedy_enabled()
-            or os.environ.get("SGLANG_DT_VOCAB_PARALLEL_GREEDY", "0") == "1"
-        )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -505,35 +496,24 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
 
-        select_index = logits_metadata.logits_select_index
-        if select_index is None:
-            select_index = logits_metadata.draft_extend_select_index
-
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
-            or logits_metadata.capture_all_logits
         ):
-            if select_index is not None:
-                pruned_states = hidden_states[select_index]
-                if hidden_states_before_norm is not None:
-                    pruned_states_before_norm = hidden_states_before_norm[select_index]
-                if aux_hidden_states is not None:
-                    aux_pruned_states = (
-                        aux_hidden_states[select_index]
-                        if isinstance(aux_hidden_states, torch.Tensor)
-                        else [hidden[select_index] for hidden in aux_hidden_states]
-                    )
+            if logits_metadata.draft_extend_select_index is not None:
+                # Only next_token_logits narrows to [bs, vocab]; the
+                # FULL-capture hidden stays unpruned.
+                pruned_states = hidden_states[logits_metadata.draft_extend_select_index]
             else:
                 pruned_states = hidden_states
-                pruned_states_before_norm = hidden_states_before_norm
-                if aux_hidden_states is not None:
-                    aux_pruned_states = (
-                        aux_hidden_states
-                        if isinstance(aux_hidden_states, torch.Tensor)
-                        else [hidden for hidden in aux_hidden_states]
-                    )
+            pruned_states_before_norm = hidden_states_before_norm
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden for hidden in aux_hidden_states]
+                )
             sample_indices = None
             input_logprob_indices = None
 
@@ -747,11 +727,7 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        skip_target_verify_gather = (
-            self._dt_vocab_parallel_greedy
-            and logits_metadata.forward_mode.is_target_verify()
-        )
-        if self.do_tensor_parallel_all_gather and not skip_target_verify_gather:
+        if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
@@ -887,6 +863,7 @@ class LogitsProcessor(nn.Module):
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
+        logits_width = logits.shape[-1]
         # The shared logits buffer is keyed by vocab width and rows; skip it
         # when this batch has a different logits shape than the graph buffer.
         if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
