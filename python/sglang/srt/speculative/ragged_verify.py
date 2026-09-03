@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 from enum import Enum
 from typing import List, Optional, Sequence, Tuple
 
@@ -17,6 +18,11 @@ class RaggedVerifyMode(str, Enum):
 
 
 def read_ragged_verify_mode() -> RaggedVerifyMode:
+    budgeted = os.environ.get("SGLANG_FLASHMTP_BUDGETED_VERIFY", "0")
+    if budgeted not in ("0", "1"):
+        raise ValueError("SGLANG_FLASHMTP_BUDGETED_VERIFY must be 0 or 1")
+    if budgeted == "1":
+        return RaggedVerifyMode.COMPACT
     value = envs.SGLANG_RAGGED_VERIFY_MODE.get()
     for mode in RaggedVerifyMode:
         if value == mode.value:
@@ -141,11 +147,33 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         device: torch.device,
         grid: Sequence[int],
         graph_num_tokens_floor: int = 0,
+        verify_lens_host: Optional[torch.Tensor] = None,
     ) -> RaggedVerifyLayout:
         verify_lens_list = [int(v) for v in verify_lens_cpu]
         total_verify_tokens = sum(verify_lens_list)
         bucket_input = max(total_verify_tokens, graph_num_tokens_floor)
         graph_num_tokens = round_up_grid(total=bucket_input, grid=grid)
+
+        if verify_lens_host is not None:
+            if verify_lens_host.device.type != "cpu":
+                raise ValueError("verify_lens_host must be a CPU tensor")
+            if verify_lens_host.dtype != torch.int32:
+                raise ValueError("verify_lens_host must have dtype torch.int32")
+            if verify_lens_host.numel() != len(verify_lens_list):
+                raise ValueError(
+                    "verify_lens_host size does not match verify_lens_cpu"
+                )
+            verify_lens = verify_lens_host.to(
+                device=device,
+                dtype=torch.int32,
+                non_blocking=verify_lens_host.is_pinned(),
+            )
+            return cls._assemble_device(
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                verify_lens_cpu=verify_lens_list,
+                total_verify_tokens=total_verify_tokens,
+            )
 
         return cls._assemble(
             verify_lens_cpu=verify_lens_list,

@@ -560,6 +560,8 @@ class Scheduler(
         self.init_diffusion_llm()
 
         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
+        if self.dt_target_controller is not None:
+            self.dt_target_controller.install_profile_device_timer()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -1046,11 +1048,36 @@ class Scheduler(
 
     def init_dt_target_controller(self):
         self.dt_target_controller = None
+        self._dt_mixed_phase = False
+        self._dt_composite_phase = False
+        self._dt_mixed_min_verify_bs = 1
+        self._dt_mixed_max_verify_bs = 0
         if self.server_args.draft_target_disaggregation_role != "target":
             return
         from sglang.srt.speculative.dt_target import DTTargetController
 
         self.dt_target_controller = DTTargetController(self)
+        self._dt_composite_phase = (
+            os.environ.get("SGLANG_DT_COMPOSITE_PHASE", "0") == "1"
+        )
+        self._dt_mixed_phase = (
+            os.environ.get("SGLANG_DT_MIXED_PHASE", "0") == "1"
+            or self._dt_composite_phase
+        )
+        self._dt_mixed_min_verify_bs = max(
+            int(os.environ.get("SGLANG_DT_MIXED_MIN_VERIFY_BS", "1")), 1
+        )
+        self._dt_mixed_max_verify_bs = max(
+            int(os.environ.get("SGLANG_DT_MIXED_MAX_VERIFY_BS", "32")), 1
+        )
+        if self._dt_mixed_phase and self.ps.tp_rank == 0:
+            logger.info(
+                "Enabled experimental DT %s prefill+verify scheduling "
+                "for verify batches with %d..%d rows",
+                "composite" if self._dt_composite_phase else "mixed-forward",
+                self._dt_mixed_min_verify_bs,
+                self._dt_mixed_max_verify_bs,
+            )
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2911,12 +2938,18 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
+            allow_dt_mixed_prefill = self._can_attempt_dt_mixed_prefill(
+                running_batch=running_batch,
+                ready_batch_size=dt_ready_batch_size,
+            )
             defer_dt_prefill = (
                 self.dt_target_controller is not None
                 and self.chunked_req is None
                 and self.dt_target_controller.should_defer_prefill(
+                    waiting_queue_size=len(self.waiting_queue),
                     ready_batch_size=dt_ready_batch_size,
                 )
+                and not allow_dt_mixed_prefill
             )
             if defer_dt_prefill:
                 new_batch = None
@@ -2964,7 +2997,157 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        if self.dt_target_controller is not None:
+            self.dt_target_controller.record_scheduler_plan(
+                ready_batch_size=dt_ready_batch_size,
+                prefill_batch_size=new_batch.batch_size() if new_batch else 0,
+                running_batch_size=running_batch.batch_size(),
+                waiting_queue_size=len(self.waiting_queue),
+                selected_mode=str(ret.forward_mode) if ret else "idle",
+                selected_batch_size=ret.batch_size() if ret else 0,
+            )
+
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _can_attempt_dt_mixed_prefill(
+        self, *, running_batch: ScheduleBatch, ready_batch_size: int
+    ) -> bool:
+        """Return whether bypassing READY_VERIFY prefill deferral is safe.
+
+        This is deliberately conservative: unsupported request features retain
+        the established verify-first policy instead of being admitted into a
+        prefill batch that cannot subsequently be mixed.
+        """
+        if (
+            not getattr(self, "_dt_mixed_phase", False)
+            or ready_batch_size <= 0
+            or running_batch.is_empty()
+            or running_batch.batch_size() < self._dt_mixed_min_verify_bs
+            or running_batch.batch_size() > self._dt_mixed_max_verify_bs
+            or not self.waiting_queue
+        ):
+            return False
+        verify_spec = running_batch.spec_info
+        if verify_spec is None or getattr(verify_spec, "draft_tokens", None) is None:
+            return False
+        if (
+            running_batch.return_logprob
+            or running_batch.return_hidden_states
+            or running_batch.has_grammar
+            or running_batch.sampling_info is None
+            or not running_batch.sampling_info.is_all_greedy
+        ):
+            return False
+        if not all(
+            not req.return_logprob
+            and not req.return_hidden_states
+            and req.grammar is None
+            and req.input_embeds is None
+            and req.multimodal_inputs is None
+            and req.positional_embed_overrides is None
+            and not req.is_prefill_only
+            for req in self.waiting_queue
+        ):
+            return False
+        if self._dt_composite_phase:
+            # Do not let composite scheduling defeat the existing replacement-
+            # prefill coalescer.  A READY wave used to win priority while small
+            # prefill arrivals accumulated behind the bounded wait/threshold;
+            # bypassing that policy produced mostly singleton prefill launches
+            # and increased total GPU work even though each composite removed
+            # one scheduler round-trip.  Only compose when the waiting side is
+            # already large enough to flush under the accepted fixed policy.
+            return (
+                len(self.waiting_queue)
+                >= self.dt_target_controller.prefill_batch_threshold
+            )
+
+        verify_lens_cpu = getattr(verify_spec, "verify_lens_cpu", None)
+        verify_tokens = (
+            int(verify_lens_cpu.sum())
+            if verify_lens_cpu is not None
+            else ready_batch_size
+            * int(self.server_args.speculative_num_draft_tokens)
+        )
+        graph_output = getattr(self.tp_worker.model_runner, "graph_shared_output", None)
+        prefill_runner = getattr(
+            self.tp_worker.model_runner, "prefill_cuda_graph_runner", None
+        )
+        # One output row is needed for every verify token plus at least one
+        # admitted prefill request.  Do not bypass verify-first scheduling if
+        # the combined forward cannot use the existing prefill graph/output
+        # buffers; the eager fallback was slower than the accepted path.
+        if (
+            graph_output is None
+            or verify_tokens + 1 > graph_output.max_rows
+            or not getattr(prefill_runner, "capture_num_tokens", None)
+        ):
+            return False
+        if getattr(prefill_runner, "_is_full_backend", False) and (
+            running_batch.batch_size() + 1
+            > getattr(prefill_runner, "_capture_req_slots", 0)
+        ):
+            return False
+        return True
+
+    def _can_mix_dt_batches(
+        self, *, prefill_batch: ScheduleBatch, verify_batch: ScheduleBatch
+    ) -> bool:
+        if not (
+            getattr(self, "_dt_mixed_phase", False)
+            and not verify_batch.is_empty()
+            and verify_batch.batch_size() >= self._dt_mixed_min_verify_bs
+            and verify_batch.batch_size() <= self._dt_mixed_max_verify_bs
+            and prefill_batch.spec_info is None
+            and verify_batch.spec_info is not None
+            and getattr(verify_batch.spec_info, "draft_tokens", None) is not None
+            and not (prefill_batch.return_logprob or verify_batch.return_logprob)
+            and not (
+                prefill_batch.return_hidden_states
+                or verify_batch.return_hidden_states
+            )
+            and not (prefill_batch.has_grammar or verify_batch.has_grammar)
+            and prefill_batch.input_embeds is None
+            and prefill_batch.replace_embeds is None
+            and prefill_batch.model_config.is_encoder_decoder is False
+            and verify_batch.sampling_info is not None
+            and verify_batch.sampling_info.is_all_greedy
+        ):
+            return False
+
+        if self._dt_composite_phase:
+            return True
+
+        verify_lens_cpu = getattr(verify_batch.spec_info, "verify_lens_cpu", None)
+        verify_tokens = (
+            int(verify_lens_cpu.sum())
+            if verify_lens_cpu is not None
+            else verify_batch.batch_size()
+            * int(self.server_args.speculative_num_draft_tokens)
+        )
+        selected_output_rows = prefill_batch.batch_size() + verify_tokens
+        graph_output = getattr(self.tp_worker.model_runner, "graph_shared_output", None)
+        prefill_runner = getattr(
+            self.tp_worker.model_runner, "prefill_cuda_graph_runner", None
+        )
+        total_input_tokens = int(prefill_batch.extend_num_tokens) + verify_tokens
+        capture_tokens = getattr(prefill_runner, "capture_num_tokens", ())
+        if (
+            graph_output is None
+            or selected_output_rows > graph_output.max_rows
+            or not capture_tokens
+            or total_input_tokens > capture_tokens[-1]
+        ):
+            return False
+        if getattr(prefill_runner, "_is_full_backend", False) and (
+            prefill_batch.batch_size() + verify_batch.batch_size()
+            > getattr(prefill_runner, "_capture_req_slots", 0)
+        ):
+            return False
+        padded_tokens = next(
+            (size for size in capture_tokens if size >= total_input_tokens), None
+        )
+        return padded_tokens is not None and padded_tokens <= total_input_tokens * 2
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
@@ -3231,6 +3414,22 @@ class Scheduler(
                 ),
             ),
         )
+
+        # DT replacement prefills and remotely READY verify rows otherwise run
+        # as two serialized model phases.  Reserve the verify window as usual,
+        # then let the Target worker execute both as one variable-length EXTEND.
+        if self._can_mix_dt_batches(
+            prefill_batch=new_batch, verify_batch=running_batch
+        ):
+            running_batch.filter_batch()
+            if not running_batch.is_empty():
+                running_batch.prepare_for_decode()
+                new_batch.mix_with_dt_verify(
+                    running_batch, composite=self._dt_composite_phase
+                )
+                running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=running_batch.batch_is_full
+                )
 
         # Mixed-style chunked prefill
         if (
@@ -3753,7 +3952,9 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
-        if batch.forward_mode.is_decode():
+        if batch.dt_mixed_prefill_bs:
+            self._process_dt_mixed_batch_result(batch, result)
+        elif batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
@@ -3782,6 +3983,73 @@ class Scheduler(
             )
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _process_dt_mixed_batch_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Restore prefill and verify result semantics after one mixed forward."""
+        prefill_batch = batch.dt_mixed_prefill_batch
+        verify_batch = batch.dt_mixed_verify_batch
+        prefill_bs = batch.dt_mixed_prefill_bs
+        stride = result.speculative_num_draft_tokens
+        if prefill_batch is None or verify_batch is None or stride is None:
+            raise RuntimeError("incomplete DT mixed-phase result metadata")
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+            result.copy_done = None
+        if not torch.is_tensor(result.next_token_ids) or not torch.is_tensor(
+            result.accept_lens
+        ):
+            raise RuntimeError("DT mixed-phase result tensors are missing")
+
+        token_rows = result.next_token_ids.view(batch.batch_size(), stride)
+        prefill_result = GenerationBatchResult(
+            logits_output=result.logits_output,
+            next_token_ids=token_rows[:prefill_bs, 0].contiguous(),
+            can_run_cuda_graph=result.can_run_cuda_graph,
+            extend_input_len_per_req=(
+                result.extend_input_len_per_req[:prefill_bs]
+                if result.extend_input_len_per_req is not None
+                else None
+            ),
+            extend_logprob_start_len_per_req=(
+                result.extend_logprob_start_len_per_req[:prefill_bs]
+                if result.extend_logprob_start_len_per_req is not None
+                else None
+            ),
+            routed_experts_output=result.routed_experts_output,
+            indexer_topk_output=result.indexer_topk_output,
+        )
+        result.routed_experts_output = None
+        result.indexer_topk_output = None
+        self.batch_result_processor.process_batch_result_prefill(
+            prefill_batch, prefill_result
+        )
+
+        verify_result = GenerationBatchResult(
+            logits_output=result.logits_output,
+            next_token_ids=token_rows[prefill_bs:].contiguous().view(-1),
+            accept_lens=result.accept_lens[prefill_bs:].contiguous(),
+            block_accept_lens=(
+                result.block_accept_lens[prefill_bs:].contiguous()
+                if result.block_accept_lens is not None
+                else None
+            ),
+            cap_lens=(
+                result.cap_lens[prefill_bs:].contiguous()
+                if result.cap_lens is not None
+                else None
+            ),
+            can_run_cuda_graph=result.can_run_cuda_graph,
+            speculative_num_draft_tokens=stride,
+        )
+        self.batch_result_processor.process_batch_result_decode(
+            verify_batch, verify_result
+        )
+        result.num_correct_drafts = verify_result.num_correct_drafts
+        result.num_correct_drafts_per_req_cpu = (
+            verify_result.num_correct_drafts_per_req_cpu
+        )
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

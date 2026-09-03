@@ -458,6 +458,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dimensions: Optional[list[int]] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+    # Preserve every EXTEND token's logits for DT mixed-phase splitting.
+    capture_all_logits: bool = False
+    # Optional token-row gather before the LM head.  This lets a mixed EXTEND
+    # retain all verify rows without also projecting every prompt token.
+    logits_select_index: Optional[torch.Tensor] = None
 
     # For DP attention
     is_extend_in_batch: bool = False
@@ -771,6 +776,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            capture_all_logits=batch.capture_all_logits,
+            logits_select_index=batch.logits_select_index,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
