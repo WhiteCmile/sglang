@@ -494,8 +494,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         represents the legal fixed-width ragged-preparation ablation.
         """
         if verify_lens is None and not self._pinned_verify_metadata:
+            width = self.model_block_size if fixed_width is None else int(fixed_width)
             return torch.full(
-                (batch_size,), self.model_block_size, dtype=torch.int32, device="cpu"
+                (batch_size,), width, dtype=torch.int32, device="cpu"
             )
         if verify_lens is not None and (
             self._adaptive_verify and batch_size < self._shared_adaptive_min_batch

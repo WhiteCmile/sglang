@@ -223,6 +223,23 @@ def test_chard_stops_when_queue_is_exhausted():
     torch.testing.assert_close(next_lens, torch.zeros((1,), dtype=torch.int32))
 
 
+def test_chard_fixed_width_survives_unpinned_host_staging():
+    from sglang.srt.speculative.flashmtp_worker_v2 import FlashMTPWorkerV2
+
+    worker = SimpleNamespace(
+        _pinned_verify_metadata=False,
+        model_block_size=8,
+    )
+    verify_lens = FlashMTPWorkerV2._stage_verify_lens_cpu(
+        worker,
+        None,
+        batch_size=3,
+        fixed_width=2,
+    )
+
+    torch.testing.assert_close(verify_lens, torch.tensor([2, 2, 2], dtype=torch.int32))
+
+
 def test_flashmtp_fused_residual_path_matches_reference():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
