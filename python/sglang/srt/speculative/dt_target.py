@@ -22,6 +22,7 @@ from sglang.srt.speculative.flashmtp_shared import (
     pinned_verify_metadata_enabled,
     ragged_verify_enabled,
     read_adaptive_min_batch,
+    read_chard_chunk_size,
     validate_component_dependencies,
 )
 from sglang.srt.utils import broadcast_pyobj
@@ -47,6 +48,7 @@ class ParkedTargetRound:
     lane_id: int = 0
     candidate_bytes: bytes | None = None
     verify_len: int | None = None
+    queue_len: int | None = None
     padding_priority: int | None = None
     failure: str | None = None
 
@@ -118,10 +120,15 @@ class DTTargetController:
         self.remote_block_size = int(
             getattr(scheduler.draft_worker, "remote_block_size", self.block_size)
         )
+        self.chard_chunk_size = read_chard_chunk_size(block_size=self.block_size)
         validate_component_dependencies()
         adaptive_component = adaptive_verify_enabled()
         adaptive_margin = os.environ.get("SGLANG_DT_ADAPTIVE_VERIFY_MARGIN")
-        self.ragged_verify = ragged_verify_enabled() or adaptive_margin is not None
+        self.ragged_verify = (
+            ragged_verify_enabled()
+            or adaptive_margin is not None
+            or self.chard_chunk_size is not None
+        )
         self.pinned_verify_metadata = (
             pinned_verify_metadata_enabled() or adaptive_margin is not None
         )
@@ -845,6 +852,34 @@ class DTTargetController:
             and getattr(req, "inflight_middle_chunks", 0) <= 0
             and self._target_inflight_count(req.rid) == 0
         ]
+        continuations: list[tuple[bytes, int] | None] = [None] * len(active_indices)
+        if self.chard_chunk_size is not None and batch_result is not None:
+            continuation_tokens = getattr(
+                batch_result, "chard_continuation_tokens", None
+            )
+            continuation_lens = getattr(
+                batch_result, "chard_continuation_lens", None
+            )
+            if (continuation_tokens is None) != (continuation_lens is None):
+                raise RuntimeError("CHARD continuation tokens and lengths diverged")
+            if continuation_tokens is not None:
+                if continuation_tokens.device.type != "cpu":
+                    raise RuntimeError("CHARD continuation tokens were not copied to CPU")
+                if continuation_lens.device.type != "cpu":
+                    raise RuntimeError("CHARD continuation lengths were not copied to CPU")
+                if tuple(continuation_tokens.shape) != (
+                    original_batch_size,
+                    self.block_size,
+                ) or int(continuation_lens.numel()) != original_batch_size:
+                    raise ValueError("CHARD continuation result shape mismatch")
+                for active_index, row_index in enumerate(active_indices):
+                    queue_len = int(continuation_lens[row_index])
+                    if queue_len <= 0:
+                        continue
+                    row = continuation_tokens[row_index].to(
+                        dtype=torch.int32
+                    ).contiguous()
+                    continuations[active_index] = (row.numpy().tobytes(), queue_len)
         if active_indices:
             self._cohort_sequence += 1
         cohort_id = self._cohort_sequence
@@ -1132,12 +1167,27 @@ class DTTargetController:
                 parked_ns=park_start_ns,
                 lane_id=lane_ids[active_index],
             )
+            continuation = continuations[active_index]
+            if continuation is not None:
+                candidate_bytes, queue_len = continuation
+                root = struct.unpack_from("<i", candidate_bytes)[0]
+                if root != bonus_token:
+                    raise RuntimeError(
+                        "CHARD continuation root does not match Target bonus token"
+                    )
+                state.candidate_bytes = candidate_bytes
+                state.verify_len = min(self.chard_chunk_size, queue_len)
+                state.queue_len = queue_len
+                state.result_ready_ns = park_start_ns
             self._parked[transfer_id] = state
             parked_reqs.append(req)
 
             if getattr(self, "is_export_rank", False):
                 source_slot = source_slots[active_index]
                 source_generation = source_generations[active_index]
+                if continuation is not None:
+                    self._free_source_slots.append(source_slot)
+                    continue
                 self._source_slot_by_transfer[transfer_id] = (
                     source_slot,
                     source_generation,
@@ -1218,6 +1268,9 @@ class DTTargetController:
                 round_id_max=max(round_ids, default=-1),
                 original_batch_size=original_batch_size,
                 parked_count=len(parked_reqs),
+                chard_continuation_count=sum(
+                    continuation is not None for continuation in continuations
+                ),
                 target_step_before_export_ns=(
                     park_start_ns - int(launch_ts * 1_000_000_000) if launch_ts else 0
                 ),
@@ -1332,6 +1385,8 @@ class DTTargetController:
                 else:
                     state.candidate_bytes = payload
                     state.verify_len = getattr(self, "block_size", None)
+                if self.chard_chunk_size is not None and state.queue_len is None:
+                    state.queue_len = self.block_size
                 state.result_ready_ns = poll_now_ns
             else:
                 state.failure = payload
@@ -2164,7 +2219,16 @@ class DTTargetController:
             or getattr(self, "adaptive_verify_margin", None) is not None
         ):
             min_adaptive_batch = getattr(self, "adaptive_verify_min_target_batch", 1)
-            if (
+            if self.chard_chunk_size is not None:
+                verify_lens = [
+                    min(
+                        state.verify_len or self.chard_chunk_size,
+                        state.queue_len or self.block_size,
+                        self.chard_chunk_size,
+                    )
+                    for state in ready
+                ]
+            elif (
                 getattr(self, "adaptive_verify_margin", None) is None
                 or len(ready) < min_adaptive_batch
             ):
@@ -2235,6 +2299,15 @@ class DTTargetController:
             draft_tokens=draft_tokens,
             verify_lens_cpu=verify_lens_cpu,
             padding_priorities_cpu=padding_priorities_cpu,
+            chard_queue_lens=(
+                torch.tensor(
+                    [state.queue_len or self.block_size for state in ready],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if self.chard_chunk_size is not None
+                else None
+            ),
         )
         batch.input_ids = None
         spec_alloc_end_ns = (
@@ -2983,11 +3056,18 @@ class DTTargetController:
                     raise ValueError(
                         "DT result candidate root does not match bonus token"
                     )
-                verify_len = self.remote_block_size
+                verify_len = (
+                    self.chard_chunk_size
+                    if self.chard_chunk_size is not None
+                    else self.remote_block_size
+                )
                 if self.adaptive_verify_margin is not None:
-                    verify_len = struct.unpack_from(
-                        "<i", payload, start + candidate_width_bytes
-                    )[0]
+                    verify_len = min(
+                        verify_len,
+                        struct.unpack_from(
+                            "<i", payload, start + candidate_width_bytes
+                        )[0],
+                    )
                     if not 1 <= verify_len <= self.block_size:
                         raise ValueError(
                             f"DT adaptive verify length {verify_len} is outside "
@@ -3018,6 +3098,7 @@ class DTTargetController:
                         state.seq_len,
                     )
                 events.append(("ready", entry.transfer_id, ready_payload))
+                state.queue_len = self.block_size
                 self._ledger.finish(entry.transfer_id)
             elif entry.transfer_id in failed_ids:
                 if entry.transfer_id in self._cancelled_transfers:

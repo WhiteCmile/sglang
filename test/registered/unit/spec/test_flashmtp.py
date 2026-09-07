@@ -18,6 +18,7 @@ from sglang.srt.speculative.flashmtp_utils import (
     gather_flashmtp_next_pivot,
     parse_flashmtp_draft_config,
 )
+from sglang.srt.speculative.flashmtp_shared import build_chard_continuation
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from torch import nn
 
@@ -184,6 +185,42 @@ def test_flashmtp_gathers_pivot_at_accept_len():
     )
     expected = torch.stack([hidden[0], hidden[block_size + 2]])
     torch.testing.assert_close(gathered, expected)
+
+
+def test_chard_continues_only_after_full_chunk_and_matching_anchor():
+    candidates = torch.tensor(
+        [
+            [10, 11, 12, 13, 14, 15, 16, 17],
+            [20, 21, 22, 23, 24, 25, 26, 27],
+            [30, 31, 32, 33, 34, 35, 36, 37],
+        ]
+    )
+    next_tokens, next_lens = build_chard_continuation(
+        candidates=candidates,
+        queue_lens=torch.tensor([8, 8, 8]),
+        verify_lens=torch.tensor([2, 2, 2]),
+        commit_lens=torch.tensor([2, 1, 2]),
+        bonus_tokens=torch.tensor([12, 22, 99]),
+    )
+
+    torch.testing.assert_close(
+        next_tokens[0], torch.tensor([12, 13, 14, 15, 16, 17, 0, 0])
+    )
+    torch.testing.assert_close(next_tokens[1:], torch.zeros((2, 8), dtype=torch.int64))
+    torch.testing.assert_close(next_lens, torch.tensor([6, 0, 0], dtype=torch.int32))
+
+
+def test_chard_stops_when_queue_is_exhausted():
+    next_tokens, next_lens = build_chard_continuation(
+        candidates=torch.tensor([[12, 13, 0, 0]]),
+        queue_lens=torch.tensor([2]),
+        verify_lens=torch.tensor([2]),
+        commit_lens=torch.tensor([2]),
+        bonus_tokens=torch.tensor([99]),
+    )
+
+    torch.testing.assert_close(next_tokens, torch.zeros((1, 4), dtype=torch.int64))
+    torch.testing.assert_close(next_lens, torch.zeros((1,), dtype=torch.int32))
 
 
 def test_flashmtp_fused_residual_path_matches_reference():

@@ -407,8 +407,9 @@ def validate_result(path: Path, args: argparse.Namespace, topology: str) -> dict
 
 def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
     topology = "baseline" if label.startswith("b") else "dt"
-    algo = label.endswith("1")
-    budgeted_verify = algo
+    variant = label[1:]
+    budgeted_verify = variant in {"1", "x"}
+    chard = variant in {"c", "x"}
     leg = args.output_dir / f"leg-{ordinal}-{label}"
     leg.mkdir()
     server_dir = leg / "servers"
@@ -432,6 +433,9 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
         "SGLANG_FLASHMTP_VOCAB_PARALLEL_GREEDY": "0",
         "SGLANG_FLASHMTP_GRAPH_TIER_PADDING": "0",
         "SGLANG_FLASHMTP_BUDGETED_VERIFY": "1" if budgeted_verify else "0",
+        "SGLANG_FLASHMTP_CHARD_CHUNK_SIZE": (
+            str(args.chard_chunk_size) if chard else "0"
+        ),
     }
     if args.thresholds:
         env["SGLANG_FLASHMTP_BUDGETED_VERIFY_THRESHOLDS"] = args.thresholds
@@ -495,8 +499,9 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
         {
             "label": label,
             "topology": topology,
-            "algorithm": algo,
+            "algorithm": variant,
             "budgeted_verify": budgeted_verify,
+            "chard": chard,
             "launcher_argv": launcher_argv,
             "benchmark_argv": benchmark_argv,
             "environment": env,
@@ -550,8 +555,9 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
             return {
                 "label": label,
                 "topology": topology,
-                "algorithm": algo,
+                "algorithm": variant,
                 "budgeted_verify": budgeted_verify,
+                "chard": chard,
                 **result,
             }
     finally:
@@ -572,6 +578,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-requests", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=320)
     parser.add_argument("--thresholds", default="")
+    parser.add_argument("--chard-chunk-size", type=int, default=2)
     parser.add_argument("--enable-profile", action="store_true")
     parser.add_argument("--startup-timeout-s", type=float, default=1800)
     parser.add_argument("--run-timeout-s", type=float, default=7200)
@@ -584,7 +591,11 @@ def main() -> None:
     require(args.concurrency == 768, "this runner is fixed to B768")
     require(args.max_new_tokens == 320, "this runner is fixed to max_new_tokens=320")
     labels = [value.strip() for value in args.schedule.split(",") if value.strip()]
-    require(labels and set(labels) <= {"b0", "b1", "d0", "d1"}, "bad schedule")
+    require(
+        labels
+        and set(labels) <= {"b0", "b1", "bc", "bx", "d0", "d1", "dc", "dx"},
+        "bad schedule",
+    )
     require(not args.output_dir.exists(), "output directory already exists")
     args.prompts_file = args.prompts_file.resolve()
     require(args.prompts_file.is_file(), "prompts file does not exist")
@@ -630,6 +641,7 @@ def main() -> None:
         "measurement_requests": args.measurement_requests,
         "max_new_tokens": args.max_new_tokens,
         "thresholds": args.thresholds or None,
+        "chard_chunk_size": args.chard_chunk_size,
     }
     atomic_json(args.output_dir / "provenance.json", provenance)
     results = []
@@ -662,6 +674,23 @@ def main() -> None:
         comparisons["dt_algo_lift"] = (
             by_label["d1"]["throughput"] / by_label["d0"]["throughput"]
         )
+    for topology, prefix in (("baseline", "b"), ("dt", "d")):
+        if f"{prefix}0" in by_label and f"{prefix}c" in by_label:
+            comparisons[f"{topology}_chard_lift"] = (
+                by_label[f"{prefix}c"]["throughput"]
+                / by_label[f"{prefix}0"]["throughput"]
+            )
+        if f"{prefix}1" in by_label and f"{prefix}x" in by_label:
+            comparisons[f"{topology}_chard_on_budgeted_lift"] = (
+                by_label[f"{prefix}x"]["throughput"]
+                / by_label[f"{prefix}1"]["throughput"]
+            )
+    for variant in ("c", "x"):
+        baseline, dt = by_label.get(f"b{variant}"), by_label.get(f"d{variant}")
+        if baseline and dt:
+            comparisons[f"dt_over_baseline_algo_{variant}"] = (
+                dt["throughput"] / baseline["throughput"]
+            )
     comparisons["all_output_digests_equal"] = (
         len({result["output_digest"] for result in results}) == 1
     )

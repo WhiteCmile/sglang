@@ -38,6 +38,7 @@ from sglang.srt.speculative.flashmtp_shared import (
     plan_ragged_execution_tier,
     ragged_epilogue_capacity,
     ragged_verify_enabled,
+    read_chard_chunk_size,
     reclaim_ragged_graph_padding,
     validate_component_dependencies,
     vocab_parallel_greedy_enabled,
@@ -138,7 +139,12 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         self._new_seq_lens_bufs: list[torch.Tensor] = []
         validate_component_dependencies()
         adaptive_margin = os.environ.get("SGLANG_DT_ADAPTIVE_VERIFY_MARGIN")
-        self._ragged_verify = ragged_verify_enabled() or adaptive_margin is not None
+        self._chard_chunk_size = read_chard_chunk_size(block_size=self.block_size)
+        self._ragged_verify = (
+            ragged_verify_enabled()
+            or adaptive_margin is not None
+            or self._chard_chunk_size is not None
+        )
         self._adaptive_verify = adaptive_verify_enabled()
         self._adaptive_verify_margin = (
             0.0
@@ -447,6 +453,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         if (
             graph_tier_available
             and self._adaptive_fill_graph_padding
+            and self._chard_chunk_size is None
             and total_verify_tokens < graph_num_tokens
         ):
             padding_priorities = None
@@ -668,6 +675,14 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             new_seq_lens=new_seq_lens,
             pivot_hidden=next_pivot,
         )
+        chard_tokens, chard_lens = self._build_chard_continuation(
+            draft_input=draft_input,
+            candidates=candidates,
+            verify_lens=layout.verify_lens,
+            commit_lens=commit_lens,
+            bonus_tokens=bonus,
+            next_input=next_input,
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
@@ -676,6 +691,8 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             next_draft_input=next_input,
             speculative_num_draft_tokens=self.block_size,
             new_seq_lens=new_seq_lens,
+            chard_continuation_tokens=chard_tokens,
+            chard_continuation_lens=chard_lens,
         )
 
     def _emit_accept_profile(

@@ -84,6 +84,12 @@ class GenerationBatchResult:
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
 
+    # CHARD T1 continuation exported to the DT controller.  The worker keeps
+    # the device-owned copies on next_draft_input; these aliases are copied to
+    # CPU with the rest of the result metadata.
+    chard_continuation_tokens: Optional[torch.Tensor] = None
+    chard_continuation_lens: Optional[torch.Tensor] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
@@ -153,6 +159,13 @@ class GenerationBatchResult:
 
         if self.cap_lens is not None:
             self.cap_lens = _async_d2h(self.cap_lens)
+
+        if self.chard_continuation_tokens is not None:
+            self.chard_continuation_tokens = _async_d2h(
+                self.chard_continuation_tokens
+            )
+        if self.chard_continuation_lens is not None:
+            self.chard_continuation_lens = _async_d2h(self.chard_continuation_lens)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so

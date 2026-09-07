@@ -43,6 +43,11 @@ class DFlashDraftInputV2(SpecInput):
     # Populated only by a disaggregated Target after remote Draft completion.
     # Shape: [bs, block_size], including the slot-0 bonus token.
     draft_tokens: Optional[torch.Tensor] = None
+    # CHARD T1 request-local proposal queue.  Rows are left-aligned and
+    # anchor-inclusive; a zero length means the next step must use a fresh
+    # Draft block.  These tensors stay on device across overlap iterations.
+    chard_queue_tokens: Optional[torch.Tensor] = None
+    chard_queue_lens: Optional[torch.Tensor] = None
     # Optional per-request Target verify widths. Kept on CPU so the compact
     # CUDA-graph tier can be selected without a device synchronization.
     verify_lens_cpu: Optional[torch.Tensor] = None
@@ -147,7 +152,6 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-        page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
@@ -256,6 +260,11 @@ class DFlashDraftInputV2(SpecInput):
         if self.draft_tokens is not None:
             self.draft_tokens = self.draft_tokens[new_indices]
 
+        if self.chard_queue_tokens is not None:
+            self.chard_queue_tokens = self.chard_queue_tokens[new_indices]
+            assert self.chard_queue_lens is not None
+            self.chard_queue_lens = self.chard_queue_lens[new_indices]
+
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -315,6 +324,47 @@ class DFlashDraftInputV2(SpecInput):
         if self.draft_tokens is not None:
             self.draft_tokens = torch.cat(
                 [self.draft_tokens, spec_info.draft_tokens], dim=0
+            )
+
+        if self.chard_queue_tokens is None and spec_info.chard_queue_tokens is not None:
+            other_width = int(spec_info.chard_queue_tokens.shape[1])
+            self_rows = int(self.bonus_tokens.shape[0])
+            self.chard_queue_tokens = torch.zeros(
+                (self_rows, other_width),
+                dtype=spec_info.chard_queue_tokens.dtype,
+                device=spec_info.chard_queue_tokens.device,
+            )
+            self.chard_queue_lens = torch.zeros(
+                (self_rows,),
+                dtype=spec_info.chard_queue_lens.dtype,
+                device=spec_info.chard_queue_lens.device,
+            )
+        if self.chard_queue_tokens is not None:
+            if spec_info.chard_queue_tokens is None:
+                other_rows = int(spec_info.bonus_tokens.shape[0])
+                other_tokens = torch.zeros(
+                    (other_rows, self.chard_queue_tokens.shape[1]),
+                    dtype=self.chard_queue_tokens.dtype,
+                    device=self.chard_queue_tokens.device,
+                )
+                other_lens = torch.zeros(
+                    (other_rows,),
+                    dtype=self.chard_queue_lens.dtype,
+                    device=self.chard_queue_lens.device,
+                )
+            else:
+                if (
+                    self.chard_queue_tokens.shape[1]
+                    != spec_info.chard_queue_tokens.shape[1]
+                ):
+                    raise ValueError("cannot merge CHARD queues with different widths")
+                other_tokens = spec_info.chard_queue_tokens
+                other_lens = spec_info.chard_queue_lens
+            self.chard_queue_tokens = torch.cat(
+                [self.chard_queue_tokens, other_tokens], dim=0
+            )
+            self.chard_queue_lens = torch.cat(
+                [self.chard_queue_lens, other_lens], dim=0
             )
 
         if self.future_indices is not None:

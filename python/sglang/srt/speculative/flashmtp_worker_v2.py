@@ -56,6 +56,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.srt.speculative.flashmtp_shared import (
     adaptive_verify_enabled,
+    build_chard_continuation,
     graph_tier_padding_enabled,
     pinned_verify_metadata_enabled,
     plan_ragged_execution_tier,
@@ -63,6 +64,7 @@ from sglang.srt.speculative.flashmtp_shared import (
     ragged_verify_enabled,
     read_adaptive_thresholds,
     read_adaptive_min_batch,
+    read_chard_chunk_size,
     reclaim_ragged_graph_padding,
     select_adaptive_verify_lens,
     shared_optimizations_enabled,
@@ -263,7 +265,10 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         # for matched ablation.  DT transport/lifecycle flags remain separate.
         validate_component_dependencies()
         self._shared_optimizations = shared_optimizations_enabled()
-        self._ragged_verify = ragged_verify_enabled()
+        self._chard_chunk_size = read_chard_chunk_size(block_size=self.block_size)
+        self._ragged_verify = (
+            ragged_verify_enabled() or self._chard_chunk_size is not None
+        )
         self._adaptive_verify = adaptive_verify_enabled()
         self._pinned_verify_metadata = pinned_verify_metadata_enabled()
         self._vocab_parallel_greedy = vocab_parallel_greedy_enabled()
@@ -431,6 +436,37 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             hidden_states=pivot_hidden,
         )
 
+    def _build_chard_continuation(
+        self,
+        *,
+        draft_input: DFlashDraftInputV2,
+        candidates: torch.Tensor,
+        verify_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        next_input: DFlashDraftInputV2,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self._chard_chunk_size is None:
+            return None, None
+        queue_lens = draft_input.chard_queue_lens
+        if queue_lens is None:
+            queue_lens = torch.full(
+                (candidates.shape[0],),
+                self.block_size,
+                dtype=torch.int32,
+                device=candidates.device,
+            )
+        next_tokens, next_lens = build_chard_continuation(
+            candidates=candidates,
+            queue_lens=queue_lens,
+            verify_lens=verify_lens,
+            commit_lens=commit_lens,
+            bonus_tokens=bonus_tokens,
+        )
+        next_input.chard_queue_tokens = next_tokens
+        next_input.chard_queue_lens = next_lens
+        return next_tokens, next_lens
+
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         """Grow the inherited block buffers and cache local draft positions."""
         super()._ensure_draft_block_buffers(bs)
@@ -445,7 +481,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             ).contiguous()
 
     def _stage_verify_lens_cpu(
-        self, verify_lens: torch.Tensor | None, *, batch_size: int
+        self,
+        verify_lens: torch.Tensor | None,
+        *,
+        batch_size: int,
+        fixed_width: int | None = None,
     ) -> torch.Tensor:
         """Materialize ragged widths, optionally through pinned host storage.
 
@@ -480,7 +520,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             self._verify_lens_cpu_cap = capacity
         staged = self._verify_lens_cpu_buf[:batch_size]
         if verify_lens is None:
-            staged.fill_(self.model_block_size)
+            staged.fill_(
+                self.model_block_size if fixed_width is None else int(fixed_width)
+            )
         else:
             staged.copy_(verify_lens, non_blocking=True)
             torch.get_device_module(self.device).current_stream().synchronize()
@@ -712,6 +754,31 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         candidates.zero_()
         candidates[:, 0].copy_(block_ids[:, 0])
         candidates[:, 1 : 1 + self.model_num_proposed_tokens].copy_(draft_next)
+        if self._chard_chunk_size is not None:
+            previous_tokens = draft_input.chard_queue_tokens
+            previous_lens = draft_input.chard_queue_lens
+            if (previous_tokens is None) != (previous_lens is None):
+                raise RuntimeError("CHARD queue tokens and lengths must travel together")
+            if previous_tokens is None:
+                current_lens = torch.full(
+                    (batch_size,),
+                    self.block_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                if tuple(previous_tokens.shape) != (batch_size, self.block_size):
+                    raise ValueError("CHARD queue shape does not match the running batch")
+                active = previous_lens.view(-1) > 0
+                candidates.copy_(
+                    torch.where(active[:, None], previous_tokens, candidates)
+                )
+                current_lens = torch.where(
+                    active,
+                    previous_lens.to(dtype=torch.int32),
+                    torch.full_like(previous_lens, self.block_size, dtype=torch.int32),
+                )
+            draft_input.chard_queue_lens = current_lens
         if self._ragged_verify:
             sampling_info = batch.sampling_info
             if not (
@@ -728,9 +795,21 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 raise RuntimeError(
                     "adaptive FlashMTP verify requires Markov confidence"
                 )
-            draft_input.verify_lens_cpu = self._stage_verify_lens_cpu(
-                verify_lens_device, batch_size=batch_size
-            )
+            if self._chard_chunk_size is not None:
+                if verify_lens_device is not None:
+                    verify_lens_device = torch.minimum(
+                        verify_lens_device,
+                        torch.full_like(verify_lens_device, self._chard_chunk_size),
+                    )
+                draft_input.verify_lens_cpu = self._stage_verify_lens_cpu(
+                    verify_lens_device,
+                    batch_size=batch_size,
+                    fixed_width=self._chard_chunk_size,
+                )
+            else:
+                draft_input.verify_lens_cpu = self._stage_verify_lens_cpu(
+                    verify_lens_device, batch_size=batch_size
+                )
             return self._verify_candidates_ragged(
                 batch=batch,
                 draft_input=draft_input,
@@ -799,6 +878,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         if (
             graph_tier_available
             and self._adaptive_fill_graph_padding
+            and self._chard_chunk_size is None
             and total_verify_tokens < graph_num_tokens
         ):
             verify_lens_cpu = reclaim_ragged_graph_padding(
@@ -1002,6 +1082,14 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             new_seq_lens=new_seq_lens,
             pivot_hidden=next_pivot,
         )
+        chard_tokens, chard_lens = self._build_chard_continuation(
+            draft_input=draft_input,
+            candidates=candidates,
+            verify_lens=layout.verify_lens,
+            commit_lens=commit_lens,
+            bonus_tokens=bonus,
+            next_input=next_input,
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
@@ -1010,6 +1098,8 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             next_draft_input=next_input,
             speculative_num_draft_tokens=self.block_size,
             new_seq_lens=new_seq_lens,
+            chard_continuation_tokens=chard_tokens,
+            chard_continuation_lens=chard_lens,
         )
 
     def _verify_candidates(

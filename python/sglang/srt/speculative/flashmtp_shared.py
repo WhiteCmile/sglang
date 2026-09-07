@@ -16,6 +16,7 @@ ADAPTIVE_THRESHOLDS_ENV = "SGLANG_FLASHMTP_ADAPTIVE_VERIFY_THRESHOLDS"
 BUDGETED_VERIFY_ENV = "SGLANG_FLASHMTP_BUDGETED_VERIFY"
 BUDGETED_VERIFY_THRESHOLDS_ENV = "SGLANG_FLASHMTP_BUDGETED_VERIFY_THRESHOLDS"
 BUDGETED_VERIFY_MIN_BATCH_ENV = "SGLANG_FLASHMTP_BUDGETED_VERIFY_MIN_BATCH"
+CHARD_CHUNK_SIZE_ENV = "SGLANG_FLASHMTP_CHARD_CHUNK_SIZE"
 DEFAULT_ADAPTIVE_THRESHOLDS = (
     0.625,
     1.25,
@@ -43,6 +44,74 @@ def budgeted_verify_enabled() -> bool:
     if raw not in ("0", "1"):
         raise ValueError(f"{BUDGETED_VERIFY_ENV} must be 0 or 1")
     return raw == "1"
+
+
+def read_chard_chunk_size(*, block_size: int) -> int | None:
+    """Return the anchor-inclusive CHARD verify width, or ``None`` when off."""
+    raw = os.environ.get(CHARD_CHUNK_SIZE_ENV, "0")
+    try:
+        chunk_size = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{CHARD_CHUNK_SIZE_ENV} must be an integer") from exc
+    if chunk_size == 0:
+        return None
+    if not 2 <= chunk_size < block_size:
+        raise ValueError(
+            f"{CHARD_CHUNK_SIZE_ENV} must be in [2, {block_size - 1}]"
+        )
+    if block_size % chunk_size != 0:
+        raise ValueError(
+            f"{CHARD_CHUNK_SIZE_ENV}={chunk_size} must divide block_size={block_size}"
+        )
+    return chunk_size
+
+
+def build_chard_continuation(
+    *,
+    candidates: torch.Tensor,
+    queue_lens: torch.Tensor,
+    verify_lens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shift fully accepted, anchor-safe candidate suffixes to the next round.
+
+    Candidate rows are anchor-inclusive.  A verified prefix of width ``C`` may
+    continue only when all ``C`` output tokens were committed and the Target's
+    last (bonus) token equals candidate ``C``, which becomes the next anchor.
+    """
+    if candidates.ndim != 2:
+        raise ValueError("CHARD candidates must have shape [batch, block_size]")
+    batch_size, block_size = candidates.shape
+    for name, value in (
+        ("queue_lens", queue_lens),
+        ("verify_lens", verify_lens),
+        ("commit_lens", commit_lens),
+        ("bonus_tokens", bonus_tokens),
+    ):
+        if value.ndim != 1 or value.numel() != batch_size:
+            raise ValueError(f"CHARD {name} must have shape [batch]")
+
+    verify_lens = verify_lens.to(device=candidates.device, dtype=torch.int64)
+    queue_lens = queue_lens.to(device=candidates.device, dtype=torch.int64)
+    commit_lens = commit_lens.to(device=candidates.device, dtype=torch.int64)
+    bonus_tokens = bonus_tokens.to(device=candidates.device, dtype=candidates.dtype)
+    boundary_indices = verify_lens.clamp(max=block_size - 1)
+    boundary_tokens = candidates.gather(1, boundary_indices[:, None]).view(-1)
+    remaining = queue_lens - verify_lens
+    can_continue = (
+        (verify_lens < queue_lens)
+        & (commit_lens == verify_lens)
+        & (bonus_tokens == boundary_tokens)
+    )
+    next_lens = torch.where(can_continue, remaining, torch.zeros_like(remaining))
+
+    columns = torch.arange(block_size, device=candidates.device)[None, :]
+    source_columns = columns + verify_lens[:, None]
+    shifted = candidates.gather(1, source_columns.clamp(max=block_size - 1))
+    shifted.masked_fill_(source_columns >= block_size, 0)
+    shifted.masked_fill_(~can_continue[:, None], 0)
+    return shifted, next_lens.to(dtype=torch.int32)
 
 
 def component_enabled(env_name: str) -> bool:
