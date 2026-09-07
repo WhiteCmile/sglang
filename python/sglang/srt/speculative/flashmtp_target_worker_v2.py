@@ -95,11 +95,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             draft_hf_config=draft_model_config.hf_config
         )
         self.remote_block_size = int(server_args.speculative_num_draft_tokens)
-        self.block_size = int(
-            os.environ.get("SGLANG_FLASHMTP_NGRAM_HORIZON", self.remote_block_size)
-        )
-        if self.block_size < self.remote_block_size:
-            raise ValueError("FlashMTP ngram horizon cannot shrink the draft block")
+        self.block_size = self.remote_block_size
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1
         self._mask_token_id = int(flash_config.mask_token_id)
@@ -140,11 +136,6 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         self._bonus_id_bufs: list[torch.Tensor] = []
         self._out_tokens_bufs: list[torch.Tensor] = []
         self._new_seq_lens_bufs: list[torch.Tensor] = []
-        # Online correction lives in the shared standalone Draft service for
-        # DT.  Keeping it out of each Target is what lets the algorithm reuse
-        # feedback across Target instances.
-        self._ngram_correction = None
-
         validate_component_dependencies()
         adaptive_margin = os.environ.get("SGLANG_DT_ADAPTIVE_VERIFY_MARGIN")
         self._ragged_verify = ragged_verify_enabled() or adaptive_margin is not None
@@ -181,9 +172,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             self._adaptive_verify_margin is not None
             and self._adaptive_verify_margin < 0
         ):
-            raise ValueError(
-                "SGLANG_DT_ADAPTIVE_VERIFY_MARGIN must be non-negative"
-            )
+            raise ValueError("SGLANG_DT_ADAPTIVE_VERIFY_MARGIN must be non-negative")
         if self._ragged_verify and not ragged_verify_compact_enabled():
             raise ValueError(
                 "ragged DT verify requires SGLANG_RAGGED_VERIFY_MODE=compact"
@@ -192,9 +181,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         greedy_selector = None
         if self._vocab_parallel_greedy:
             if not self._ragged_verify:
-                raise ValueError(
-                    "DT vocab-parallel greedy requires ragged verify"
-                )
+                raise ValueError("DT vocab-parallel greedy requires ragged verify")
             if server_args.disable_cuda_graph or not is_cuda():
                 raise ValueError(
                     "DT vocab-parallel greedy currently requires CUDA graph verify"
@@ -230,11 +217,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             )
 
         self._ragged_verify_epilogue = None
-        if (
-            self._ragged_verify
-            and not server_args.disable_cuda_graph
-            and is_cuda()
-        ):
+        if self._ragged_verify and not server_args.disable_cuda_graph and is_cuda():
             self._ragged_verify_epilogue = DsparkVerifyEpilogue(
                 # CUDA graph capture stops at its configured batch size, but a
                 # full remote wave can be larger and correctly falls back to
@@ -255,14 +238,12 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             logger.info(
                 "Initialized disaggregated FLASHMTP Target worker without Draft "
                 "weights. block_size=%d remote_block_size=%d pivot_layers=%d "
-                "pivot_width=%d "
-                "vocab_parallel_greedy=%s ngram_correction=%s",
+                "pivot_width=%d vocab_parallel_greedy=%s",
                 self.block_size,
                 self.remote_block_size,
                 self._num_pivot_layers,
                 self._pivot_width,
                 self._vocab_parallel_greedy,
-                self._ngram_correction is not None,
             )
 
     @property
@@ -352,12 +333,6 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             # require the fixed-layout scratch buffer, so consuming it directly
             # avoids one scheduler-critical device copy per verify wave.
             candidates = remote_candidates.to(device=self.device, dtype=torch.int64)
-            if self._ngram_correction is not None:
-                self._ngram_correction.apply(
-                    reqs=batch.reqs,
-                    candidates=candidates,
-                    verify_lens_cpu=draft_input.verify_lens_cpu,
-                )
             result = self._verify_candidates_ragged(
                 batch=batch,
                 draft_input=draft_input,

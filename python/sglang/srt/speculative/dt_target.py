@@ -18,9 +18,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.flashmtp_shared import (
-    OnlineNgramCorrectionCache,
     adaptive_verify_enabled,
-    ngram_correction_enabled,
     pinned_verify_metadata_enabled,
     ragged_verify_enabled,
     read_adaptive_min_batch,
@@ -149,71 +147,6 @@ class DTTargetController:
         self.reuse_result_metadata = (
             os.environ.get("SGLANG_DT_REUSE_RESULT_METADATA", "0") == "1"
         )
-        self.remote_ngram_context = ngram_correction_enabled()
-        prompt_affinity_raw = os.environ.get(
-            "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY", "1"
-        )
-        if prompt_affinity_raw not in ("0", "1"):
-            raise ValueError(
-                "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY must be 0 or 1"
-            )
-        self.remote_ngram_prompt_affinity = prompt_affinity_raw == "1"
-        self._remote_ngram_cache_keys: dict[str, int] = {}
-        self.remote_ngram_order = int(
-            os.environ.get("SGLANG_FLASHMTP_NGRAM_ORDER", "12")
-        )
-        self.remote_ngram_context_width = int(
-            os.environ.get(
-                "SGLANG_FLASHMTP_NGRAM_CONTEXT_WIDTH",
-                str(self.remote_ngram_order + self.block_size),
-            )
-        )
-        if self.remote_ngram_order <= 0:
-            raise ValueError("SGLANG_FLASHMTP_NGRAM_ORDER must be positive")
-        self.ngram_min_sources = int(
-            os.environ.get("SGLANG_FLASHMTP_NGRAM_MIN_SOURCES", "1")
-        )
-        if self.ngram_min_sources <= 0:
-            raise ValueError("SGLANG_FLASHMTP_NGRAM_MIN_SOURCES must be positive")
-        self.ngram_shared_probe_interval = int(
-            os.environ.get("SGLANG_FLASHMTP_NGRAM_SHARED_PROBE_INTERVAL", "1")
-        )
-        if self.ngram_shared_probe_interval <= 0:
-            raise ValueError(
-                "SGLANG_FLASHMTP_NGRAM_SHARED_PROBE_INTERVAL must be positive"
-            )
-        if (
-            self.remote_ngram_context_width
-            < self.remote_ngram_order + self.block_size
-        ):
-            raise ValueError(
-                "SGLANG_FLASHMTP_NGRAM_CONTEXT_WIDTH must cover one order-sized "
-                "prefix plus a complete verified block"
-            )
-        self._local_ngram_cache = (
-            OnlineNgramCorrectionCache(
-                order=self.remote_ngram_order,
-                max_proposals=self.block_size - 1,
-                max_rows=int(self.server_args.max_running_requests or 384),
-                max_entries=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MAX_ENTRIES", "262144")
-                ),
-                min_count=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MIN_COUNT", "1")
-                ),
-                device="cpu",
-                pin_memory=False,
-                min_sources=self.ngram_min_sources,
-                source_gated_from=int(
-                    os.environ.get(
-                        "SGLANG_FLASHMTP_NGRAM_SOURCE_GATED_FROM",
-                        str(self.remote_block_size - 1),
-                    )
-                ),
-            )
-            if self.remote_ngram_context
-            else None
-        )
         self.reuse_ready_metadata = (
             os.environ.get("SGLANG_DT_REUSE_READY_METADATA", "0") == "1"
         )
@@ -323,8 +256,7 @@ class DTTargetController:
             raise ValueError("draft_target_prefill_batch_wait_ms must be non-negative")
         if prefill_flush_launch_age_ms < 0:
             raise ValueError(
-                "SGLANG_DT_TARGET_PREFILL_FLUSH_LAUNCH_AGE_MS must be "
-                "non-negative"
+                "SGLANG_DT_TARGET_PREFILL_FLUSH_LAUNCH_AGE_MS must be non-negative"
             )
         if self.prefill_batch_threshold <= 0:
             raise ValueError("draft_target_prefill_batch_threshold must be positive")
@@ -357,9 +289,7 @@ class DTTargetController:
                 "draft_target_pipeline_lane_slack requires more than one pipeline lane"
             )
         if self.pipeline_idle_slack < 0:
-            raise ValueError(
-                "draft_target_pipeline_idle_slack must be non-negative"
-            )
+            raise ValueError("draft_target_pipeline_idle_slack must be non-negative")
         if self.pipeline_idle_slack > 0:
             if self.pipeline_lanes <= 1:
                 raise ValueError(
@@ -371,9 +301,7 @@ class DTTargetController:
                     "draft_target_pipeline_idle_slack must be at least the "
                     "normal lane slack"
                 )
-            if not getattr(
-                self.server_args, "draft_target_overlap_schedule", False
-            ):
+            if not getattr(self.server_args, "draft_target_overlap_schedule", False):
                 raise ValueError(
                     "draft_target_pipeline_idle_slack requires overlap schedule"
                 )
@@ -434,9 +362,7 @@ class DTTargetController:
                 )
         self.ready_batch_wait_ns = int(ready_batch_wait_ms * 1_000_000)
         self.prefill_batch_wait_ns = int(prefill_batch_wait_ms * 1_000_000)
-        self.prefill_flush_launch_age_ns = int(
-            prefill_flush_launch_age_ms * 1_000_000
-        )
+        self.prefill_flush_launch_age_ns = int(prefill_flush_launch_age_ms * 1_000_000)
         self.full_wave_refill_wait_ns = int(full_wave_refill_wait_ms * 1_000_000)
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
@@ -522,9 +448,7 @@ class DTTargetController:
             )
             safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", self.instance_id)
             data_dir = Path(self.server_args.draft_target_data_dir)
-            cleanup_stale_slot_files(
-                data_dir, instance_id=safe_id, kind="pivots"
-            )
+            cleanup_stale_slot_files(data_dir, instance_id=safe_id, kind="pivots")
             source_path = data_dir / f"dt-{safe_id}-{os.getpid()}-pivots.slots"
             self._source_store = MmapSlotStore.create(
                 source_path,
@@ -578,9 +502,7 @@ class DTTargetController:
                 self._source_store = None
                 raise
 
-    def stage_overlap_pivot_copy(
-        self, batch: ScheduleBatch, batch_result
-    ) -> None:
+    def stage_overlap_pivot_copy(self, batch: ScheduleBatch, batch_result) -> None:
         """Start pivot D2H as soon as the Target forward has been submitted.
 
         The overlap scheduler calls this method from its dedicated result-copy
@@ -591,10 +513,7 @@ class DTTargetController:
         the selected host destination is ready before publish.
         """
         if (
-            (
-                getattr(self, "reuse_result_metadata", False)
-                or getattr(self, "remote_ngram_context", False)
-            )
+            getattr(self, "reuse_result_metadata", False)
             and getattr(batch_result, "dt_input_seq_lens_cpu", None) is None
         ):
             # DFLASH prepare_for_decode uses a reusable CPU planning buffer for
@@ -615,9 +534,7 @@ class DTTargetController:
                 # packed tensor.
                 prefill_batch = getattr(batch, "dt_mixed_prefill_batch", None)
                 verify_batch = getattr(batch, "dt_mixed_verify_batch", None)
-                prefill_seq_lens_cpu = getattr(
-                    prefill_batch, "seq_lens_cpu", None
-                )
+                prefill_seq_lens_cpu = getattr(prefill_batch, "seq_lens_cpu", None)
                 verify_seq_lens_cpu = getattr(verify_batch, "seq_lens_cpu", None)
                 if (
                     torch.is_tensor(prefill_seq_lens_cpu)
@@ -659,9 +576,7 @@ class DTTargetController:
                 )
             rows = int(pivot_hidden.shape[0])
             if rows != len(batch.reqs):
-                raise RuntimeError(
-                    "DT pivot rows do not match launched batch requests"
-                )
+                raise RuntimeError("DT pivot rows do not match launched batch requests")
             if rows == 0 or not self._early_pivot_host_free_slots:
                 return
 
@@ -760,7 +675,7 @@ class DTTargetController:
         batch_result,
         active_indices: list[int],
         original_batch_size: int,
-    ) -> tuple[list[int], list[int], list[tuple[int, ...]]] | None:
+    ) -> tuple[list[int], list[int]] | None:
         """Recover Draft root tokens and sequence lengths from existing D2H.
 
         The overlap result processor already waits for next_token_ids and
@@ -770,16 +685,10 @@ class DTTargetController:
         established direct metadata copy remains the correctness fallback.
         """
 
-        if (
-            not (
-                getattr(self, "reuse_result_metadata", False)
-                or getattr(self, "remote_ngram_context", False)
-            )
-            or batch_result is None
-        ):
+        if not getattr(self, "reuse_result_metadata", False) or batch_result is None:
             return None
         if not active_indices:
-            return ([], [], [])
+            return ([], [])
 
         input_seq_lens = getattr(batch_result, "dt_input_seq_lens_cpu", None)
         next_token_ids = getattr(batch_result, "next_token_ids", None)
@@ -805,8 +714,7 @@ class DTTargetController:
                 or not torch.is_tensor(accept_lens)
                 or accept_lens.device.type != "cpu"
                 or int(accept_lens.numel()) != original_batch_size
-                or int(next_token_ids.numel())
-                < original_batch_size * stride
+                or int(next_token_ids.numel()) < original_batch_size * stride
             ):
                 return None
             commit_lens = accept_lens.to(dtype=torch.int64).reshape(-1)
@@ -823,17 +731,6 @@ class DTTargetController:
             seq_lens = input_seq_lens.reshape(-1)[row_ids].clone()
             verify_rows = row_ids >= mixed_prefill_bs
             seq_lens[verify_rows] += selected_commit_lens[verify_rows]
-            committed_rows = [
-                tuple(
-                    int(value)
-                    for value in next_token_ids.reshape(-1)[
-                        int(row) * stride : int(row) * stride + int(commit_len)
-                    ].tolist()
-                )
-                for row, commit_len in zip(
-                    row_ids.tolist(), selected_commit_lens.tolist(), strict=True
-                )
-            ]
         elif forward_mode is not None and forward_mode.is_decode():
             accept_lens = getattr(batch_result, "accept_lens", None)
             stride = int(
@@ -844,8 +741,7 @@ class DTTargetController:
                 not torch.is_tensor(accept_lens)
                 or accept_lens.device.type != "cpu"
                 or int(accept_lens.numel()) != original_batch_size
-                or int(next_token_ids.numel())
-                < original_batch_size * stride
+                or int(next_token_ids.numel()) < original_batch_size * stride
             ):
                 return None
             commit_lens = accept_lens.to(dtype=torch.int64).reshape(-1)
@@ -858,17 +754,6 @@ class DTTargetController:
             token_offsets = row_ids * stride + selected_commit_lens - 1
             bonus_tokens = next_token_ids.reshape(-1)[token_offsets]
             seq_lens = input_seq_lens.reshape(-1)[row_ids] + selected_commit_lens
-            committed_rows = [
-                tuple(
-                    int(value)
-                    for value in next_token_ids.reshape(-1)[
-                        int(row) * stride : int(row) * stride + int(commit_len)
-                    ].tolist()
-                )
-                for row, commit_len in zip(
-                    row_ids.tolist(), selected_commit_lens.tolist(), strict=True
-                )
-            ]
         elif forward_mode is not None and forward_mode.is_extend():
             if int(next_token_ids.numel()) != original_batch_size:
                 return None
@@ -877,50 +762,15 @@ class DTTargetController:
             # Prefill samples the root token but has committed only the prompt
             # prefix to Target KV, matching next_draft_input.new_seq_lens.
             seq_lens = input_seq_lens.reshape(-1)[row_ids]
-            committed_rows = [
-                (int(next_token_ids.reshape(-1)[int(row)]),)
-                for row in row_ids.tolist()
-            ]
         else:
             return None
-
-        context_rows: list[tuple[int, ...]] = []
-        for index, committed in zip(active_indices, committed_rows, strict=True):
-            req = batch.reqs[index]
-            # The normal result processor runs before this hook, so request
-            # state already contains exactly the tokens committed by this
-            # result.  Send one order-sized predecessor prefix plus the new
-            # run.  The shared Draft can then learn every new transition once,
-            # independent of which Draft instance receives the next round.
-            context_span = self.remote_ngram_order + len(committed)
-            context_width = min(context_span, self.remote_ngram_context_width)
-            output_tail_width = min(context_width, len(req.output_ids))
-            prompt_tail_width = context_width - output_tail_width
-            prompt_tail = (
-                req.origin_input_ids[-prompt_tail_width:]
-                if prompt_tail_width
-                else ()
-            )
-            output_tail = (
-                req.output_ids[-output_tail_width:] if output_tail_width else ()
-            )
-            context_rows.append(
-                tuple(
-                    int(token)
-                    for token in (*prompt_tail, *output_tail)
-                )
-            )
-
         return (
             [int(value) for value in bonus_tokens.tolist()],
             [int(value) for value in seq_lens.tolist()],
-            context_rows,
         )
 
     def park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
-        staged_pinned_pivots = getattr(
-            batch_result, "dt_staged_pinned_pivots", None
-        )
+        staged_pinned_pivots = getattr(batch_result, "dt_staged_pinned_pivots", None)
         try:
             self._park_completed_batch(batch, batch_result=batch_result)
         finally:
@@ -930,9 +780,7 @@ class DTTargetController:
                     is staged_pinned_pivots
                 ):
                     batch_result.dt_staged_pinned_pivots = None
-                self._release_early_pinned_staging(
-                    staged_pinned_pivots.buffer_slot
-                )
+                self._release_early_pinned_staging(staged_pinned_pivots.buffer_slot)
 
     def _park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
         self._release_ready_metadata_slot(batch)
@@ -981,7 +829,6 @@ class DTTargetController:
         for req in batch.reqs:
             if req.finished() or req.is_retracted:
                 getattr(self, "_next_round", {}).pop(req.rid, None)
-                self._remote_ngram_cache_keys.pop(req.rid, None)
         # A long prompt can have multiple prefill chunks.  In non-overlap mode
         # the normal result processor decrements ``inflight_middle_chunks``
         # from one to zero before this hook, but ``batch.chunked_req`` still
@@ -1079,18 +926,15 @@ class DTTargetController:
                     and self._direct_pivot_slot_tensors
                 )
                 if staged_pinned_pivots is not None:
-                    if (
-                        staged_pinned_pivots.rows
-                        != len(staged_pinned_pivots.request_ids)
+                    if staged_pinned_pivots.rows != len(
+                        staged_pinned_pivots.request_ids
                     ):
                         raise RuntimeError(
                             "DT staged pivot row and request counts differ"
                         )
                     staged_index_by_rid = {
                         rid: index
-                        for index, rid in enumerate(
-                            staged_pinned_pivots.request_ids
-                        )
+                        for index, rid in enumerate(staged_pinned_pivots.request_ids)
                     }
                     if len(staged_index_by_rid) != staged_pinned_pivots.rows:
                         raise RuntimeError(
@@ -1116,16 +960,11 @@ class DTTargetController:
                     ]
                     pivot_rows = pivot_cpu.view(torch.uint8).numpy()
                     pivot_payloads = [
-                        memoryview(pivot_rows[index])
-                        for index in staged_active_indices
+                        memoryview(pivot_rows[index]) for index in staged_active_indices
                     ]
                     copy_end_ns = time.monotonic_ns()
-                    pivot_copy_nbytes = (
-                        staged_pinned_pivots.rows * self.pivot_width * 2
-                    )
-                    pivot_publish_nbytes = (
-                        len(active_indices) * self.pivot_width * 2
-                    )
+                    pivot_copy_nbytes = staged_pinned_pivots.rows * self.pivot_width * 2
+                    pivot_publish_nbytes = len(active_indices) * self.pivot_width * 2
                     prepare_views_ns = copy_end_ns - prepare_views_start_ns
                 else:
                     pivot_hidden = draft_input.hidden_states
@@ -1136,13 +975,11 @@ class DTTargetController:
                             f"DT Target expected bfloat16 pivot, got {pivot_hidden.dtype}"
                         )
                     copy_start_ns = time.monotonic_ns()
-                    pivot_gpu = pivot_hidden.detach().contiguous().view(
-                        len(active_indices), -1
+                    pivot_gpu = (
+                        pivot_hidden.detach().contiguous().view(len(active_indices), -1)
                     )
                     if not direct_export:
-                        pivot_host_staging = getattr(
-                            self, "_pivot_host_staging", None
-                        )
+                        pivot_host_staging = getattr(self, "_pivot_host_staging", None)
                         if pivot_host_staging is None:
                             # Keep construction-through-``__new__`` test doubles
                             # and CPU transports usable without a pinned allocator.
@@ -1167,13 +1004,9 @@ class DTTargetController:
                 acquired_source_slots = []
                 try:
                     if len(self._free_source_slots) < len(active_indices):
-                        raise RuntimeError(
-                            "DT Target source slot ring is exhausted"
-                        )
+                        raise RuntimeError("DT Target source slot ring is exhausted")
                     for _ in active_indices:
-                        acquired_source_slots.append(
-                            self._free_source_slots.popleft()
-                        )
+                        acquired_source_slots.append(self._free_source_slots.popleft())
                     source_slots = tuple(acquired_source_slots)
                     source_generations = self._source_store.reserve_write_many(
                         tuple((slot, pivot_nbytes) for slot in source_slots)
@@ -1191,9 +1024,7 @@ class DTTargetController:
                         tuple(zip(source_slots, source_generations))
                     )
                 except Exception:
-                    self._free_source_slots.extendleft(
-                        reversed(acquired_source_slots)
-                    )
+                    self._free_source_slots.extendleft(reversed(acquired_source_slots))
                     raise
                 profile_emit(
                     "target_pivot_batch_copy",
@@ -1236,21 +1067,15 @@ class DTTargetController:
                 acquired_source_slots = []
                 try:
                     if len(self._free_source_slots) < len(active_indices):
-                        raise RuntimeError(
-                            "DT Target source slot ring is exhausted"
-                        )
+                        raise RuntimeError("DT Target source slot ring is exhausted")
                     for _ in active_indices:
-                        acquired_source_slots.append(
-                            self._free_source_slots.popleft()
-                        )
+                        acquired_source_slots.append(self._free_source_slots.popleft())
                     source_slots = tuple(acquired_source_slots)
                     source_generations = self._source_store.write_many(
                         tuple(zip(source_slots, pivot_payloads))
                     )
                 except Exception:
-                    self._free_source_slots.extendleft(
-                        reversed(acquired_source_slots)
-                    )
+                    self._free_source_slots.extendleft(reversed(acquired_source_slots))
                     raise
                 profile_emit(
                     "target_pivot_batch_publish",
@@ -1268,7 +1093,7 @@ class DTTargetController:
             original_batch_size,
         )
         if reused_metadata is not None:
-            bonus_tokens_cpu, seq_lens_cpu, ngram_context_rows = reused_metadata
+            bonus_tokens_cpu, seq_lens_cpu = reused_metadata
             metadata_source = "result_cpu"
         elif active_indices:
             bonus_values = draft_input.bonus_tokens
@@ -1283,24 +1108,7 @@ class DTTargetController:
         else:
             bonus_tokens_cpu = []
             seq_lens_cpu = []
-            ngram_context_rows = []
             metadata_source = "empty"
-        if reused_metadata is None:
-            ngram_context_rows = [()] * len(active_indices)
-        local_ngram_predictions = (
-            self._local_ngram_cache.predict_contexts(ngram_context_rows)
-            if self._local_ngram_cache is not None
-            else None
-        )
-        local_fast_width = self.remote_block_size - 1
-        local_ngram_fast_batch = bool(local_ngram_predictions) and all(
-            len(prediction) >= local_fast_width
-            for prediction in local_ngram_predictions
-        )
-        local_ngram_full_rows = sum(
-            len(prediction) >= local_fast_width
-            for prediction in (local_ngram_predictions or ())
-        )
         metadata_copy_end_ns = time.monotonic_ns()
         task_build_start_ns = time.monotonic_ns()
         for active_index, index in enumerate(active_indices):
@@ -1311,22 +1119,6 @@ class DTTargetController:
             transfer_id = f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
             bonus_token = int(bonus_tokens_cpu[active_index])
             seq_len = int(seq_lens_cpu[active_index])
-            local_prediction = (
-                local_ngram_predictions[active_index]
-                if local_ngram_predictions is not None
-                else ()
-            )
-            local_ngram_hit = len(local_prediction) >= local_fast_width
-            if (
-                local_ngram_hit
-                and len(local_prediction) < self.block_size - 1
-                and self.ngram_min_sources > 1
-                and round_id % self.ngram_shared_probe_interval == 0
-            ):
-                # Periodically consult the multi-producer cache even when the
-                # Target-local cache can supply a native-width block.  Other
-                # rounds retain the zero-transport local fast path.
-                local_ngram_hit = False
             state = ParkedTargetRound(
                 req=req,
                 transfer_id=transfer_id,
@@ -1340,47 +1132,32 @@ class DTTargetController:
                 parked_ns=park_start_ns,
                 lane_id=lane_ids[active_index],
             )
-            if local_ngram_hit:
-                padded_prediction = (
-                    *local_prediction,
-                    *((0,) * (self.block_size - 1 - len(local_prediction))),
-                )
-                state.candidate_bytes = struct.pack(
-                    f"<{self.block_size}i", bonus_token, *padded_prediction
-                )
-                state.verify_len = len(local_prediction) + 1
-                state.result_ready_ns = park_start_ns
             self._parked[transfer_id] = state
             parked_reqs.append(req)
 
             if getattr(self, "is_export_rank", False):
                 source_slot = source_slots[active_index]
                 source_generation = source_generations[active_index]
-                if local_ngram_hit:
-                    self._free_source_slots.append(source_slot)
-                else:
-                    self._source_slot_by_transfer[transfer_id] = (
-                        source_slot,
-                        source_generation,
+                self._source_slot_by_transfer[transfer_id] = (
+                    source_slot,
+                    source_generation,
+                )
+                tasks.append(
+                    self._make_task(
+                        transfer_id=transfer_id,
+                        req=req,
+                        round_id=round_id,
+                        attempt=attempt,
+                        bonus_token=bonus_token,
+                        source_slot=source_slot,
+                        source_generation=source_generation,
+                        pivot_nbytes=(
+                            self.pivot_width * 2
+                            if pivot_payloads is None
+                            else len(pivot_payloads[active_index])
+                        ),
                     )
-                    tasks.append(
-                        self._make_task(
-                            transfer_id=transfer_id,
-                            req=req,
-                            round_id=round_id,
-                            attempt=attempt,
-                            bonus_token=bonus_token,
-                            source_slot=source_slot,
-                            source_generation=source_generation,
-                            pivot_nbytes=(
-                                self.pivot_width * 2
-                                if pivot_payloads is None
-                                else len(pivot_payloads[active_index])
-                            ),
-                            context_tokens=ngram_context_rows[active_index],
-                            cache_key=self._remote_ngram_cache_key(req),
-                        )
-                    )
+                )
 
         task_build_end_ns = time.monotonic_ns()
         if tasks:
@@ -1452,8 +1229,6 @@ class DTTargetController:
                 detach_ns=detach_end_ns - wave_update_end_ns,
                 park_and_export_ns=time.monotonic_ns() - park_start_ns,
                 parked_rounds=len(self._parked),
-                local_ngram_fast_batch=local_ngram_fast_batch,
-                local_ngram_full_rows=local_ngram_full_rows,
             )
 
     def poll(self, *, overlap_result=None) -> None:
@@ -1527,10 +1302,7 @@ class DTTargetController:
                         bonus_token,
                         seq_len,
                     ) = payload
-                    if (
-                        state.bonus_token != bonus_token
-                        or state.seq_len != seq_len
-                    ):
+                    if state.bonus_token != bonus_token or state.seq_len != seq_len:
                         raise RuntimeError(
                             "DT Target TP metadata diverged before Draft result: "
                             f"transfer_id={transfer_id}, "
@@ -1544,10 +1316,7 @@ class DTTargetController:
                     state.padding_priority = padding_priority
                 elif isinstance(payload, tuple) and len(payload) == 4:
                     candidate_bytes, verify_len, bonus_token, seq_len = payload
-                    if (
-                        state.bonus_token != bonus_token
-                        or state.seq_len != seq_len
-                    ):
+                    if state.bonus_token != bonus_token or state.seq_len != seq_len:
                         raise RuntimeError(
                             "DT Target TP metadata diverged before Draft result: "
                             f"transfer_id={transfer_id}, "
@@ -1571,15 +1340,11 @@ class DTTargetController:
             self._profile_poll_calls += 1
             self._profile_poll_empty_calls += int(not events)
             self._profile_poll_total_ns += apply_done_ns - poll_start_ns
-            self._profile_poll_export_recv_ns += (
-                export_recv_done_ns - poll_start_ns
-            )
+            self._profile_poll_export_recv_ns += export_recv_done_ns - poll_start_ns
             self._profile_poll_overlap_query_ns += (
                 overlap_query_done_ns - export_recv_done_ns
             )
-            self._profile_poll_broadcast_ns += (
-                broadcast_done_ns - overlap_query_done_ns
-            )
+            self._profile_poll_broadcast_ns += broadcast_done_ns - overlap_query_done_ns
             self._profile_poll_apply_ns += apply_done_ns - broadcast_done_ns
         if self.is_export_rank and events:
             profile_fields = {
@@ -1594,12 +1359,8 @@ class DTTargetController:
                     poll_calls_since_event=self._profile_poll_calls,
                     empty_poll_calls_since_event=self._profile_poll_empty_calls,
                     poll_accumulated_ns=self._profile_poll_total_ns,
-                    export_recv_accumulated_ns=(
-                        self._profile_poll_export_recv_ns
-                    ),
-                    overlap_query_accumulated_ns=(
-                        self._profile_poll_overlap_query_ns
-                    ),
+                    export_recv_accumulated_ns=(self._profile_poll_export_recv_ns),
+                    overlap_query_accumulated_ns=(self._profile_poll_overlap_query_ns),
                     broadcast_accumulated_ns=self._profile_poll_broadcast_ns,
                     apply_accumulated_ns=self._profile_poll_apply_ns,
                 )
@@ -1909,9 +1670,7 @@ class DTTargetController:
             self._selected_pipeline_lane = lane_id
             self._selected_pipeline_lane_lagging_rows = lagging_rows
             self._selected_pipeline_lane_slack_used = lane_slack
-            fill_threshold = getattr(
-                self, "pipeline_cross_lane_fill_threshold", 0
-            )
+            fill_threshold = getattr(self, "pipeline_cross_lane_fill_threshold", 0)
             if fill_threshold <= len(lane_ready):
                 return lane_ready
 
@@ -1951,8 +1710,7 @@ class DTTargetController:
                     (
                         rid
                         for rid, assigned_lane in self._lane_by_request.items()
-                        if assigned_lane == lane_id
-                        and rid not in ready_rids
+                        if assigned_lane == lane_id and rid not in ready_rids
                     ),
                     key=lambda rid: (
                         0 if rid in parked_laggards else 1,
@@ -1964,9 +1722,7 @@ class DTTargetController:
                 # valid partial-lane launch into a process-wide crash.  Borrow
                 # only rows for which an equal ownership swap is possible.
                 borrowed = borrowed[: len(laggard_rids)]
-                for donor, laggard_rid in zip(
-                    borrowed, laggard_rids, strict=True
-                ):
+                for donor, laggard_rid in zip(borrowed, laggard_rids, strict=True):
                     donor_lane = donor.lane_id
                     donor.lane_id = lane_id
                     laggard = parked_laggards.get(laggard_rid)
@@ -1986,11 +1742,7 @@ class DTTargetController:
         pooled_can_launch = not pooled_idle_only or (
             getattr(self, "_overlap_result_ready", None) is True
         )
-        if (
-            pooled_min_rows > 0
-            and len(ready) >= pooled_min_rows
-            and pooled_can_launch
-        ):
+        if pooled_min_rows > 0 and len(ready) >= pooled_min_rows and pooled_can_launch:
             # Both persistent lanes are incomplete, but together they already
             # contain enough ready work for a full (or nearly full) graph.  A
             # strict lane boundary would idle Target until one lane's last
@@ -2025,9 +1777,7 @@ class DTTargetController:
         if not batch.reqs:
             return
         parked_req_ids = {id(state.req) for state in self._parked.values()}
-        target_inflight_rids = set(
-            getattr(self, "_target_inflight_counts", {}).keys()
-        )
+        target_inflight_rids = set(getattr(self, "_target_inflight_counts", {}).keys())
         keep_indices = [
             index
             for index, req in enumerate(batch.reqs)
@@ -2116,9 +1866,7 @@ class DTTargetController:
         self._overlap_launch_poll_ns = self._last_poll_ns
 
         if self.is_export_rank:
-            target_inflight_counts = getattr(
-                self, "_target_inflight_counts", Counter()
-            )
+            target_inflight_counts = getattr(self, "_target_inflight_counts", Counter())
             profile_emit(
                 "target_overlap_inflight_detach",
                 instance_id=self.instance_id,
@@ -2166,9 +1914,7 @@ class DTTargetController:
             self._forget_request_lane(state.req)
             getattr(self, "_next_round", {}).pop(state.req.rid, None)
 
-        inflight_reqs = list(
-            getattr(self, "_target_inflight_reqs", {}).values()
-        )
+        inflight_reqs = list(getattr(self, "_target_inflight_reqs", {}).values())
         getattr(self, "_target_inflight_counts", {}).clear()
         getattr(self, "_target_inflight_reqs", {}).clear()
 
@@ -2285,9 +2031,7 @@ class DTTargetController:
             ready = []
         if not ready:
             return None
-        select_end_ns = (
-            time.monotonic_ns() if profile_build_stages else build_start_ns
-        )
+        select_end_ns = time.monotonic_ns() if profile_build_stages else build_start_ns
         remaining_by_cohort = Counter(
             state.cohort_id for state in self._parked.values()
         )
@@ -2316,9 +2060,7 @@ class DTTargetController:
             full_wave_members = getattr(self, "_full_wave_members", None)
             if full_wave_members is not None:
                 full_wave_members.discard(state.transfer_id)
-        cohort_end_ns = (
-            time.monotonic_ns() if profile_build_stages else select_end_ns
-        )
+        cohort_end_ns = time.monotonic_ns() if profile_build_stages else select_end_ns
 
         reqs = [state.req for state in ready]
         device = self.scheduler.device
@@ -2335,9 +2077,7 @@ class DTTargetController:
             time.monotonic_ns() if profile_build_stages else cohort_end_ns
         )
         req_pool_indices = [req.req_pool_idx for req in reqs]
-        metadata_slot_id, metadata_slot = self._acquire_ready_metadata_slot(
-            len(ready)
-        )
+        metadata_slot_id, metadata_slot = self._acquire_ready_metadata_slot(len(ready))
         batch.dt_ready_metadata_slots = (
             (metadata_slot_id,) if metadata_slot_id is not None else ()
         )
@@ -2358,9 +2098,7 @@ class DTTargetController:
             ]
             batch.req_pool_indices_cpu.numpy()[:] = req_pool_indices
             batch.req_pool_indices = metadata_slot.req_pool_indices[: len(ready)]
-            batch.req_pool_indices.copy_(
-                batch.req_pool_indices_cpu, non_blocking=True
-            )
+            batch.req_pool_indices.copy_(batch.req_pool_indices_cpu, non_blocking=True)
         req_indices_end_ns = (
             time.monotonic_ns() if profile_build_stages else batch_init_end_ns
         )
@@ -2393,9 +2131,7 @@ class DTTargetController:
             bonus_tokens_cpu.numpy()[:] = bonus_token_values
             bonus_tokens = metadata_slot.bonus_tokens[: len(ready)]
             bonus_tokens.copy_(bonus_tokens_cpu, non_blocking=True)
-        bonus_end_ns = (
-            time.monotonic_ns() if profile_build_stages else seq_meta_end_ns
-        )
+        bonus_end_ns = time.monotonic_ns() if profile_build_stages else seq_meta_end_ns
         row_bytes = self.block_size * 4
         candidate_blob = b"".join(state.candidate_bytes for state in ready)
         if len(candidate_blob) != len(ready) * row_bytes:
@@ -2427,9 +2163,7 @@ class DTTargetController:
             getattr(self, "ragged_verify", False)
             or getattr(self, "adaptive_verify_margin", None) is not None
         ):
-            min_adaptive_batch = getattr(
-                self, "adaptive_verify_min_target_batch", 1
-            )
+            min_adaptive_batch = getattr(self, "adaptive_verify_min_target_batch", 1)
             if (
                 getattr(self, "adaptive_verify_margin", None) is None
                 or len(ready) < min_adaptive_batch
@@ -2481,9 +2215,9 @@ class DTTargetController:
                         pin_memory=is_pin_memory_available(device),
                     )
                 else:
-                    padding_priorities_cpu = (
-                        metadata_slot.padding_priorities_cpu[: len(ready)]
-                    )
+                    padding_priorities_cpu = metadata_slot.padding_priorities_cpu[
+                        : len(ready)
+                    ]
                     padding_priorities_cpu.numpy()[:] = padding_priorities
         adaptive_end_ns = (
             time.monotonic_ns() if profile_build_stages else candidate_device_end_ns
@@ -2547,9 +2281,7 @@ class DTTargetController:
                 seq_meta_ns=seq_meta_end_ns - req_indices_end_ns,
                 bonus_ns=bonus_end_ns - seq_meta_end_ns,
                 candidate_host_ns=candidate_host_end_ns - bonus_end_ns,
-                candidate_device_ns=(
-                    candidate_device_end_ns - candidate_host_end_ns
-                ),
+                candidate_device_ns=(candidate_device_end_ns - candidate_host_end_ns),
                 adaptive_host_ns=adaptive_end_ns - candidate_device_end_ns,
                 spec_alloc_ns=spec_alloc_end_ns - adaptive_end_ns,
                 future_stash_ns=future_stash_end_ns - spec_alloc_end_ns,
@@ -2603,9 +2335,7 @@ class DTTargetController:
                 pipeline_lane_tail_merge_armed=getattr(
                     self, "_pipeline_lane_tail_merge_armed", False
                 ),
-                pipeline_lanes_pooled=getattr(
-                    self, "_pipeline_lanes_pooled", False
-                ),
+                pipeline_lanes_pooled=getattr(self, "_pipeline_lanes_pooled", False),
                 pipeline_pooled_ready_min_rows=getattr(
                     self, "pipeline_pooled_ready_min_rows", 0
                 ),
@@ -2706,9 +2436,7 @@ class DTTargetController:
                     instance_id=self.instance_id,
                     waiting_queue_size=waiting_queue_size,
                     active_verify_rows=active_verify_rows,
-                    flush_on_gpu_idle=getattr(
-                        self, "prefill_flush_on_gpu_idle", False
-                    ),
+                    flush_on_gpu_idle=getattr(self, "prefill_flush_on_gpu_idle", False),
                     flush_launch_age_ns=flush_launch_age_ns,
                     launch_age_ns=launch_age_ns,
                 )
@@ -2917,8 +2645,6 @@ class DTTargetController:
         source_slot: int,
         source_generation: int,
         pivot_nbytes: int,
-        context_tokens: tuple[int, ...] = (),
-        cache_key: int = 0,
     ):
         from dt_protocol import DraftTask, SourceRef
 
@@ -2950,20 +2676,7 @@ class DTTargetController:
             ),
             created_ns=now_ns,
             deadline_ns=now_ns + self.round_timeout_ns,
-            context_tokens=context_tokens,
-            cache_key=cache_key,
         )
-
-    def _remote_ngram_cache_key(self, req: Req) -> int:
-        if not self.remote_ngram_context or not self.remote_ngram_prompt_affinity:
-            return 0
-        key = self._remote_ngram_cache_keys.get(req.rid)
-        if key is None:
-            # Tuple-of-int hashes are deterministic across these worker
-            # processes.  Reserve zero for disabled/non-affine dispatch.
-            key = (hash(tuple(req.origin_input_ids)) & ((1 << 62) - 1)) + 1
-            self._remote_ngram_cache_keys[req.rid] = key
-        return key
 
     def _queue_task_batch(self, tasks: tuple) -> None:
         from dt_protocol import PROTOCOL_VERSION, TargetTaskBatch
@@ -2988,9 +2701,7 @@ class DTTargetController:
             self._ledger.begin(batch)
             outbox = self._reliable_outbox()
             outbox.add("task_batch", batch.batch_id, batch)
-            outbox.mark_sent(
-                "task_batch", batch.batch_id, now_ns=submitted_ns
-            )
+            outbox.mark_sent("task_batch", batch.batch_id, now_ns=submitted_ns)
             self._pending_send.popleft()
             profile_emit(
                 "target_task_batch_sent",
@@ -3113,9 +2824,7 @@ class DTTargetController:
             elif operation == CANCEL_TRANSFERS:
                 sent = self._client.cancel(message)
             else:
-                raise RuntimeError(
-                    f"unknown Target delivery operation {operation!r}"
-                )
+                raise RuntimeError(f"unknown Target delivery operation {operation!r}")
             if not sent:
                 break
             outbox.mark_sent(operation, message_id, now_ns=now_ns)
@@ -3255,9 +2964,7 @@ class DTTargetController:
 
         ready_ids = set(disposition.ready_transfer_ids)
         failed_ids = set(disposition.failed_transfer_ids)
-        expected_row_width = getattr(
-            self, "result_row_width", self.remote_block_size
-        )
+        expected_row_width = getattr(self, "result_row_width", self.remote_block_size)
         row_stride_bytes = expected_row_width * 4
         candidate_width_bytes = self.block_size * 4
         for entry in batch.entries:

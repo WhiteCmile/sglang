@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import replace
 
@@ -13,6 +12,7 @@ except ImportError:  # Standalone SGLang use does not require dt-runtime.
 
     def profile_emit(*_args, **_kwargs) -> None:
         return None
+
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import (
@@ -55,10 +55,8 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.flashmtp_shared import (
-    OnlineNgramCorrectionCache,
     adaptive_verify_enabled,
     graph_tier_padding_enabled,
-    ngram_correction_enabled,
     pinned_verify_metadata_enabled,
     plan_ragged_execution_tier,
     ragged_epilogue_capacity,
@@ -191,11 +189,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self.model_block_size = int(server_args.speculative_num_draft_tokens)
-        self.block_size = int(
-            os.environ.get("SGLANG_FLASHMTP_NGRAM_HORIZON", self.model_block_size)
-        )
-        if self.block_size < self.model_block_size:
-            raise ValueError("FlashMTP ngram horizon cannot shrink the draft block")
+        self.block_size = self.model_block_size
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1
         self.model_num_proposed_tokens = int(flash_config.num_proposed_tokens)
@@ -282,50 +276,10 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         self._single_load_verify_graph = False
         self._verify_lens_cpu_buf: torch.Tensor | None = None
         self._verify_lens_cpu_cap = 0
-        self._ngram_correction = (
-            OnlineNgramCorrectionCache(
-                order=int(os.environ.get("SGLANG_FLASHMTP_NGRAM_ORDER", "12")),
-                max_proposals=self.num_proposed_tokens,
-                max_rows=int(server_args.max_running_requests or 384),
-                max_entries=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MAX_ENTRIES", "262144")
-                ),
-                min_count=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MIN_COUNT", "4")
-                ),
-                device=self.device,
-                pin_memory=is_pin_memory_available(self.device),
-                min_sources=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MIN_SOURCES", "1")
-                ),
-                source_gated_from=int(
-                    os.environ.get(
-                        "SGLANG_FLASHMTP_NGRAM_SOURCE_GATED_FROM",
-                        str(self.model_num_proposed_tokens),
-                    )
-                ),
-            )
-            if ngram_correction_enabled()
-            else None
-        )
-        self._ngram_full_verify_lens = (
-            torch.full(
-                (int(server_args.max_running_requests or 384),),
-                # The model-backed proposal width stays immediately usable;
-                # producer diversity is required only for an extended tail.
-                self.model_block_size,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if self._ngram_correction is not None
-            else None
-        )
-
         if self._ragged_verify:
             if not ragged_verify_compact_enabled():
                 raise ValueError(
-                    "FlashMTP ragged verify requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=compact"
+                    "FlashMTP ragged verify requires SGLANG_RAGGED_VERIFY_MODE=compact"
                 )
         greedy_selector = None
         if self._vocab_parallel_greedy:
@@ -360,11 +314,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 device=self.device,
                 tp_group=tp_group if int(tp_group.world_size) > 1 else None,
             )
-        if (
-            self._ragged_verify
-            and not server_args.disable_cuda_graph
-            and is_cuda()
-        ):
+        if self._ragged_verify and not server_args.disable_cuda_graph and is_cuda():
             self._ragged_verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=ragged_epilogue_capacity(server_args),
                 verify_num_draft_tokens=self.block_size,
@@ -383,7 +333,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 "model_block_size=%d, num_proposed_tokens=%d, pivot_layers=%d, "
                 "mask_token_id=%d, "
                 "shared_optimizations=%s, ragged=%s, adaptive=%s, pinned=%s, "
-                "vocab_greedy=%s, graph_padding=%s, ngram_correction=%s",
+                "vocab_greedy=%s, graph_padding=%s",
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.model_block_size,
@@ -396,7 +346,6 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 self._pinned_verify_metadata,
                 self._vocab_parallel_greedy,
                 self._adaptive_fill_graph_padding,
-                self._ngram_correction is not None,
             )
 
     def _maybe_build_draft_sampler(self):
@@ -665,59 +614,6 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             )
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
-        ngram_predictions = (
-            self._ngram_correction.predict_requests(batch.reqs)
-            if self._ngram_correction is not None
-            else None
-        )
-        if ngram_predictions and all(
-            len(prediction) >= self.model_num_proposed_tokens
-            for prediction in ngram_predictions
-        ):
-            assert self._ngram_full_verify_lens is not None
-            candidates = self._draft_block_tokens_buf[:batch_size]
-            candidates.zero_()
-            candidates[:, 0].copy_(block_ids[:, 0])
-            verify_lens_device = self._ngram_full_verify_lens[:batch_size]
-            verify_lens_device.fill_(self.model_block_size)
-            self._ngram_correction.patch_predictions(
-                predictions=ngram_predictions,
-                candidates=candidates,
-                verify_lens=verify_lens_device,
-            )
-            if self._ragged_verify:
-                sampling_info = batch.sampling_info
-                if not (
-                    not batch.has_grammar
-                    and sampling_info is not None
-                    and sampling_info.is_all_greedy
-                    and verify_logits_adjustments_are_noop(sampling_info)
-                ):
-                    raise RuntimeError(
-                        "FlashMTP ragged verify requires adjustment-free "
-                        "greedy decoding without grammar constraints"
-                    )
-                draft_input.verify_lens_cpu = self._stage_verify_lens_cpu(
-                    verify_lens_device, batch_size=batch_size
-                )
-                return self._verify_candidates_ragged(
-                    batch=batch,
-                    draft_input=draft_input,
-                    candidates=candidates,
-                    prefix_lens=prefix_lens,
-                    on_publish=on_publish,
-                )
-            return self._verify_candidates(
-                batch=batch,
-                draft_input=draft_input,
-                candidates=candidates,
-                prefix_lens=prefix_lens,
-                target_positions_2d=target_positions_2d,
-                verify_out_cache_loc=verify_out_cache_loc,
-                on_publish=on_publish,
-                grammar_barrier=grammar_barrier,
-            )
-
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
@@ -835,12 +731,6 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             draft_input.verify_lens_cpu = self._stage_verify_lens_cpu(
                 verify_lens_device, batch_size=batch_size
             )
-            if self._ngram_correction is not None:
-                self._ngram_correction.patch_predictions(
-                    predictions=ngram_predictions,
-                    candidates=candidates,
-                    verify_lens=draft_input.verify_lens_cpu,
-                )
             return self._verify_candidates_ragged(
                 batch=batch,
                 draft_input=draft_input,

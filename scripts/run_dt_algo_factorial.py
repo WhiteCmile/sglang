@@ -24,11 +24,11 @@ RUNTIME = WORKSPACE / "dt-runtime-algo"
 SGLANG = WORKSPACE / "sglang-dt-algo"
 PYTHON = WORKSPACE / "sglang-v1-clean/.venv/bin/python"
 PROFILE = RUNTIME / "configs/qwen3-14b-flashmtp-v2.toml"
-PROMPTS = WORKSPACE / "benchmark-data/flashmtp-prompts-20260731/specbench_reasoning.json"
-PROMPTS_SHA256 = "bc3baa1ac11f9e832fff50bb5348d57e3effaf70e060c6457dbac6b95cac2b1f"
-GRAPH_RE = re.compile(
-    r'^sglang:cuda_graph_passes_total\{([^}]*)\}\s+([0-9.eE+-]+)$'
+PROMPTS = (
+    WORKSPACE / "benchmark-data/flashmtp-prompts-20260731/specbench_reasoning.json"
 )
+PROMPTS_SHA256 = "bc3baa1ac11f9e832fff50bb5348d57e3effaf70e060c6457dbac6b95cac2b1f"
+GRAPH_RE = re.compile(r"^sglang:cuda_graph_passes_total\{([^}]*)\}\s+([0-9.eE+-]+)$")
 FATAL_RE = re.compile(
     r"Traceback \(most recent call last\)|RuntimeError:|CUDA error:|"
     r"NCCL[^\n]*(?:error|fail)|fatal[^\n]*error|replay[^\n]*(?:error|fail)",
@@ -158,10 +158,14 @@ def listening_ports() -> set[int]:
 
 
 def fixed_ports() -> set[int]:
-    return set(range(30000, 30003)) | set(range(31000, 31004)) | {
-        19001,
-        19002,
-    }
+    return (
+        set(range(30000, 30003))
+        | set(range(31000, 31004))
+        | {
+            19001,
+            19002,
+        }
+    )
 
 
 def proc_identity(pid: int) -> dict[str, object]:
@@ -257,19 +261,45 @@ def capture_audit(leg: Path, topology: str) -> dict[str, object]:
     for name in names:
         text = (leg / "servers" / f"{name}.log").read_text(errors="replace")
         normalized = text.replace("\r", "\n")
-        require(normalized.count("Capture target prefill CUDA graph begin.") == 2, f"{name}: prefill capture")
-        require(normalized.count("Capture target verify CUDA graph begin.") == 2, f"{name}: verify capture")
-        require("61/61" in normalized and "59/59" in normalized, f"{name}: incomplete target capture")
+        require(
+            normalized.count("Capture target prefill CUDA graph begin.") == 2,
+            f"{name}: prefill capture",
+        )
+        require(
+            normalized.count("Capture target verify CUDA graph begin.") == 2,
+            f"{name}: verify capture",
+        )
+        require(
+            "61/61" in normalized and "59/59" in normalized,
+            f"{name}: incomplete target capture",
+        )
         require("disable_cuda_graph=False" in normalized, f"{name}: graph disabled")
-        require("disable_cuda_graph_padding=False" in normalized, f"{name}: graph padding disabled")
+        require(
+            "disable_cuda_graph_padding=False" in normalized,
+            f"{name}: graph padding disabled",
+        )
         if topology == "baseline":
-            require(normalized.count("Capture draft verify CUDA graph begin.") == 2, f"{name}: colocated draft capture")
+            require(
+                normalized.count("Capture draft verify CUDA graph begin.") == 2,
+                f"{name}: colocated draft capture",
+            )
         report[name] = {"target_prefill_buckets": 61, "target_decode_buckets": 59}
     if topology == "dt":
         for name in ("draft-0", "draft-1"):
-            text = (leg / "servers" / f"{name}.log").read_text(errors="replace").replace("\r", "\n")
-            require("Captured standalone Draft CUDA graphs:" in text, f"{name}: missing draft capture")
-            require("batch_sizes=(1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 44, 48, 52, 56, 60, 64, 72, 80, 88, 96, 104, 112, 120, 128)" in text, f"{name}: wrong draft capture grid")
+            text = (
+                (leg / "servers" / f"{name}.log")
+                .read_text(errors="replace")
+                .replace("\r", "\n")
+            )
+            require(
+                "Captured standalone Draft CUDA graphs:" in text,
+                f"{name}: missing draft capture",
+            )
+            require(
+                "batch_sizes=(1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 44, 48, 52, 56, 60, 64, 72, 80, 88, 96, 104, 112, 120, 128)"
+                in text,
+                f"{name}: wrong draft capture grid",
+            )
             require("cuda_graph=True" in text, f"{name}: draft graph disabled")
             report[name] = {"draft_decode_buckets": 36}
     return report
@@ -323,7 +353,9 @@ def remove_owned_dt_data_dir(path: Path) -> None:
             child = Path(current) / name
             child_stat = os.lstat(child)
             require(child_stat.st_uid == uid, f"foreign DT data entry: {child}")
-            require(not stat.S_ISLNK(child_stat.st_mode), f"symlink in DT data: {child}")
+            require(
+                not stat.S_ISLNK(child_stat.st_mode), f"symlink in DT data: {child}"
+            )
     shutil.rmtree(path)
 
 
@@ -342,13 +374,21 @@ def validate_result(path: Path, args: argparse.Namespace, topology: str) -> dict
         "prompts_sha256": args.prompts_sha256,
     }
     for key, value in expected.items():
-        require(result.get(key) == value, f"result {key}: {result.get(key)!r} != {value!r}")
+        require(
+            result.get(key) == value, f"result {key}: {result.get(key)!r} != {value!r}"
+        )
     require(result.get("fixed_work_valid") is True, "fixed work invalid")
-    require(result.get("successful_requests") == args.measurement_requests, "request failures")
+    require(
+        result.get("successful_requests") == args.measurement_requests,
+        "request failures",
+    )
     require(result.get("failed_requests") == 0, "request failures")
     require(result.get("committed_output_tokens") == expected_tokens, "token total")
     records = result.get("records")
-    require(isinstance(records, list) and len(records) == args.measurement_requests, "record count")
+    require(
+        isinstance(records, list) and len(records) == args.measurement_requests,
+        "record count",
+    )
     output_digest = hashlib.sha256(
         json.dumps(
             [record["output_token_ids_sha256"] for record in records],
@@ -368,15 +408,7 @@ def validate_result(path: Path, args: argparse.Namespace, topology: str) -> dict
 def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
     topology = "baseline" if label.startswith("b") else "dt"
     algo = label.endswith("1")
-    if args.factor == "bundle":
-        budgeted_verify = algo
-        ngram_correction = algo
-    elif args.factor == "ngram":
-        budgeted_verify = True
-        ngram_correction = algo
-    else:
-        budgeted_verify = algo
-        ngram_correction = False
+    budgeted_verify = algo
     leg = args.output_dir / f"leg-{ordinal}-{label}"
     leg.mkdir()
     server_dir = leg / "servers"
@@ -400,56 +432,63 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
         "SGLANG_FLASHMTP_VOCAB_PARALLEL_GREEDY": "0",
         "SGLANG_FLASHMTP_GRAPH_TIER_PADDING": "0",
         "SGLANG_FLASHMTP_BUDGETED_VERIFY": "1" if budgeted_verify else "0",
-        "SGLANG_FLASHMTP_NGRAM_CORRECTION": (
-            "1" if ngram_correction else "0"
-        ),
-        "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY": (
-            "1" if args.ngram_prompt_affinity else "0"
-        ),
     }
-    if ngram_correction:
-        env["SGLANG_FLASHMTP_NGRAM_HORIZON"] = str(args.ngram_horizon)
-        env["SGLANG_FLASHMTP_NGRAM_MAX_ENTRIES"] = str(args.ngram_max_entries)
-        env["SGLANG_FLASHMTP_NGRAM_MIN_COUNT"] = str(args.ngram_min_count)
-        env["SGLANG_FLASHMTP_NGRAM_MIN_SOURCES"] = str(args.ngram_min_sources)
-        env["SGLANG_FLASHMTP_NGRAM_ORDER"] = str(args.ngram_order)
-        env["SGLANG_FLASHMTP_NGRAM_SOURCE_GATED_FROM"] = str(
-            args.ngram_source_gated_from
-        )
-        env["SGLANG_FLASHMTP_NGRAM_SHARED_PROBE_INTERVAL"] = str(
-            args.ngram_shared_probe_interval
-        )
-        if args.vocab_parallel_greedy:
-            env["SGLANG_FLASHMTP_VOCAB_PARALLEL_GREEDY"] = "1"
     if args.thresholds:
         env["SGLANG_FLASHMTP_BUDGETED_VERIFY_THRESHOLDS"] = args.thresholds
     if args.enable_profile:
         env["DT_PROFILE_DIR"] = str(leg / "profile")
     launcher_argv = [
-        str(PYTHON), "-m", "dt_launcher", topology,
-        "--preset", "h11-production-v1",
-        "--workspace", str(WORKSPACE),
-        "--python-executable", str(PYTHON),
-        "--profile", str(PROFILE),
-        "--dt-stage", "3t2d",
-        "--dt-data-dir", str(dt_data_dir),
-        "--run-dir", str(server_dir),
-        "--dt-sglang-dir", str(SGLANG),
-        "--baseline-sglang-dir", str(SGLANG),
+        str(PYTHON),
+        "-m",
+        "dt_launcher",
+        topology,
+        "--preset",
+        "h11-production-v1",
+        "--workspace",
+        str(WORKSPACE),
+        "--python-executable",
+        str(PYTHON),
+        "--profile",
+        str(PROFILE),
+        "--dt-stage",
+        "3t2d",
+        "--dt-data-dir",
+        str(dt_data_dir),
+        "--run-dir",
+        str(server_dir),
+        "--dt-sglang-dir",
+        str(SGLANG),
+        "--baseline-sglang-dir",
+        str(SGLANG),
     ]
     result_path = leg / "result.json"
     benchmark_argv = [
-        str(PYTHON), "-m", "dt_benchmark",
-        "--topology", topology,
-        "--prompts-file", str(args.prompts_file),
-        "--output", str(result_path),
-        "--global-concurrency", str(args.concurrency),
-        "--routing-policy", "least-inflight",
-        "--warmup-requests", "32",
-        "--measurement-requests", str(args.measurement_requests),
-        "--max-new-tokens", str(args.max_new_tokens),
-        "--seed", "0", "--ignore-eos",
-        "--request-timeout-s", "900", "--health-timeout-s", "1800",
+        str(PYTHON),
+        "-m",
+        "dt_benchmark",
+        "--topology",
+        topology,
+        "--prompts-file",
+        str(args.prompts_file),
+        "--output",
+        str(result_path),
+        "--global-concurrency",
+        str(args.concurrency),
+        "--routing-policy",
+        "least-inflight",
+        "--warmup-requests",
+        "32",
+        "--measurement-requests",
+        str(args.measurement_requests),
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--seed",
+        "0",
+        "--ignore-eos",
+        "--request-timeout-s",
+        "900",
+        "--health-timeout-s",
+        "1800",
     ]
     atomic_json(
         leg / "invocation.json",
@@ -457,9 +496,7 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
             "label": label,
             "topology": topology,
             "algorithm": algo,
-            "factor": args.factor,
             "budgeted_verify": budgeted_verify,
-            "ngram_correction": ngram_correction,
             "launcher_argv": launcher_argv,
             "benchmark_argv": benchmark_argv,
             "environment": env,
@@ -514,9 +551,7 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
                 "label": label,
                 "topology": topology,
                 "algorithm": algo,
-                "factor": args.factor,
                 "budgeted_verify": budgeted_verify,
-                "ngram_correction": ngram_correction,
                 **result,
             }
     finally:
@@ -533,24 +568,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompts-file", type=Path, default=PROMPTS)
     parser.add_argument("--require-unique-measurement-prompts", action="store_true")
     parser.add_argument("--schedule", default="b1,d1,b0,d0")
-    parser.add_argument(
-        "--factor",
-        choices=("bundle", "ngram", "budgeted_verify"),
-        default="bundle",
-    )
     parser.add_argument("--concurrency", type=int, default=768)
     parser.add_argument("--measurement-requests", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=320)
     parser.add_argument("--thresholds", default="")
-    parser.add_argument("--ngram-min-count", type=int, default=1)
-    parser.add_argument("--ngram-min-sources", type=int, default=2)
-    parser.add_argument("--ngram-order", type=int, default=12)
-    parser.add_argument("--ngram-horizon", type=int, default=12)
-    parser.add_argument("--ngram-max-entries", type=int, default=262144)
-    parser.add_argument("--ngram-shared-probe-interval", type=int, default=1)
-    parser.add_argument("--ngram-source-gated-from", type=int, default=0)
-    parser.add_argument("--ngram-prompt-affinity", action="store_true")
-    parser.add_argument("--vocab-parallel-greedy", action="store_true")
     parser.add_argument("--enable-profile", action="store_true")
     parser.add_argument("--startup-timeout-s", type=float, default=1800)
     parser.add_argument("--run-timeout-s", type=float, default=7200)
@@ -562,19 +583,6 @@ def main() -> None:
     require(socket.gethostname() == "is-dcszf4wke5colmrw-devmachine-0", "wrong host")
     require(args.concurrency == 768, "this runner is fixed to B768")
     require(args.max_new_tokens == 320, "this runner is fixed to max_new_tokens=320")
-    require(args.ngram_min_count > 0, "ngram min count must be positive")
-    require(args.ngram_min_sources > 0, "ngram min sources must be positive")
-    require(args.ngram_order > 0, "ngram order must be positive")
-    require(args.ngram_horizon >= 8, "ngram horizon must be at least 8")
-    require(args.ngram_max_entries > 0, "ngram max entries must be positive")
-    require(
-        0 <= args.ngram_source_gated_from < args.ngram_horizon,
-        "ngram source gate must be within proposal width",
-    )
-    require(
-        args.ngram_shared_probe_interval > 0,
-        "ngram shared probe interval must be positive",
-    )
     labels = [value.strip() for value in args.schedule.split(",") if value.strip()]
     require(labels and set(labels) <= {"b0", "b1", "d0", "d1"}, "bad schedule")
     require(not args.output_dir.exists(), "output directory already exists")
@@ -622,16 +630,6 @@ def main() -> None:
         "measurement_requests": args.measurement_requests,
         "max_new_tokens": args.max_new_tokens,
         "thresholds": args.thresholds or None,
-        "factor": args.factor,
-        "ngram_min_count": args.ngram_min_count,
-        "ngram_min_sources": args.ngram_min_sources,
-        "ngram_order": args.ngram_order,
-        "ngram_horizon": args.ngram_horizon,
-        "ngram_max_entries": args.ngram_max_entries,
-        "ngram_shared_probe_interval": args.ngram_shared_probe_interval,
-        "ngram_source_gated_from": args.ngram_source_gated_from,
-        "ngram_prompt_affinity": args.ngram_prompt_affinity,
-        "vocab_parallel_greedy": args.vocab_parallel_greedy,
     }
     atomic_json(args.output_dir / "provenance.json", provenance)
     results = []
@@ -657,10 +655,16 @@ def main() -> None:
                 dt["throughput"] / baseline["throughput"]
             )
     if "b0" in by_label and "b1" in by_label:
-        comparisons["baseline_algo_lift"] = by_label["b1"]["throughput"] / by_label["b0"]["throughput"]
+        comparisons["baseline_algo_lift"] = (
+            by_label["b1"]["throughput"] / by_label["b0"]["throughput"]
+        )
     if "d0" in by_label and "d1" in by_label:
-        comparisons["dt_algo_lift"] = by_label["d1"]["throughput"] / by_label["d0"]["throughput"]
-    comparisons["all_output_digests_equal"] = len({result["output_digest"] for result in results}) == 1
+        comparisons["dt_algo_lift"] = (
+            by_label["d1"]["throughput"] / by_label["d0"]["throughput"]
+        )
+    comparisons["all_output_digests_equal"] = (
+        len({result["output_digest"] for result in results}) == 1
+    )
     summary = {"provenance": provenance, "results": results, "comparisons": comparisons}
     atomic_json(args.output_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)

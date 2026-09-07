@@ -29,12 +29,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_worker_common import build_draft_tp_worker
-from sglang.srt.speculative.flashmtp_shared import (
-    OnlineNgramCorrectionCache,
-    ngram_correction_enabled,
-)
 from sglang.srt.speculative.flashmtp_utils import parse_flashmtp_draft_config
-from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +55,7 @@ def flashmtp_component_enabled(env_name: str) -> bool:
     if raw not in ("0", "1"):
         raise ValueError(f"{env_name} must be 0 or 1")
     return raw == "1"
+
 
 # Calibrated on the full-width confidence control trace at
 # ``runs/dt-confidence-full8-profile-1t1d-c256-n512-r1-20260815``.  The model
@@ -673,14 +669,7 @@ class FlashMTPDraftEngine:
         self.EntryStatus = EntryStatus
         self.instance_id = instance_id
         self.profile = load_draft_profile(profile_path)
-        self._verify_block_size = int(
-            os.environ.get(
-                "SGLANG_FLASHMTP_NGRAM_HORIZON",
-                str(self.profile.block_size),
-            )
-        )
-        if self._verify_block_size < self.profile.block_size:
-            raise ValueError("FlashMTP ngram horizon cannot shrink the draft block")
+        self._verify_block_size = self.profile.block_size
         self.gpu_id = gpu_id
         self.max_pending_tasks = max_pending_tasks
         self.max_batch_size = max_batch_size
@@ -704,9 +693,7 @@ class FlashMTPDraftEngine:
             )
         )
         if prepare_wait_ms < 0:
-            raise ValueError(
-                "SGLANG_DT_DRAFT_PREPARE_WAIT_MS must be non-negative"
-            )
+            raise ValueError("SGLANG_DT_DRAFT_PREPARE_WAIT_MS must be non-negative")
         if prepare_wait_ms > 0 and not self._prepare_overlap:
             raise ValueError(
                 "SGLANG_DT_DRAFT_PREPARE_WAIT_MS requires Draft prepare overlap"
@@ -755,9 +742,9 @@ class FlashMTPDraftEngine:
         self._profile_confidence = (
             os.environ.get("SGLANG_DT_DRAFT_CONFIDENCE_PROFILE", "0") == "1"
         )
-        self._confidence_mode = os.environ.get(
-            "SGLANG_DT_DRAFT_CONFIDENCE_MODE", "margin"
-        ).strip().lower()
+        self._confidence_mode = (
+            os.environ.get("SGLANG_DT_DRAFT_CONFIDENCE_MODE", "margin").strip().lower()
+        )
         if self._confidence_mode not in ("margin", "top1", "top1_trace"):
             raise ValueError(
                 "SGLANG_DT_DRAFT_CONFIDENCE_MODE must be 'margin', 'top1', "
@@ -771,8 +758,7 @@ class FlashMTPDraftEngine:
         )
         if self._dispatch_batch_isolation_min_rows < 0:
             raise ValueError(
-                "SGLANG_DT_DRAFT_DISPATCH_BATCH_ISOLATION_MIN_ROWS must be "
-                "non-negative"
+                "SGLANG_DT_DRAFT_DISPATCH_BATCH_ISOLATION_MIN_ROWS must be non-negative"
             )
         self._dispatch_batch_isolation_min_next_rows = int(
             os.environ.get(
@@ -875,9 +861,7 @@ class FlashMTPDraftEngine:
         self._stop = False
 
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id)
-        cleanup_stale_slot_files(
-            Path(data_dir), instance_id=safe_id, kind="results"
-        )
+        cleanup_stale_slot_files(Path(data_dir), instance_id=safe_id, kind="results")
         result_path = (
             Path(data_dir).absolute() / f"dt-{safe_id}-{os.getpid()}-results.slots"
         )
@@ -933,10 +917,7 @@ class FlashMTPDraftEngine:
             for _ in range(buffer_count)
         )
         self._pivot_host_view_buffers = tuple(
-            tuple(
-                memoryview(row.view(torch.uint8).numpy())
-                for row in staging_buffer
-            )
+            tuple(memoryview(row.view(torch.uint8).numpy()) for row in staging_buffer)
             for staging_buffer in self._pivot_host_staging_buffers
         )
         # Keep the original attributes as aliases for tests and for the serial
@@ -1033,60 +1014,6 @@ class FlashMTPDraftEngine:
         self._token_embedding = self._load_target_embedding(
             self.profile.target_model_path
         )
-        self._ngram_correction = (
-            OnlineNgramCorrectionCache(
-                order=int(os.environ.get("SGLANG_FLASHMTP_NGRAM_ORDER", "12")),
-                max_proposals=self._verify_block_size - 1,
-                max_rows=self.max_batch_size,
-                max_entries=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MAX_ENTRIES", "262144")
-                ),
-                min_count=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MIN_COUNT", "1")
-                ),
-                device=self.device,
-                pin_memory=is_pin_memory_available(self.device),
-                min_sources=int(
-                    os.environ.get("SGLANG_FLASHMTP_NGRAM_MIN_SOURCES", "1")
-                ),
-                source_gated_from=int(
-                    os.environ.get(
-                        "SGLANG_FLASHMTP_NGRAM_SOURCE_GATED_FROM",
-                        str(self.profile.draft_k),
-                    )
-                ),
-            )
-            if ngram_correction_enabled()
-            else None
-        )
-        self._ngram_candidate_buf = (
-            torch.empty(
-                (self.max_batch_size, self._verify_block_size),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if self._ngram_correction is not None
-            else None
-        )
-        self._ngram_verify_lens_buf = (
-            torch.empty(
-                self.max_batch_size,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if self._ngram_correction is not None
-            else None
-        )
-        self._ngram_margin_buf = (
-            torch.empty(
-                (self.max_batch_size, self._num_proposals),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            if self._ngram_correction is not None
-            else None
-        )
-
         if self._draft_model.markov_head is None:
             raise ValueError("DT V1 requires the FlashMTP Markov direct-output head")
         self._draft_cuda_graph = None
@@ -1121,8 +1048,7 @@ class FlashMTPDraftEngine:
             )
         logger.info(
             "DT Draft model ready: instance=%s profile=%s model_block=%d "
-            "verify_block=%d batch=%d embedding_shape=%s cuda_graph=%s "
-            "ngram_correction=%s",
+            "verify_block=%d batch=%d embedding_shape=%s cuda_graph=%s",
             self.instance_id,
             self.profile.profile_id,
             self.profile.block_size,
@@ -1130,7 +1056,6 @@ class FlashMTPDraftEngine:
             self.max_batch_size,
             tuple(self._token_embedding.weight.shape),
             self._draft_cuda_graph is not None,
-            self._ngram_correction is not None,
         )
 
     def _load_target_embedding(self, model_path: str) -> torch.nn.Embedding:
@@ -1300,9 +1225,7 @@ class FlashMTPDraftEngine:
             now_ns = time.monotonic_ns()
             if now_ns >= deadline_ns or self._stop:
                 return []
-            time.sleep(
-                min(COALESCING_POLL_S, (deadline_ns - now_ns) / 1_000_000_000)
-            )
+            time.sleep(min(COALESCING_POLL_S, (deadline_ns - now_ns) / 1_000_000_000))
 
     def _poll_dispatch_messages(self) -> None:
         recv_dispatch = getattr(self._client, "recv_dispatch_nowait", None)
@@ -1357,9 +1280,7 @@ class FlashMTPDraftEngine:
         self._flush_source_done()
         for message in self._client.recv_nowait():
             if isinstance(message, DraftDispatchBatch):
-                capacity_changed = (
-                    self._accept_dispatch(message) or capacity_changed
-                )
+                capacity_changed = self._accept_dispatch(message) or capacity_changed
             elif isinstance(message, CancelTransfers):
                 published_ids = {
                     transfer_id
@@ -1464,9 +1385,7 @@ class FlashMTPDraftEngine:
         profile_dispatch_batches = getattr(
             self, "_profile_dispatch_batch_by_transfer", None
         )
-        isolation_min_rows = getattr(
-            self, "_dispatch_batch_isolation_min_rows", 0
-        )
+        isolation_min_rows = getattr(self, "_dispatch_batch_isolation_min_rows", 0)
         isolation_min_next_rows = getattr(
             self, "_dispatch_batch_isolation_min_next_rows", 0
         )
@@ -1600,13 +1519,9 @@ class FlashMTPDraftEngine:
             cohort_profile_fields = {}
             if profile_dispatch_batches is not None:
                 dispatch_batch_counts = Counter(
-                    item.dispatch_batch_id
-                    for item in tasks
-                    if item.dispatch_batch_id
+                    item.dispatch_batch_id for item in tasks if item.dispatch_batch_id
                 )
-                target_counts = Counter(
-                    item.task.target_instance_id for item in tasks
-                )
+                target_counts = Counter(item.task.target_instance_id for item in tasks)
                 round_ids = [getattr(item.task, "round_id", -1) for item in tasks]
                 cohort_profile_fields = {
                     "dispatch_batch_counts": sorted(dispatch_batch_counts.items()),
@@ -1718,18 +1633,6 @@ class FlashMTPDraftEngine:
         tasks = [item.task for item in pending]
         batch_size = len(tasks)
         cpu_prep_start_ns = time.monotonic_ns()
-        ngram_predictions = (
-            self._ngram_correction.predict_contexts(
-                [task.context_tokens for task in tasks],
-                source_ids=[task.target_instance_id for task in tasks],
-            )
-            if self._ngram_correction is not None
-            else None
-        )
-        ngram_full_batch = bool(ngram_predictions) and all(
-            len(prediction) >= self.profile.draft_k
-            for prediction in ngram_predictions
-        )
         pivot_nbytes = batch_size * self._pivot_width * 2
         pivot_buffers = {item.pivot_buffer for item in pending}
         if len(pivot_buffers) != 1:
@@ -1742,14 +1645,11 @@ class FlashMTPDraftEngine:
             else getattr(self, "_pivot_host_staging", None)
         )
         direct_mmap_h2d = getattr(self, "_direct_mmap_h2d", False)
-        ngram_fast_path = ngram_full_batch and not direct_mmap_h2d
         direct_h2d_runs = 0
         direct_h2d_max_run_rows = 0
         direct_source_release_ns = 0
         source_copy_done_event = None
-        if ngram_fast_path:
-            pass
-        elif direct_mmap_h2d:
+        if direct_mmap_h2d:
             if any(item.pivot_row != index for index, item in enumerate(pending)):
                 raise RuntimeError("direct mmap H2D pivot rows are not contiguous")
             pivots = torch.empty(
@@ -1785,9 +1685,7 @@ class FlashMTPDraftEngine:
         h2d_start_ns = time.monotonic_ns()
         if h2d_start_event is not None:
             h2d_start_event.record()
-        if ngram_fast_path:
-            pass
-        elif direct_mmap_h2d:
+        if direct_mmap_h2d:
             source_copy_done_event = torch.cuda.Event()
             try:
                 direct_h2d_runs, direct_h2d_max_run_rows = (
@@ -1815,25 +1713,7 @@ class FlashMTPDraftEngine:
             dtype=torch.int64,
             device=self.device,
         )
-        if ngram_fast_path:
-            assert self._ngram_candidate_buf is not None
-            assert self._ngram_verify_lens_buf is not None
-            assert self._ngram_margin_buf is not None
-            candidates = self._ngram_candidate_buf[:batch_size]
-            candidates.zero_()
-            candidates[:, 0].copy_(bonus_tokens)
-            verify_lens = self._ngram_verify_lens_buf[:batch_size]
-            verify_lens.fill_(self.profile.block_size)
-            logit_margins = self._ngram_margin_buf[:batch_size]
-            logit_margins.zero_()
-            padding_priorities = None
-            compute_batch_size = 0
-            self._ngram_correction.patch_predictions(
-                predictions=ngram_predictions,
-                candidates=candidates,
-                verify_lens=verify_lens,
-            )
-        elif self._draft_cuda_graph is not None:
+        if self._draft_cuda_graph is not None:
             (
                 candidates,
                 compute_batch_size,
@@ -1901,22 +1781,6 @@ class FlashMTPDraftEngine:
             )
             candidates[:, 0].copy_(bonus_tokens)
             candidates[:, 1:].copy_(proposals)
-        if (
-            self._ngram_correction is not None
-            and not ngram_fast_path
-            and self._verify_block_size > self.profile.block_size
-        ):
-            assert self._ngram_candidate_buf is not None
-            expanded_candidates = self._ngram_candidate_buf[:batch_size]
-            expanded_candidates.zero_()
-            expanded_candidates[:, : self.profile.block_size].copy_(candidates)
-            candidates = expanded_candidates
-        if self._ngram_correction is not None and not ngram_fast_path:
-            self._ngram_correction.patch_predictions(
-                predictions=ngram_predictions,
-                candidates=candidates,
-                verify_lens=verify_lens,
-            )
         if gpu_end_event is not None:
             gpu_end_event.record()
         if source_copy_done_event is not None:
@@ -1959,9 +1823,7 @@ class FlashMTPDraftEngine:
                         block_size=self.profile.block_size,
                         model=self._padding_priority_model,
                     )
-                result_rows[:, self._verify_block_size + 1].copy_(
-                    padding_priorities
-                )
+                result_rows[:, self._verify_block_size + 1].copy_(padding_priorities)
         prepare_done_event = None
         if overlap_callback is not None and getattr(
             self, "_prepare_until_gpu_done", False
@@ -2021,7 +1883,6 @@ class FlashMTPDraftEngine:
             batch_size=batch_size,
             compute_batch_size=compute_batch_size,
             cuda_graph=self._draft_cuda_graph is not None,
-            ngram_full_batch=ngram_fast_path,
             pivot_bytes=pivot_nbytes,
             candidate_bytes=len(candidate_bytes),
             task_age_mean_ns=sum(task_ages) // len(task_ages),
@@ -2341,9 +2202,7 @@ class FlashMTPDraftEngine:
         from dt_protocol import SourceReadDoneBatch
 
         now_ns = time.monotonic_ns()
-        for operation, message_id, message in self._delivery_outbox.due(
-            now_ns=now_ns
-        ):
+        for operation, message_id, message in self._delivery_outbox.due(now_ns=now_ns):
             if operation == "result":
                 sent = self._client.publish_results(message)
             elif operation == "source_read_done":
@@ -2356,9 +2215,7 @@ class FlashMTPDraftEngine:
                 raise RuntimeError(f"unknown Draft delivery operation {operation!r}")
             if not sent:
                 break
-            self._delivery_outbox.mark_sent(
-                operation, message_id, now_ns=now_ns
-            )
+            self._delivery_outbox.mark_sent(operation, message_id, now_ns=now_ns)
 
     def _publish_source_done(self, task) -> None:
         from dt_protocol import PROTOCOL_VERSION, SourceReadDone
