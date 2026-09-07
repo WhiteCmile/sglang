@@ -341,7 +341,7 @@ def wait_cold(timeout_s: float = 180.0) -> None:
 
 def remove_owned_dt_data_dir(path: Path) -> None:
     require(path.parent == Path("/dev/shm"), f"unsafe DT data parent: {path}")
-    require(path.name.startswith("dt-algo-dt-algo-"), f"unsafe DT data name: {path}")
+    require(path.name.startswith("dt-algo-"), f"unsafe DT data name: {path}")
     if not path.exists():
         return
     uid = os.getuid()
@@ -433,6 +433,9 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
         "SGLANG_FLASHMTP_VOCAB_PARALLEL_GREEDY": "0",
         "SGLANG_FLASHMTP_GRAPH_TIER_PADDING": "0",
         "SGLANG_FLASHMTP_BUDGETED_VERIFY": "1" if budgeted_verify else "0",
+        "SGLANG_RAGGED_VERIFY_MODE": (
+            "compact" if budgeted_verify or chard else "static"
+        ),
         "SGLANG_FLASHMTP_CHARD_CHUNK_SIZE": (
             str(args.chard_chunk_size) if chard else "0"
         ),
