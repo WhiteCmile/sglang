@@ -368,7 +368,15 @@ def validate_result(path: Path, args: argparse.Namespace, topology: str) -> dict
 def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
     topology = "baseline" if label.startswith("b") else "dt"
     algo = label.endswith("1")
-    budgeted_verify = algo if args.factor == "bundle" else True
+    if args.factor == "bundle":
+        budgeted_verify = algo
+        ngram_correction = algo
+    elif args.factor == "ngram":
+        budgeted_verify = True
+        ngram_correction = algo
+    else:
+        budgeted_verify = algo
+        ngram_correction = False
     leg = args.output_dir / f"leg-{ordinal}-{label}"
     leg.mkdir()
     server_dir = leg / "servers"
@@ -385,13 +393,21 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
         "SPT_NOENV": "1",
         "TOKENIZERS_PARALLELISM": "false",
+        "SGLANG_FLASHMTP_SHARED_OPTIMIZATIONS": "0",
+        "SGLANG_FLASHMTP_RAGGED_VERIFY": "0",
+        "SGLANG_FLASHMTP_ADAPTIVE_VERIFY": "0",
+        "SGLANG_FLASHMTP_PINNED_VERIFY_METADATA": "0",
+        "SGLANG_FLASHMTP_VOCAB_PARALLEL_GREEDY": "0",
+        "SGLANG_FLASHMTP_GRAPH_TIER_PADDING": "0",
         "SGLANG_FLASHMTP_BUDGETED_VERIFY": "1" if budgeted_verify else "0",
-        "SGLANG_FLASHMTP_NGRAM_CORRECTION": "1" if algo else "0",
+        "SGLANG_FLASHMTP_NGRAM_CORRECTION": (
+            "1" if ngram_correction else "0"
+        ),
         "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY": (
             "1" if args.ngram_prompt_affinity else "0"
         ),
     }
-    if algo:
+    if ngram_correction:
         env["SGLANG_FLASHMTP_NGRAM_HORIZON"] = str(args.ngram_horizon)
         env["SGLANG_FLASHMTP_NGRAM_MAX_ENTRIES"] = str(args.ngram_max_entries)
         env["SGLANG_FLASHMTP_NGRAM_MIN_COUNT"] = str(args.ngram_min_count)
@@ -443,6 +459,7 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
             "algorithm": algo,
             "factor": args.factor,
             "budgeted_verify": budgeted_verify,
+            "ngram_correction": ngram_correction,
             "launcher_argv": launcher_argv,
             "benchmark_argv": benchmark_argv,
             "environment": env,
@@ -499,6 +516,7 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
                 "algorithm": algo,
                 "factor": args.factor,
                 "budgeted_verify": budgeted_verify,
+                "ngram_correction": ngram_correction,
                 **result,
             }
     finally:
@@ -515,7 +533,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompts-file", type=Path, default=PROMPTS)
     parser.add_argument("--require-unique-measurement-prompts", action="store_true")
     parser.add_argument("--schedule", default="b1,d1,b0,d0")
-    parser.add_argument("--factor", choices=("bundle", "ngram"), default="bundle")
+    parser.add_argument(
+        "--factor",
+        choices=("bundle", "ngram", "budgeted_verify"),
+        default="bundle",
+    )
     parser.add_argument("--concurrency", type=int, default=768)
     parser.add_argument("--measurement-requests", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=320)
