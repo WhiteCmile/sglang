@@ -150,6 +150,14 @@ class DTTargetController:
             os.environ.get("SGLANG_DT_REUSE_RESULT_METADATA", "0") == "1"
         )
         self.remote_ngram_context = ngram_correction_enabled()
+        prompt_affinity_raw = os.environ.get(
+            "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY", "1"
+        )
+        if prompt_affinity_raw not in ("0", "1"):
+            raise ValueError(
+                "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY must be 0 or 1"
+            )
+        self.remote_ngram_prompt_affinity = prompt_affinity_raw == "1"
         self._remote_ngram_cache_keys: dict[str, int] = {}
         self.remote_ngram_order = int(
             os.environ.get("SGLANG_FLASHMTP_NGRAM_ORDER", "12")
@@ -2947,7 +2955,7 @@ class DTTargetController:
         )
 
     def _remote_ngram_cache_key(self, req: Req) -> int:
-        if not self.remote_ngram_context:
+        if not self.remote_ngram_context or not self.remote_ngram_prompt_affinity:
             return 0
         key = self._remote_ngram_cache_keys.get(req.rid)
         if key is None:

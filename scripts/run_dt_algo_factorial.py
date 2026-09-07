@@ -339,7 +339,7 @@ def validate_result(path: Path, args: argparse.Namespace, topology: str) -> dict
         "max_new_tokens": args.max_new_tokens,
         "seed": 0,
         "ignore_eos": True,
-        "prompts_sha256": PROMPTS_SHA256,
+        "prompts_sha256": args.prompts_sha256,
     }
     for key, value in expected.items():
         require(result.get(key) == value, f"result {key}: {result.get(key)!r} != {value!r}")
@@ -368,6 +368,7 @@ def validate_result(path: Path, args: argparse.Namespace, topology: str) -> dict
 def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
     topology = "baseline" if label.startswith("b") else "dt"
     algo = label.endswith("1")
+    budgeted_verify = algo if args.factor == "bundle" else True
     leg = args.output_dir / f"leg-{ordinal}-{label}"
     leg.mkdir()
     server_dir = leg / "servers"
@@ -384,7 +385,11 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
         "SPT_NOENV": "1",
         "TOKENIZERS_PARALLELISM": "false",
-        "SGLANG_FLASHMTP_BUDGETED_VERIFY": "1" if algo else "0",
+        "SGLANG_FLASHMTP_BUDGETED_VERIFY": "1" if budgeted_verify else "0",
+        "SGLANG_FLASHMTP_NGRAM_CORRECTION": "1" if algo else "0",
+        "SGLANG_FLASHMTP_NGRAM_PROMPT_AFFINITY": (
+            "1" if args.ngram_prompt_affinity else "0"
+        ),
     }
     if algo:
         env["SGLANG_FLASHMTP_NGRAM_HORIZON"] = str(args.ngram_horizon)
@@ -420,7 +425,7 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
     benchmark_argv = [
         str(PYTHON), "-m", "dt_benchmark",
         "--topology", topology,
-        "--prompts-file", str(PROMPTS),
+        "--prompts-file", str(args.prompts_file),
         "--output", str(result_path),
         "--global-concurrency", str(args.concurrency),
         "--routing-policy", "least-inflight",
@@ -436,6 +441,8 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
             "label": label,
             "topology": topology,
             "algorithm": algo,
+            "factor": args.factor,
+            "budgeted_verify": budgeted_verify,
             "launcher_argv": launcher_argv,
             "benchmark_argv": benchmark_argv,
             "environment": env,
@@ -486,7 +493,14 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
             fatal_audit(leg)
             audit = {"capture": capture, "metrics": metrics, "result": result}
             atomic_json(leg / "audit.json", audit)
-            return {"label": label, "topology": topology, "algorithm": algo, **result}
+            return {
+                "label": label,
+                "topology": topology,
+                "algorithm": algo,
+                "factor": args.factor,
+                "budgeted_verify": budgeted_verify,
+                **result,
+            }
     finally:
         if launcher is not None and identity is not None:
             stop_owned_launcher(launcher, identity)
@@ -498,7 +512,10 @@ def run_leg(args: argparse.Namespace, label: str, ordinal: int) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--prompts-file", type=Path, default=PROMPTS)
+    parser.add_argument("--require-unique-measurement-prompts", action="store_true")
     parser.add_argument("--schedule", default="b1,d1,b0,d0")
+    parser.add_argument("--factor", choices=("bundle", "ngram"), default="bundle")
     parser.add_argument("--concurrency", type=int, default=768)
     parser.add_argument("--measurement-requests", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=320)
@@ -510,6 +527,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ngram-max-entries", type=int, default=262144)
     parser.add_argument("--ngram-shared-probe-interval", type=int, default=1)
     parser.add_argument("--ngram-source-gated-from", type=int, default=0)
+    parser.add_argument("--ngram-prompt-affinity", action="store_true")
     parser.add_argument("--vocab-parallel-greedy", action="store_true")
     parser.add_argument("--enable-profile", action="store_true")
     parser.add_argument("--startup-timeout-s", type=float, default=1800)
@@ -538,7 +556,33 @@ def main() -> None:
     labels = [value.strip() for value in args.schedule.split(",") if value.strip()]
     require(labels and set(labels) <= {"b0", "b1", "d0", "d1"}, "bad schedule")
     require(not args.output_dir.exists(), "output directory already exists")
-    require(sha256(PROMPTS) == PROMPTS_SHA256, "prompt hash mismatch")
+    args.prompts_file = args.prompts_file.resolve()
+    require(args.prompts_file.is_file(), "prompts file does not exist")
+    args.prompts_sha256 = sha256(args.prompts_file)
+    if args.prompts_file == PROMPTS:
+        require(args.prompts_sha256 == PROMPTS_SHA256, "prompt hash mismatch")
+    prompts = json.loads(args.prompts_file.read_text(encoding="utf-8"))
+    require(
+        isinstance(prompts, list)
+        and prompts
+        and all(isinstance(prompt, str) and prompt for prompt in prompts),
+        "prompts file must be a non-empty JSON list of strings",
+    )
+    if args.require_unique_measurement_prompts:
+        warmup_requests = 32
+        measured = [
+            prompts[(warmup_requests + index) % len(prompts)]
+            for index in range(args.measurement_requests)
+        ]
+        warmup = [prompts[index % len(prompts)] for index in range(warmup_requests)]
+        require(
+            len(set(measured)) == args.measurement_requests,
+            "measurement prompts are not unique",
+        )
+        require(
+            set(warmup).isdisjoint(measured),
+            "warmup and measurement prompts overlap",
+        )
     wait_cold(timeout_s=1)
     args.output_dir.mkdir(parents=True)
     sglang_state = git_state(SGLANG, args.output_dir, "sglang")
@@ -548,13 +592,15 @@ def main() -> None:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "sglang": sglang_state,
         "runtime": runtime_state,
-        "prompts_sha256": PROMPTS_SHA256,
+        "prompts_file": str(args.prompts_file),
+        "prompts_sha256": args.prompts_sha256,
         "profile_sha256": sha256(PROFILE),
         "schedule": labels,
         "concurrency": args.concurrency,
         "measurement_requests": args.measurement_requests,
         "max_new_tokens": args.max_new_tokens,
         "thresholds": args.thresholds or None,
+        "factor": args.factor,
         "ngram_min_count": args.ngram_min_count,
         "ngram_min_sources": args.ngram_min_sources,
         "ngram_order": args.ngram_order,
@@ -562,6 +608,7 @@ def main() -> None:
         "ngram_max_entries": args.ngram_max_entries,
         "ngram_shared_probe_interval": args.ngram_shared_probe_interval,
         "ngram_source_gated_from": args.ngram_source_gated_from,
+        "ngram_prompt_affinity": args.ngram_prompt_affinity,
         "vocab_parallel_greedy": args.vocab_parallel_greedy,
     }
     atomic_json(args.output_dir / "provenance.json", provenance)
