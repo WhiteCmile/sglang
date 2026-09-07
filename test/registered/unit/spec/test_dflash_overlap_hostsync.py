@@ -264,6 +264,53 @@ class TestFilterBatchHostIndices(CustomTestCase):
         self.assertEqual(a.reserved_seq_lens_sum, b.reserved_seq_lens_sum)
         torch.testing.assert_close(a.future_indices, b.future_indices)
 
+    def test_chard_length_only_filter_tracks_candidate_rows(self):
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
+        info.chard_queue_lens = torch.tensor([8, 6, 4], dtype=torch.int32)
+        info.future_indices = torch.tensor([10, 11, 12], dtype=torch.int64)
+
+        info.filter_batch(new_indices=torch.tensor([0, 2]))
+
+        self.assertIsNone(info.chard_queue_tokens)
+        torch.testing.assert_close(
+            info.chard_queue_lens, torch.tensor([8, 4], dtype=torch.int32)
+        )
+
+    def test_chard_merge_preserves_lengths_without_local_queue_tokens(self):
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        def make(rows: int) -> DFlashDraftInputV2:
+            return DFlashDraftInputV2(
+                topk_p=torch.empty((rows, 0)),
+                topk_index=torch.empty((rows, 0), dtype=torch.int64),
+                bonus_tokens=torch.arange(rows, dtype=torch.int64),
+                new_seq_lens=torch.ones(rows, dtype=torch.int64),
+                hidden_states=torch.empty((rows, 2)),
+            )
+
+        remote = make(2)
+        remote.chard_queue_lens = torch.tensor([8, 6], dtype=torch.int32)
+        continuation = make(1)
+        continuation.chard_queue_tokens = torch.tensor(
+            [[101, 102, 103, 104]], dtype=torch.int64
+        )
+        continuation.chard_queue_lens = torch.tensor([4], dtype=torch.int32)
+
+        remote.merge_batch(continuation)
+
+        torch.testing.assert_close(
+            remote.chard_queue_tokens,
+            torch.tensor(
+                [[0, 0, 0, 0], [0, 0, 0, 0], [101, 102, 103, 104]],
+                dtype=torch.int64,
+            ),
+        )
+        torch.testing.assert_close(
+            remote.chard_queue_lens, torch.tensor([8, 6, 4], dtype=torch.int32)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

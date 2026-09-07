@@ -262,7 +262,7 @@ class DFlashDraftInputV2(SpecInput):
 
         if self.chard_queue_tokens is not None:
             self.chard_queue_tokens = self.chard_queue_tokens[new_indices]
-            assert self.chard_queue_lens is not None
+        if self.chard_queue_lens is not None:
             self.chard_queue_lens = self.chard_queue_lens[new_indices]
 
         if self.future_indices is not None:
@@ -326,31 +326,33 @@ class DFlashDraftInputV2(SpecInput):
                 [self.draft_tokens, spec_info.draft_tokens], dim=0
             )
 
+        self_rows = int(self.bonus_tokens.shape[0])
+        other_rows = int(spec_info.bonus_tokens.shape[0])
+        if self.chard_queue_tokens is not None and self.chard_queue_lens is None:
+            raise ValueError("CHARD queue tokens require queue lengths")
+        if (
+            spec_info.chard_queue_tokens is not None
+            and spec_info.chard_queue_lens is None
+        ):
+            raise ValueError("CHARD queue tokens require queue lengths")
+
+        # A DT READY batch has remote candidates plus queue lengths, but no
+        # local continuation-token tensor yet.  Keep the token and length
+        # fields independently row-aligned so filtering/merging that first
+        # wave does not lose its full-block queue length.
         if self.chard_queue_tokens is None and spec_info.chard_queue_tokens is not None:
             other_width = int(spec_info.chard_queue_tokens.shape[1])
-            self_rows = int(self.bonus_tokens.shape[0])
             self.chard_queue_tokens = torch.zeros(
                 (self_rows, other_width),
                 dtype=spec_info.chard_queue_tokens.dtype,
                 device=spec_info.chard_queue_tokens.device,
             )
-            self.chard_queue_lens = torch.zeros(
-                (self_rows,),
-                dtype=spec_info.chard_queue_lens.dtype,
-                device=spec_info.chard_queue_lens.device,
-            )
         if self.chard_queue_tokens is not None:
             if spec_info.chard_queue_tokens is None:
-                other_rows = int(spec_info.bonus_tokens.shape[0])
                 other_tokens = torch.zeros(
                     (other_rows, self.chard_queue_tokens.shape[1]),
                     dtype=self.chard_queue_tokens.dtype,
                     device=self.chard_queue_tokens.device,
-                )
-                other_lens = torch.zeros(
-                    (other_rows,),
-                    dtype=self.chard_queue_lens.dtype,
-                    device=self.chard_queue_lens.device,
                 )
             else:
                 if (
@@ -359,10 +361,25 @@ class DFlashDraftInputV2(SpecInput):
                 ):
                     raise ValueError("cannot merge CHARD queues with different widths")
                 other_tokens = spec_info.chard_queue_tokens
-                other_lens = spec_info.chard_queue_lens
             self.chard_queue_tokens = torch.cat(
                 [self.chard_queue_tokens, other_tokens], dim=0
             )
+
+        if self.chard_queue_lens is None and spec_info.chard_queue_lens is not None:
+            self.chard_queue_lens = torch.zeros(
+                (self_rows,),
+                dtype=spec_info.chard_queue_lens.dtype,
+                device=spec_info.chard_queue_lens.device,
+            )
+        if self.chard_queue_lens is not None:
+            if spec_info.chard_queue_lens is None:
+                other_lens = torch.zeros(
+                    (other_rows,),
+                    dtype=self.chard_queue_lens.dtype,
+                    device=self.chard_queue_lens.device,
+                )
+            else:
+                other_lens = spec_info.chard_queue_lens
             self.chard_queue_lens = torch.cat(
                 [self.chard_queue_lens, other_lens], dim=0
             )
