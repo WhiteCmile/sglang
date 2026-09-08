@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import time
+from array import array
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
@@ -16,19 +17,32 @@ from types import SimpleNamespace
 
 import torch
 from dt_client import RetryOutbox
+from dt_profile import cuda_sync_enabled
+from dt_profile import emit as profile_emit
+from dt_profile import enabled as profile_enabled
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.model_executor.model_runner import (
+    DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
+)
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_worker_common import build_draft_tp_worker
 from sglang.srt.speculative.flashmtp_utils import parse_flashmtp_draft_config
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.0005
 COALESCING_POLL_S = 0.0001
 CONTROL_RETRY_INTERVAL_NS = 50_000_000
+DT_DRAFT_GRAPH_MEASUREMENT_MARKER = "DT Draft graph measurement evidence: "
 
 
 @dataclass(slots=True)
@@ -55,6 +69,118 @@ class CapturedDraftBatch:
     bonus_tokens: torch.Tensor
     block_ids: torch.Tensor
     candidates: torch.Tensor
+
+
+@dataclass(slots=True)
+class PersistentDraftRequest:
+    """One Draft-owned request slot and its valid committed KV boundary."""
+
+    req: Req
+    target_instance_id: str
+    request_id: str
+    draft_kv_handle: str
+    valid_committed_len: int
+    last_round_id: int
+    proposal_base_len: int
+
+
+STANDALONE_DRAFT_DECODE_GRAPH_BATCH_SIZES = (
+    1,
+    2,
+    4,
+    8,
+    12,
+    16,
+    24,
+    32,
+    40,
+    48,
+    56,
+    64,
+    72,
+    80,
+    88,
+    96,
+    104,
+    112,
+    120,
+    128,
+)
+STANDALONE_DRAFT_PREFILL_GRAPH_BATCH_SIZES = (
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32,
+    48,
+    64,
+    80,
+    96,
+    112,
+    128,
+    144,
+    160,
+    176,
+    192,
+    208,
+    224,
+    240,
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512,
+    576,
+    640,
+    704,
+    768,
+    832,
+    896,
+    960,
+    1024,
+    1280,
+    1536,
+    1792,
+    2048,
+    2304,
+    2560,
+    2816,
+    3072,
+    3328,
+    3584,
+    3840,
+    4096,
+    4608,
+    5120,
+    5632,
+    6144,
+    6656,
+    7168,
+    7680,
+    8192,
+)
+
+
+def standalone_draft_decode_graph_batch_sizes(
+    max_batch_size: int,
+) -> tuple[int, ...]:
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive")
+    sizes = [
+        size
+        for size in STANDALONE_DRAFT_DECODE_GRAPH_BATCH_SIZES
+        if size <= max_batch_size
+    ]
+    if max_batch_size not in sizes:
+        sizes.append(max_batch_size)
+    return tuple(sizes)
 
 
 def draft_cuda_graph_batch_sizes(max_batch_size: int) -> tuple[int, ...]:
@@ -258,7 +384,7 @@ def target_major(tasks: list[PendingDraftTask]) -> list[PendingDraftTask]:
 
 
 class FlashMTPDraftEngine:
-    """One-GPU FlashMTP engine with an independent continuous batch queue."""
+    """One-GPU DT engine with the existing independent continuous batch queue."""
 
     def __init__(
         self,
@@ -306,6 +432,11 @@ class FlashMTPDraftEngine:
         self.EntryStatus = EntryStatus
         self.instance_id = instance_id
         self.profile = load_draft_profile(profile_path)
+        if self.profile.method not in {"flashmtp", "standalone"}:
+            raise ValueError(
+                "DT Draft engine supports FlashMTP V1 and STANDALONE V2 only"
+            )
+        self._persistent = self.profile.method == "standalone"
         self.gpu_id = gpu_id
         self.max_pending_tasks = max_pending_tasks
         self.max_batch_size = max_batch_size
@@ -319,6 +450,7 @@ class FlashMTPDraftEngine:
         self._pending_ids: set[str] = set()
         self._received_ns_by_transfer: dict[str, int] = {}
         self._cancelled_ids: set[str] = set()
+        self._persistent_requests: dict[str, PersistentDraftRequest] = {}
         self._source_stores: dict[str, object] = {}
         self._published_by_batch: dict[str, PublishedResult] = {}
         self._published_by_range: dict[tuple[int, int, int, int], str] = {}
@@ -330,6 +462,7 @@ class FlashMTPDraftEngine:
         self._result_sequence = 0
         self._source_done_sequence = 0
         self._stop = False
+        self._graph_measurement_counts: dict[tuple[str, str], list[int]] = {}
 
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id)
         cleanup_stale_slot_files(Path(data_dir), instance_id=safe_id, kind="results")
@@ -369,7 +502,7 @@ class FlashMTPDraftEngine:
     def _initialize_pivot_staging(self) -> None:
         self._pivot_host_staging = None
         self._pivot_host_views = ()
-        if not self.pinned_pivot_staging:
+        if self._persistent or not self.pinned_pivot_staging:
             return
         self._pivot_host_staging = torch.empty(
             (self.max_batch_size, self._pivot_width),
@@ -394,6 +527,13 @@ class FlashMTPDraftEngine:
         mem_fraction_static: float,
         disable_cuda_graph: bool,
     ) -> None:
+        if self._persistent:
+            self._initialize_standalone_model(
+                nccl_port=nccl_port,
+                mem_fraction_static=mem_fraction_static,
+                disable_cuda_graph=disable_cuda_graph,
+            )
+            return
         server_args_kwargs = {
             "model_path": self.profile.target_model_path,
             "tokenizer_path": self.profile.target_model_path,
@@ -499,6 +639,107 @@ class FlashMTPDraftEngine:
             self._draft_cuda_graph is not None,
         )
 
+    def _initialize_standalone_model(
+        self,
+        *,
+        nccl_port: int,
+        mem_fraction_static: float,
+        disable_cuda_graph: bool,
+    ) -> None:
+        # The external Draft is an independent causal-LM worker, not an
+        # in-process speculative sub-worker.  Giving it the Draft checkpoint
+        # as its primary model lets the normal worker path size and own its KV
+        # pools; proposal construction is driven explicitly below.
+        server_args_kwargs = {
+            "model_path": self.profile.draft_model_path,
+            "tokenizer_path": self.profile.target_model_path,
+            "skip_tokenizer_init": True,
+            "trust_remote_code": True,
+            "device": "cuda",
+            "dtype": self.profile.draft_dtype,
+            "tp_size": 1,
+            "pp_size": 1,
+            "mem_fraction_static": mem_fraction_static,
+            "page_size": 1,
+            "disable_overlap_schedule": True,
+            # The persistent Draft builds ordinary SGLang ScheduleBatch inputs,
+            # so its extend/decode forwards can reuse the production graph
+            # runners. Freeze the H800 production backends and bounds; SGLang
+            # resolves the exact bucket lists from this source revision.
+            "disable_cuda_graph": disable_cuda_graph,
+            "cuda_graph_config": {
+                "decode": {
+                    "backend": "full",
+                    "max_bs": self.max_batch_size,
+                    "bs": list(
+                        standalone_draft_decode_graph_batch_sizes(
+                            self.max_batch_size
+                        )
+                    ),
+                },
+                "prefill": {
+                    "backend": "breakable",
+                    "max_bs": 8192,
+                    "bs": list(STANDALONE_DRAFT_PREFILL_GRAPH_BATCH_SIZES),
+                },
+            },
+            "max_running_requests": self.max_pending_tasks,
+        }
+        if self.enable_deterministic_inference:
+            server_args_kwargs["enable_deterministic_inference"] = True
+        server_args = ServerArgs(**server_args_kwargs)
+        get_context().set_server_args(server_args)
+        parallel_state = ParallelState.trivial(gpu_id=self.gpu_id)
+        torch.get_device_module(server_args.device).set_device(self.gpu_id)
+        self._draft_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=self.gpu_id,
+            ps=parallel_state,
+            nccl_port=nccl_port,
+            is_draft_worker=False,
+        )
+        self._draft_model_runner = self._draft_worker.model_runner
+        self._draft_model = self._draft_model_runner.model
+        self.device = self._draft_model_runner.device
+        self._draft_worker.alloc_memory_pool()
+        self.max_pending_tasks = min(
+            self.max_pending_tasks,
+            int(self._draft_model_runner.max_running_requests),
+        )
+        self._client.max_pending_tasks = self.max_pending_tasks
+        self._draft_worker.init_attention_backends()
+        # This installs the eager runner objects when graphs are disabled.
+        self._draft_worker.init_cuda_graphs()
+        if (
+            int(self._draft_model_runner.model_config.vocab_size)
+            != self.profile.vocab_size
+        ):
+            raise ValueError(
+                "STANDALONE Draft vocabulary does not match the configured profile"
+            )
+        self._tree_cache = ChunkCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=self._draft_model_runner.req_to_token_pool,
+                token_to_kv_pool_allocator=(
+                    self._draft_model_runner.token_to_kv_pool_allocator
+                ),
+                page_size=self._draft_model_runner.server_args.page_size,
+            )
+        )
+        self._pivot_width = 0
+        self._draft_cuda_graph = None
+        logger.info(
+            "DT STANDALONE Draft ready: instance=%s profile=%s block=%d "
+            "max_requests=%d cuda_graph=%s resolved_cuda_graph=%s",
+            self.instance_id,
+            self.profile.profile_id,
+            self.profile.block_size,
+            self.max_pending_tasks,
+            not disable_cuda_graph,
+            server_args.cuda_graph_config,
+        )
+
     def _load_target_embedding(self, model_path: str) -> torch.nn.Embedding:
         from safetensors import safe_open
 
@@ -537,6 +778,8 @@ class FlashMTPDraftEngine:
         self._stop = True
 
     def close(self) -> None:
+        for draft_kv_handle in tuple(self._persistent_requests):
+            self._release_persistent_request(draft_kv_handle)
         for store in self._source_stores.values():
             store.close()
         self._source_stores.clear()
@@ -549,6 +792,7 @@ class FlashMTPDraftEngine:
             CancelTransfers,
             ControlAck,
             DraftDispatchBatch,
+            DraftRequestRelease,
             ErrorMessage,
             PullDone,
             ResultBatchAck,
@@ -569,6 +813,22 @@ class FlashMTPDraftEngine:
                     transfer_id
                     for transfer_id in message.transfer_ids
                     if transfer_id not in published_ids
+                )
+                capacity_changed = True
+            elif isinstance(message, DraftRequestRelease):
+                if message.draft_instance_id != self.instance_id:
+                    raise ValueError("DraftRequestRelease belongs to another Draft")
+                # A shutdown/abort release can overtake local execution of an
+                # already-dispatched task.  Cancel matching queued work before
+                # freeing the row so bootstrap cannot recreate it afterward.
+                self._cancelled_ids.update(
+                    task.transfer_id
+                    for task in self._pending
+                    if task.draft_kv_handle == message.draft_kv_handle
+                    and task.request_id == message.request_id
+                )
+                self._release_persistent_request(
+                    message.draft_kv_handle, request_id=message.request_id
                 )
                 capacity_changed = True
             elif isinstance(message, ResultBatchAck):
@@ -660,6 +920,8 @@ class FlashMTPDraftEngine:
         # The result publisher needs rows grouped by Target. Sort before direct
         # mmap reads so pinned staging is already laid out in publish order.
         queued = target_major(queued)
+        if self._persistent:
+            return queued
         pinned_staging = self._pivot_host_staging
         tasks: list[PendingDraftTask] = []
         for item in queued:
@@ -706,6 +968,9 @@ class FlashMTPDraftEngine:
 
     @torch.inference_mode()
     def _execute_batch(self, pending: list[PendingDraftTask]) -> None:
+        if self._persistent:
+            self._execute_standalone_batch(pending)
+            return
         tasks = [item.task for item in pending]
         batch_size = len(tasks)
         if self._pivot_host_staging is None:
@@ -776,6 +1041,321 @@ class FlashMTPDraftEngine:
         candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
         self._publish_successes(tasks, candidate_bytes)
         self._publish_capacity()
+
+    def _execute_standalone_batch(self, pending: list[PendingDraftTask]) -> None:
+        batch_start_ns = time.monotonic_ns()
+        sync_profile = profile_enabled() and cuda_sync_enabled()
+        tasks = [item.task for item in pending]
+        states: list[PersistentDraftRequest] = []
+        prepare_done_ns = batch_start_ns
+        extend_done_ns = batch_start_ns
+        decode_done_ns: list[int] = []
+        extend_cuda_graph = False
+        decode_graph_replays = 0
+        try:
+            states = [self._prepare_persistent_task(task) for task in tasks]
+            batch = ScheduleBatch.init_new(
+                reqs=[state.req for state in states],
+                req_to_token_pool=self._draft_model_runner.req_to_token_pool,
+                token_to_kv_pool_allocator=(
+                    self._draft_model_runner.token_to_kv_pool_allocator
+                ),
+                tree_cache=self._tree_cache,
+                model_config=self._draft_model_runner.model_config,
+                enable_overlap=False,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+            )
+            batch.prepare_for_extend()
+            self._resolve_prefill_inputs(batch)
+            prepare_done_ns = time.monotonic_ns()
+            extend_result = self._draft_worker.forward_batch_generation(batch)
+            next_tokens = extend_result.next_token_ids
+            extend_cuda_graph = bool(extend_result.can_run_cuda_graph)
+            extend_measurement_event_id = (
+                self._draft_model_runner._last_cuda_graph_measurement_event_id
+            )
+            if sync_profile:
+                torch.get_device_module(self.device).synchronize()
+            extend_done_ns = time.monotonic_ns()
+            proposals = [next_tokens]
+            proposal_measurement_event_id = None
+            for _ in range(1, self.profile.draft_k):
+                batch.input_ids = next_tokens.to(torch.int64)
+                batch.prepare_for_decode()
+                decode_result = self._draft_worker.forward_batch_generation(batch)
+                next_tokens = decode_result.next_token_ids
+                decode_graph_replays += int(decode_result.can_run_cuda_graph)
+                proposal_measurement_event_id = (
+                    self._draft_model_runner._last_cuda_graph_measurement_event_id
+                )
+                if sync_profile:
+                    torch.get_device_module(self.device).synchronize()
+                decode_done_ns.append(time.monotonic_ns())
+                proposals.append(next_tokens)
+
+            measurement_tasks = [
+                task
+                for task in tasks
+                if task.request_id.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+            ]
+            measurement_reconcile = sum(
+                task.round_id > 0 for task in measurement_tasks
+            )
+            measurement_bootstrap = len(measurement_tasks) - measurement_reconcile
+            if measurement_bootstrap:
+                self._record_graph_measurement(
+                    path="bootstrap_prefill",
+                    execution="graph" if extend_cuda_graph else "eager",
+                    measurement_rows=measurement_bootstrap,
+                    measurement_batch_rows=len(measurement_tasks),
+                    batch_size=len(tasks),
+                    model_runner_event_id=extend_measurement_event_id,
+                )
+            if measurement_reconcile:
+                self._record_graph_measurement(
+                    path="reconcile_prefill",
+                    execution="graph" if extend_cuda_graph else "eager",
+                    measurement_rows=measurement_reconcile,
+                    measurement_batch_rows=len(measurement_tasks),
+                    batch_size=len(tasks),
+                    model_runner_event_id=extend_measurement_event_id,
+                )
+            if measurement_tasks:
+                expected_decode_replays = max(self.profile.draft_k - 1, 0)
+                if decode_graph_replays == expected_decode_replays:
+                    decode_execution = "graph"
+                elif decode_graph_replays == 0:
+                    decode_execution = "eager"
+                else:
+                    decode_execution = "mixed"
+                self._record_graph_measurement(
+                    path="proposal_decode",
+                    execution=decode_execution,
+                    measurement_rows=len(measurement_tasks),
+                    measurement_batch_rows=len(measurement_tasks),
+                    batch_size=len(tasks),
+                    model_runner_event_id=proposal_measurement_event_id,
+                    graph_replays=decode_graph_replays,
+                    expected_graph_replays=expected_decode_replays,
+                )
+
+            roots = torch.tensor(
+                [task.committed_token_ids[-1] for task in tasks],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            candidates = torch.stack([roots, *proposals], dim=1).to(torch.int32)
+            if tuple(candidates.shape) != (len(tasks), self.profile.block_size):
+                raise RuntimeError(
+                    "STANDALONE proposal shape does not match profile block size"
+                )
+            for state in states:
+                # Ordinary decode accounts proposal inputs as committed.  They
+                # remain physically allocated until reconciliation, but the
+                # stable logical boundary is exactly the Target commit.
+                state.req.kv_committed_len = state.valid_committed_len
+                state.proposal_base_len = state.valid_committed_len
+                logger.debug(
+                    "DT Draft proposal ready: request=%s round=%d committed=%d "
+                    "allocated=%d",
+                    state.request_id,
+                    state.last_round_id,
+                    state.valid_committed_len,
+                    state.req.kv.kv_allocated_len,
+                )
+            candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
+        except Exception as exc:
+            logger.exception("failed DT STANDALONE batch")
+            for task in tasks:
+                self._release_persistent_request(task.draft_kv_handle)
+            self._publish_failures([(task, exc) for task in tasks])
+        else:
+            self._publish_successes(tasks, candidate_bytes)
+        finished_ns = time.monotonic_ns()
+        decode_durations_ns = []
+        previous_ns = extend_done_ns
+        for done_ns in decode_done_ns:
+            decode_durations_ns.append(done_ns - previous_ns)
+            previous_ns = done_ns
+        profile_emit(
+            "draft_standalone_batch",
+            batch_size=len(tasks),
+            bootstrap_count=sum(task.round_id == 0 for task in tasks),
+            reconcile_count=sum(task.round_id > 0 for task in tasks),
+            extend_cuda_graph=extend_cuda_graph,
+            decode_graph_replays=decode_graph_replays,
+            prepare_ns=prepare_done_ns - batch_start_ns,
+            extend_ns=extend_done_ns - prepare_done_ns,
+            decode_ns=decode_durations_ns,
+            publish_ns=finished_ns - previous_ns,
+            total_ns=finished_ns - batch_start_ns,
+        )
+        self._publish_capacity()
+
+    def _record_graph_measurement(
+        self,
+        *,
+        path: str,
+        execution: str,
+        measurement_rows: int,
+        measurement_batch_rows: int,
+        batch_size: int,
+        model_runner_event_id: int | None = None,
+        graph_replays: int | None = None,
+        expected_graph_replays: int | None = None,
+    ) -> None:
+        key = (path, execution)
+        counts = self._graph_measurement_counts.setdefault(key, [0, 0])
+        counts[0] += 1
+        counts[1] += measurement_rows
+        if execution == "graph" and counts[0] & (counts[0] - 1):
+            return
+        payload = {
+            "draft_instance": self.instance_id,
+            "path": path,
+            "execution": execution,
+            "fallback_reason": (
+                None if execution == "graph" else "model_runner_reported"
+            ),
+            "batches": counts[0],
+            "measurement_rows": counts[1],
+            "measurement_batch_rows": measurement_batch_rows,
+            "batch_size": batch_size,
+            "model_runner_event_namespace": "model_runner",
+            "model_runner_event_id": model_runner_event_id,
+            "graph_replays": graph_replays,
+            "expected_graph_replays": expected_graph_replays,
+        }
+        logger.info(
+            "%s%s",
+            DT_DRAFT_GRAPH_MEASUREMENT_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    @staticmethod
+    def _resolve_prefill_inputs(batch: ScheduleBatch) -> None:
+        if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+
+    def _prepare_persistent_task(self, task) -> PersistentDraftRequest:
+        from dt_protocol import DraftTaskKind
+
+        if task.kind == DraftTaskKind.BOOTSTRAP:
+            if task.draft_kv_handle in self._persistent_requests:
+                raise ValueError("Draft bootstrap KV handle already exists")
+            req = Req(
+                rid=task.request_id,
+                origin_input_text="",
+                origin_input_ids=array("q", task.committed_token_ids),
+                sampling_params=SamplingParams(
+                    temperature=0, max_new_tokens=self.profile.draft_k
+                ),
+            )
+            req.full_untruncated_fill_ids = req.origin_input_ids
+            req.logprob_start_len = -1
+            req.set_extend_range(0, task.committed_kv_len)
+            state = PersistentDraftRequest(
+                req=req,
+                target_instance_id=task.target_instance_id,
+                request_id=task.request_id,
+                draft_kv_handle=task.draft_kv_handle,
+                valid_committed_len=task.committed_kv_len,
+                last_round_id=task.round_id,
+                proposal_base_len=task.committed_kv_len,
+            )
+            self._persistent_requests[task.draft_kv_handle] = state
+            return state
+
+        state = self._persistent_requests.get(task.draft_kv_handle)
+        if state is None:
+            raise ValueError("Draft reconcile KV handle does not exist")
+        if (
+            state.request_id != task.request_id
+            or state.target_instance_id != task.target_instance_id
+        ):
+            raise ValueError("Draft reconcile request identity does not match KV owner")
+        if task.round_id != state.last_round_id + 1:
+            raise ValueError("Draft reconcile round is not the next request round")
+        if state.proposal_base_len != state.valid_committed_len:
+            raise RuntimeError("Draft proposal base diverged from committed boundary")
+        if not task.committed_token_ids:
+            raise ValueError("Draft reconcile requires a non-empty committed delta")
+        expected_len = state.valid_committed_len + len(task.committed_token_ids)
+        if task.committed_kv_len != expected_len:
+            raise ValueError("Draft reconcile delta does not end at committed length")
+
+        req = state.req
+        if req.kv is None or req.req_pool_idx is None:
+            raise RuntimeError("Draft reconcile lost its persistent KV handle")
+        old_allocated_len = req.kv.kv_allocated_len
+        if old_allocated_len < state.valid_committed_len:
+            raise RuntimeError("Draft allocated KV is shorter than committed prefix")
+        self._free_persistent_kv_suffix(
+            req, state.valid_committed_len, old_allocated_len
+        )
+        logger.debug(
+            "DT Draft reconcile: request=%s round=%d stable=%d discarded=%d "
+            "refill=%d committed=%d",
+            state.request_id,
+            task.round_id,
+            state.valid_committed_len,
+            old_allocated_len - state.valid_committed_len,
+            len(task.committed_token_ids),
+            task.committed_kv_len,
+        )
+        req.kv.kv_allocated_len = state.valid_committed_len
+        req.kv_committed_len = state.valid_committed_len
+        req.prefix_indices = self._draft_model_runner.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : state.valid_committed_len
+        ].to(torch.int64)
+        req.output_ids.extend(task.committed_token_ids)
+        req._refresh_fill_ids()
+        req.set_extend_range(state.valid_committed_len, task.committed_kv_len)
+        state.valid_committed_len = task.committed_kv_len
+        state.proposal_base_len = task.committed_kv_len
+        state.last_round_id = task.round_id
+        return state
+
+    def _release_persistent_request(
+        self, draft_kv_handle: str, *, request_id: str | None = None
+    ) -> None:
+        state = self._persistent_requests.pop(draft_kv_handle, None)
+        if state is None:
+            return
+        if request_id is not None and state.request_id != request_id:
+            self._persistent_requests[draft_kv_handle] = state
+            raise ValueError("Draft release request identity does not match KV owner")
+        req = state.req
+        if req.kv is not None:
+            if req.req_pool_idx is None:
+                raise RuntimeError("Draft KV exists without a request-pool handle")
+            self._free_persistent_kv_suffix(req, 0, req.kv.kv_allocated_len)
+            req.kv = None
+        if req.req_pool_idx is not None:
+            self._draft_model_runner.req_to_token_pool.free(req)
+        logger.debug(
+            "DT Draft released persistent KV: request=%s handle=%s",
+            state.request_id,
+            state.draft_kv_handle,
+        )
+
+    def _free_persistent_kv_suffix(self, req: Req, start: int, end: int) -> None:
+        """Free an intentionally uncommitted proposal suffix from Draft KV."""
+        if not 0 <= start <= end:
+            raise ValueError("invalid persistent Draft KV suffix")
+        if self._draft_model_runner.server_args.page_size != 1:
+            raise RuntimeError("DT STANDALONE milestone 1 requires page_size == 1")
+        if start == end:
+            return
+        indices = self._draft_model_runner.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start:end
+        ]
+        self._draft_model_runner.token_to_kv_pool_allocator.free_segment(
+            indices, start_pos=start
+        )
 
     def _publish_successes(self, tasks: list[object], candidate_bytes: bytes) -> None:
         from dt_protocol import (
@@ -911,11 +1491,39 @@ class FlashMTPDraftEngine:
         return store
 
     def _validate_task(self, task) -> None:
+        from dt_protocol import DraftTaskKind
+
         source = task.source
         if task.draft_profile_id != self.profile.profile_id:
             raise ValueError("Draft task profile mismatch")
         if task.k != self.profile.draft_k:
             raise ValueError("Draft task k mismatch")
+        if self._persistent:
+            if task.kind not in {
+                DraftTaskKind.BOOTSTRAP,
+                DraftTaskKind.RECONCILE,
+            }:
+                raise ValueError("STANDALONE Draft requires a persistent task kind")
+            if source is not None:
+                raise ValueError("STANDALONE Draft does not accept Target features")
+            if not task.draft_kv_handle:
+                raise ValueError("STANDALONE Draft task requires a KV handle")
+            if not task.committed_token_ids:
+                raise ValueError("STANDALONE Draft task requires committed token IDs")
+            if task.committed_token_ids[-1] != task.next_token_id:
+                raise ValueError(
+                    "STANDALONE committed token delta must end in next_token_id"
+                )
+            if any(
+                token_id < 0 or token_id >= self.profile.vocab_size
+                for token_id in task.committed_token_ids
+            ):
+                raise ValueError("STANDALONE committed token ID is outside vocabulary")
+            return
+        if task.kind != DraftTaskKind.PROPOSE:
+            raise ValueError("FlashMTP V1 accepts only pivot proposal tasks")
+        if source is None:
+            raise ValueError("FlashMTP V1 requires a Target feature source")
         if source.feature_schema_id != self.profile.feature_schema.schema_id:
             raise ValueError("Draft task feature schema mismatch")
         expected_nbytes = self._pivot_width * 2
@@ -935,7 +1543,8 @@ class FlashMTPDraftEngine:
                 self._pending_ids.discard(task.transfer_id)
                 self._cancelled_ids.discard(task.transfer_id)
                 self._received_ns_by_transfer.pop(task.transfer_id, None)
-                self._publish_source_done(task)
+                if not self._persistent:
+                    self._publish_source_done(task)
             else:
                 kept.append(task)
         self._pending = kept
@@ -1087,7 +1696,7 @@ class FlashMTPDraftEngine:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SGLang DT FlashMTP Draft engine")
+    parser = argparse.ArgumentParser(description="SGLang external DT Draft engine")
     parser.add_argument("--coordinator-endpoint", required=True)
     parser.add_argument("--instance-id", required=True)
     parser.add_argument("--profile", required=True)

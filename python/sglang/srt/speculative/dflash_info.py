@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -67,6 +69,8 @@ class DFlashVerifyInput(SpecInput):
         metadata or eager attention metadata so the actual forward can run with
         `skip_attn_backend_init=True`.
         """
+        profile = bool(os.environ.get("DT_PROFILE_DIR"))
+        started_ns = time.monotonic_ns()
         batch.input_ids = self.draft_token
         batch.spec_info = self
         batch.forward_mode = (
@@ -80,6 +84,13 @@ class DFlashVerifyInput(SpecInput):
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
         )
+        pipeline_lane_ids = {
+            getattr(req, "dt_pipeline_lane_id", None) for req in batch.reqs
+        }
+        verify_forward_batch.dt_pipeline_lane_id = (
+            pipeline_lane_ids.pop() if len(pipeline_lane_ids) == 1 else None
+        )
+        initialized_ns = time.monotonic_ns()
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
@@ -87,6 +98,7 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
+        admitted_ns = time.monotonic_ns()
         if can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
@@ -94,6 +106,17 @@ class DFlashVerifyInput(SpecInput):
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
+            )
+        if profile:
+            from dt_profile import emit as profile_emit
+
+            profile_emit(
+                "target_verify_prepare",
+                batch_size=verify_forward_batch.batch_size,
+                init_new_ns=initialized_ns - started_ns,
+                admission_ns=admitted_ns - initialized_ns,
+                load_batch_ns=time.monotonic_ns() - admitted_ns,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
 
         return verify_forward_batch, can_run_cuda_graph

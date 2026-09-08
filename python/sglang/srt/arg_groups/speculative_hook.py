@@ -688,7 +688,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     )
 
     if (
-        server_args.speculative_algorithm == "STANDALONE"
+        server_args.speculative_algorithm in ("STANDALONE", "STANDALONE_DT")
         and resolved_view(server_args).enable_dp_attention
     ):
         # TODO: support dp attention for standalone speculative decoding
@@ -823,6 +823,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
+    if (
+        server_args.speculative_algorithm == "STANDALONE_DT"
+        and server_args.draft_target_disaggregation_role is None
+    ):
+        raise ValueError("STANDALONE_DT is internal to the disaggregated Target role")
+    if server_args.speculative_algorithm in ("STANDALONE", "STANDALONE_DT") and (
+        server_args.draft_target_disaggregation_role is not None
+    ):
+        _validate_standalone_draft_target(server_args)
+
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
@@ -837,6 +847,62 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
+        )
+
+
+def _validate_standalone_draft_target(server_args: ServerArgs) -> None:
+    """Validate the milestone-1 token-only Target role.
+
+    The external Draft engine is launched separately, so this SGLang process
+    must not construct a local Draft worker or opt into unsupported overlap or
+    multi-DP ownership.
+    """
+    if server_args.draft_target_disaggregation_role != "target":
+        raise ValueError(
+            "--draft-target-disaggregation-role currently accepts only target"
+        )
+    if server_args.dp_size != 1:
+        raise ValueError(
+            "disaggregated STANDALONE V2 milestone 1 requires dp_size == 1"
+        )
+    if not server_args.disable_overlap_schedule:
+        raise ValueError(
+            "disaggregated STANDALONE V2 milestone 1 requires "
+            "--disable-overlap-schedule"
+        )
+    if server_args.draft_target_overlap_schedule:
+        raise ValueError(
+            "disaggregated STANDALONE V2 milestone 1 does not support Target "
+            "overlap scheduling"
+        )
+    missing = [
+        flag
+        for flag, value in (
+            (
+                "--draft-target-coordinator-endpoint",
+                server_args.draft_target_coordinator_endpoint,
+            ),
+            ("--draft-target-instance-id", server_args.draft_target_instance_id),
+            ("--draft-target-profile-id", server_args.draft_target_profile_id),
+            (
+                "--draft-target-feature-schema-id",
+                server_args.draft_target_feature_schema_id,
+            ),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "disaggregated STANDALONE Target requires " + ", ".join(missing)
+        )
+    if server_args.draft_target_round_timeout_ms <= 0:
+        raise ValueError("--draft-target-round-timeout-ms must be positive")
+    if server_args.draft_target_registration_timeout_s <= 0:
+        raise ValueError("--draft-target-registration-timeout-s must be positive")
+    if server_args.speculative_eagle_topk != 1:
+        raise ValueError(
+            "disaggregated STANDALONE V2 milestone 1 requires "
+            "--speculative-eagle-topk=1"
         )
 
 
@@ -957,7 +1023,7 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if server_args.speculative_algorithm == "STANDALONE":
+    if server_args.speculative_algorithm in ("STANDALONE", "STANDALONE_DT"):
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)

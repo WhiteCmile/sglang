@@ -2810,13 +2810,6 @@ class Scheduler(
         dt_ready_batch_size = 0
         if self.dt_target_controller is not None:
             self.dt_target_controller.detach_parked_requests(running_batch)
-            ready_batch = self.dt_target_controller.build_ready_batch()
-            if ready_batch is not None:
-                dt_ready_batch_size = ready_batch.batch_size()
-                if running_batch.is_empty():
-                    running_batch = ready_batch
-                else:
-                    running_batch.merge_batch(ready_batch)
             for failed in self.dt_target_controller.pop_failures():
                 prepare_abort(failed.req, f"Remote Draft failed: {failed.failure}")
                 release_kv_cache(failed.req, self.tree_cache, is_insert=False)
@@ -2907,6 +2900,16 @@ class Scheduler(
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
+
+        if self.dt_target_controller is not None and running_batch.is_empty():
+            # Reconcile the previous prefill result above before admitting a
+            # completed Draft lane.  Injecting the lane earlier lets the
+            # previous prefill batch merge into it, producing a mixed verify
+            # wave with no authoritative pipeline-lane identity.
+            ready_batch = self.dt_target_controller.build_ready_batch()
+            if ready_batch is not None:
+                dt_ready_batch_size = ready_batch.batch_size()
+                running_batch = ready_batch
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3317,6 +3320,11 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            if self.dt_target_controller is not None:
+                self.dt_target_controller.cleanup_running_after_oom(
+                    retracted_reqs=retracted_reqs,
+                    aborted_reqs=reqs_to_abort,
+                )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (

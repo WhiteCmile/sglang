@@ -1400,6 +1400,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL
                     if self.model_runner.is_draft_worker
+                    or self.model_runner.spec_algorithm.is_standalone_dt()
                     else CaptureHiddenMode.FULL
                 ),
                 ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
