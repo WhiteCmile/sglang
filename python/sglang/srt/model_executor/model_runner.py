@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -228,6 +229,8 @@ elif current_platform.is_out_of_tree():
 
 
 logger = logging.getLogger(__name__)
+DT_BENCHMARK_MEASUREMENT_RID_PREFIX = "dt-benchmark-measurement-"
+CUDA_GRAPH_MEASUREMENT_MARKER = "CUDA graph measurement evidence: "
 
 
 @dataclass
@@ -290,6 +293,12 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        self._cuda_graph_replay_modes_observed: set[object] = set()
+        self._cuda_graph_measurement_counts: dict[
+            tuple[str, str, str, int | None], list[int]
+        ] = {}
+        self._cuda_graph_measurement_event_seq = 0
+        self._last_cuda_graph_measurement_event_id: int | None = None
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -919,6 +928,34 @@ class ModelRunner:
         self.prefill_cuda_graph_runner = capture.prefill_runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_mem_usage = capture.decode.graph_mem_usage
+        config = self.server_args.cuda_graph_config
+        resolved = {
+            "worker": {
+                "role": "draft" if self.is_draft_worker else "target",
+                "tp_rank": self.ps.tp_rank,
+                "tp_size": self.ps.tp_size,
+                "pp_rank": self.ps.pp_rank,
+                "pp_size": self.ps.pp_size,
+            },
+            "capture_decode_cuda_graph": capture_decode_cuda_graph,
+            "config": {
+                "decode": {
+                    "backend": config.decode.backend,
+                    "max_bs": config.decode.max_bs,
+                    "bs": config.decode.bs,
+                },
+                "prefill": {
+                    "backend": config.prefill.backend,
+                    "max_bs": config.prefill.max_bs,
+                    "bs": config.prefill.bs,
+                },
+                "padding": not self.server_args.disable_cuda_graph_padding,
+            },
+        }
+        logger.info(
+            "CUDA graph resolved config: %s",
+            json.dumps(resolved, sort_keys=True, separators=(",", ":")),
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1513,6 +1550,10 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                self._log_cuda_graph_replay_once(forward_batch)
+                self._record_cuda_graph_measurement(
+                    forward_batch, execution="graph"
+                )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1563,8 +1604,17 @@ class ModelRunner:
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
+                self._log_cuda_graph_replay_once(forward_batch)
+                self._record_cuda_graph_measurement(
+                    forward_batch, execution="graph"
+                )
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
+                self._record_cuda_graph_measurement(
+                    forward_batch,
+                    execution="eager",
+                    fallback_reason=self._cuda_graph_fallback_reason(forward_batch),
+                )
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
@@ -1576,6 +1626,99 @@ class ModelRunner:
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+    def _log_cuda_graph_replay_once(self, forward_batch: ForwardBatch) -> None:
+        mode = forward_batch.forward_mode
+        if mode in self._cuda_graph_replay_modes_observed:
+            return
+        self._cuda_graph_replay_modes_observed.add(mode)
+        logger.info(
+            "CUDA graph replay observed: mode=%s batch_size=%d",
+            mode.name,
+            forward_batch.batch_size,
+        )
+
+    def _record_cuda_graph_measurement(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        execution: str,
+        fallback_reason: str = "",
+    ) -> None:
+        self._last_cuda_graph_measurement_event_id = None
+        measurement_rows = sum(
+            rid.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+            for rid in (forward_batch.rids or ())
+        )
+        if not measurement_rows:
+            return
+        self._cuda_graph_measurement_event_seq += 1
+        event_id = self._cuda_graph_measurement_event_seq
+        self._last_cuda_graph_measurement_event_id = event_id
+        mode = forward_batch.forward_mode.name
+        pipeline_lane_id = getattr(forward_batch, "dt_pipeline_lane_id", None)
+        key = (mode, execution, fallback_reason, pipeline_lane_id)
+        counts = self._cuda_graph_measurement_counts.setdefault(key, [0, 0])
+        counts[0] += 1
+        counts[1] += measurement_rows
+        # Graph replay uses logarithmic sampling. Fallbacks are exceptional and
+        # are all emitted so the admission audit can link each one to its exact
+        # forward and validate the reported shape-dependent reason.
+        if execution == "graph" and counts[0] & (counts[0] - 1):
+            return
+        payload = {
+            "event_namespace": "model_runner",
+            "worker": {
+                "role": "draft" if self.is_draft_worker else "target",
+                "tp_rank": self.ps.tp_rank,
+                "tp_size": self.ps.tp_size,
+                "pp_rank": self.ps.pp_rank,
+                "pp_size": self.ps.pp_size,
+            },
+            "mode": mode,
+            "execution": execution,
+            "fallback_reason": fallback_reason or None,
+            "pipeline_lane_id": pipeline_lane_id,
+            "event_id": event_id,
+            "batches": counts[0],
+            "measurement_rows": counts[1],
+            "batch_measurement_rows": measurement_rows,
+            "batch_size": forward_batch.batch_size,
+            "num_tokens": int(forward_batch.input_ids.numel()),
+        }
+        logger.info(
+            "%s%s",
+            CUDA_GRAPH_MEASUREMENT_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _cuda_graph_fallback_reason(self, forward_batch: ForwardBatch) -> str:
+        mode = forward_batch.forward_mode
+        if mode.is_cuda_graph():
+            runner = self.decode_cuda_graph_runner
+            if runner is None or isinstance(runner, EagerRunner):
+                return "decode_runner_unavailable"
+            if forward_batch.batch_size > runner.max_bs:
+                return "decode_batch_size_exceeds_max"
+            return "decode_runner_rejected"
+        if mode.is_split_prefill():
+            return "split_prefill"
+        if mode.is_extend(include_draft_extend_v2=True):
+            runner = self.prefill_cuda_graph_runner
+            if runner is None or isinstance(runner, EagerRunner):
+                return "prefill_runner_unavailable"
+            if get_cp_strategy() is not None:
+                return "context_parallel_prefill"
+            num_tokens = int(forward_batch.input_ids.numel())
+            if num_tokens > runner.max_num_tokens:
+                return "prefill_tokens_exceed_max"
+            padded_num_tokens = runner._pad_to_bucket(
+                num_tokens, runner.capture_num_tokens
+            )
+            if padded_num_tokens > num_tokens * 2:
+                return "prefill_padding_factor_exceeded"
+            return "prefill_runner_rejected"
+        return "mode_not_graph_eligible"
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

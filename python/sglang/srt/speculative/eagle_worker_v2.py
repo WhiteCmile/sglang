@@ -1,4 +1,5 @@
 import contextlib
+import json
 import logging
 import time
 from dataclasses import replace
@@ -39,6 +40,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner import (
+    CUDA_GRAPH_MEASUREMENT_MARKER,
+    DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
+)
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
@@ -218,6 +223,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.init_attention_backend()
 
     def init_cuda_graphs(self):
+        # StandaloneDraftWorker deliberately bypasses this class's constructor,
+        # but shares both graph execution paths below.  Initialize the evidence
+        # flags in the shared graph lifecycle that every implementation calls.
+        self._draft_decode_graph_replay_observed = False
+        self._draft_extend_graph_replay_observed = False
+        self._draft_graph_measurement_counts: dict[
+            tuple[str, str, str], list[int]
+        ] = {}
+        self._draft_graph_measurement_event_seq = 0
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -246,6 +260,58 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
+
+    def _record_draft_graph_measurement(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        mode: str,
+        execution: str,
+        fallback_reason: str = "",
+    ) -> None:
+        measurement_rows = sum(
+            rid.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+            for rid in (forward_batch.rids or ())
+        )
+        if not measurement_rows or forward_batch.forward_mode.is_idle():
+            return
+        self._draft_graph_measurement_event_seq += 1
+        event_id = self._draft_graph_measurement_event_seq
+        key = (mode, execution, fallback_reason)
+        counts = self._draft_graph_measurement_counts.setdefault(key, [0, 0])
+        counts[0] += 1
+        counts[1] += measurement_rows
+        if execution == "graph" and counts[0] & (counts[0] - 1):
+            return
+        token_rows = (
+            forward_batch.input_ids
+            if forward_batch.input_ids is not None
+            else forward_batch.positions
+        )
+        payload = {
+            "event_namespace": "colocated_draft",
+            "worker": {
+                "role": "draft",
+                "tp_rank": self.ps.tp_rank,
+                "tp_size": self.ps.tp_size,
+                "pp_rank": self.ps.pp_rank,
+                "pp_size": self.ps.pp_size,
+            },
+            "mode": mode,
+            "execution": execution,
+            "fallback_reason": fallback_reason or None,
+            "event_id": event_id,
+            "batches": counts[0],
+            "measurement_rows": counts[1],
+            "batch_measurement_rows": measurement_rows,
+            "batch_size": forward_batch.batch_size,
+            "num_tokens": int(token_rows.numel()),
+        }
+        logger.info(
+            "%s%s",
+            CUDA_GRAPH_MEASUREMENT_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
     def init_token_map(self):
@@ -492,10 +558,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
+                if not self._draft_decode_graph_replay_observed:
+                    self._draft_decode_graph_replay_observed = True
+                    log_info_on_rank0(
+                        logger,
+                        "Draft CUDA graph replay observed: mode=DRAFT_DECODE",
+                    )
+                self._record_draft_graph_measurement(
+                    forward_batch, mode="DRAFT_DECODE", execution="graph"
+                )
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
+                self._record_draft_graph_measurement(
+                    forward_batch,
+                    mode="DRAFT_DECODE",
+                    execution="eager",
+                    fallback_reason="draft_decode_runner_rejected",
+                )
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1
@@ -901,13 +982,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             if can_cuda_graph:
+                if not self._draft_extend_graph_replay_observed:
+                    self._draft_extend_graph_replay_observed = True
+                    log_info_on_rank0(
+                        logger,
+                        "Draft CUDA graph replay observed: mode=DRAFT_EXTEND",
+                    )
+                self._record_draft_graph_measurement(
+                    forward_batch, mode="DRAFT_EXTEND", execution="graph"
+                )
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
                 )
             else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
-                ).logits_output
+                draft_runner_output = self.draft_runner.forward(forward_batch)
+                if draft_runner_output.can_run_graph:
+                    if not self._draft_extend_graph_replay_observed:
+                        self._draft_extend_graph_replay_observed = True
+                        log_info_on_rank0(
+                            logger,
+                            "Draft CUDA graph replay observed: mode=DRAFT_EXTEND",
+                        )
+                    self._record_draft_graph_measurement(
+                        forward_batch, mode="DRAFT_EXTEND", execution="graph"
+                    )
+                else:
+                    self._record_draft_graph_measurement(
+                        forward_batch,
+                        mode="DRAFT_EXTEND",
+                        execution="eager",
+                        fallback_reason="draft_extend_runner_rejected",
+                    )
+                draft_logits_output = draft_runner_output.logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,

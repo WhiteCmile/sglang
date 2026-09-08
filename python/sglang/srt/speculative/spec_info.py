@@ -41,6 +41,7 @@ class SpeculativeAlgorithm(Enum):
     FLASHMTP = auto()
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
+    STANDALONE_DT = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -123,13 +124,20 @@ class SpeculativeAlgorithm(Enum):
         return self.is_dflash() or self.is_dspark()
 
     def uses_linear_chain_verify(self) -> bool:
-        return self.is_dflash_family() or self.is_flashmtp()
+        return (
+            self.is_dflash_family()
+            or self.is_flashmtp()
+            or self == SpeculativeAlgorithm.STANDALONE_DT
+        )
 
     def uses_block_verify_reservation(self) -> bool:
         return self.uses_linear_chain_verify()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
+
+    def is_standalone_dt(self) -> bool:
+        return self == SpeculativeAlgorithm.STANDALONE_DT
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
@@ -232,7 +240,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
-        elif self.is_eagle() or self.is_standalone():
+        elif self.is_eagle() or self.is_standalone() or self.is_standalone_dt():
             _handle_eagle_family(server_args)
         elif self.is_ngram():
             _handle_ngram(server_args)
@@ -317,7 +325,13 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
             return EAGLEWorkerV2
-        elif self.is_standalone():
+        elif self.is_standalone() or self.is_standalone_dt():
+            if server_args.draft_target_disaggregation_role == "target":
+                from sglang.srt.speculative.flashmtp_target_worker_v2 import (
+                    FlashMTPDisaggregatedTargetWorkerV2,
+                )
+
+                return FlashMTPDisaggregatedTargetWorkerV2
             from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 
             return StandaloneWorkerV2
@@ -447,7 +461,9 @@ def create_dummy_verify_input(
             draft_token_num=server_args.speculative_num_draft_tokens,
             custom_mask=None,
             capture_hidden_mode=(
-                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+                CaptureHiddenMode.NULL
+                if is_draft_worker or spec_algorithm.is_standalone_dt()
+                else CaptureHiddenMode.FULL
             ),
         )
 

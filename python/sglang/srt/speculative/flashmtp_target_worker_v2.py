@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 
 import torch
 from sglang.kernels.ops.speculative.dflash import (
@@ -22,11 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
-    """Target-only FlashMTP worker fed by remotely produced candidates.
+    """Target-only linear-chain verifier fed by remotely produced candidates.
 
-    The Draft checkpoint config is read to freeze the feature schema, but no
-    Draft parameters, runner, attention backend, memory pool, or CUDA graph is
-    created in this process.
+    FlashMTP carries Target pivots as in V1.  STANDALONE is the V2 milestone-1
+    token-only path: the Target loads no Draft weights and captures no hidden
+    states while reusing the same candidate verification and KV commit logic.
     """
 
     def __init__(
@@ -55,25 +57,30 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             model_revision=server_args.speculative_draft_model_revision,
             is_draft_model=True,
         )
-        flash_config = parse_flashmtp_draft_config(
-            draft_hf_config=draft_model_config.hf_config
-        )
+        self._is_token_only = server_args.speculative_algorithm == "STANDALONE_DT"
         self.block_size = int(server_args.speculative_num_draft_tokens)
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1
-        self._mask_token_id = int(flash_config.mask_token_id)
-        self._num_pivot_layers = len(flash_config.target_layer_ids)
 
         target_config = target_worker.model_runner.model_config
-        if int(target_config.hidden_size) != int(draft_model_config.hidden_size):
-            raise ValueError(
-                "FLASHMTP target/draft hidden size mismatch: "
-                f"target={target_config.hidden_size}, "
-                f"draft={draft_model_config.hidden_size}."
+        if self._is_token_only:
+            self._mask_token_id = 0
+            self._num_pivot_layers = 0
+        else:
+            flash_config = parse_flashmtp_draft_config(
+                draft_hf_config=draft_model_config.hf_config
             )
+            self._mask_token_id = int(flash_config.mask_token_id)
+            self._num_pivot_layers = len(flash_config.target_layer_ids)
+            if int(target_config.hidden_size) != int(draft_model_config.hidden_size):
+                raise ValueError(
+                    "FLASHMTP target/draft hidden size mismatch: "
+                    f"target={target_config.hidden_size}, "
+                    f"draft={draft_model_config.hidden_size}."
+                )
         if int(target_config.vocab_size) != int(draft_model_config.vocab_size):
             raise ValueError(
-                "FLASHMTP target/draft vocab size mismatch: "
+                "disaggregated target/draft vocab size mismatch: "
                 f"target={target_config.vocab_size}, "
                 f"draft={draft_model_config.vocab_size}."
             )
@@ -102,8 +109,9 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
 
         if self.ps.tp_rank == 0:
             logger.info(
-                "Initialized disaggregated FLASHMTP Target worker without Draft "
-                "weights. block_size=%d pivot_layers=%d pivot_width=%d",
+                "Initialized disaggregated %s Target worker without Draft weights. "
+                "block_size=%d pivot_layers=%d pivot_width=%d",
+                server_args.speculative_algorithm,
                 self.block_size,
                 self._num_pivot_layers,
                 self._pivot_width,
@@ -140,9 +148,15 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
+        profile = bool(os.environ.get("DT_PROFILE_DIR"))
+        started_ns = time.monotonic_ns()
+        if profile:
+            torch.get_device_module(self.device).synchronize()
+            started_ns = time.monotonic_ns()
         if getattr(batch, "return_logprob", False):
             raise ValueError(
-                "FLASHMTP speculative decoding does not support return_logprob yet."
+                "disaggregated linear-chain verification does not support "
+                "return_logprob yet."
             )
         self._validate_phase1_sampling_support(batch)
 
@@ -153,15 +167,13 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
-            raise TypeError(
-                "disaggregated FLASHMTP Target expected DFlashDraftInputV2 state"
-            )
+            raise TypeError("disaggregated Target expected DFlashDraftInputV2 state")
 
         if batch.forward_mode.is_idle():
             return self._forward_idle(on_publish=on_publish)
         if draft_input.draft_tokens is None:
             raise RuntimeError(
-                "disaggregated FLASHMTP Target cannot verify before remote Draft "
+                "disaggregated Target cannot verify before remote Draft "
                 "candidates are attached"
             )
 
@@ -173,7 +185,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         remote_candidates = draft_input.draft_tokens
         if tuple(remote_candidates.shape) != (batch_size, self.block_size):
             raise ValueError(
-                "remote FLASHMTP candidate shape mismatch: "
+                "remote candidate shape mismatch: "
                 f"expected {(batch_size, self.block_size)}, "
                 f"got {tuple(remote_candidates.shape)}"
             )
@@ -184,6 +196,9 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         assert self._draft_verify_out_cache_loc_buf is not None
         candidates = self._draft_block_tokens_buf[:batch_size]
         candidates.copy_(remote_candidates.to(device=self.device, dtype=torch.int64))
+        if profile:
+            torch.get_device_module(self.device).synchronize()
+            candidates_ready_ns = time.monotonic_ns()
         # DT validates every candidate root against the round's bonus token in
         # ``DraftTargetController._consume_result_batch`` before publishing a
         # READY event, then broadcasts the validated bytes and metadata to all
@@ -204,6 +219,17 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             target_positions_2d=target_positions_2d,
             verify_out_cache_loc_2d=verify_out_cache_loc_2d,
         )
+        if profile:
+            torch.get_device_module(self.device).synchronize()
+            layout_ready_ns = time.monotonic_ns()
+            from dt_profile import emit as profile_emit
+
+            profile_emit(
+                "target_layout_breakdown",
+                batch_size=batch_size,
+                candidate_copy_ns=candidates_ready_ns - started_ns,
+                layout_ns=layout_ready_ns - candidates_ready_ns,
+            )
 
         result = self._verify_candidates(
             batch=batch,
@@ -215,27 +241,45 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             on_publish=on_publish,
             grammar_barrier=grammar_barrier,
         )
+        if profile:
+            torch.get_device_module(self.device).synchronize()
+            from dt_profile import emit as profile_emit
+
+            profile_emit(
+                "target_verify_forward",
+                batch_size=batch_size,
+                total_ns=time.monotonic_ns() - started_ns,
+            )
         return result
 
     def _forward_prefill(
         self, batch: ScheduleBatch, *, on_publish=None
     ) -> GenerationBatchResult:
+        capture_mode = (
+            CaptureHiddenMode.NULL if self._is_token_only else CaptureHiddenMode.LAST
+        )
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.LAST
+            batch, capture_hidden_mode=capture_mode
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        pivot_hidden = logits_output.hidden_states
-        if pivot_hidden is None:
-            raise RuntimeError(
-                "disaggregated FLASHMTP prefill requires target pivot hidden states"
+        if self._is_token_only:
+            pivot_hidden = torch.empty(
+                (len(batch.reqs), 0), dtype=torch.bfloat16, device=self.device
             )
-        if pivot_hidden.ndim != 2 or pivot_hidden.shape[-1] != self._pivot_width:
-            raise RuntimeError(
-                "FLASHMTP prefill pivot shape mismatch: "
-                f"expected [bs, {self._pivot_width}], got {tuple(pivot_hidden.shape)}"
-            )
-        logits_output.hidden_states = None
+        else:
+            pivot_hidden = logits_output.hidden_states
+            if pivot_hidden is None:
+                raise RuntimeError(
+                    "disaggregated FLASHMTP prefill requires target pivot hidden states"
+                )
+            if pivot_hidden.ndim != 2 or pivot_hidden.shape[-1] != self._pivot_width:
+                raise RuntimeError(
+                    "FLASHMTP prefill pivot shape mismatch: "
+                    f"expected [bs, {self._pivot_width}], "
+                    f"got {tuple(pivot_hidden.shape)}"
+                )
+            logits_output.hidden_states = None
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)

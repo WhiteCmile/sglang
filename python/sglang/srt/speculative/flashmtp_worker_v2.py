@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import replace
 
 import torch
@@ -534,6 +536,10 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         disaggregated Target worker reuse the exact same acceptance, KV commit,
         grammar, and next-pivot path.
         """
+        profile = bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
+            self, "_is_token_only", False
+        )
+        started_ns = time.monotonic_ns()
         batch_size = int(candidates.shape[0])
         if tuple(candidates.shape) != (batch_size, self.block_size):
             raise ValueError(
@@ -550,7 +556,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             positions=target_positions,
             draft_token_num=self.block_size,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self._num_pivot_layers
+                else CaptureHiddenMode.NULL
+            ),
         )
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
@@ -567,6 +577,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        prepared_ns = time.monotonic_ns()
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
         target_out = self.target_worker.forward_batch_generation(
@@ -575,6 +586,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        if profile:
+            torch.get_device_module(self.device).synchronize()
+        target_done_ns = time.monotonic_ns()
         logits_output = target_out.logits_output
 
         grammar_mask = None
@@ -679,29 +693,52 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        if profile:
+            torch.get_device_module(self.device).synchronize()
+        accepted_ns = time.monotonic_ns()
+
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
-        packed_hidden = logits_output.hidden_states
-        if packed_hidden is None:
-            raise RuntimeError(
-                "FLASHMTP verify requires captured target auxiliary hidden states."
+        if self._num_pivot_layers:
+            packed_hidden = logits_output.hidden_states
+            if packed_hidden is None:
+                raise RuntimeError(
+                    "FLASHMTP verify requires captured target auxiliary hidden states."
+                )
+            next_pivot = gather_flashmtp_next_pivot(
+                packed_hidden=packed_hidden,
+                accept_len=accept_len,
+                block_size=self.block_size,
             )
-        next_pivot = gather_flashmtp_next_pivot(
-            packed_hidden=packed_hidden,
-            accept_len=accept_len,
-            block_size=self.block_size,
-        )
-        logits_output.hidden_states = None
+            logits_output.hidden_states = None
+        else:
+            # Token-only disaggregation has no Target feature payload.  Keep the
+            # linear-chain verifier and its authoritative accepted-token result,
+            # but do not manufacture hidden state for the next Draft round.
+            next_pivot = torch.empty(
+                (batch_size, 0), dtype=torch.bfloat16, device=self.device
+            )
 
         next_input = self._make_next_input(
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
             pivot_hidden=next_pivot,
         )
-        return GenerationBatchResult(
+        if profile:
+            from dt_profile import emit as profile_emit
+
+            profile_emit(
+                "target_verify_breakdown",
+                batch_size=batch_size,
+                prepare_ns=prepared_ns - started_ns,
+                target_forward_ns=target_done_ns - prepared_ns,
+                accept_ns=accepted_ns - target_done_ns,
+                finish_ns=time.monotonic_ns() - accepted_ns,
+            )
+        batch_result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
@@ -710,6 +747,10 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             speculative_num_draft_tokens=self.block_size,
             new_seq_lens=new_seq_lens,
         )
+        batch_result.dt_cuda_graph_measurement_event_id = (
+            self.target_worker.model_runner._last_cuda_graph_measurement_event_id
+        )
+        return batch_result
 
     def _prepare_draft_block_eager(
         self,

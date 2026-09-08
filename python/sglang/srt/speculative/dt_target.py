@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,12 +12,16 @@ from pathlib import Path
 import torch
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.model_executor.model_runner import (
+    DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 CONTROL_RETRY_INTERVAL_NS = 50_000_000
+DT_LANE_MEASUREMENT_MARKER = "DT lane measurement evidence: "
 
 
 @dataclass(slots=True)
@@ -30,6 +35,7 @@ class ParkedTargetRound:
     lane_id: int = 0
     candidate_bytes: bytes | None = None
     failure: str | None = None
+    draft_admitted: bool = False
 
 
 @dataclass(slots=True)
@@ -51,6 +57,7 @@ class DTTargetController:
                 TargetCoordinatorClient,
                 TargetRoundLedger,
             )
+            from dt_profile import emit as profile_emit
             from dt_transport import MmapSlotStore, cleanup_stale_slot_files
         except ImportError as exc:
             raise RuntimeError(
@@ -58,12 +65,14 @@ class DTTargetController:
             ) from exc
 
         self.scheduler = scheduler
+        self._profile_emit = profile_emit
         self.server_args = scheduler.server_args
         self.instance_id = self.server_args.draft_target_instance_id
         self.profile_id = self.server_args.draft_target_profile_id
         self.feature_schema_id = self.server_args.draft_target_feature_schema_id
         self.block_size = int(self.server_args.speculative_num_draft_tokens)
         self.pivot_width = int(scheduler.draft_worker._pivot_width)
+        self.is_token_only = scheduler.spec_algorithm.is_standalone_dt()
         self.round_timeout_ns = (
             int(self.server_args.draft_target_round_timeout_ms) * 1_000_000
         )
@@ -86,7 +95,16 @@ class DTTargetController:
                 "draft_target_overlap_result_defer_ms requires "
                 "draft_target_overlap_schedule"
             )
-        if not self.server_args.draft_target_full_wave or self.pipeline_lanes != 2:
+        if self.is_token_only:
+            if (
+                not self.server_args.draft_target_full_wave
+                or self.pipeline_lanes not in {1, 2}
+            ):
+                raise ValueError(
+                    "Draft-Target V2 requires full-wave verification with one or "
+                    "two pipeline lanes"
+                )
+        elif not self.server_args.draft_target_full_wave or self.pipeline_lanes != 2:
             raise ValueError(
                 "Draft-Target V1 requires full-wave verification with two lanes"
             )
@@ -102,6 +120,13 @@ class DTTargetController:
         self._target_inflight_counts: Counter[str] = Counter()
         self._target_inflight_reqs: dict[str, Req] = {}
         self._next_round: dict[str, int] = {}
+        # V2 token-only lifecycle.  The Draft owns the physical KV handle; the
+        # Target records the authoritative full committed sequence boundary and
+        # the transfer currently being verified.
+        self._draft_committed_len: dict[str, int] = {}
+        self._draft_kv_handle_by_request: dict[str, str] = {}
+        self._lifecycle_attempt_by_request: dict[str, int] = {}
+        self._verify_transfer_by_request: dict[str, str] = {}
         self._batch_sequence = 0
         self._pending_send = deque()
         self._delivery_outbox = RetryOutbox[object](
@@ -116,6 +141,7 @@ class DTTargetController:
         self._lane_target_sizes = [0] * self.pipeline_lanes
         self._lane_assignment_cursor = 0
         self._lane_ready_cursor = 0
+        self._measurement_lane_counts: dict[tuple[int, str], int] = {}
         self._overlap_launch_poll_ns = 0
         self._overlap_result_ready: bool | None = None
         self._client = None
@@ -126,23 +152,27 @@ class DTTargetController:
         self._early_pivot_host_free_slots: deque[int] = deque()
         self._early_pivot_host_in_use: set[int] = set()
         if self.is_export_rank:
-            slot_bytes = (
-                self.pivot_width * torch.tensor([], dtype=torch.bfloat16).element_size()
-            )
-            safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", self.instance_id)
-            data_dir = Path(self.server_args.draft_target_data_dir)
-            cleanup_stale_slot_files(data_dir, instance_id=safe_id, kind="pivots")
-            source_path = data_dir / f"dt-{safe_id}-{os.getpid()}-pivots.slots"
-            self._source_store = MmapSlotStore.create(
-                source_path,
-                slot_count=scheduler.max_running_requests,
-                slot_bytes=slot_bytes,
-            )
+            if self.pivot_width:
+                slot_bytes = (
+                    self.pivot_width
+                    * torch.tensor([], dtype=torch.bfloat16).element_size()
+                )
+                safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", self.instance_id)
+                data_dir = Path(self.server_args.draft_target_data_dir)
+                cleanup_stale_slot_files(data_dir, instance_id=safe_id, kind="pivots")
+                source_path = data_dir / f"dt-{safe_id}-{os.getpid()}-pivots.slots"
+                self._source_store = MmapSlotStore.create(
+                    source_path,
+                    slot_count=scheduler.max_running_requests,
+                    slot_bytes=slot_bytes,
+                )
             try:
                 self._client = TargetCoordinatorClient(
                     endpoint=self.server_args.draft_target_coordinator_endpoint,
                     instance_id=self.instance_id,
-                    data_endpoint=self._source_store.uri,
+                    data_endpoint=(
+                        self._source_store.uri if self._source_store is not None else ""
+                    ),
                 )
                 self._client.register_target(
                     timeout_s=self.server_args.draft_target_registration_timeout_s
@@ -150,13 +180,14 @@ class DTTargetController:
                 self._ledger = TargetRoundLedger(target_instance_id=self.instance_id)
                 # The source ring bounds the largest wave. Keep one staging
                 # buffer for the serial path and two leases for overlap copies.
-                self._pivot_host_staging = torch.empty(
-                    (scheduler.max_running_requests, self.pivot_width),
-                    dtype=torch.bfloat16,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                if self.early_pinned_staging:
+                if self.pivot_width:
+                    self._pivot_host_staging = torch.empty(
+                        (scheduler.max_running_requests, self.pivot_width),
+                        dtype=torch.bfloat16,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                if self.early_pinned_staging and self.pivot_width:
                     for buffer_slot in range(2):
                         self._early_pivot_host_buffers.append(
                             torch.empty(
@@ -171,9 +202,10 @@ class DTTargetController:
                 if self._client is not None:
                     self._client.close()
                     self._client = None
-                self._source_store.close()
-                self._source_store.unlink()
-                self._source_store = None
+                if self._source_store is not None:
+                    self._source_store.close()
+                    self._source_store.unlink()
+                    self._source_store = None
                 raise
 
     def stage_overlap_pivot_copy(self, batch: ScheduleBatch, batch_result) -> None:
@@ -224,8 +256,11 @@ class DTTargetController:
         self._early_pivot_host_free_slots.append(buffer_slot)
 
     def park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
+        started_ns = time.monotonic_ns()
+        batch_size = len(batch.reqs)
         staged_pinned_pivots = getattr(batch_result, "dt_staged_pinned_pivots", None)
         try:
+            self._record_measurement_lane_execution(batch, batch_result)
             self._park_completed_batch(batch, batch_result=batch_result)
         finally:
             if staged_pinned_pivots is not None:
@@ -235,6 +270,69 @@ class DTTargetController:
                 ):
                     batch_result.dt_staged_pinned_pivots = None
                 self._release_early_pinned_staging(staged_pinned_pivots.buffer_slot)
+            if self.is_export_rank and batch_size:
+                self._profile_emit(
+                    "target_park_batch",
+                    batch_size=batch_size,
+                    total_ns=time.monotonic_ns() - started_ns,
+                    parked=len(self._parked),
+                )
+
+    def _record_measurement_lane_execution(
+        self, batch: ScheduleBatch, batch_result
+    ) -> None:
+        if not self.is_export_rank or batch_result is None:
+            return
+        # Speculative verification keeps the scheduler batch in DECODE mode;
+        # only the derived ForwardBatch seen by ModelRunner is TARGET_VERIFY.
+        # The event id is attached exclusively to the completed Target verify
+        # result, so use it as the authoritative execution discriminator.
+        model_runner_event_id = getattr(
+            batch_result, "dt_cuda_graph_measurement_event_id", None
+        )
+        if model_runner_event_id is None:
+            return
+        measurement_reqs = [
+            req
+            for req in batch.reqs
+            if req.rid.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+        ]
+        if not measurement_reqs:
+            return
+        lanes = {self._lane_by_request.get(req.rid) for req in measurement_reqs}
+        if None in lanes or len(lanes) != 1:
+            raise RuntimeError(
+                "DT measurement verify batch does not have one assigned lane"
+            )
+        lane_id = lanes.pop()
+        execution = "graph" if batch_result.can_run_cuda_graph else "eager"
+        key = (lane_id, execution)
+        count = self._measurement_lane_counts.get(key, 0) + 1
+        self._measurement_lane_counts[key] = count
+        if count & (count - 1):
+            return
+        logger.info(
+            "%s%s",
+            DT_LANE_MEASUREMENT_MARKER,
+            json.dumps(
+                {
+                    "target_instance": self.instance_id,
+                    "lane_id": lane_id,
+                    "pipeline_lanes": self.pipeline_lanes,
+                    "execution": execution,
+                    "fallback_reason": (
+                        None if execution == "graph" else "target_verify_not_graphed"
+                    ),
+                    "batches": count,
+                    "batch_measurement_rows": len(measurement_reqs),
+                    "batch_size": len(batch.reqs),
+                    "model_runner_event_namespace": "model_runner",
+                    "model_runner_event_id": model_runner_event_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
 
     def _park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
         staged_pinned_pivots = (
@@ -255,9 +353,19 @@ class DTTargetController:
         for req in batch.reqs:
             if req.finished() or req.is_retracted:
                 self._forget_request_lane(req)
+                verified_transfer = self._verify_transfer_by_request.pop(req.rid, None)
+                if (
+                    self.is_export_rank
+                    and verified_transfer is not None
+                    and self._ledger.get(verified_transfer) is not None
+                ):
+                    self._ledger.finish(verified_transfer)
+                self._release_draft_request(req.rid)
         for req in batch.reqs:
             if req.finished() or req.is_retracted:
                 self._next_round.pop(req.rid, None)
+            if req.finished():
+                self._lifecycle_attempt_by_request.pop(req.rid, None)
         # A long prompt can have multiple prefill chunks.  In non-overlap mode
         # the normal result processor decrements ``inflight_middle_chunks``
         # from one to zero before this hook, but ``batch.chunked_req`` still
@@ -282,7 +390,7 @@ class DTTargetController:
         pivot_payloads = None
         source_slots = None
         source_generations = None
-        if self.is_export_rank and active_indices:
+        if self.is_export_rank and active_indices and not self.is_token_only:
             if staged_pinned_pivots is not None:
                 if staged_pinned_pivots.rows != len(staged_pinned_pivots.request_ids):
                     raise RuntimeError("DT staged pivot row and request counts differ")
@@ -360,8 +468,17 @@ class DTTargetController:
             req = batch.reqs[index]
             round_id = self._next_round.get(req.rid, 0)
             self._next_round[req.rid] = round_id + 1
-            attempt = 0
+            attempt = self._lifecycle_attempt_by_request.setdefault(req.rid, 0)
             transfer_id = f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
+            previous_transfer_id = None
+            if self.is_token_only and round_id > 0:
+                previous_transfer_id = self._verify_transfer_by_request.pop(
+                    req.rid, None
+                )
+                if previous_transfer_id is None:
+                    raise RuntimeError(
+                        "DT reconcile is missing the previous verified transfer"
+                    )
             bonus_token = int(bonus_tokens_cpu[active_index])
             seq_len = int(seq_lens_cpu[active_index])
             self._parked[transfer_id] = ParkedTargetRound(
@@ -376,12 +493,18 @@ class DTTargetController:
             parked_reqs.append(req)
 
             if self.is_export_rank:
-                source_slot = source_slots[active_index]
-                source_generation = source_generations[active_index]
-                self._source_slot_by_transfer[transfer_id] = (
-                    source_slot,
-                    source_generation,
-                )
+                if self.is_token_only:
+                    source_slot = None
+                    source_generation = None
+                    pivot_nbytes = 0
+                else:
+                    source_slot = source_slots[active_index]
+                    source_generation = source_generations[active_index]
+                    self._source_slot_by_transfer[transfer_id] = (
+                        source_slot,
+                        source_generation,
+                    )
+                    pivot_nbytes = len(pivot_payloads[active_index])
                 tasks.append(
                     self._make_task(
                         transfer_id=transfer_id,
@@ -391,7 +514,8 @@ class DTTargetController:
                         bonus_token=bonus_token,
                         source_slot=source_slot,
                         source_generation=source_generation,
-                        pivot_nbytes=len(pivot_payloads[active_index]),
+                        pivot_nbytes=pivot_nbytes,
+                        previous_transfer_id=previous_transfer_id,
                     )
                 )
 
@@ -425,13 +549,19 @@ class DTTargetController:
                 batch.filter_batch(chunked_req_to_exclude=parked_reqs)
 
     def poll(self, *, overlap_result=None) -> None:
+        poll_entered_ns = time.monotonic_ns()
+        previous_poll_ns = self._last_poll_ns
+        receive_ns = 0
         packet = None
         if self.is_export_rank:
+            receive_start_ns = time.monotonic_ns()
             packet = (
                 time.monotonic_ns(),
                 self._poll_export_rank(),
                 self._query_overlap_result_ready(overlap_result),
             )
+            receive_ns = time.monotonic_ns() - receive_start_ns
+        broadcast_start_ns = time.monotonic_ns()
         if self.scheduler.ps.tp_size > 1:
             packet = broadcast_pyobj(
                 packet,
@@ -439,10 +569,27 @@ class DTTargetController:
                 self.scheduler.tp_cpu_group,
                 src=self.scheduler.tp_group.ranks[0],
             )
+        broadcast_ns = time.monotonic_ns() - broadcast_start_ns
         assert packet is not None
         poll_now_ns, events, result_ready = packet
         self._last_poll_ns = poll_now_ns
         self._overlap_result_ready = result_ready
+        if self.is_export_rank and events:
+            self._profile_emit(
+                "target_result_poll",
+                poll_gap_ns=(
+                    poll_entered_ns - previous_poll_ns if previous_poll_ns else 0
+                ),
+                receive_ns=receive_ns,
+                broadcast_ns=broadcast_ns,
+                event_count=len(events),
+                ready_count=sum(kind == "ready" for kind, _transfer_id, _ in events),
+                accepted_count=sum(
+                    kind == "accepted" for kind, _transfer_id, _ in events
+                ),
+                failed_count=sum(kind == "failed" for kind, _transfer_id, _ in events),
+                parked=len(self._parked),
+            )
         for kind, transfer_id, payload in events:
             state = self._parked.get(transfer_id)
             if state is None:
@@ -459,6 +606,9 @@ class DTTargetController:
                         f"export_seq_len={seq_len}"
                     )
                 state.candidate_bytes = candidate_bytes
+                state.draft_admitted = True
+            elif kind == "accepted":
+                state.draft_admitted = True
             else:
                 state.failure = payload
 
@@ -478,12 +628,20 @@ class DTTargetController:
         ready_by_lane = [[] for _ in range(self.pipeline_lanes)]
         parked_by_lane = Counter(state.lane_id for state in self._parked.values())
         live_by_lane = Counter(self._lane_by_request.values())
+        admitted_by_lane = Counter(
+            state.lane_id for state in self._parked.values() if state.draft_admitted
+        )
         for state in ready:
             ready_by_lane[state.lane_id].append(state)
 
         for offset in range(self.pipeline_lanes):
             lane_id = (self._lane_ready_cursor + offset) % self.pipeline_lanes
             lane_ready = ready_by_lane[lane_id]
+            if self.is_token_only:
+                if lane_ready and len(lane_ready) == admitted_by_lane[lane_id]:
+                    self._lane_ready_cursor = (lane_id + 1) % self.pipeline_lanes
+                    return lane_ready
+                continue
             live_rows = max(parked_by_lane[lane_id], live_by_lane[lane_id])
             if lane_ready and live_rows < self._lane_target_sizes[lane_id]:
                 self._lane_target_sizes[lane_id] = live_rows
@@ -624,6 +782,11 @@ class DTTargetController:
             transfer_ids = tuple(state.transfer_id for state in states)
             self._cancelled_transfers.update(transfer_ids)
             self._drop_cancelled_unsent()
+            if self.is_token_only:
+                for transfer_id in transfer_ids:
+                    if self._ledger.get(transfer_id) is not None:
+                        self._ledger.finish(transfer_id)
+                        self._cancelled_transfers.discard(transfer_id)
             cancellation = CancelTransfers(
                 protocol_version=PROTOCOL_VERSION,
                 target_instance_id=self.instance_id,
@@ -640,7 +803,44 @@ class DTTargetController:
         unique: dict[int, Req] = {}
         for req in [*(state.req for state in states), *inflight_reqs]:
             unique[id(req)] = req
+        for req in unique.values():
+            self._finish_verified_request(req.rid)
+            self._release_draft_request(req.rid)
+            if req.finished():
+                self._lifecycle_attempt_by_request.pop(req.rid, None)
+            else:
+                self._lifecycle_attempt_by_request[req.rid] = (
+                    self._lifecycle_attempt_by_request.get(req.rid, 0) + 1
+                )
+        if self.is_export_rank:
+            self._flush_reliable_outbox()
         return list(unique.values())
+
+    def cleanup_running_after_oom(
+        self,
+        *,
+        retracted_reqs: list[Req],
+        aborted_reqs: list[Req],
+    ) -> None:
+        """Release V2 Draft lifecycles removed by generic decode retraction."""
+
+        if not self.is_token_only:
+            return
+        aborted_ids = {id(req) for req in aborted_reqs}
+        unique = {id(req): req for req in [*retracted_reqs, *aborted_reqs]}
+        for req_id, req in unique.items():
+            self._forget_request_lane(req)
+            self._next_round.pop(req.rid, None)
+            self._finish_verified_request(req.rid)
+            self._release_draft_request(req.rid)
+            if req_id in aborted_ids:
+                self._lifecycle_attempt_by_request.pop(req.rid, None)
+            else:
+                self._lifecycle_attempt_by_request[req.rid] = (
+                    self._lifecycle_attempt_by_request.get(req.rid, 0) + 1
+                )
+        if unique and self.is_export_rank:
+            self._flush_reliable_outbox()
 
     def should_defer_overlap_result(
         self, *, next_batch: ScheduleBatch | None, last_batch: ScheduleBatch | None
@@ -676,10 +876,22 @@ class DTTargetController:
         if not ready:
             return None
 
+        started_ns = time.monotonic_ns()
+
         for state in ready:
             self._parked.pop(state.transfer_id)
+            if self.is_token_only:
+                existing = self._verify_transfer_by_request.get(state.req.rid)
+                if existing is not None and existing != state.transfer_id:
+                    raise RuntimeError(
+                        "DT request already has a different round in Target verify"
+                    )
+                self._verify_transfer_by_request[state.req.rid] = state.transfer_id
 
         reqs = [state.req for state in ready]
+        lane_id = ready[0].lane_id
+        if any(state.lane_id != lane_id for state in ready):
+            raise RuntimeError("DT ready verification batch spans pipeline lanes")
         device = self.scheduler.device
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -690,6 +902,8 @@ class DTTargetController:
             enable_overlap=False,
             spec_algorithm=self.scheduler.spec_algorithm,
         )
+        batch.dt_pipeline_lane_id = lane_id
+        initialized_ns = time.monotonic_ns()
         batch.req_pool_indices_cpu = torch.tensor(
             [req.req_pool_idx for req in reqs], dtype=torch.int64
         )
@@ -726,6 +940,7 @@ class DTTargetController:
             ),
             draft_tokens=draft_tokens,
         )
+        tensors_ready_ns = time.monotonic_ns()
         batch.input_ids = None
         self.scheduler.future_map.stash(
             batch.req_pool_indices,
@@ -734,9 +949,21 @@ class DTTargetController:
                 hidden_states=batch.spec_info.hidden_states,
             ),
         )
+        relay_ready_ns = time.monotonic_ns()
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.scheduler.model_config.vocab_size
         )
+        finished_ns = time.monotonic_ns()
+        if self.is_export_rank:
+            self._profile_emit(
+                "target_ready_batch",
+                batch_size=len(ready),
+                initialize_ns=initialized_ns - started_ns,
+                tensors_ns=tensors_ready_ns - initialized_ns,
+                relay_ns=relay_ready_ns - tensors_ready_ns,
+                sampling_ns=finished_ns - relay_ready_ns,
+                total_ns=finished_ns - started_ns,
+            )
         return batch
 
     def should_defer_prefill(self, *, ready_batch_size: int) -> bool:
@@ -752,6 +979,11 @@ class DTTargetController:
             self._parked.pop(state.transfer_id)
             self._forget_request_lane(state.req)
             self._next_round.pop(state.req.rid, None)
+            self._finish_verified_request(state.req.rid)
+            self._release_draft_request(state.req.rid)
+            self._lifecycle_attempt_by_request.pop(state.req.rid, None)
+        if failed and self.is_export_rank:
+            self._flush_reliable_outbox()
         return failed
 
     def pop_aborted(self, *, abort_all: bool, rid_prefix: str) -> list[Req]:
@@ -773,6 +1005,9 @@ class DTTargetController:
             self._parked.pop(state.transfer_id, None)
             self._forget_request_lane(state.req)
             self._next_round.pop(state.req.rid, None)
+            self._finish_verified_request(state.req.rid)
+            self._release_draft_request(state.req.rid)
+            self._lifecycle_attempt_by_request.pop(state.req.rid, None)
         if self.is_export_rank:
             transfer_ids = {state.transfer_id for state in matched}
             self._cancelled_transfers.update(transfer_ids)
@@ -797,6 +1032,15 @@ class DTTargetController:
             )
             self._flush_reliable_outbox()
         return [state.req for state in matched]
+
+    def _finish_verified_request(self, request_id: str) -> None:
+        transfer_id = self._verify_transfer_by_request.pop(request_id, None)
+        if (
+            self.is_export_rank
+            and transfer_id is not None
+            and self._ledger.get(transfer_id) is not None
+        ):
+            self._ledger.finish(transfer_id)
 
     def __len__(self) -> int:
         return len(self._parked)
@@ -832,21 +1076,134 @@ class DTTargetController:
                 ),
             )
         self._lane_by_request[req.rid] = lane_id
+        req.dt_pipeline_lane_id = lane_id
         self._lane_assignment_cursor = (lane_id + 1) % self.pipeline_lanes
         return lane_id
 
     def _forget_request_lane(self, req: Req) -> None:
         self._lane_by_request.pop(req.rid, None)
+        if hasattr(req, "dt_pipeline_lane_id"):
+            del req.dt_pipeline_lane_id
 
     def close(self) -> None:
-        for store in self._result_stores.values():
-            store.close()
-        self._result_stores.clear()
-        if self._client is not None:
-            self._client.close()
-        if self._source_store is not None:
-            self._source_store.close()
-            self._source_store.unlink()
+        try:
+            if self.is_export_rank and self.is_token_only:
+                self._drain_token_only_shutdown()
+        finally:
+            for store in self._result_stores.values():
+                store.close()
+            self._result_stores.clear()
+            if self._client is not None:
+                self._client.close()
+            if self._source_store is not None:
+                self._source_store.close()
+                self._source_store.unlink()
+
+    def _drain_token_only_shutdown(self) -> None:
+        from dt_protocol import (
+            CANCEL_TRANSFERS,
+            PROTOCOL_VERSION,
+            CancelTransfers,
+            cancel_transfers_id,
+        )
+
+        transfer_ids = tuple(
+            dict.fromkeys([*self._parked, *self._verify_transfer_by_request.values()])
+        )
+
+        # No new request work may overtake shutdown control. Task batches that
+        # reached the Coordinator are retired by the cancellation below; those
+        # still in _pending_send were never submitted and can simply be dropped.
+        self._pending_send.clear()
+        for operation, message_id, _message in self._delivery_outbox.pending():
+            if operation == "task_batch":
+                self._delivery_outbox.ack(operation, message_id)
+        for transfer_id in transfer_ids:
+            if self._ledger.get(transfer_id) is not None:
+                self._ledger.finish(transfer_id)
+        self._parked.clear()
+        self._verify_transfer_by_request.clear()
+        self._lane_by_request.clear()
+        self._next_round.clear()
+        self._target_inflight_counts.clear()
+        self._target_inflight_reqs.clear()
+        self._lifecycle_attempt_by_request.clear()
+
+        if transfer_ids:
+            cancellation = CancelTransfers(
+                protocol_version=PROTOCOL_VERSION,
+                target_instance_id=self.instance_id,
+                transfer_ids=transfer_ids,
+                reason="target_shutdown",
+            )
+            self._delivery_outbox.add(
+                CANCEL_TRANSFERS,
+                cancel_transfers_id(cancellation),
+                cancellation,
+            )
+        for request_id in tuple(self._draft_kv_handle_by_request):
+            self._release_draft_request(request_id)
+
+        deadline_ns = time.monotonic_ns() + self.round_timeout_ns
+        while len(self._delivery_outbox):
+            self._flush_reliable_outbox()
+            self._consume_shutdown_acks()
+            if not len(self._delivery_outbox):
+                return
+            now_ns = time.monotonic_ns()
+            if now_ns >= deadline_ns:
+                pending = tuple(
+                    (operation, message_id)
+                    for operation, message_id, _message in (
+                        self._delivery_outbox.pending()
+                    )
+                )
+                raise RuntimeError(
+                    "DT Target shutdown cleanup timed out with unacknowledged "
+                    f"messages: {pending!r}"
+                )
+            time.sleep(min(0.01, (deadline_ns - now_ns) / 1_000_000_000))
+
+    def _consume_shutdown_acks(self) -> None:
+        from dt_protocol import (
+            ControlAck,
+            ErrorMessage,
+            SourceReadDone,
+            SourceReadDoneBatch,
+            TargetResultBatch,
+            TaskBatchAck,
+        )
+
+        for message in self._client.recv_nowait():
+            if isinstance(message, ControlAck):
+                self._delivery_outbox.ack(message.operation, message.message_id)
+            elif isinstance(message, TaskBatchAck):
+                # Request work has already been retired locally. A late task
+                # ACK cannot restart it and needs no retry bookkeeping.
+                self._delivery_outbox.ack("task_batch", message.batch_id)
+            elif isinstance(message, TargetResultBatch):
+                if message.buffer is not None:
+                    self._enqueue_pull_done(message)
+            elif isinstance(message, SourceReadDone):
+                self._release_source_slot(message.transfer_id)
+            elif isinstance(message, SourceReadDoneBatch):
+                for entry in message.entries:
+                    self._release_source_slot(entry.transfer_id)
+            elif isinstance(message, ErrorMessage):
+                if message.code == "PermissionError":
+                    self._delivery_outbox.retry_all_now()
+                logger.warning(
+                    "Draft Coordinator error during shutdown code=%s "
+                    "related_id=%s message=%s",
+                    message.code,
+                    message.related_id,
+                    message.message,
+                )
+            else:
+                raise TypeError(
+                    "unexpected Target Coordinator shutdown message "
+                    f"{type(message).__name__}"
+                )
 
     def _make_task(
         self,
@@ -856,18 +1213,81 @@ class DTTargetController:
         round_id: int,
         attempt: int,
         bonus_token: int,
-        source_slot: int,
-        source_generation: int,
+        source_slot: int | None,
+        source_generation: int | None,
         pivot_nbytes: int,
+        previous_transfer_id: str | None,
     ):
-        from dt_protocol import DraftTask, SourceRef
+        from dt_protocol import DraftTask, DraftTaskKind, SourceRef
+
+        now_ns = time.monotonic_ns()
+        if self.is_token_only:
+            full_sequence = tuple(req.origin_input_ids) + tuple(req.output_ids)
+            if not full_sequence:
+                raise ValueError("DT Draft bootstrap requires a non-empty sequence")
+            if len(full_sequence) != int(req.kv_committed_len) + 1:
+                raise RuntimeError(
+                    "DT Target token sequence does not match its committed KV boundary"
+                )
+            if full_sequence[-1] != bonus_token:
+                raise RuntimeError(
+                    "DT Target authoritative sequence does not end in the bonus token"
+                )
+            if round_id == 0:
+                if req.rid in self._draft_kv_handle_by_request:
+                    raise RuntimeError("DT bootstrap already has a Draft KV handle")
+                draft_kv_handle = f"{self.instance_id}:{req.rid}:{attempt}"
+                kind = DraftTaskKind.BOOTSTRAP
+                committed_token_ids = full_sequence
+            else:
+                draft_kv_handle = self._draft_kv_handle_by_request.get(req.rid)
+                previous_len = self._draft_committed_len.get(req.rid)
+                if (
+                    draft_kv_handle is None
+                    or previous_len is None
+                    or previous_transfer_id is None
+                ):
+                    raise RuntimeError(
+                        "DT reconcile is missing the previous committed boundary"
+                    )
+                if len(full_sequence) <= previous_len:
+                    raise RuntimeError(
+                        "DT Target verification produced no committed token delta"
+                    )
+                self._ledger.mark_need_reconcile(previous_transfer_id)
+                committed_token_ids = full_sequence[previous_len:]
+                kind = DraftTaskKind.RECONCILE
+            self._draft_committed_len[req.rid] = len(full_sequence)
+            if round_id == 0:
+                self._draft_kv_handle_by_request[req.rid] = draft_kv_handle
+            task = DraftTask(
+                transfer_id=transfer_id,
+                request_id=req.rid,
+                round_id=round_id,
+                attempt=attempt,
+                target_instance_id=self.instance_id,
+                draft_profile_id=self.profile_id,
+                k=self.block_size - 1,
+                next_token_id=bonus_token,
+                source=None,
+                created_ns=now_ns,
+                deadline_ns=now_ns + self.round_timeout_ns,
+                kind=kind,
+                draft_kv_handle=draft_kv_handle,
+                committed_token_ids=committed_token_ids,
+                committed_kv_len=len(full_sequence),
+            )
+            if round_id > 0:
+                self._ledger.finish(previous_transfer_id)
+            return task
 
         expected_bytes = self.pivot_width * 2
         if pivot_nbytes != expected_bytes:
             raise ValueError(
                 f"DT Target expected {expected_bytes} pivot bytes, got {pivot_nbytes}"
             )
-        now_ns = time.monotonic_ns()
+        assert source_slot is not None and source_generation is not None
+        assert self._source_store is not None
         return DraftTask(
             transfer_id=transfer_id,
             request_id=req.rid,
@@ -937,6 +1357,14 @@ class DTTargetController:
                     continue
                 self._delivery_outbox.ack("task_batch", message.batch_id)
                 retry_tasks = self._ledger.apply_ack(message)
+                if self.is_token_only:
+                    for transfer_id in (
+                        *message.accepted_transfer_ids,
+                        *message.duplicate_transfer_ids,
+                    ):
+                        state = self._ledger.get(transfer_id)
+                        if state is not None and state.dispatch_accepted:
+                            events.append(("accepted", transfer_id, None))
                 active_retries = []
                 for task in retry_tasks:
                     if task.transfer_id in self._cancelled_transfers:
@@ -976,7 +1404,7 @@ class DTTargetController:
         return events
 
     def _flush_reliable_outbox(self) -> None:
-        from dt_protocol import CANCEL_TRANSFERS, PULL_DONE
+        from dt_protocol import CANCEL_TRANSFERS, PULL_DONE, RELEASE_DRAFT_REQUEST
 
         now_ns = time.monotonic_ns()
         outbox = self._delivery_outbox
@@ -987,11 +1415,38 @@ class DTTargetController:
                 sent = self._client.pull_done(message)
             elif operation == CANCEL_TRANSFERS:
                 sent = self._client.cancel(message)
+            elif operation == RELEASE_DRAFT_REQUEST:
+                sent = self._client.release_draft_request(message)
             else:
                 raise RuntimeError(f"unknown Target delivery operation {operation!r}")
             if not sent:
                 break
             outbox.mark_sent(operation, message_id, now_ns=now_ns)
+
+    def _release_draft_request(self, request_id: str) -> None:
+        if not self.is_export_rank or not self.is_token_only:
+            return
+        draft_kv_handle = self._draft_kv_handle_by_request.pop(request_id, None)
+        if draft_kv_handle is None:
+            return
+        from dt_protocol import (
+            PROTOCOL_VERSION,
+            RELEASE_DRAFT_REQUEST,
+            DraftRequestRelease,
+            draft_request_release_id,
+        )
+
+        message = DraftRequestRelease(
+            protocol_version=PROTOCOL_VERSION,
+            target_instance_id=self.instance_id,
+            request_id=request_id,
+            draft_kv_handle=draft_kv_handle,
+            released_ns=time.monotonic_ns(),
+        )
+        self._delivery_outbox.add(
+            RELEASE_DRAFT_REQUEST, draft_request_release_id(message), message
+        )
+        self._draft_committed_len.pop(request_id, None)
 
     def _expire_local_rounds(self) -> list[tuple[str, str, object]]:
         from dt_protocol import (
@@ -1005,9 +1460,17 @@ class DTTargetController:
         if not expired:
             return []
         transfer_ids = tuple(state.task.transfer_id for state in expired)
-        for transfer_id in transfer_ids:
+        for state in expired:
+            transfer_id = state.task.transfer_id
             self._ledger.finish(transfer_id)
+            self._release_draft_request(state.task.request_id)
         self._cancelled_transfers.update(transfer_ids)
+        self._drop_cancelled_unsent()
+        if self.is_token_only:
+            # Token-only rounds have neither SourceReadDone nor an active
+            # ledger entry after timeout.  A late result is therefore stale,
+            # so no later event exists (or is needed) to retire this marker.
+            self._cancelled_transfers.difference_update(transfer_ids)
         cancellation = CancelTransfers(
             protocol_version=PROTOCOL_VERSION,
             target_instance_id=self.instance_id,
@@ -1137,7 +1600,8 @@ class DTTargetController:
                         (candidate_bytes, state.bonus_token, state.seq_len),
                     )
                 )
-                self._ledger.finish(transfer_id)
+                if not self.is_token_only:
+                    self._ledger.finish(transfer_id)
             elif transfer_id in failed_ids:
                 if transfer_id in self._cancelled_transfers:
                     self._ledger.finish(transfer_id)
