@@ -899,6 +899,7 @@ class FlashMTPDraftEngine:
             num_org=self.profile.vocab_size,
             org_vocab_start=0,
             max_bs=self.max_batch_size,
+            sample_from_anchor=config.sample_from_anchor,
         )
         self._dflash_materializer = DFlashKvMaterializer(
             draft_model_runner=self._draft_model_runner,
