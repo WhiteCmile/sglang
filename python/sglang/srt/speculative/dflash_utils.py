@@ -124,8 +124,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -393,6 +392,7 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    sample_from_anchor: bool
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -511,6 +511,30 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    raw_sample_from_anchor = dflash_cfg.get(
+        "sample_from_anchor",
+        _cfg_get(draft_hf_config, "sample_from_anchor", None),
+    )
+    if raw_sample_from_anchor is None:
+        architectures = _cfg_get(draft_hf_config, "architectures", []) or []
+        is_dspark_checkpoint = any(
+            str(architecture).endswith("DSparkModel") for architecture in architectures
+        )
+        # The first public DSpark checkpoints predate the explicit
+        # sample_from_anchor field.  Unlike the original DFlash checkpoints,
+        # they do carry markov_rank (including rank 0 checkpoints) and train
+        # the anchor position to predict the first proposal.
+        has_markov_rank = _cfg_get(draft_hf_config, "markov_rank", None) is not None
+        sample_from_anchor = is_dspark_checkpoint or has_markov_rank
+    elif isinstance(raw_sample_from_anchor, bool):
+        sample_from_anchor = raw_sample_from_anchor
+    else:
+        raise ValueError(
+            "DFLASH sample_from_anchor must be a boolean, "
+            f"got {raw_sample_from_anchor!r} "
+            f"(type={type(raw_sample_from_anchor).__name__})."
+        )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -518,6 +542,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        sample_from_anchor=sample_from_anchor,
     )
 
 
@@ -651,8 +676,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape

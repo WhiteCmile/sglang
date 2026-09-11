@@ -77,6 +77,15 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _select_dflash_prediction_hidden_states(
+    hidden_states: torch.Tensor, *, sample_from_anchor: bool
+) -> torch.Tensor:
+    """Select the block_size - 1 states used to produce draft proposals."""
+    if sample_from_anchor:
+        return hidden_states[:, :-1, :]
+    return hidden_states[:, 1:, :]
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -90,12 +99,21 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        sample_from_anchor,
+        tp_group=None,
     ):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
+        self.sample_from_anchor = bool(sample_from_anchor)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
         max_tokens = int(max_bs) * (self.block_size - 1)
@@ -124,11 +142,11 @@ class _DflashDraftSampler:
             )
 
     def __call__(self, hidden_states, input_ids=None):
-        # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
-            -1, hidden_states.shape[-1]
-        )
+        hs = _select_dflash_prediction_hidden_states(
+            hidden_states.view(bs, self.block_size, -1),
+            sample_from_anchor=self.sample_from_anchor,
+        ).reshape(-1, hidden_states.shape[-1])
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
@@ -223,16 +241,18 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
+        self._sample_from_anchor = draft_config.sample_from_anchor
         self._mask_token_id = self._resolve_mask_token_id(
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
         if self.ps.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, sample_from_anchor=%s, draft_window_size=%s, compact_cache=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.block_size,
+                self._sample_from_anchor,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
@@ -404,6 +424,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            sample_from_anchor=self._sample_from_anchor,
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
@@ -1337,7 +1358,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
-    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+    def _next_accept_bonus_buffers(
+        self, bs: int
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1649,9 +1672,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
             draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
+                hidden_states=_select_dflash_prediction_hidden_states(
+                    draft_hidden,
+                    sample_from_anchor=self._sample_from_anchor,
+                ).reshape(-1, draft_hidden.shape[-1]),
                 lm_head=lm_head,
             ).view(bs, int(self.block_size) - 1)
 
