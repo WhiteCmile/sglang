@@ -44,6 +44,14 @@ class DFlashDraftInputV2(SpecInput):
     # Populated only by a disaggregated Target after remote Draft completion.
     # Shape: [bs, block_size], including the slot-0 bonus token.
     draft_tokens: Optional[torch.Tensor] = None
+    # Target-only DT handoff.  Each entry is one request's packed authoritative
+    # feature rows and the exact token ids represented by those rows.  A list of
+    # row tensors is intentional: prefill chunks are ragged while verify blocks
+    # are prefix-valid.  These fields never cross the control plane directly;
+    # DTTargetController publishes them through its registered GPU ring.
+    dt_feature_chunks: Optional[List[torch.Tensor]] = None
+    dt_feature_token_chunks: Optional[List[torch.Tensor]] = None
+    dt_feature_offsets: Optional[List[int]] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -142,7 +150,6 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-        page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
@@ -220,6 +227,20 @@ class DFlashDraftInputV2(SpecInput):
         new_indices: torch.Tensor,
         new_indices_cpu: Optional[List[int]] = None,
     ):
+        if self.dt_feature_chunks is not None:
+            if new_indices_cpu is None:
+                new_indices_cpu = new_indices.to("cpu").tolist()
+            self.dt_feature_chunks = [
+                self.dt_feature_chunks[index] for index in new_indices_cpu
+            ]
+            assert self.dt_feature_token_chunks is not None
+            assert self.dt_feature_offsets is not None
+            self.dt_feature_token_chunks = [
+                self.dt_feature_token_chunks[index] for index in new_indices_cpu
+            ]
+            self.dt_feature_offsets = [
+                self.dt_feature_offsets[index] for index in new_indices_cpu
+            ]
         if self.reserved_seq_lens_cpu is not None:
             if new_indices_cpu is not None:
                 self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
@@ -246,6 +267,19 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+        if self.dt_feature_chunks is None and spec_info.dt_feature_chunks is not None:
+            raise ValueError("cannot merge a non-DT input with DT feature chunks")
+        if self.dt_feature_chunks is not None and spec_info.dt_feature_chunks is None:
+            raise ValueError("cannot merge DT feature chunks with a non-DT input")
+        if self.dt_feature_chunks is not None:
+            assert self.dt_feature_token_chunks is not None
+            assert self.dt_feature_offsets is not None
+            assert spec_info.dt_feature_token_chunks is not None
+            assert spec_info.dt_feature_offsets is not None
+            self.dt_feature_chunks.extend(spec_info.dt_feature_chunks)
+            self.dt_feature_token_chunks.extend(spec_info.dt_feature_token_chunks)
+            self.dt_feature_offsets.extend(spec_info.dt_feature_offsets)
+
         if self.reserved_seq_lens_cpu is not None:
             assert spec_info.reserved_seq_lens_cpu is not None
             self.reserved_seq_lens_cpu = torch.cat(

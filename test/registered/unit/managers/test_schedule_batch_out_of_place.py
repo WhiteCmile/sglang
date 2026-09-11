@@ -75,6 +75,14 @@ class _FakeReq:
 
 
 class TestMergeBatchOutOfPlace(unittest.TestCase):
+    def test_copy_preserves_chunked_request_boundary(self):
+        chunked_req = types.SimpleNamespace(rid="chunked")
+        batch = ScheduleBatch(reqs=[chunked_req], chunked_req=chunked_req)
+
+        copied = batch.copy()
+
+        self.assertIs(copied.chunked_req, chunked_req)
+
     def test_merge_batch_rebinds_lists_without_mutating_either_side(self):
         """merge_batch must build new list objects; no field of either side may be mutated in place."""
         self_batch = make_schedule_batch(

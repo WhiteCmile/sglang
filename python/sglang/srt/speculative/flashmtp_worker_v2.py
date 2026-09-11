@@ -29,7 +29,10 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
-from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.dflash_worker_v2 import (
+    DFlashWorkerV2,
+    split_dflash_committed_rows,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -539,6 +542,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         profile = bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
             self, "_is_token_only", False
         )
+        sync_profile = False
+        if profile:
+            from dt_profile import cuda_sync_enabled
+
+            sync_profile = cuda_sync_enabled()
         started_ns = time.monotonic_ns()
         batch_size = int(candidates.shape[0])
         if tuple(candidates.shape) != (batch_size, self.block_size):
@@ -586,7 +594,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             is_verify=True,
             skip_attn_backend_init=True,
         )
-        if profile:
+        if sync_profile:
             torch.get_device_module(self.device).synchronize()
         target_done_ns = time.monotonic_ns()
         logits_output = target_out.logits_output
@@ -693,7 +701,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if profile:
+        if sync_profile:
             torch.get_device_module(self.device).synchronize()
         accepted_ns = time.monotonic_ns()
 
@@ -708,11 +716,22 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 raise RuntimeError(
                     "FLASHMTP verify requires captured target auxiliary hidden states."
                 )
-            next_pivot = gather_flashmtp_next_pivot(
-                packed_hidden=packed_hidden,
-                accept_len=accept_len,
-                block_size=self.block_size,
-            )
+            if getattr(self, "_is_dflash", False):
+                feature_chunks, feature_token_chunks = split_dflash_committed_rows(
+                    packed_hidden=packed_hidden,
+                    candidates=candidates,
+                    commit_lens=commit_lens,
+                    block_size=self.block_size,
+                )
+                next_pivot = torch.empty(
+                    (batch_size, 0), dtype=packed_hidden.dtype, device=self.device
+                )
+            else:
+                next_pivot = gather_flashmtp_next_pivot(
+                    packed_hidden=packed_hidden,
+                    accept_len=accept_len,
+                    block_size=self.block_size,
+                )
             logits_output.hidden_states = None
         else:
             # Token-only disaggregation has no Target feature payload.  Keep the
@@ -727,6 +746,18 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             new_seq_lens=new_seq_lens,
             pivot_hidden=next_pivot,
         )
+        if getattr(self, "_is_dflash", False):
+            next_input.dt_feature_chunks = feature_chunks
+            next_input.dt_feature_token_chunks = feature_token_chunks
+            if seq_lens_cpu_backup is not None:
+                next_input.dt_feature_offsets = [
+                    int(value) for value in seq_lens_cpu_backup.tolist()
+                ]
+            else:
+                next_input.dt_feature_offsets = [
+                    int(value)
+                    for value in prefix_lens.to(device="cpu", dtype=torch.int64).tolist()
+                ]
         if profile:
             from dt_profile import emit as profile_emit
 
@@ -737,6 +768,8 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 target_forward_ns=target_done_ns - prepared_ns,
                 accept_ns=accepted_ns - target_done_ns,
                 finish_ns=time.monotonic_ns() - accepted_ns,
+                cuda_synchronized=sync_profile,
+                timing_scope=("gpu_complete" if sync_profile else "host_submission"),
             )
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -750,6 +783,8 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         batch_result.dt_cuda_graph_measurement_event_id = (
             self.target_worker.model_runner._last_cuda_graph_measurement_event_id
         )
+        if getattr(self, "_is_dflash", False):
+            batch_result.dt_hidden_produced_ns = target_done_ns
         return batch_result
 
     def _prepare_draft_block_eager(

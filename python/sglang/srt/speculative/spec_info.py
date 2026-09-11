@@ -279,6 +279,12 @@ class SpeculativeAlgorithm(Enum):
         ), "Cannot create worker for NONE speculative algorithm."
 
         if self.is_dflash():
+            if server_args.draft_target_disaggregation_role == "target":
+                from sglang.srt.speculative.flashmtp_target_worker_v2 import (
+                    FlashMTPDisaggregatedTargetWorkerV2,
+                )
+
+                return FlashMTPDisaggregatedTargetWorkerV2
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2

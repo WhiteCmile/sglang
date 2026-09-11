@@ -3096,6 +3096,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             extend_num_tokens=self.extend_num_tokens,
+            # The overlap result snapshot is consumed after generic prefill
+            # processing decrements ``inflight_middle_chunks``.  Preserve the
+            # launch-time marker so consumers can still distinguish an
+            # intermediate chunk from the final prompt chunk.
+            chunked_req=self.chunked_req,
         )
 
     def maybe_evict_swa(self):

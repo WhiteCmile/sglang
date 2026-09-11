@@ -14,6 +14,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import build_block_pos_offsets
 from sglang.srt.speculative.flashmtp_utils import parse_flashmtp_draft_config
@@ -58,6 +59,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             is_draft_model=True,
         )
         self._is_token_only = server_args.speculative_algorithm == "STANDALONE_DT"
+        self._is_dflash = server_args.speculative_algorithm == "DFLASH"
         self.block_size = int(server_args.speculative_num_draft_tokens)
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1
@@ -66,6 +68,26 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         if self._is_token_only:
             self._mask_token_id = 0
             self._num_pivot_layers = 0
+        elif self._is_dflash:
+            dflash_config = parse_dflash_draft_config(
+                draft_hf_config=draft_model_config.hf_config
+            )
+            target_layer_ids = dflash_config.resolve_target_layer_ids(
+                target_num_layers=int(target_config.num_hidden_layers),
+                draft_num_layers=dflash_config.require_num_layers(),
+            )
+            self._num_pivot_layers = len(target_layer_ids)
+            self._mask_token_id = DFlashWorkerV2._resolve_mask_token_id(
+                self,
+                mask_token=dflash_config.mask_token,
+                mask_token_id=dflash_config.mask_token_id,
+            )
+            if int(target_config.hidden_size) != int(draft_model_config.hidden_size):
+                raise ValueError(
+                    "DFLASH target/draft hidden size mismatch: "
+                    f"target={target_config.hidden_size}, "
+                    f"draft={draft_model_config.hidden_size}."
+                )
         else:
             flash_config = parse_flashmtp_draft_config(
                 draft_hf_config=draft_model_config.hf_config
@@ -149,8 +171,13 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         grammar_barrier=None,
     ) -> GenerationBatchResult:
         profile = bool(os.environ.get("DT_PROFILE_DIR"))
-        started_ns = time.monotonic_ns()
+        sync_profile = False
         if profile:
+            from dt_profile import cuda_sync_enabled
+
+            sync_profile = cuda_sync_enabled()
+        started_ns = time.monotonic_ns()
+        if sync_profile:
             torch.get_device_module(self.device).synchronize()
             started_ns = time.monotonic_ns()
         if getattr(batch, "return_logprob", False):
@@ -197,7 +224,8 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         candidates = self._draft_block_tokens_buf[:batch_size]
         candidates.copy_(remote_candidates.to(device=self.device, dtype=torch.int64))
         if profile:
-            torch.get_device_module(self.device).synchronize()
+            if sync_profile:
+                torch.get_device_module(self.device).synchronize()
             candidates_ready_ns = time.monotonic_ns()
         # DT validates every candidate root against the round's bonus token in
         # ``DraftTargetController._consume_result_batch`` before publishing a
@@ -220,7 +248,8 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             verify_out_cache_loc_2d=verify_out_cache_loc_2d,
         )
         if profile:
-            torch.get_device_module(self.device).synchronize()
+            if sync_profile:
+                torch.get_device_module(self.device).synchronize()
             layout_ready_ns = time.monotonic_ns()
             from dt_profile import emit as profile_emit
 
@@ -229,6 +258,8 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
                 batch_size=batch_size,
                 candidate_copy_ns=candidates_ready_ns - started_ns,
                 layout_ns=layout_ready_ns - candidates_ready_ns,
+                cuda_synchronized=sync_profile,
+                timing_scope=("gpu_complete" if sync_profile else "host_submission"),
             )
 
         result = self._verify_candidates(
@@ -242,31 +273,74 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             grammar_barrier=grammar_barrier,
         )
         if profile:
-            torch.get_device_module(self.device).synchronize()
+            if sync_profile:
+                torch.get_device_module(self.device).synchronize()
+            verify_completed_ns = time.monotonic_ns()
             from dt_profile import emit as profile_emit
 
             profile_emit(
                 "target_verify_forward",
                 batch_size=batch_size,
-                total_ns=time.monotonic_ns() - started_ns,
+                verify_completed_ns=verify_completed_ns,
+                total_ns=verify_completed_ns - started_ns,
+                cuda_synchronized=sync_profile,
+                timing_scope=("gpu_complete" if sync_profile else "host_submission"),
             )
         return result
 
     def _forward_prefill(
         self, batch: ScheduleBatch, *, on_publish=None
     ) -> GenerationBatchResult:
+        input_ids = batch.input_ids
         capture_mode = (
-            CaptureHiddenMode.NULL if self._is_token_only else CaptureHiddenMode.LAST
+            CaptureHiddenMode.NULL
+            if self._is_token_only
+            else (
+                CaptureHiddenMode.FULL
+                if self._is_dflash
+                else CaptureHiddenMode.LAST
+            )
         )
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=capture_mode
         )
+        if self._is_dflash:
+            batch_output.dt_hidden_produced_ns = time.monotonic_ns()
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         if self._is_token_only:
             pivot_hidden = torch.empty(
                 (len(batch.reqs), 0), dtype=torch.bfloat16, device=self.device
             )
+        elif self._is_dflash:
+            packed_hidden = logits_output.hidden_states
+            if packed_hidden is None:
+                raise RuntimeError(
+                    "disaggregated DFLASH prefill requires target auxiliary hidden states"
+                )
+            if batch.extend_lens is None or batch.prefix_lens is None:
+                raise RuntimeError(
+                    "disaggregated DFLASH prefill requires extend/prefix lengths"
+                )
+            total_tokens = int(sum(batch.extend_lens))
+            if (
+                packed_hidden.ndim != 2
+                or int(packed_hidden.shape[0]) != total_tokens
+                or int(packed_hidden.shape[1]) != self._pivot_width
+            ):
+                raise RuntimeError(
+                    "DFLASH prefill feature shape mismatch: "
+                    f"expected {(total_tokens, self._pivot_width)}, "
+                    f"got {tuple(packed_hidden.shape)}"
+                )
+            if input_ids is None or int(input_ids.numel()) != total_tokens:
+                raise RuntimeError("DFLASH prefill input ids do not match feature rows")
+            feature_chunks = list(torch.split(packed_hidden, batch.extend_lens, dim=0))
+            feature_token_chunks = list(torch.split(input_ids, batch.extend_lens, dim=0))
+            pivot_hidden = torch.empty(
+                (len(batch.reqs), 0), dtype=torch.bfloat16, device=self.device
+            )
+            logits_output.hidden_states = None
         else:
             pivot_hidden = logits_output.hidden_states
             if pivot_hidden is None:
@@ -283,11 +357,16 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
-        batch_output.next_draft_input = self._make_next_input(
+        next_input = self._make_next_input(
             bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             pivot_hidden=pivot_hidden,
         )
+        if self._is_dflash:
+            next_input.dt_feature_chunks = feature_chunks
+            next_input.dt_feature_token_chunks = feature_token_chunks
+            next_input.dt_feature_offsets = [int(value) for value in batch.prefix_lens]
+        batch_output.next_draft_input = next_input
         return batch_output
 
     def _forward_idle(self, *, on_publish=None) -> GenerationBatchResult:

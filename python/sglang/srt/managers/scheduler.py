@@ -2901,6 +2901,16 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        if (
+            self.dt_target_controller is not None
+            and not self.dt_target_controller.has_feature_source_capacity()
+        ):
+            # A remote-DFlash Target forward always produces authoritative
+            # feature rows. Keep the selected work in running_batch until TP0
+            # observes a reusable registered source slot; this is ordinary
+            # scheduler backpressure, not a per-round allocation fallback.
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+
         if self.dt_target_controller is not None and running_batch.is_empty():
             # Reconcile the previous prefill result above before admitting a
             # completed Draft lane.  Injecting the lane earlier lets the

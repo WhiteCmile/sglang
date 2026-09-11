@@ -86,6 +86,51 @@ def _select_dflash_prediction_hidden_states(
     return hidden_states[:, 1:, :]
 
 
+def split_dflash_committed_rows(
+    *,
+    packed_hidden: torch.Tensor,
+    candidates: torch.Tensor,
+    commit_lens: torch.Tensor,
+    block_size: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Return the exact prefix-valid feature/token rows committed by verify.
+
+    This is the shared DFlash commit-selection boundary for co-located and
+    disaggregated execution.  The returned tensors are views; callers that
+    retain them beyond the current result must establish their own lifetime.
+    """
+    if packed_hidden.ndim != 2:
+        raise ValueError(
+            "DFLASH committed hidden states must be packed 2D rows, "
+            f"got shape={tuple(packed_hidden.shape)}."
+        )
+    batch_size = int(candidates.shape[0])
+    if tuple(candidates.shape) != (batch_size, int(block_size)):
+        raise ValueError(
+            "DFLASH committed candidate shape mismatch: "
+            f"expected {(batch_size, int(block_size))}, "
+            f"got {tuple(candidates.shape)}."
+        )
+    if int(packed_hidden.shape[0]) != batch_size * int(block_size):
+        raise ValueError(
+            "DFLASH committed hidden row count does not match the verify block."
+        )
+    if commit_lens.ndim != 1 or int(commit_lens.numel()) != batch_size:
+        raise ValueError("DFLASH commit lengths do not match the verify batch.")
+    lengths = commit_lens.to(device="cpu", dtype=torch.int64).tolist()
+    hidden_3d = packed_hidden.view(batch_size, int(block_size), -1)
+    hidden_rows: list[torch.Tensor] = []
+    token_rows: list[torch.Tensor] = []
+    for row, length in enumerate(lengths):
+        if length <= 0 or length > int(block_size):
+            raise ValueError(
+                f"DFLASH commit length {length} is outside [1, {block_size}]."
+            )
+        hidden_rows.append(hidden_3d[row, :length])
+        token_rows.append(candidates[row, :length])
+    return hidden_rows, token_rows
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -496,14 +541,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             first_attn = layers[0].self_attn
             rotary_emb = first_attn.rotary_emb
 
+            max_position_hint = getattr(
+                self, "_kv_materializer_max_position_hint", None
+            )
+            if max_position_hint is None:
+                max_position_hint = (
+                    self.target_worker.model_runner.model_config.context_len
+                    + int(self.block_size)
+                )
             self._fused_kv_helper = FusedKVMaterializeHelper(
                 layers=layers,
                 rotary_emb=rotary_emb,
                 num_kv_heads=first_attn.num_kv_heads,
                 head_dim=first_attn.head_dim,
                 device=self.device,
-                max_position_hint=self.target_worker.model_runner.model_config.context_len
-                + int(self.block_size),
+                max_position_hint=max_position_hint,
             )
             if self.ps.tp_rank == 0:
                 logger.info(
@@ -1918,3 +1970,40 @@ class DFlashWorkerV2(BaseSpecWorker):
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
         )
+
+
+class DFlashKvMaterializer:
+    """Remote-Draft facade over DFlashWorkerV2's production KV writer.
+
+    Keeping these methods as aliases, rather than copies, makes the co-located
+    and disaggregated paths execute the same projection, fused eligibility,
+    RoPE, normalization, and KV-pool writes.
+    """
+
+    _init_fused_kv_helper = DFlashWorkerV2._init_fused_kv_helper
+    _append_target_hidden_sequential = (
+        DFlashWorkerV2._append_target_hidden_sequential
+    )
+    _append_target_hidden_fused = DFlashWorkerV2._append_target_hidden_fused
+    append = DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc
+
+    def __init__(
+        self,
+        *,
+        draft_model_runner,
+        draft_model,
+        ps: ParallelState,
+        block_size: int,
+        context_len: int,
+    ) -> None:
+        self.model_runner = draft_model_runner
+        self.draft_model_runner = draft_model_runner
+        self.draft_model = draft_model
+        self.ps = ps
+        self.device = draft_model_runner.device
+        self.block_size = int(block_size)
+        self._kv_materializer_max_position_hint = int(context_len) + self.block_size
+        self._use_fused_kv_materialize = is_cuda() or is_hip()
+        self._fused_kv_helper: Optional[object] = None
+        if self._use_fused_kv_materialize:
+            self._init_fused_kv_helper()
