@@ -61,6 +61,114 @@ DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 DT_DIRECT_GPU_REQUEST_EVIDENCE_IDLE_NS = 750_000_000
 
 
+def _prepare_eagle3_extend_batch(batch: ScheduleBatch) -> bool:
+    """Prepare a text-only persistent EAGLE3 reconcile without dead token input.
+
+    The feature-aligned IDs are installed by the caller. Keep the generic KV
+    allocator, sampling state and request accounting; only skip rebuilding a
+    committed-ID tensor that this adapter never consumes. Unsupported request
+    types fall back before any state is changed.
+    """
+    from sglang.srt.managers.schedule_batch import compute_extend_logprob_start_len
+    from sglang.srt.mem_cache.allocation import alloc_for_extend
+    from sglang.srt.runtime_context import get_server_args
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.utils.common import is_pin_memory_available
+
+    server_args = get_server_args()
+    reqs = batch.reqs
+    if (
+        not reqs
+        or not batch.spec_algorithm.is_eagle3()
+        or batch.tree_cache.supports_swa()
+        or batch.tree_cache.supports_mamba()
+        or batch.is_dllm()
+        or batch.enable_overlap
+        or batch.return_logprob
+        or batch.model_config.is_encoder_decoder
+        or server_args.enable_mamba_extra_buffer()
+        or any(
+            req.input_embeds is not None
+            or req.positional_embed_overrides is not None
+            or req.multimodal_inputs is not None
+            or req.mamba_pool_idx is not None
+            for req in reqs
+        )
+    ):
+        return False
+
+    prefix_lens = [len(req.prefix_indices) for req in reqs]
+    seq_lens = [req.extend_range.end for req in reqs]
+    extend_lens = [req.extend_range.length for req in reqs]
+    for req, prefix_len, seq_len in zip(reqs, prefix_lens, seq_lens):
+        # Generic preparation derives token counts by slicing the history.
+        # Validate the same boundaries explicitly when using metadata alone.
+        if (
+            prefix_len != req.extend_range.start
+            or seq_len < prefix_len
+            or seq_len > len(req.full_untruncated_fill_ids)
+        ):
+            raise ValueError("EAGLE3 extend range does not match committed history")
+    extend_logprob_start_lens = [
+        compute_extend_logprob_start_len(
+            logprob_start_len=req.logprob_start_len,
+            prefix_len=prefix_len,
+            extend_len=extend_len,
+            full_untruncated_fill_len=len(req.full_untruncated_fill_ids),
+        )
+        for req, prefix_len, extend_len in zip(reqs, prefix_lens, extend_lens)
+    ]
+    pin = is_pin_memory_available(batch.device)
+    batch.forward_mode = ForwardMode.EXTEND
+    batch.prefix_lens = prefix_lens
+    batch.extend_lens = extend_lens
+    batch.extend_num_tokens = sum(extend_lens)
+    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=pin).to(
+        batch.device, non_blocking=True
+    )
+    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+    orig_seq_lens = torch.tensor(
+        [max(end, len(req.origin_input_ids)) for req, end in zip(reqs, seq_lens)],
+        dtype=torch.int32,
+        pin_memory=pin,
+    ).to(batch.device, non_blocking=True)
+    out_cache_loc, req_pool_indices, req_pool_indices_cpu = alloc_for_extend(batch)
+
+    # Keep this accounting in lockstep with ScheduleBatch.prepare_for_extend.
+    for req, seq_len, prefix_len in zip(reqs, seq_lens, prefix_lens):
+        req.extend_batch_idx += 1
+        req.kv_committed_len = seq_len
+        if not req.retracted_stain:
+            req.cached_tokens += prefix_len - req.already_computed
+            if not req._cache_breakdown_computed:
+                host_total = req.host_hit_length
+                storage_portion = min(host_total, req.storage_hit_length)
+                req.cached_tokens_device = max(0, prefix_len - host_total)
+                req.cached_tokens_host = host_total - storage_portion
+                req.cached_tokens_storage = storage_portion
+                req._cache_breakdown_computed = True
+            req.already_computed = seq_len
+        req.is_retracted = False
+
+    batch.input_ids = None
+    batch.prefill_input_ids_cpu = None
+    batch.req_pool_indices = req_pool_indices
+    batch.req_pool_indices_cpu = req_pool_indices_cpu
+    batch.orig_seq_lens = orig_seq_lens
+    batch.out_cache_loc = out_cache_loc
+    batch.input_embeds = None
+    batch.replace_embeds = None
+    batch.replace_positions = None
+    batch.multimodal_inputs = [None] * len(reqs)
+    batch.seq_lens_sum = sum(seq_lens)
+    batch.extend_logprob_start_lens = extend_logprob_start_lens
+    batch.extend_input_logprob_token_ids = None
+    batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+        batch, batch.model_config.vocab_size
+    )
+    return True
+
+
 def _eagle3_feature_staging_view_bounds(
     *,
     requires_proposal: bool,
@@ -3409,8 +3517,8 @@ class FlashMTPDraftEngine:
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         )
-        batch.prepare_for_extend()
-        self._resolve_prefill_inputs(batch)
+        if not grouped_reconcile or not _prepare_eagle3_extend_batch(batch):
+            batch.prepare_for_extend()
         batch_prepared_ns = time.monotonic_ns()
         # Target sends the exact token aligned with each auxiliary-hidden row
         # (the output-token stream used by stock EAGLE draft-extend), while the
@@ -3435,6 +3543,11 @@ class FlashMTPDraftEngine:
         batch.input_ids = torch.tensor(
             feature_input_ids, dtype=torch.int64, device=self.device
         )
+        # EAGLE3 consumes the authoritative feature-aligned stream above.
+        # The committed-ID buffer from generic extend preparation has no
+        # consumer here; do not upload it or let deferred resolution replace
+        # the feature-aligned inputs.
+        batch.prefill_input_ids_cpu = None
         staging = self._feature_staging_buffers[staging_slot]
         staging_view_bounds = _eagle3_feature_staging_view_bounds(
             requires_proposal=bool(tasks[0].requires_proposal),
