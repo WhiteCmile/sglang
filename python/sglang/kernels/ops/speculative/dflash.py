@@ -59,7 +59,6 @@ def _dflash_accept_bonus_contig_kernel(
         out_tokens_ptr + row * out_tokens_row_stride + cols, out_val, mask=row_mask
     )
 
-
 def _pick_num_warps(block_size: int) -> int:
     if block_size <= 16:
         return 1

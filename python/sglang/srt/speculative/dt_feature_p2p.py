@@ -68,7 +68,7 @@ class FeatureSourceDescriptor:
     visible range.  Consumers must map the handle and calculate the address
     locally.  ``allocation_base_address`` is deliberately not published.
 
-    The field names align with the DFlash extension of ``dt_protocol.SourceRef``
+    The field names align with the direct-GPU extension of ``dt_protocol.SourceRef``
     so the controller can construct its wire struct without translating any
     payload data.
     """
@@ -128,6 +128,8 @@ class FeaturePublish:
     descriptors: tuple[FeatureSourceDescriptor, ...]
     hidden_produced_ns: int
     descriptor_published_ns: int
+    pack_strategy: str
+    pack_chunk_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,19 @@ class FeaturePullMetrics:
     gpu_copy_ns: int
     feature_bytes: int
     cold_mapping_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FeaturePullBatchMetrics:
+    submitted_ns: int
+    gpu_completed_ns: int
+    mapping_ns: int
+    driver_submit_ns: int
+    gpu_copy_ns: int
+    feature_bytes: int
+    cold_mapping_count: int
+    segment_count: int
+    peer_count: int
 
 
 @dataclass(slots=True)
@@ -179,7 +194,7 @@ class TargetFeatureSourcePool:
             raise ValueError("feature source-pool dimensions must be positive")
         requested_device = torch.device(device)
         if requested_device.type != "cuda":
-            raise ValueError("DFlash feature source buffers require a CUDA device")
+            raise ValueError("direct GPU source buffers require a CUDA device")
         self.device_index = (
             torch.cuda.current_device()
             if requested_device.index is None
@@ -213,6 +228,12 @@ class TargetFeatureSourcePool:
         self._buffer = buffers[0]
         self._slots = [_FeatureSlot() for _ in range(self.slot_count)]
         self._active: dict[str, tuple[int, int]] = {}
+        # Cancelling an undelivered descriptor is not equivalent to a remote
+        # read completion: the Target publication copy can still be using the
+        # slot.  Keep those leases active until the local producer event can be
+        # queried complete.  This also makes existing active-lease lifecycle
+        # accounting include deferred producer retirement.
+        self._cancelled_transfers: set[str] = set()
         # Bounded history makes duplicate read-done idempotent without allowing
         # a stale acknowledgement to free a reissued slot generation.
         self._completed: OrderedDict[str, tuple[int, int]] = OrderedDict()
@@ -229,6 +250,7 @@ class TargetFeatureSourcePool:
 
     @property
     def free_slot_count(self) -> int:
+        self.poll_cancelled_producers()
         with self._lock:
             return sum(slot.state is FeatureSlotState.FREE for slot in self._slots)
 
@@ -236,6 +258,13 @@ class TargetFeatureSourcePool:
     def quarantined_slot_count(self) -> int:
         with self._lock:
             return sum(slot.state is FeatureSlotState.QUARANTINED for slot in self._slots)
+
+    @property
+    def active_lease_count(self) -> int:
+        """Active remote leases plus cancellations awaiting producer completion."""
+
+        with self._lock:
+            return len(self._active)
 
     def publish(
         self,
@@ -255,6 +284,7 @@ class TargetFeatureSourcePool:
         """
         if self._closed:
             raise FeatureTransportError("feature source pool is closed")
+        self.poll_cancelled_producers()
         if not feature_schema_id:
             raise ValueError("feature schema id must not be empty")
         chunks = (
@@ -275,6 +305,12 @@ class TargetFeatureSourcePool:
             raise ValueError("a published feature range needs at least one transfer")
 
         with self._lock:
+            # ``close()`` uses this same lock to fence publication and snapshot
+            # ownership. Validation above is intentionally outside the lock,
+            # so admission must be rechecked here before reserving a slot; an
+            # initial fast-path check alone would allow post-close CUDA work.
+            if self._closed:
+                raise FeatureTransportError("feature source pool is closed")
             slot_id = next(
                 (
                     index
@@ -301,23 +337,39 @@ class TargetFeatureSourcePool:
             for item in slices:
                 self._active[item.transfer_id] = (slot_id, generation)
 
+        producer_event = None
         try:
             target = self._storage[slot_id]
-            row_offset = 0
-            # Every chunk is CUDA BF16. Copy directly into the fixed registered
-            # allocation without constructing a per-round packed tensor.
-            for chunk in chunks:
-                row_end = row_offset + int(chunk.shape[0])
-                target[row_offset:row_end].copy_(chunk, non_blocking=True)
-                row_offset = row_end
+            cat = getattr(torch, "cat", None)
+            if len(chunks) > 1 and callable(cat):
+                # Pack ragged request chunks directly into the leased,
+                # registered slot. ``out=`` avoids a transient packed tensor
+                # while replacing one D2D enqueue per request with one ordered
+                # CUDA operation. The producer event below fences the complete
+                # pack exactly as it fenced the former copy loop.
+                cat(chunks, dim=0, out=target[:token_count])
+                pack_strategy = "cat-out"
+            else:
+                # A single chunk is already one enqueue. Keep the original
+                # loop as the capability fallback for runtimes without cat.
+                row_offset = 0
+                for chunk in chunks:
+                    row_end = row_offset + int(chunk.shape[0])
+                    target[row_offset:row_end].copy_(chunk, non_blocking=True)
+                    row_offset = row_end
+                pack_strategy = "copy-loop"
             producer_event = torch.cuda.Event(interprocess=True)
             producer_event.record(torch.cuda.current_stream(self.device))
             event_handle = producer_event.ipc_handle()
         except Exception:
             # A failed enqueue is not safe to reuse: CUDA may have accepted a
             # prefix of work.  Keep the fixed slot quarantined until process
-            # teardown rather than risking a late remote read.
+            # teardown rather than risking a late remote read. If event
+            # creation or IPC-handle export failed after recording, retain that
+            # event with the quarantined slot as part of the uncertain work.
             with self._lock:
+                if producer_event is not None:
+                    self._slots[slot_id].producer_event = producer_event
                 self._quarantine_locked(slot_id, generation)
             raise
 
@@ -364,6 +416,8 @@ class TargetFeatureSourcePool:
                 time.monotonic_ns() if hidden_produced_ns is None else hidden_produced_ns
             ),
             descriptor_published_ns=descriptor_published_ns,
+            pack_strategy=pack_strategy,
+            pack_chunk_count=len(chunks),
         )
 
     def read_done(
@@ -386,20 +440,18 @@ class TargetFeatureSourcePool:
             pool_generation=pool_generation,
         )
         with self._lock:
-            active = self._active.get(transfer_id)
+            active = self._validate_read_done_locked(
+                transfer_id=transfer_id,
+                source_slot_id=source_slot_id,
+                slot_generation=slot_generation,
+            )
             if active is None:
-                completed = self._completed.get(transfer_id)
-                if completed is None:
-                    raise FeatureTransportError(f"unknown feature transfer {transfer_id!r}")
-                if completed != (source_slot_id, slot_generation):
-                    raise FeatureTransportError("stale read-done conflicts with completed lease")
                 return False
-            if active != (source_slot_id, slot_generation):
-                raise FeatureTransportError("read-done slot or generation does not match lease")
             slot = self._slot_for_generation_locked(
                 source_slot_id, slot_generation, allow_quarantined=True
             )
             self._active.pop(transfer_id)
+            self._cancelled_transfers.discard(transfer_id)
             slot.active_transfers.remove(transfer_id)
             self._remember_completed_locked(transfer_id, active)
             if slot.active_transfers:
@@ -407,6 +459,54 @@ class TargetFeatureSourcePool:
             slot.state = FeatureSlotState.FREE
             slot.producer_event = None
             return True
+
+    def validate_read_done(
+        self,
+        *,
+        transfer_id: str,
+        source_slot_id: int,
+        slot_generation: int,
+        source_session_id: str,
+        pool_generation: str,
+    ) -> None:
+        """Validate a read completion without retiring its source lease."""
+
+        self._validate_fence(
+            source_session_id=source_session_id,
+            pool_generation=pool_generation,
+        )
+        with self._lock:
+            self._validate_read_done_locked(
+                transfer_id=transfer_id,
+                source_slot_id=source_slot_id,
+                slot_generation=slot_generation,
+            )
+
+    def _validate_read_done_locked(
+        self,
+        *,
+        transfer_id: str,
+        source_slot_id: int,
+        slot_generation: int,
+    ) -> tuple[int, int] | None:
+        active = self._active.get(transfer_id)
+        if active is None:
+            completed = self._completed.get(transfer_id)
+            if completed is None:
+                raise FeatureTransportError(f"unknown feature transfer {transfer_id!r}")
+            if completed != (source_slot_id, slot_generation):
+                raise FeatureTransportError(
+                    "stale read-done conflicts with completed lease"
+                )
+            return None
+        if active != (source_slot_id, slot_generation):
+            raise FeatureTransportError(
+                "read-done slot or generation does not match lease"
+            )
+        self._slot_for_generation_locked(
+            source_slot_id, slot_generation, allow_quarantined=True
+        )
+        return active
 
     def cancel(
         self,
@@ -417,14 +517,106 @@ class TargetFeatureSourcePool:
         source_session_id: str,
         pool_generation: str,
     ) -> bool:
-        """Release an undelivered descriptor through the same fenced lease path."""
-        return self.read_done(
-            transfer_id=transfer_id,
-            source_slot_id=source_slot_id,
-            slot_generation=slot_generation,
+        """Retire an undelivered descriptor after its producer copy completes.
+
+        A remote read-done proves that the consumer waited for the producer
+        event. Cancellation has no such ordering guarantee, so it leaves the
+        lease active and polls the event without synchronizing. Normal serving
+        retires delayed cancellations from ``free_slot_count``; shutdown sees
+        the still-active lease and retains the pool if the event is pending.
+        """
+        self._validate_fence(
             source_session_id=source_session_id,
             pool_generation=pool_generation,
         )
+        with self._lock:
+            active = self._validate_read_done_locked(
+                transfer_id=transfer_id,
+                source_slot_id=source_slot_id,
+                slot_generation=slot_generation,
+            )
+            if active is None:
+                return False
+            self._cancelled_transfers.add(transfer_id)
+
+        self.poll_cancelled_producers()
+        with self._lock:
+            return (
+                transfer_id not in self._active
+                and self._slots[source_slot_id].generation == slot_generation
+                and self._slots[source_slot_id].state is FeatureSlotState.FREE
+            )
+
+    def poll_cancelled_producers(self) -> int:
+        """Nonblocking retirement for cancelled, producer-owned source leases.
+
+        A failed event query leaves the event, storage, and lease reachable in
+        a permanently quarantined slot.  No synchronization is attempted: an
+        uncertain CUDA fence must remain owned until process teardown.
+        """
+        with self._lock:
+            candidates: list[tuple[int, int, torch.cuda.Event]] = []
+            seen: set[tuple[int, int]] = set()
+            for transfer_id in self._cancelled_transfers:
+                active = self._active.get(transfer_id)
+                if active is None or active in seen:
+                    continue
+                slot_id, generation = active
+                slot = self._slot_for_generation_locked(
+                    slot_id, generation, allow_quarantined=True
+                )
+                if slot.state is FeatureSlotState.QUARANTINED:
+                    continue
+                if slot.producer_event is None:
+                    self._quarantine_locked(slot_id, generation)
+                    raise FeatureTransportQuiescenceError(
+                        "cancelled feature source has no producer completion event"
+                    )
+                seen.add(active)
+                candidates.append((slot_id, generation, slot.producer_event))
+
+        retired = 0
+        for slot_id, generation, producer_event in candidates:
+            try:
+                producer_complete = bool(producer_event.query())
+            except Exception as exc:
+                with self._lock:
+                    slot = self._slots[slot_id]
+                    if (
+                        slot.generation == generation
+                        and slot.state is FeatureSlotState.PUBLISHED
+                        and slot.producer_event is producer_event
+                    ):
+                        self._quarantine_locked(slot_id, generation)
+                raise FeatureTransportQuiescenceError(
+                    "failed to query cancelled feature producer completion"
+                ) from exc
+            if not producer_complete:
+                continue
+            with self._lock:
+                slot = self._slots[slot_id]
+                if (
+                    slot.generation != generation
+                    or slot.state is not FeatureSlotState.PUBLISHED
+                    or slot.producer_event is not producer_event
+                ):
+                    continue
+                cancelled = slot.active_transfers.intersection(
+                    self._cancelled_transfers
+                )
+                for transfer_id in tuple(cancelled):
+                    active = self._active.get(transfer_id)
+                    if active != (slot_id, generation):
+                        continue
+                    self._active.pop(transfer_id)
+                    self._cancelled_transfers.discard(transfer_id)
+                    slot.active_transfers.remove(transfer_id)
+                    self._remember_completed_locked(transfer_id, active)
+                    retired += 1
+                if not slot.active_transfers:
+                    slot.state = FeatureSlotState.FREE
+                    slot.producer_event = None
+        return retired
 
     def quarantine(
         self,
@@ -451,16 +643,34 @@ class TargetFeatureSourcePool:
                 raise FeatureTransportError("feature source slot is not published")
             self._quarantine_locked(source_slot_id, slot_generation)
 
-    def close(self) -> None:
-        """Stop publishing. CUDA allocation lifetime remains with this process."""
+    def close(self) -> tuple[int, int]:
+        """Fence publication and snapshot ownership without releasing CUDA state.
+
+        The returned pair is ``(active_leases, quarantined_slots)``.  Taking
+        that snapshot under the same lock that closes admission lets the
+        Target controller decide whether it may detach the pool without a new
+        publication racing the shutdown ownership check.
+        """
         with self._lock:
             self._closed = True
+        # Publication is now fenced. Retire only cancellations whose producer
+        # event is already complete; pending work remains counted in _active,
+        # and a failed query quarantines the exact owning slot.
+        self.poll_cancelled_producers()
+        with self._lock:
+            return (
+                len(self._active),
+                sum(
+                    slot.state is FeatureSlotState.QUARANTINED
+                    for slot in self._slots
+                ),
+            )
 
     def _validate_hidden_states(self, hidden_states: torch.Tensor) -> None:
         if hidden_states.device != self.device:
             raise ValueError("feature hidden states must be on the source CUDA device")
         if hidden_states.dtype is not self.dtype:
-            raise ValueError("DFlash feature hidden states must be bfloat16")
+            raise ValueError("direct GPU source rows must be bfloat16")
         if hidden_states.ndim != 2 or hidden_states.shape[1] != self.feature_width:
             raise ValueError(
                 "feature hidden states must have shape [tokens, feature_width]"
@@ -530,12 +740,17 @@ class TargetFeatureSourcePool:
 class DraftFeaturePullTransport:
     """Asynchronously pull one Target feature range into Draft-local VRAM."""
 
-    def __init__(self, *, device: torch.device, max_workers: int = 1) -> None:
-        if max_workers <= 0:
-            raise ValueError("feature copy worker count must be positive")
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        max_workers: int = 1,
+    ) -> None:
+        if max_workers != 1:
+            raise ValueError("feature copy transport requires exactly one worker")
         requested_device = torch.device(device)
         if requested_device.type != "cuda":
-            raise ValueError("DFlash feature pulls require a CUDA device")
+            raise ValueError("direct GPU source pulls require a CUDA device")
         self.device_index = (
             torch.cuda.current_device()
             if requested_device.index is None
@@ -571,6 +786,25 @@ class DraftFeaturePullTransport:
                 ) from self._fatal_error
             return self._executor.submit(self._run_pull, source, destination)
 
+    def submit_batch(
+        self,
+        *,
+        sources: Sequence[FeatureSourceDescriptor],
+        destinations: Sequence[torch.Tensor],
+    ) -> Future[FeaturePullBatchMetrics]:
+        """Queue one ordered CUDA batch for a scheduler-owned feature batch."""
+        sources = tuple(sources)
+        destinations = tuple(destinations)
+        self._validate_batch_submission(sources, destinations)
+        with self._lock:
+            if self._closed:
+                raise FeatureTransportError("feature pull transport is closed")
+            if self._fatal_error is not None:
+                raise FeatureTransportError(
+                    "feature pull transport is quarantined after an unquiesced GPU-copy failure"
+                ) from self._fatal_error
+            return self._executor.submit(self._run_batch, sources, destinations)
+
     @staticmethod
     def query(future: Future[FeaturePullMetrics]) -> FeaturePullMetrics | None:
         """Return completed metrics without waiting, or ``None`` while in flight."""
@@ -581,10 +815,36 @@ class DraftFeaturePullTransport:
         return future.result()
 
     def invalidate_peer(self, target_instance_id: str) -> None:
+        with self._lock:
+            if self._closed:
+                raise FeatureTransportError("feature pull transport is closed")
+            if self._fatal_error is not None:
+                raise FeatureTransportError(
+                    "cannot invalidate a peer while feature pulls are quarantined"
+                ) from self._fatal_error
+            invalidated = self._executor.submit(
+                self._invalidate_peer_if_healthy, target_instance_id
+            )
+        # Generation changes are rare lifecycle events. Waiting here makes the
+        # unmap a peer-FIFO barrier instead of closing an allocation still used
+        # by an earlier copy from that peer.
+        invalidated.result()
+
+    def _invalidate_peer_if_healthy(self, target_instance_id: str) -> None:
+        with self._lock:
+            if self._fatal_error is not None:
+                raise FeatureTransportError(
+                    "peer invalidation was fenced by feature-pull quarantine"
+                ) from self._fatal_error
         self._mapping_cache.invalidate(target_instance_id)
 
     def quarantine(self) -> None:
-        """Reject new pulls after an external lifecycle failure."""
+        """Permanently fence admission without touching CUDA-owned resources.
+
+        Already-running work may be uncertain and is intentionally not
+        synchronized, cancelled, unmapped, or released here.  Queued callbacks
+        recheck ``_fatal_error`` before mapping IPC memory or issuing a copy.
+        """
         with self._lock:
             if self._fatal_error is None:
                 self._fatal_error = FeatureTransportQuiescenceError(
@@ -592,11 +852,11 @@ class DraftFeaturePullTransport:
                 )
 
     def probe_quiescence(self) -> Future[bool]:
-        """Fence the copy stream asynchronously before retrying/releasing state."""
+        """Fence all admitted copy work before retrying/releasing state."""
         with self._lock:
             if self._closed:
                 raise FeatureTransportError("feature pull transport is closed")
-            return self._executor.submit(self._probe_quiescence)
+            return self._executor.submit(self._probe_stream_quiescence)
 
     def close(self) -> None:
         with self._lock:
@@ -609,7 +869,7 @@ class DraftFeaturePullTransport:
         if self._fatal_error is None:
             self._mapping_cache.close()
 
-    def _probe_quiescence(self) -> bool:
+    def _probe_stream_quiescence(self) -> bool:
         torch.cuda.set_device(self.device)
         try:
             self._copy_stream.synchronize()
@@ -618,43 +878,90 @@ class DraftFeaturePullTransport:
         return True
 
     def _run_pull(
-        self, source: FeatureSourceDescriptor, destination: torch.Tensor
+        self,
+        source: FeatureSourceDescriptor,
+        destination: torch.Tensor,
     ) -> FeaturePullMetrics:
-        torch.cuda.set_device(self.device)
-        mapping_started_ns = time.monotonic_ns()
-        mapped_base, warm = self._mapping_cache.map(
-            peer_instance_id=source.target_instance_id,
-            peer_session_id=source.source_session_id,
-            pool_generation=source.pool_generation,
-            ipc_handle=source.ipc_handle,
-        )
-        mapping_done_ns = time.monotonic_ns()
-        source_address = mapped_base + source.allocation_offset + source.byte_offset
-        source_ready = torch.cuda.Event.from_ipc_handle(
-            self.device_index, source.producer_event_handle
-        )
-        segment = CopySegment(
-            source_address=source_address,
-            destination_address=destination.data_ptr(),
-            length=source.nbytes,
-        )
-        return self._copy_and_wait(
-            source_ready=source_ready,
-            segment=segment,
-            mapping_started_ns=mapping_started_ns,
-            mapping_done_ns=mapping_done_ns,
-            cold_mapping_count=int(not warm),
+        batch = self._run_batch((source,), (destination,))
+        return FeaturePullMetrics(
+            submitted_ns=batch.submitted_ns,
+            gpu_completed_ns=batch.gpu_completed_ns,
+            mapping_ns=batch.mapping_ns,
+            driver_submit_ns=batch.driver_submit_ns,
+            gpu_copy_ns=batch.gpu_copy_ns,
+            feature_bytes=batch.feature_bytes,
+            cold_mapping_count=batch.cold_mapping_count,
         )
 
-    def _copy_and_wait(
+    def _run_batch(
+        self,
+        sources: tuple[FeatureSourceDescriptor, ...],
+        destinations: tuple[torch.Tensor, ...],
+    ) -> FeaturePullBatchMetrics:
+        with self._lock:
+            if self._fatal_error is not None:
+                raise FeatureTransportError(
+                    "feature pull was queued before transport quarantine"
+                ) from self._fatal_error
+        # Only callbacks admitted by the transport fence may touch CUDA state.
+        # A callback that passes this check is considered already running; a
+        # later quarantine retains all of its possibly referenced resources.
+        torch.cuda.set_device(self.device)
+        mapping_started_ns = time.monotonic_ns()
+        segments = []
+        source_events: dict[tuple[str, str, bytes], torch.cuda.Event] = {}
+        cold_mapping_count = 0
+        feature_bytes = 0
+        for source, destination in zip(sources, destinations, strict=True):
+            mapped_base, warm = self._mapping_cache.map(
+                peer_instance_id=source.target_instance_id,
+                peer_session_id=source.source_session_id,
+                pool_generation=source.pool_generation,
+                ipc_handle=source.ipc_handle,
+            )
+            cold_mapping_count += int(not warm)
+            feature_bytes += source.nbytes
+            source_address = (
+                mapped_base + source.allocation_offset + source.byte_offset
+            )
+            segments.append(
+                CopySegment(
+                    source_address=source_address,
+                    destination_address=destination.data_ptr(),
+                    length=source.nbytes,
+                )
+            )
+            event_key = (
+                source.target_instance_id,
+                source.source_session_id,
+                source.producer_event_handle,
+            )
+            if event_key not in source_events:
+                source_events[event_key] = torch.cuda.Event.from_ipc_handle(
+                    self.device_index, source.producer_event_handle
+                )
+        mapping_done_ns = time.monotonic_ns()
+        return self._copy_batch_and_wait(
+            source_ready=tuple(source_events.values()),
+            segments=tuple(segments),
+            mapping_started_ns=mapping_started_ns,
+            mapping_done_ns=mapping_done_ns,
+            feature_bytes=feature_bytes,
+            cold_mapping_count=cold_mapping_count,
+            peer_count=len({source.target_instance_id for source in sources}),
+        )
+
+    def _copy_batch_and_wait(
         self,
         *,
-        source_ready: torch.cuda.Event,
-        segment: CopySegment,
+        source_ready: tuple[torch.cuda.Event, ...],
+        segments: tuple[CopySegment, ...],
         mapping_started_ns: int,
         mapping_done_ns: int,
+        feature_bytes: int,
         cold_mapping_count: int,
-    ) -> FeaturePullMetrics:
+        peer_count: int,
+    ) -> FeaturePullBatchMetrics:
         """Finish a submitted batch only once it cannot touch source memory."""
         gpu_start = torch.cuda.Event(enable_timing=True)
         gpu_done = torch.cuda.Event(enable_timing=True)
@@ -663,10 +970,13 @@ class DraftFeaturePullTransport:
         try:
             with torch.cuda.stream(self._copy_stream):
                 stream_may_reference_source = True
-                self._copy_stream.wait_event(source_ready)
+                for event in source_ready:
+                    self._copy_stream.wait_event(event)
                 gpu_start.record(self._copy_stream)
                 driver_submit_started_ns = time.monotonic_ns()
-                self._runtime.copy_batch_async((segment,), self._copy_stream.cuda_stream)
+                self._runtime.copy_batch_async(
+                    segments, self._copy_stream.cuda_stream
+                )
                 driver_submit_done_ns = time.monotonic_ns()
                 gpu_done.record(self._copy_stream)
             # This synchronization happens only in the bounded copy worker;
@@ -684,15 +994,49 @@ class DraftFeaturePullTransport:
                         self._fatal_error = fatal
                     raise fatal from fence_exc
             raise
-        return FeaturePullMetrics(
+        return FeaturePullBatchMetrics(
             submitted_ns=submitted_ns,
             gpu_completed_ns=time.monotonic_ns(),
             mapping_ns=mapping_done_ns - mapping_started_ns,
             driver_submit_ns=driver_submit_done_ns - driver_submit_started_ns,
             gpu_copy_ns=int(gpu_start.elapsed_time(gpu_done) * 1_000_000),
-            feature_bytes=segment.length,
+            feature_bytes=feature_bytes,
             cold_mapping_count=cold_mapping_count,
+            segment_count=len(segments),
+            peer_count=peer_count,
         )
+
+    def _validate_batch_submission(
+        self,
+        sources: tuple[FeatureSourceDescriptor, ...],
+        destinations: tuple[torch.Tensor, ...],
+    ) -> None:
+        if not sources or len(sources) != len(destinations):
+            raise ValueError("feature batch requires matching non-empty inputs")
+        peer_generations: dict[str, tuple[str, str, str]] = {}
+        destination_ranges = []
+        for source, destination in zip(sources, destinations, strict=True):
+            self._validate_submission(source, destination)
+            generation = (
+                source.source_session_id,
+                source.pool_generation,
+                source.transport_session,
+            )
+            previous = peer_generations.setdefault(
+                source.target_instance_id, generation
+            )
+            if previous != generation:
+                raise FeatureTransportError(
+                    "one feature batch cannot mix generations from the same peer"
+                )
+            start = destination.data_ptr()
+            destination_ranges.append((start, start + source.nbytes))
+        destination_ranges.sort()
+        if any(
+            destination_ranges[index][1] > destination_ranges[index + 1][0]
+            for index in range(len(destination_ranges) - 1)
+        ):
+            raise ValueError("feature batch destinations must not overlap")
 
     def _validate_submission(
         self, source: FeatureSourceDescriptor, destination: torch.Tensor

@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
+from dt_profile import event_enabled as profile_event_enabled
+from dt_profile import explicit_event_enabled as profile_event_explicitly_enabled
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.model_runner import (
@@ -18,6 +19,7 @@ from sglang.srt.model_executor.model_runner import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 # Initial control delivery is immediate.  A one-second retry cadence still
@@ -25,6 +27,188 @@ logger = logging.getLogger(__name__)
 # scheduler from turning transient ACK latency into a duplicate-message storm.
 CONTROL_RETRY_INTERVAL_NS = 1_000_000_000
 DT_LANE_MEASUREMENT_MARKER = "DT lane measurement evidence: "
+DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
+DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
+DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
+EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
+
+
+def _parse_pipeline_lane_weights(
+    value: str | None, pipeline_lanes: int
+) -> tuple[int, ...]:
+    if value is None:
+        return (1,) * pipeline_lanes
+    try:
+        weights = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "draft_target_pipeline_lane_weights must contain comma-separated "
+            "positive integers"
+        ) from exc
+    if len(weights) != pipeline_lanes or any(weight <= 0 for weight in weights):
+        raise ValueError(
+            "draft_target_pipeline_lane_weights must contain one positive "
+            "integer per pipeline lane"
+        )
+    return weights
+
+
+def _batched_eagle3_token_metadata(
+    *,
+    active_indices: list[int],
+    token_chunks: list[torch.Tensor],
+    committed_chunks: list[torch.Tensor],
+) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
+    """Copy EAGLE3's two ragged token streams to CPU in two batches."""
+    if not active_indices:
+        return {}, {}
+    lengths = [int(token_chunks[index].numel()) for index in active_indices]
+    committed_lengths = [
+        int(committed_chunks[index].numel()) for index in active_indices
+    ]
+    if any(length <= 0 for length in lengths) or committed_lengths != lengths:
+        raise ValueError("EAGLE3 token metadata lengths do not match feature rows")
+    token_values = (
+        torch.cat([token_chunks[index] for index in active_indices])
+        .detach()
+        .to(device="cpu")
+        .tolist()
+    )
+    committed_values = (
+        torch.cat([committed_chunks[index] for index in active_indices])
+        .detach()
+        .to(device="cpu")
+        .tolist()
+    )
+    tokens_by_index: dict[int, tuple[int, ...]] = {}
+    committed_by_index: dict[int, tuple[int, ...]] = {}
+    offset = 0
+    for index, length in zip(active_indices, lengths, strict=True):
+        end = offset + length
+        tokens_by_index[index] = tuple(int(value) for value in token_values[offset:end])
+        committed_by_index[index] = tuple(
+            int(value) for value in committed_values[offset:end]
+        )
+        offset = end
+    if offset != len(token_values) or offset != len(committed_values):
+        raise RuntimeError("EAGLE3 batched token metadata split lost rows")
+    return tokens_by_index, committed_by_index
+
+
+def _flashmtp_pivot_preservation_indices(batch: ScheduleBatch) -> list[int]:
+    """Rows whose GPU bytes must survive deferred overlap result processing.
+
+    Proposal eligibility is intentionally absent here.  A final prefill chunk
+    may launch while an older middle-chunk result still owns the same request;
+    those ownership fences are authoritative only when results are processed
+    in order.  At this boundary the graph output can be replayed first, so every
+    live row needs an independent bounded source lease.
+    """
+
+    return [
+        index
+        for index, req in enumerate(batch.reqs)
+        if not req.finished() and not req.is_retracted
+    ]
+
+
+def _flashmtp_pivot_publish_view(
+    pivot_hidden: torch.Tensor, preserved_indices: list[int]
+) -> tuple[torch.Tensor, bool]:
+    """Return contiguous publication rows without gathering an unchanged batch.
+
+    The direct source pool copies the returned rows into its own fenced storage
+    before the graph output may be replayed.  When every batch row is live and
+    the graph output is already contiguous, an advanced-index gather would
+    only materialize the same tensor and can dominate the Target wave.  A
+    filtered or non-contiguous selection still takes the owning gather path.
+    """
+
+    if (
+        len(preserved_indices) == int(pivot_hidden.shape[0])
+        and all(index == row for row, index in enumerate(preserved_indices))
+        and pivot_hidden.is_contiguous()
+    ):
+        return pivot_hidden.detach(), False
+    return pivot_hidden[preserved_indices].detach().contiguous(), True
+
+
+def _flashmtp_park_scalar_values(
+    *,
+    batch_result,
+    draft_input: DFlashDraftInputV2,
+    active_indices: list[int],
+    original_batch_size: int,
+) -> tuple[list[int], list[int], bool]:
+    """Resolve FlashMTP control scalars, preferring overlap-staged CPU rows."""
+
+    if not active_indices:
+        return [], [], False
+    staged_bonus = getattr(batch_result, "dt_flashmtp_bonus_tokens_cpu", None)
+    staged_seq_lens = getattr(batch_result, "dt_flashmtp_seq_lens_cpu", None)
+    if (staged_bonus is None) != (staged_seq_lens is None):
+        raise RuntimeError("FlashMTP scalar staging is incomplete")
+    if staged_bonus is not None:
+        if (
+            not isinstance(staged_bonus, torch.Tensor)
+            or not isinstance(staged_seq_lens, torch.Tensor)
+            or staged_bonus.device.type != "cpu"
+            or staged_seq_lens.device.type != "cpu"
+            or staged_bonus.ndim != 1
+            or staged_seq_lens.ndim != 1
+            or int(staged_bonus.numel()) != original_batch_size
+            or int(staged_seq_lens.numel()) != original_batch_size
+        ):
+            raise RuntimeError("FlashMTP staged control scalars changed shape or device")
+        bonus_values = staged_bonus
+        seq_len_values = staged_seq_lens
+    else:
+        bonus_values = draft_input.bonus_tokens
+        seq_len_values = draft_input.new_seq_lens
+    if active_indices != list(range(original_batch_size)):
+        bonus_values = bonus_values[active_indices]
+        seq_len_values = seq_len_values[active_indices]
+    return (
+        [int(value) for value in bonus_values.detach().cpu().tolist()],
+        [int(value) for value in seq_len_values.detach().cpu().tolist()],
+        staged_bonus is not None,
+    )
+
+
+def _ready_batch_h2d(
+    cpu_tensor: torch.Tensor,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Queue a READY-batch host tensor without synchronizing the scheduler."""
+
+    return cpu_tensor.to(
+        device=device,
+        dtype=dtype,
+        non_blocking=cpu_tensor.is_pinned(),
+    )
+
+
+def _ready_candidate_host_tensor(
+    candidate_blob: bytes,
+    *,
+    batch_size: int,
+    block_size: int,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """Decode int32 wire candidates into the final int64 host staging dtype."""
+
+    wire_tokens = torch.frombuffer(
+        bytearray(candidate_blob), dtype=torch.int32
+    ).reshape(batch_size, block_size)
+    staged_tokens = torch.empty(
+        (batch_size, block_size),
+        dtype=torch.int64,
+        pin_memory=pin_memory,
+    )
+    staged_tokens.copy_(wire_tokens)
+    return staged_tokens
 
 
 @dataclass(slots=True)
@@ -39,15 +223,11 @@ class ParkedTargetRound:
     candidate_bytes: bytes | None = None
     failure: str | None = None
     draft_admitted: bool = False
-
-
-@dataclass(slots=True)
-class StagedPinnedPivotBatch:
-    """Pinned staging lease filled on the asynchronous result-copy stream."""
-
-    buffer_slot: int
-    rows: int
-    request_ids: tuple[str, ...]
+    # Profiling-only provenance. Only the export rank consumes coordinator
+    # result batches directly; these fields let its READY event distinguish
+    # transport/poll delay from lane assembly without changing the TP payload.
+    result_batch_id: str | None = None
+    result_received_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +240,7 @@ class StagedDFlashTask:
     feature_token_offset: int
     feature_token_count: int
     feature_token_ids: tuple[int, ...]
+    committed_token_ids: tuple[int, ...]
     previous_transfer_id: str | None
     bonus_token: int
     seq_len: int
@@ -68,6 +249,19 @@ class StagedDFlashTask:
 @dataclass(slots=True)
 class StagedDFlashFeatureBatch:
     tasks: tuple[StagedDFlashTask, ...]
+    descriptors_by_transfer: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class StagedFlashMTPTask:
+    request_id: str
+    request_index: int
+    source_lease_id: str
+
+
+@dataclass(slots=True)
+class StagedFlashMTPPivotBatch:
+    tasks: tuple[StagedFlashMTPTask, ...]
     descriptors_by_transfer: dict[str, object]
 
 
@@ -82,7 +276,7 @@ class DTTargetController:
                 TargetRoundLedger,
             )
             from dt_profile import emit as profile_emit
-            from dt_transport import MmapSlotStore, cleanup_stale_slot_files
+            from dt_profile import flush as profile_flush
         except ImportError as exc:
             raise RuntimeError(
                 "Draft-Target mode requires dt-runtime on PYTHONPATH"
@@ -90,6 +284,10 @@ class DTTargetController:
 
         self.scheduler = scheduler
         self._profile_emit = profile_emit
+        self._profile_flush = profile_flush
+        self._eagle3_host_span_startup_flushed = False
+        self._eagle3_host_span_flushed_health_ids: set[str] = set()
+        self._profile_active = bool(os.environ.get("DT_PROFILE_DIR"))
         self.server_args = scheduler.server_args
         self.instance_id = self.server_args.draft_target_instance_id
         self.profile_id = self.server_args.draft_target_profile_id
@@ -98,19 +296,35 @@ class DTTargetController:
         self.pivot_width = int(scheduler.draft_worker._pivot_width)
         self.is_token_only = scheduler.spec_algorithm.is_standalone_dt()
         self.is_dflash = scheduler.spec_algorithm.is_dflash()
-        self.is_persistent = self.is_token_only or self.is_dflash
-        if self.is_dflash and not self.server_args.disable_radix_cache:
+        self.is_eagle3 = scheduler.spec_algorithm.is_eagle3()
+        self.is_feature_backed = self.is_dflash or self.is_eagle3
+        self.is_persistent = self.is_token_only or self.is_feature_backed
+        self.defer_dflash_feature_stage = bool(
+            self.server_args.draft_target_defer_dflash_feature_stage
+        )
+        if self.defer_dflash_feature_stage and (
+            not self.is_dflash or not self.server_args.draft_target_overlap_schedule
+        ):
             raise ValueError(
-                "remote DFLASH requires --disable-radix-cache until cached-prefix "
+                "deferred DFlash feature staging requires remote DFlash with "
+                "Draft-Target overlap scheduling"
+            )
+        if self.is_feature_backed and not self.server_args.disable_radix_cache:
+            raise ValueError(
+                "remote feature-backed Draft requires --disable-radix-cache until cached-prefix "
                 "hidden states have an authoritative export path"
             )
         self.round_timeout_ns = (
             int(self.server_args.draft_target_round_timeout_ms) * 1_000_000
         )
-        self.early_pinned_staging = (
-            os.environ.get("SGLANG_DT_EARLY_PINNED_STAGING", "0") == "1"
+        self.whole_batch_task_fifo_ablation = (
+            os.environ.get("SGLANG_DT_WHOLE_BATCH_TASK_FIFO_ABLATION", "0") == "1"
         )
         self.pipeline_lanes = int(self.server_args.draft_target_pipeline_lanes)
+        self.pipeline_lane_weights = _parse_pipeline_lane_weights(
+            self.server_args.draft_target_pipeline_lane_weights,
+            self.pipeline_lanes,
+        )
         overlap_result_defer_ms = float(
             self.server_args.draft_target_overlap_result_defer_ms
         )
@@ -135,12 +349,36 @@ class DTTargetController:
                     "Draft-Target V2 requires full-wave verification with one or "
                     "two pipeline lanes"
                 )
+        elif self.is_feature_backed:
+            if (
+                not self.server_args.draft_target_full_wave
+                or self.pipeline_lanes not in {2, 3}
+            ):
+                raise ValueError(
+                    "DFlash Draft-Target requires full-wave verification with "
+                    "two or three pipeline lanes"
+                )
         elif not self.server_args.draft_target_full_wave or self.pipeline_lanes != 2:
             raise ValueError(
                 "Draft-Target V1 requires full-wave verification with two lanes"
             )
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
+        # This diagnostic performs per-batch timestamping, so unlike ordinary
+        # host trace events it must never inherit the empty-filter-means-all
+        # behavior.  Only TP0 owns the emitted control-plane chronology.
+        self.eagle3_host_span_profile_enabled = bool(
+            self.is_eagle3
+            and self.is_export_rank
+            and profile_event_explicitly_enabled(EAGLE3_HOST_SPAN_PROFILE_EVENT)
+        )
+        if (
+            self.eagle3_host_span_profile_enabled
+            and not self.server_args.draft_target_overlap_schedule
+        ):
+            raise ValueError(
+                "target_eagle3_host_span requires Draft-Target overlap scheduling"
+            )
         self._parked: dict[str, ParkedTargetRound] = {}
         self._feature_control_rounds: dict[str, ParkedTargetRound] = {}
         # Overlap scheduling can have more than one chunked-prefill forward for
@@ -164,6 +402,7 @@ class DTTargetController:
         self._lifecycle_attempt_by_request: dict[str, int] = {}
         self._next_lifecycle_attempt = 0
         self._verify_transfer_by_request: dict[str, str] = {}
+        self._flashmtp_pivot_sequence = 0
         self._batch_sequence = 0
         self._pending_send = deque()
         self._last_pending_send_block: tuple[str, str, str] | None = None
@@ -171,12 +410,30 @@ class DTTargetController:
             retry_interval_ns=CONTROL_RETRY_INTERVAL_NS
         )
         self._cancelled_transfers: set[str] = set()
-        self._free_source_slots = deque(range(scheduler.max_running_requests))
+        # FlashMTP graph-output preservation happens before ordered result
+        # processing decides whether a row may become a remote proposal.  Keep
+        # those unpublished leases distinct from Coordinator-owned transfers:
+        # they can be cancelled locally, including during shutdown, until a
+        # task batch has been committed to the reliable control path.
+        self._staged_flashmtp_source_leases: set[str] = set()
         self._source_slot_by_transfer: dict[str, tuple[int, int]] = {}
         self._source_deadline_by_transfer: dict[str, int] = {}
         self._source_done_applied_ids: set[str] = set()
+        self._source_done_batch_entries: dict[str, tuple[str, ...]] = {}
         self._result_stores: dict[str, object] = {}
         self._last_poll_ns = 0
+        self._lifecycle_status_sequence = 0
+        self._last_lifecycle_status_ns = 0
+        self._last_lifecycle_status_sample_ns = 0
+        self._last_lifecycle_quiescent: bool | None = None
+        # The formal harness needs one successful measured CUDA-IPC event from
+        # every endpoint.  Emitting the same proof for every scheduler batch
+        # adds synchronous JSON/log I/O to the inference hot path without
+        # strengthening that admission check.
+        self._direct_gpu_measurement_evidence_emitted = False
+        self._direct_gpu_measurement_epochs: dict[
+            tuple[str, str, str, str], list[int]
+        ] = {}
         self._lane_by_request: dict[str, int] = {}
         self._lane_target_sizes = [0] * self.pipeline_lanes
         self._lane_assignment_cursor = 0
@@ -185,57 +442,54 @@ class DTTargetController:
         self._last_full_wave_completed_ns = 0
         self._last_lane_full_wave_completed_ns = [0] * self.pipeline_lanes
         self._measurement_lane_counts: dict[tuple[int, str], int] = {}
-        self._overlap_launch_poll_ns = 0
+        self._overlap_launch_ns = 0
         self._overlap_result_ready: bool | None = None
         self._client = None
         self._ledger = None
-        self._source_store = None
         self._feature_source_pool = None
+        # A failed direct-GPU-source shutdown is not an ordinary close.  Until
+        # every remote read is acknowledged, the pool remains the owner of its
+        # exported allocation, producer events, and active leases.  Latch the
+        # first failure so a later close cannot retry cleanup against uncertain
+        # CUDA work or drop the last strong reference to that ownership.
+        self._source_shutdown_quarantine_error: BaseException | None = None
         self._feature_source_free_slots = 0
+        self._deferred_dflash_feature_stages = 0
         self._feature_source_stall_started_ns = 0
-        self._pivot_host_staging = None
-        self._early_pivot_host_buffers: list[torch.Tensor] = []
-        self._early_pivot_host_free_slots: deque[int] = deque()
-        self._early_pivot_host_in_use: set[int] = set()
         if self.is_export_rank:
-            if self.pivot_width and not self.is_dflash:
-                slot_bytes = (
-                    self.pivot_width
-                    * torch.tensor([], dtype=torch.bfloat16).element_size()
-                )
-                safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", self.instance_id)
-                data_dir = Path(self.server_args.draft_target_data_dir)
-                cleanup_stale_slot_files(data_dir, instance_id=safe_id, kind="pivots")
-                source_path = data_dir / f"dt-{safe_id}-{os.getpid()}-pivots.slots"
-                self._source_store = MmapSlotStore.create(
-                    source_path,
-                    slot_count=scheduler.max_running_requests,
-                    slot_bytes=slot_bytes,
-                )
             try:
                 self._client = TargetCoordinatorClient(
                     endpoint=self.server_args.draft_target_coordinator_endpoint,
                     instance_id=self.instance_id,
-                    data_endpoint=(
-                        self._source_store.uri if self._source_store is not None else ""
-                    ),
+                    data_endpoint="",
                 )
-                if self.is_dflash:
+                if self.uses_direct_gpu_source:
                     from sglang.srt.speculative.dt_feature_p2p import (
                         TargetFeatureSourcePool,
                     )
 
-                    max_feature_tokens = max(
-                        int(self.server_args.max_prefill_buffer_tokens()),
-                        int(scheduler.max_running_requests) * self.block_size,
+                    max_source_rows = (
+                        max(
+                            int(self.server_args.max_prefill_buffer_tokens()),
+                            int(scheduler.max_running_requests) * self.block_size,
+                        )
+                        if self.is_feature_backed
+                        else int(scheduler.max_running_requests)
                     )
                     self._feature_source_pool = TargetFeatureSourcePool(
                         target_instance_id=self.instance_id,
                         source_session_id=self._client.instance_session_id,
                         device=scheduler.device,
                         slot_count=max(2, self.pipeline_lanes * 2),
-                        max_tokens=max_feature_tokens,
+                        max_tokens=max_source_rows,
                         feature_width=self.pivot_width,
+                    )
+                    self._profile_emit(
+                        "target_feature_pool_registration",
+                        target_instance=self.instance_id,
+                        source_session_id=self._feature_source_pool.source_session_id,
+                        pool_generation=self._feature_source_pool.pool_generation,
+                        transport_session=self._feature_source_pool.transport_session,
                     )
                     self._feature_source_free_slots = (
                         self._feature_source_pool.free_slot_count
@@ -244,107 +498,517 @@ class DTTargetController:
                     timeout_s=self.server_args.draft_target_registration_timeout_s
                 )
                 self._ledger = TargetRoundLedger(target_instance_id=self.instance_id)
-                # The source ring bounds the largest wave. Keep one staging
-                # buffer for the serial path and two leases for overlap copies.
-                if self.pivot_width and not self.is_dflash:
-                    self._pivot_host_staging = torch.empty(
-                        (scheduler.max_running_requests, self.pivot_width),
-                        dtype=torch.bfloat16,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                if self.early_pinned_staging and self.pivot_width and not self.is_dflash:
-                    for buffer_slot in range(2):
-                        self._early_pivot_host_buffers.append(
-                            torch.empty(
-                                (scheduler.max_running_requests, self.pivot_width),
-                                dtype=torch.bfloat16,
-                                device="cpu",
-                                pin_memory=True,
-                            )
-                        )
-                        self._early_pivot_host_free_slots.append(buffer_slot)
             except Exception:
                 if self._client is not None:
                     self._client.close()
                     self._client = None
-                if self._source_store is not None:
-                    self._source_store.close()
-                    self._source_store.unlink()
-                    self._source_store = None
                 if self._feature_source_pool is not None:
                     self._feature_source_pool.close()
                     self._feature_source_pool = None
                 raise
 
+    @property
+    def uses_direct_gpu_source(self) -> bool:
+        """Whether proposal input is leased from registered Target VRAM."""
+
+        return self.is_feature_backed or not self.is_token_only
+
+    def _emit_direct_gpu_measurement_evidence_once(
+        self, payload: dict[str, object]
+    ) -> bool:
+        """Log the first successful measured direct-GPU publication."""
+
+        if getattr(self, "_direct_gpu_measurement_evidence_emitted", False):
+            return False
+        logger.info(
+            "%s%s",
+            DT_DIRECT_GPU_SOURCE_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        self._direct_gpu_measurement_evidence_emitted = True
+        return True
+
+    def _record_direct_gpu_measurement_epoch(
+        self,
+        *,
+        measurement_rows: int,
+        measurement_requests: int,
+        source_session_id: str,
+        pool_generation: str,
+        transport_session: str,
+    ) -> None:
+        epochs = getattr(self, "_direct_gpu_measurement_epochs", None)
+        if epochs is None:
+            epochs = {}
+            self._direct_gpu_measurement_epochs = epochs
+        key = (
+            self.instance_id,
+            source_session_id,
+            pool_generation,
+            transport_session,
+        )
+        counts = epochs.setdefault(key, [0, 0, 0])
+        counts[0] += 1
+        counts[1] += measurement_rows
+        counts[2] += measurement_requests
+
+    def _direct_gpu_measurement_epoch_evidence(self) -> list[dict[str, object]]:
+        epochs = getattr(self, "_direct_gpu_measurement_epochs", {})
+        return [
+            {
+                "target_instance_id": key[0],
+                "source_session_id": key[1],
+                "pool_generation": key[2],
+                "transport_session": key[3],
+                "batches": counts[0],
+                "measurement_rows": counts[1],
+                "measurement_requests": counts[2],
+            }
+            for key, counts in sorted(epochs.items())
+        ]
+
     def stage_overlap_pivot_copy(self, batch: ScheduleBatch, batch_result) -> None:
-        """Copy pivots to a leased pinned buffer on the result-copy stream."""
-        if self.is_dflash:
+        """Stage persistent feature paths; FlashMTP publishes pivots in VRAM."""
+        if self.is_feature_backed:
+            if getattr(batch_result, "dt_deferred_dflash_feature_stage", False):
+                if getattr(batch_result, "dt_dflash_feature_stage_credit", False):
+                    raise RuntimeError(
+                        "deferred DFlash result acquired source capacity twice"
+                    )
+                if self.is_export_rank:
+                    from sglang.srt.managers.utils import _async_d2h
+
+                    candidates = batch_result.dt_dflash_candidate_tokens
+                    draft_input = batch_result.next_draft_input
+                    if candidates is None or not candidates.is_cuda:
+                        raise RuntimeError(
+                            "deferred DFlash staging lost GPU candidate rows"
+                        )
+                    batch_result.dt_dflash_candidate_tokens_cpu = _async_d2h(candidates)
+                    batch_result.dt_dflash_bonus_tokens_cpu = _async_d2h(
+                        draft_input.bonus_tokens
+                    )
+                    batch_result.dt_dflash_seq_lens_cpu = _async_d2h(
+                        draft_input.new_seq_lens
+                    )
+                    batch_result.dt_dflash_accept_lens_cpu = _async_d2h(
+                        batch_result.accept_lens
+                    )
+                batch_result.dt_dflash_feature_stage_credit = True
+                self._deferred_dflash_feature_stages += 1
+                return
             self._stage_dflash_feature_copy(batch, batch_result)
             return
-        if (
-            not self.is_export_rank
-            or not self.early_pinned_staging
-            or getattr(batch_result, "dt_staged_pinned_pivots", None) is not None
-        ):
+        if not self.is_token_only:
+            self._stage_flashmtp_scalar_copy(batch, batch_result)
+            self._stage_flashmtp_pivot_copy(batch, batch_result)
+
+    def _stage_flashmtp_scalar_copy(self, batch: ScheduleBatch, batch_result) -> None:
+        """Preserve graph-owned control scalars on the overlap copy stream."""
+
+        staged_bonus = getattr(batch_result, "dt_flashmtp_bonus_tokens_cpu", None)
+        staged_seq_lens = getattr(batch_result, "dt_flashmtp_seq_lens_cpu", None)
+        if staged_bonus is not None or staged_seq_lens is not None:
+            if staged_bonus is None or staged_seq_lens is None:
+                raise RuntimeError("FlashMTP scalar staging is incomplete")
             return
         draft_input = getattr(batch_result, "next_draft_input", None)
-        pivot_hidden = getattr(draft_input, "hidden_states", None)
-        if pivot_hidden is None or not torch.is_tensor(pivot_hidden):
+        if not isinstance(draft_input, DFlashDraftInputV2):
             return
-        if pivot_hidden.ndim != 2 or pivot_hidden.shape[1] != self.pivot_width:
-            return
-        if pivot_hidden.dtype != torch.bfloat16:
-            raise TypeError(
-                f"DT Target expected bfloat16 pivot, got {pivot_hidden.dtype}"
-            )
-        rows = int(pivot_hidden.shape[0])
-        if rows != len(batch.reqs):
-            raise RuntimeError("DT pivot rows do not match launched batch requests")
-        if rows == 0 or not self._early_pivot_host_free_slots:
+        if not _flashmtp_pivot_preservation_indices(batch):
             return
 
-        buffer_slot = self._early_pivot_host_free_slots.popleft()
-        self._early_pivot_host_in_use.add(buffer_slot)
-        try:
-            self._early_pivot_host_buffers[buffer_slot][:rows].copy_(
-                pivot_hidden.detach(), non_blocking=True
+        from sglang.srt.managers.utils import _async_d2h
+
+        started_ns = time.monotonic_ns() if self._profile_active else 0
+        batch_result.dt_flashmtp_bonus_tokens_cpu = _async_d2h(
+            draft_input.bonus_tokens
+        )
+        batch_result.dt_flashmtp_seq_lens_cpu = _async_d2h(
+            draft_input.new_seq_lens
+        )
+        scalar_copy_done = self.scheduler.device_module.Event()
+        scalar_copy_done.record()
+        self.scheduler.forward_stream.wait_event(scalar_copy_done)
+        batch_result.dt_flashmtp_scalar_copy_done = scalar_copy_done
+        if self._profile_active:
+            batch_result.dt_flashmtp_scalar_stage_submission_ns = (
+                time.monotonic_ns() - started_ns
             )
+
+    def _stage_flashmtp_pivot_copy(self, batch: ScheduleBatch, batch_result) -> None:
+        """Copy graph-owned FlashMTP pivots into leased Target VRAM.
+
+        Overlap scheduling processes this result only after launching the next
+        Target forward.  CUDA Graph outputs may therefore be replayed in place.
+        Publish on the scheduler copy stream immediately after the producing
+        forward so the registered source slot, rather than the graph output,
+        owns the bytes while control routing remains deferred.
+        """
+
+        if getattr(batch_result, "dt_staged_flashmtp_pivots", None) is not None:
+            return
+        draft_input = getattr(batch_result, "next_draft_input", None)
+        if not isinstance(draft_input, DFlashDraftInputV2):
+            return
+        if not batch.reqs:
+            batch_result.dt_staged_flashmtp_pivots = StagedFlashMTPPivotBatch(
+                tasks=(), descriptors_by_transfer={}
+            )
+            return
+
+        profile_started_ns = time.monotonic_ns() if self._profile_active else 0
+        packet = None
+        published = None
+        descriptors = {}
+        if self.is_export_rank:
+            try:
+                preserved_indices = _flashmtp_pivot_preservation_indices(batch)
+                specs = []
+                for index in preserved_indices:
+                    req = batch.reqs[index]
+                    self._flashmtp_pivot_sequence += 1
+                    specs.append(
+                        (
+                            req.rid,
+                            index,
+                            f"{self.instance_id}:{req.rid}:pivot:"
+                            f"{self._flashmtp_pivot_sequence}",
+                        )
+                    )
+                selection_done_ns = (
+                    time.monotonic_ns() if self._profile_active else 0
+                )
+
+                if specs:
+                    if self._feature_source_pool is None:
+                        raise RuntimeError(
+                            "FlashMTP direct GPU source pool is unavailable"
+                        )
+                    pivot_hidden = draft_input.hidden_states
+                    if (
+                        not isinstance(pivot_hidden, torch.Tensor)
+                        or pivot_hidden.device.type != "cuda"
+                        or pivot_hidden.dtype != torch.bfloat16
+                        or pivot_hidden.ndim != 2
+                        or int(pivot_hidden.shape[0]) != len(batch.reqs)
+                        or int(pivot_hidden.shape[1]) != self.pivot_width
+                    ):
+                        raise TypeError(
+                            "DT Target FlashMTP pivot must be a batch-aligned CUDA "
+                            "BF16 tensor with the profile width"
+                        )
+                    from sglang.srt.speculative.dt_feature_p2p import (
+                        FeatureTransferSlice,
+                    )
+
+                    pivot_gpu, materialized_selection = (
+                        _flashmtp_pivot_publish_view(
+                            pivot_hidden, preserved_indices
+                        )
+                    )
+                    gather_submitted_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
+                    publish_started_ns = time.monotonic_ns()
+                    published = self._feature_source_pool.publish(
+                        hidden_states=pivot_gpu,
+                        feature_schema_id=self.feature_schema_id,
+                        transfers=tuple(
+                            FeatureTransferSlice(
+                                transfer_id=values[2],
+                                row_offset=row,
+                                row_count=1,
+                            )
+                            for row, values in enumerate(specs)
+                        ),
+                        hidden_produced_ns=getattr(
+                            batch_result, "dt_hidden_produced_ns", publish_started_ns
+                        ),
+                    )
+                    publish_done_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
+                    descriptors = {
+                        descriptor.transfer_id: descriptor
+                        for descriptor in published.descriptors
+                    }
+                    # The source may be a stable CUDA Graph output buffer.  The
+                    # copy stream already waits for the producing forward; add
+                    # the reverse edge after the pool copy so the next replay
+                    # cannot overwrite the pivot while it is being captured.
+                    self.scheduler.forward_stream.wait_event(
+                        published.producer_event
+                    )
+                    reverse_edge_done_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
+                    # Establish ownership before profiling or control work can
+                    # fail.  Any later uncertain failure quarantines the slot.
+                    for descriptor in published.descriptors:
+                        self._source_slot_by_transfer[descriptor.transfer_id] = (
+                            descriptor.source_slot_id,
+                            descriptor.slot_generation,
+                        )
+                        self._staged_flashmtp_source_leases.add(
+                            descriptor.transfer_id
+                        )
+                    ownership_done_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
+                    for descriptor in published.descriptors:
+                        self._profile_emit(
+                            "target_flashmtp_pivot_publish",
+                            target_instance=self.instance_id,
+                            transfer_id=descriptor.transfer_id,
+                            source_slot_id=descriptor.source_slot_id,
+                            slot_generation=descriptor.slot_generation,
+                            pivot_bytes=descriptor.nbytes,
+                            transport=descriptor.transport,
+                        )
+                    profile_done_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
+                    if self._profile_active:
+                        self._profile_emit(
+                            "target_flashmtp_pivot_batch_publish",
+                            target_instance=self.instance_id,
+                            batch_size=len(batch.reqs),
+                            preserved_rows=len(specs),
+                            materialized_selection=materialized_selection,
+                            pivot_bytes=sum(
+                                descriptor.nbytes
+                                for descriptor in published.descriptors
+                            ),
+                            selection_ns=selection_done_ns - profile_started_ns,
+                            gather_submission_ns=(
+                                gather_submitted_ns - selection_done_ns
+                            ),
+                            pool_publish_ns=publish_done_ns - publish_started_ns,
+                            reverse_edge_ns=(
+                                reverse_edge_done_ns - publish_done_ns
+                            ),
+                            ownership_ns=ownership_done_ns - reverse_edge_done_ns,
+                            descriptor_profile_ns=(
+                                profile_done_ns - ownership_done_ns
+                            ),
+                            scalar_stage_submission_ns=getattr(
+                                batch_result,
+                                "dt_flashmtp_scalar_stage_submission_ns",
+                                0,
+                            ),
+                            total_ns=profile_done_ns - profile_started_ns,
+                            timing_scope="host_submission",
+                            cuda_synchronized=False,
+                        )
+                    measurement_rows = sum(
+                        batch.reqs[index].rid.startswith(
+                            DT_BENCHMARK_MEASUREMENT_RID_PREFIX
+                        )
+                        for index in preserved_indices
+                    )
+                    if measurement_rows:
+                        self._record_direct_gpu_measurement_epoch(
+                            measurement_rows=measurement_rows,
+                            measurement_requests=measurement_rows,
+                            source_session_id=(
+                                self._feature_source_pool.source_session_id
+                            ),
+                            pool_generation=(
+                                self._feature_source_pool.pool_generation
+                            ),
+                            transport_session=(
+                                self._feature_source_pool.transport_session
+                            ),
+                        )
+                        if not getattr(
+                            self,
+                            "_direct_gpu_measurement_evidence_emitted",
+                            False,
+                        ):
+                            self._emit_direct_gpu_measurement_evidence_once(
+                                {
+                                    "role": "target",
+                                    "method": "flashmtp",
+                                    "transport": "cuda-ipc",
+                                    "measurement_rows": measurement_rows,
+                                    "measurement_requests": measurement_rows,
+                                    "batch_rows": len(preserved_indices),
+                                    "source_session_id": (
+                                        self._feature_source_pool.source_session_id
+                                    ),
+                                    "pool_generation": (
+                                        self._feature_source_pool.pool_generation
+                                    ),
+                                    "transport_session": (
+                                        self._feature_source_pool.transport_session
+                                    ),
+                                }
+                            )
+                packet = (specs, None)
+            except Exception as exc:
+                if published is not None:
+                    first = published.descriptors[0]
+                    self._feature_source_pool.quarantine(
+                        source_slot_id=first.source_slot_id,
+                        slot_generation=first.slot_generation,
+                        source_session_id=first.source_session_id,
+                        pool_generation=first.pool_generation,
+                    )
+                    for descriptor in published.descriptors:
+                        self._source_slot_by_transfer.pop(descriptor.transfer_id, None)
+                        self._staged_flashmtp_source_leases.discard(
+                            descriptor.transfer_id
+                        )
+                descriptors = {}
+                packet = (None, f"{type(exc).__name__}: {exc}")
+
+        try:
+            if self.scheduler.ps.tp_size > 1:
+                packet = broadcast_pyobj(
+                    packet,
+                    self.scheduler.tp_group.rank,
+                    self.scheduler.tp_cpu_group,
+                    src=self.scheduler.tp_group.ranks[0],
+                )
         except Exception:
-            self._release_early_pinned_staging(buffer_slot)
+            if self.is_export_rank and published is not None:
+                first = published.descriptors[0]
+                self._feature_source_pool.quarantine(
+                    source_slot_id=first.source_slot_id,
+                    slot_generation=first.slot_generation,
+                    source_session_id=first.source_session_id,
+                    pool_generation=first.pool_generation,
+                )
+                for descriptor in published.descriptors:
+                    self._source_slot_by_transfer.pop(descriptor.transfer_id, None)
+                    self._staged_flashmtp_source_leases.discard(
+                        descriptor.transfer_id
+                    )
             raise
-        batch_result.dt_staged_pinned_pivots = StagedPinnedPivotBatch(
-            buffer_slot=buffer_slot,
-            rows=rows,
-            request_ids=tuple(req.rid for req in batch.reqs),
+        assert packet is not None
+        specs, error = packet
+        if error is not None:
+            raise RuntimeError(f"FlashMTP pivot publication failed: {error}")
+
+        staged_tasks = []
+        for values in specs:
+            staged = StagedFlashMTPTask(*values)
+            if self.is_export_rank:
+                descriptor = descriptors[staged.source_lease_id]
+                if self._source_slot_by_transfer.get(staged.source_lease_id) != (
+                    descriptor.source_slot_id,
+                    descriptor.slot_generation,
+                ):
+                    raise RuntimeError("FlashMTP staged source lease was lost")
+            staged_tasks.append(staged)
+        batch_result.dt_staged_flashmtp_pivots = StagedFlashMTPPivotBatch(
+            tasks=tuple(staged_tasks), descriptors_by_transfer=descriptors
         )
 
-    def _stage_dflash_feature_copy(self, batch: ScheduleBatch, batch_result) -> None:
+    def _cancel_staged_flashmtp_pivots(
+        self, staged: StagedFlashMTPPivotBatch, batch_result
+    ) -> None:
+        """Release FlashMTP source leases that never reached control routing."""
+
+        for task in staged.tasks:
+            self._parked.pop(task.source_lease_id, None)
+            if self.is_export_rank:
+                self._release_source_slot(task.source_lease_id)
+        batch_result.dt_staged_flashmtp_pivots = None
+
+    def _stage_dflash_feature_copy(
+        self, batch: ScheduleBatch, batch_result, *, finalize_deferred: bool = False
+    ) -> None:
         if getattr(batch_result, "dt_staged_dflash_features", None) is not None:
             return
+        release_credit = bool(
+            finalize_deferred
+            and getattr(batch_result, "dt_deferred_dflash_feature_stage", False)
+        )
+        if release_credit and not getattr(
+            batch_result, "dt_dflash_feature_stage_credit", False
+        ):
+            raise RuntimeError("deferred DFlash result has no reserved source capacity")
+        try:
+            self._stage_dflash_feature_copy_impl(
+                batch, batch_result, finalize_deferred=finalize_deferred
+            )
+        finally:
+            if release_credit:
+                batch_result.dt_dflash_feature_stage_credit = False
+                self._deferred_dflash_feature_stages -= 1
+                if self._deferred_dflash_feature_stages < 0:
+                    raise RuntimeError(
+                        "deferred DFlash source-capacity accounting underflowed"
+                    )
+
+    def _stage_dflash_feature_copy_impl(
+        self, batch: ScheduleBatch, batch_result, *, finalize_deferred: bool = False
+    ) -> None:
         draft_input = getattr(batch_result, "next_draft_input", None)
         if not isinstance(draft_input, DFlashDraftInputV2):
             return
         feature_chunks = draft_input.dt_feature_chunks
         token_chunks = draft_input.dt_feature_token_chunks
+        committed_chunks = draft_input.dt_committed_token_chunks
         feature_offsets = draft_input.dt_feature_offsets
+        deferred = getattr(batch_result, "dt_deferred_dflash_feature_stage", False)
+        phase_started_ns = time.monotonic_ns()
+        if deferred:
+            if not finalize_deferred:
+                return
+            if self.is_export_rank:
+                from sglang.srt.speculative.dflash_worker_v2 import (
+                    split_dflash_committed_rows,
+                )
+
+                packed_hidden = batch_result.dt_dflash_packed_hidden
+                candidate_tokens = getattr(
+                    batch_result, "dt_dflash_candidate_tokens_cpu", None
+                )
+                if packed_hidden is None or candidate_tokens is None:
+                    raise RuntimeError(
+                        "deferred DFlash result lost feature staging tensors"
+                    )
+                if packed_hidden.device.type != "cuda" or candidate_tokens.is_cuda:
+                    raise RuntimeError(
+                        "deferred DFlash tensors crossed the wrong staging boundary"
+                    )
+                feature_chunks, token_chunks = split_dflash_committed_rows(
+                    packed_hidden=packed_hidden,
+                    candidates=candidate_tokens,
+                    commit_lens=batch_result.dt_dflash_accept_lens_cpu,
+                    block_size=self.block_size,
+                )
+                draft_input.dt_feature_chunks = feature_chunks
+                draft_input.dt_feature_token_chunks = token_chunks
+        batch_result.dt_dflash_feature_split_ns = time.monotonic_ns() - phase_started_ns
         if feature_chunks is None and not batch.reqs:
             return
-        if (
-            feature_chunks is None
-            or token_chunks is None
-            or feature_offsets is None
-            or len(feature_chunks) != len(batch.reqs)
-            or len(token_chunks) != len(batch.reqs)
-            or len(feature_offsets) != len(batch.reqs)
-        ):
-            raise RuntimeError("DFLASH Target result is missing feature chunks")
 
         packet = None
         published = None
         descriptors = {}
         if self.is_export_rank:
             try:
+                phase_started_ns = time.monotonic_ns()
+                if (
+                    feature_chunks is None
+                    or token_chunks is None
+                    or feature_offsets is None
+                    or len(feature_chunks) != len(batch.reqs)
+                    or len(token_chunks) != len(batch.reqs)
+                    or len(feature_offsets) != len(batch.reqs)
+                    or (
+                        self.is_eagle3
+                        and (
+                            committed_chunks is None
+                            or len(committed_chunks) != len(batch.reqs)
+                        )
+                    )
+                ):
+                    raise RuntimeError("DFLASH Target result is missing feature chunks")
                 active = [
                     index
                     for index, req in enumerate(batch.reqs)
@@ -352,8 +1016,26 @@ class DTTargetController:
                     and not req.is_retracted
                     and int(feature_chunks[index].shape[0]) > 0
                 ]
-                bonus_values = draft_input.bonus_tokens.detach().to("cpu").tolist()
-                seq_len_values = draft_input.new_seq_lens.detach().to("cpu").tolist()
+                if deferred:
+                    bonus_values = batch_result.dt_dflash_bonus_tokens_cpu.tolist()
+                    seq_len_values = batch_result.dt_dflash_seq_lens_cpu.tolist()
+                else:
+                    bonus_values = draft_input.bonus_tokens.detach().to("cpu").tolist()
+                    seq_len_values = (
+                        draft_input.new_seq_lens.detach().to("cpu").tolist()
+                    )
+                eagle_tokens_by_index = {}
+                eagle_committed_by_index = {}
+                if self.is_eagle3:
+                    assert committed_chunks is not None
+                    (
+                        eagle_tokens_by_index,
+                        eagle_committed_by_index,
+                    ) = _batched_eagle3_token_metadata(
+                        active_indices=active,
+                        token_chunks=token_chunks,
+                        committed_chunks=committed_chunks,
+                    )
                 specs = []
                 transfers = []
                 hidden_rows = []
@@ -363,12 +1045,17 @@ class DTTargetController:
                     attempt = self._ensure_lifecycle_attempt(req.rid)
                     hidden = feature_chunks[index]
                     tokens = token_chunks[index]
+                    committed_tokens = (
+                        committed_chunks[index] if self.is_eagle3 else tokens
+                    )
                     if (
                         hidden.ndim != 2
                         or int(hidden.shape[1]) != self.pivot_width
                         or hidden.dtype != torch.bfloat16
                         or tokens.ndim != 1
                         or int(tokens.numel()) != int(hidden.shape[0])
+                        or committed_tokens.ndim != 1
+                        or int(committed_tokens.numel()) != int(hidden.shape[0])
                     ):
                         raise RuntimeError(
                             "DFLASH Target feature/token chunk shape mismatch"
@@ -386,19 +1073,24 @@ class DTTargetController:
                             attempt
                         )
                     else:
-                        draft_kv_handle = self._draft_kv_handle_by_request.get(
-                            req.rid
-                        )
+                        draft_kv_handle = self._draft_kv_handle_by_request.get(req.rid)
                         if draft_kv_handle is None or previous_committed != offset:
                             raise RuntimeError(
                                 "DFLASH feature range has a committed-prefix gap"
                             )
-                    transfer_id = (
-                        f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
-                    )
-                    token_ids = tuple(
-                        int(value) for value in tokens.detach().to("cpu").tolist()
-                    )
+                    transfer_id = f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
+                    if self.is_eagle3:
+                        token_ids = eagle_tokens_by_index[index]
+                        committed_token_ids = eagle_committed_by_index[index]
+                    else:
+                        token_ids = tuple(
+                            int(value)
+                            for value in tokens.detach().to("cpu").tolist()
+                        )
+                        committed_token_ids = tuple(
+                            int(value)
+                            for value in committed_tokens.detach().to("cpu").tolist()
+                        )
                     specs.append(
                         (
                             req.rid,
@@ -409,6 +1101,7 @@ class DTTargetController:
                             offset,
                             token_count,
                             token_ids,
+                            committed_token_ids,
                             self._verify_transfer_by_request.get(req.rid),
                             int(bonus_values[index]),
                             int(seq_len_values[index]),
@@ -417,6 +1110,9 @@ class DTTargetController:
                     hidden_rows.append(hidden.contiguous())
                     transfers.append((transfer_id, row_offset, token_count))
                     row_offset += token_count
+                batch_result.dt_dflash_feature_metadata_ns = (
+                    time.monotonic_ns() - phase_started_ns
+                )
 
                 if specs:
                     assert self._feature_source_pool is not None
@@ -424,6 +1120,7 @@ class DTTargetController:
                         FeatureTransferSlice,
                     )
 
+                    phase_started_ns = time.monotonic_ns()
                     published = self._feature_source_pool.publish(
                         hidden_states=tuple(hidden_rows),
                         feature_schema_id=self.feature_schema_id,
@@ -441,6 +1138,35 @@ class DTTargetController:
                             time.monotonic_ns(),
                         ),
                     )
+                    batch_result.dt_dflash_feature_publish_strategy = (
+                        published.pack_strategy
+                    )
+                    batch_result.dt_dflash_feature_publish_chunks = (
+                        published.pack_chunk_count
+                    )
+                    # These rows may still alias a stable CUDA Graph output
+                    # buffer: ``contiguous()`` preserves an already-contiguous
+                    # view.  Scheduler has made the publication copy stream
+                    # wait for the producing forward.  Add the reverse edge
+                    # after the pool copy so a subsequent graph replay on the
+                    # forward stream cannot overwrite EAGLE3/DFlash features
+                    # while publication is still reading them.
+                    self.scheduler.forward_stream.wait_event(
+                        published.producer_event
+                    )
+                    batch_result.dt_dflash_feature_publish_ns = (
+                        time.monotonic_ns() - phase_started_ns
+                    )
+                    batch_result.dt_dflash_published_descriptor_count = len(
+                        published.descriptors
+                    )
+                    batch_result.dt_dflash_published_feature_rows = row_offset
+                    batch_result.dt_dflash_published_feature_bytes = (
+                        row_offset * self.pivot_width * 2
+                    )
+                    batch_result.dt_dflash_descriptor_published_ns = (
+                        published.descriptor_published_ns
+                    )
                     descriptors = {
                         descriptor.transfer_id: descriptor
                         for descriptor in published.descriptors
@@ -448,24 +1174,135 @@ class DTTargetController:
                     # Establish controller ownership before any profiling or
                     # control-plane work can fail.  A later exception can now
                     # deterministically quarantine every undelivered range.
+                    phase_started_ns = time.monotonic_ns()
                     for descriptor in published.descriptors:
                         self._source_slot_by_transfer[descriptor.transfer_id] = (
                             descriptor.source_slot_id,
                             descriptor.slot_generation,
                         )
-                    for descriptor in published.descriptors:
+                    profile_publish_batch = profile_event_enabled(
+                        "target_feature_publish_batch"
+                    )
+                    profile_publish_transfer = profile_event_enabled(
+                        "target_feature_publish"
+                    )
+                    if profile_publish_batch or profile_publish_transfer:
+                        specs_by_transfer = {
+                            values[1]: values for values in specs
+                        }
+                    if profile_publish_batch:
                         self._profile_emit(
-                            "target_feature_publish",
+                            "target_feature_publish_batch",
                             target_instance=self.instance_id,
-                            transfer_id=descriptor.transfer_id,
-                            source_slot_id=descriptor.source_slot_id,
-                            slot_generation=descriptor.slot_generation,
-                            feature_bytes=descriptor.nbytes,
+                            transfer_ids=tuple(
+                                descriptor.transfer_id
+                                for descriptor in published.descriptors
+                            ),
+                            request_ids=tuple(
+                                specs_by_transfer[descriptor.transfer_id][0]
+                                for descriptor in published.descriptors
+                            ),
+                            round_ids=tuple(
+                                specs_by_transfer[descriptor.transfer_id][2]
+                                for descriptor in published.descriptors
+                            ),
+                            feature_rows=tuple(
+                                specs_by_transfer[descriptor.transfer_id][6]
+                                for descriptor in published.descriptors
+                            ),
+                            publication_strategy=published.pack_strategy,
+                            publication_chunk_count=(
+                                published.pack_chunk_count
+                            ),
+                            publication_descriptor_count=len(
+                                published.descriptors
+                            ),
+                            publication_rows=row_offset,
+                            publication_bytes=(
+                                row_offset * self.pivot_width * 2
+                            ),
                             hidden_produced_ns=published.hidden_produced_ns,
                             descriptor_published_ns=(
                                 published.descriptor_published_ns
                             ),
                         )
+                    if profile_publish_transfer:
+                        for descriptor in published.descriptors:
+                            spec = specs_by_transfer[descriptor.transfer_id]
+                            self._profile_emit(
+                                "target_feature_publish",
+                                target_instance=self.instance_id,
+                                transfer_id=descriptor.transfer_id,
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                feature_rows=spec[6],
+                                source_slot_id=descriptor.source_slot_id,
+                                slot_generation=descriptor.slot_generation,
+                                feature_bytes=descriptor.nbytes,
+                                publication_strategy=published.pack_strategy,
+                                publication_chunk_count=(
+                                    published.pack_chunk_count
+                                ),
+                                publication_descriptor_count=len(
+                                    published.descriptors
+                                ),
+                                publication_rows=row_offset,
+                                publication_bytes=(
+                                    row_offset * self.pivot_width * 2
+                                ),
+                                hidden_produced_ns=published.hidden_produced_ns,
+                                descriptor_published_ns=(
+                                    published.descriptor_published_ns
+                                ),
+                            )
+                    measurement_specs = [
+                        values
+                        for values in specs
+                        if values[0].startswith(
+                            DT_BENCHMARK_MEASUREMENT_RID_PREFIX
+                        )
+                    ]
+                    if measurement_specs:
+                        first_descriptor = published.descriptors[0]
+                        measurement_rows = sum(
+                            int(values[6]) for values in measurement_specs
+                        )
+                        self._record_direct_gpu_measurement_epoch(
+                            measurement_rows=measurement_rows,
+                            measurement_requests=len(measurement_specs),
+                            source_session_id=first_descriptor.source_session_id,
+                            pool_generation=first_descriptor.pool_generation,
+                            transport_session=first_descriptor.transport_session,
+                        )
+                        if not getattr(
+                            self,
+                            "_direct_gpu_measurement_evidence_emitted",
+                            False,
+                        ):
+                            self._emit_direct_gpu_measurement_evidence_once(
+                                {
+                                    "role": "target",
+                                    "method": (
+                                        "eagle3" if self.is_eagle3 else "dflash"
+                                    ),
+                                    "transport": first_descriptor.transport,
+                                    "measurement_rows": measurement_rows,
+                                    "measurement_requests": len(measurement_specs),
+                                    "batch_rows": row_offset,
+                                    "source_session_id": (
+                                        first_descriptor.source_session_id
+                                    ),
+                                    "pool_generation": (
+                                        first_descriptor.pool_generation
+                                    ),
+                                    "transport_session": (
+                                        first_descriptor.transport_session
+                                    ),
+                                }
+                            )
+                    batch_result.dt_dflash_feature_profile_ns = (
+                        time.monotonic_ns() - phase_started_ns
+                    )
                 packet = (specs, None)
             except Exception as exc:
                 if published is not None:
@@ -477,12 +1314,11 @@ class DTTargetController:
                         pool_generation=first_descriptor.pool_generation,
                     )
                     for descriptor in published.descriptors:
-                        self._source_slot_by_transfer.pop(
-                            descriptor.transfer_id, None
-                        )
+                        self._source_slot_by_transfer.pop(descriptor.transfer_id, None)
                     published = None
                 packet = (None, f"{type(exc).__name__}: {exc}")
                 descriptors = {}
+        phase_started_ns = time.monotonic_ns()
         try:
             if self.scheduler.ps.tp_size > 1:
                 packet = broadcast_pyobj(
@@ -503,11 +1339,15 @@ class DTTargetController:
                 for descriptor in published.descriptors:
                     self._source_slot_by_transfer.pop(descriptor.transfer_id, None)
             raise
+        batch_result.dt_dflash_feature_broadcast_ns = (
+            time.monotonic_ns() - phase_started_ns
+        )
         assert packet is not None
         specs, error = packet
         if error is not None:
             raise RuntimeError(f"DFLASH feature publication failed: {error}")
 
+        phase_started_ns = time.monotonic_ns()
         staged_tasks = []
         for values in specs:
             staged = StagedDFlashTask(*values)
@@ -515,16 +1355,10 @@ class DTTargetController:
             self._draft_committed_len[staged.request_id] = (
                 staged.feature_token_offset + staged.feature_token_count
             )
-            self._draft_kv_handle_by_request[staged.request_id] = (
-                staged.draft_kv_handle
-            )
-            current_attempt = self._lifecycle_attempt_by_request.get(
-                staged.request_id
-            )
+            self._draft_kv_handle_by_request[staged.request_id] = staged.draft_kv_handle
+            current_attempt = self._lifecycle_attempt_by_request.get(staged.request_id)
             if current_attempt is None:
-                self._lifecycle_attempt_by_request[staged.request_id] = (
-                    staged.attempt
-                )
+                self._lifecycle_attempt_by_request[staged.request_id] = staged.attempt
                 self._next_lifecycle_attempt = max(
                     self._next_lifecycle_attempt, staged.attempt + 1
                 )
@@ -542,41 +1376,387 @@ class DTTargetController:
             tasks=tuple(staged_tasks),
             descriptors_by_transfer=descriptors,
         )
-
-    def _release_early_pinned_staging(self, buffer_slot: int) -> None:
-        if buffer_slot not in self._early_pivot_host_in_use:
-            raise RuntimeError(
-                f"DT early pinned staging slot {buffer_slot} is not leased"
-            )
-        self._early_pivot_host_in_use.remove(buffer_slot)
-        self._early_pivot_host_free_slots.append(buffer_slot)
+        if deferred:
+            batch_result.dt_dflash_packed_hidden = None
+            batch_result.dt_dflash_candidate_tokens = None
+            batch_result.dt_dflash_candidate_tokens_cpu = None
+            batch_result.dt_dflash_bonus_tokens_cpu = None
+            batch_result.dt_dflash_seq_lens_cpu = None
+        batch_result.dt_dflash_feature_commit_ns = (
+            time.monotonic_ns() - phase_started_ns
+        )
 
     def park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
         started_ns = time.monotonic_ns()
         batch_size = len(batch.reqs)
-        staged_pinned_pivots = getattr(batch_result, "dt_staged_pinned_pivots", None)
+        park_succeeded = False
+        if self.eagle3_host_span_profile_enabled and batch_result is not None:
+            batch_result.dt_eagle3_park_entry_ns = started_ns
         try:
+            self._record_target_verify_gpu_breakdown(batch_result, batch_size)
+            self._record_eagle3_verify_gpu_breakdown(batch_result, batch_size)
             self._record_measurement_lane_execution(batch, batch_result)
             self._park_completed_batch(batch, batch_result=batch_result)
-            self._record_full_wave_completion(batch, batch_size=batch_size)
+            park_succeeded = True
+            self._record_full_wave_completion(
+                batch, batch_result=batch_result, batch_size=batch_size
+            )
+            if (
+                self.eagle3_host_span_profile_enabled
+                and batch_result is not None
+                and getattr(batch_result, "dt_eagle3_completed_ns", None) is None
+            ):
+                batch_result.dt_eagle3_completed_ns = time.monotonic_ns()
+            if park_succeeded:
+                self._record_eagle3_host_span(batch_result, batch_size)
         finally:
-            if staged_pinned_pivots is not None:
-                if (
-                    getattr(batch_result, "dt_staged_pinned_pivots", None)
-                    is staged_pinned_pivots
-                ):
-                    batch_result.dt_staged_pinned_pivots = None
-                self._release_early_pinned_staging(staged_pinned_pivots.buffer_slot)
             if self.is_export_rank and batch_size:
                 self._profile_emit(
                     "target_park_batch",
                     batch_size=batch_size,
+                    wave_id=getattr(batch_result, "dt_full_wave_id", None),
+                    lane_id=getattr(batch_result, "dt_pipeline_lane_id", None),
+                    park_succeeded=park_succeeded,
                     total_ns=time.monotonic_ns() - started_ns,
+                    feature_stage_ns=getattr(
+                        batch_result, "dt_dflash_feature_stage_ns", 0
+                    ),
+                    feature_split_ns=getattr(
+                        batch_result, "dt_dflash_feature_split_ns", 0
+                    ),
+                    feature_metadata_ns=getattr(
+                        batch_result, "dt_dflash_feature_metadata_ns", 0
+                    ),
+                    feature_publish_ns=getattr(
+                        batch_result, "dt_dflash_feature_publish_ns", 0
+                    ),
+                    feature_publish_strategy=getattr(
+                        batch_result,
+                        "dt_dflash_feature_publish_strategy",
+                        "none",
+                    ),
+                    feature_publish_chunks=getattr(
+                        batch_result, "dt_dflash_feature_publish_chunks", 0
+                    ),
+                    feature_profile_ns=getattr(
+                        batch_result, "dt_dflash_feature_profile_ns", 0
+                    ),
+                    feature_broadcast_ns=getattr(
+                        batch_result, "dt_dflash_feature_broadcast_ns", 0
+                    ),
+                    feature_commit_ns=getattr(
+                        batch_result, "dt_dflash_feature_commit_ns", 0
+                    ),
+                    published_descriptor_count=getattr(
+                        batch_result, "dt_dflash_published_descriptor_count", 0
+                    ),
+                    published_feature_rows=getattr(
+                        batch_result, "dt_dflash_published_feature_rows", 0
+                    ),
+                    published_feature_bytes=getattr(
+                        batch_result, "dt_dflash_published_feature_bytes", 0
+                    ),
+                    descriptor_published_ns=getattr(
+                        batch_result, "dt_dflash_descriptor_published_ns", 0
+                    ),
+                    request_index_ns=getattr(
+                        batch_result, "dt_dflash_request_index_ns", 0
+                    ),
+                    retire_ns=getattr(batch_result, "dt_dflash_retire_ns", 0),
+                    task_build_ns=getattr(batch_result, "dt_dflash_task_build_ns", 0),
+                    queue_flush_ns=getattr(batch_result, "dt_dflash_queue_flush_ns", 0),
+                    release_ns=getattr(batch_result, "dt_dflash_release_ns", 0),
+                    flashmtp_release_inflight_ns=getattr(
+                        batch_result, "dt_flashmtp_release_inflight_ns", 0
+                    ),
+                    flashmtp_retire_ns=getattr(
+                        batch_result, "dt_flashmtp_retire_ns", 0
+                    ),
+                    flashmtp_select_ns=getattr(
+                        batch_result, "dt_flashmtp_select_ns", 0
+                    ),
+                    flashmtp_scalar_copy_ns=getattr(
+                        batch_result, "dt_flashmtp_scalar_copy_ns", 0
+                    ),
+                    flashmtp_task_build_ns=getattr(
+                        batch_result, "dt_flashmtp_task_build_ns", 0
+                    ),
+                    flashmtp_queue_flush_ns=getattr(
+                        batch_result, "dt_flashmtp_queue_flush_ns", 0
+                    ),
+                    flashmtp_finalize_ns=getattr(
+                        batch_result, "dt_flashmtp_finalize_ns", 0
+                    ),
                     parked=len(self._parked),
                 )
 
+    def _record_eagle3_host_span(self, batch_result, batch_size: int) -> None:
+        """Emit one TP0 host chronology row for every successful EAGLE3 batch.
+
+        The timestamps are control/enqueue boundaries.  They deliberately do
+        not claim to partition CUDA execution; the CUDA corridor is an overlay
+        with no absolute host-clock alignment.
+        """
+
+        if not self.eagle3_host_span_profile_enabled or batch_result is None:
+            return
+
+        wave_id = getattr(batch_result, "dt_full_wave_id", None)
+        is_controller_verify = wave_id is not None
+        common_names = (
+            "selection_returned_ns",
+            "run_batch_entry_ns",
+            "before_worker_call_ns",
+            "worker_entry_ns",
+            "worker_return_ns",
+            "after_worker_call_ns",
+            "copy_submit_started_ns",
+            "copy_submit_returned_ns",
+            "run_batch_return_ns",
+            "result_processing_entry_ns",
+            "copy_ready_ns",
+            "park_entry_ns",
+            "completed_ns",
+        )
+        common = {
+            name: getattr(batch_result, f"dt_eagle3_{name}", None)
+            for name in common_names
+        }
+        if any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in common.values()
+        ):
+            raise RuntimeError("EAGLE3 host-span batch boundaries are incomplete")
+        common_order = tuple(common[name] for name in common_names)
+        if any(right < left for left, right in zip(common_order, common_order[1:])):
+            raise RuntimeError("EAGLE3 host-span batch boundaries are out of order")
+
+        identity = {
+            "record_kind": (
+                "controller_verify" if is_controller_verify else "other_batch"
+            ),
+            "forward_iter": getattr(batch_result, "dt_eagle3_forward_iter", None),
+            "scheduler_forward_mode": getattr(
+                batch_result, "dt_eagle3_scheduler_forward_mode", None
+            ),
+            "scheduler_forward_mode_after_worker": getattr(
+                batch_result,
+                "dt_eagle3_scheduler_forward_mode_after_worker",
+                None,
+            ),
+            "worker_branch": getattr(
+                batch_result, "dt_eagle3_worker_branch", None
+            ),
+            "model_forward_mode": getattr(
+                batch_result, "dt_eagle3_model_forward_mode", None
+            ),
+            "launch_kind": getattr(batch_result, "dt_eagle3_launch_kind", None),
+            "batch_size": batch_size,
+            "is_extend": getattr(batch_result, "dt_eagle3_is_extend", None),
+            "can_run_cuda_graph": bool(batch_result.can_run_cuda_graph),
+            "overlap_predecessor_forward_iter": getattr(
+                batch_result, "dt_eagle3_overlap_predecessor_forward_iter", None
+            ),
+            "overlap_predecessor_scheduler_forward_mode": getattr(
+                batch_result,
+                "dt_eagle3_overlap_predecessor_scheduler_forward_mode",
+                None,
+            ),
+            "overlap_predecessor_launch_kind": getattr(
+                batch_result, "dt_eagle3_overlap_predecessor_launch_kind", None
+            ),
+            **common,
+        }
+        request_ids = getattr(batch_result, "dt_eagle3_request_ids", None)
+        if request_ids is None and getattr(
+            batch_result, "dt_eagle3_host_span_active", False
+        ):
+            raise RuntimeError("EAGLE3 host-span request identity is missing")
+        if request_ids is not None:
+            if (
+                not isinstance(request_ids, tuple)
+                or len(request_ids) != batch_size
+                or any(not isinstance(rid, str) or not rid for rid in request_ids)
+                or len(set(request_ids)) != len(request_ids)
+            ):
+                raise RuntimeError(
+                    "EAGLE3 host-span request identity is invalid"
+                )
+            identity["request_ids"] = request_ids
+        if (
+            not isinstance(identity["forward_iter"], int)
+            or isinstance(identity["forward_iter"], bool)
+            or not isinstance(identity["scheduler_forward_mode"], str)
+            or not isinstance(
+                identity["scheduler_forward_mode_after_worker"], str
+            )
+            or not isinstance(identity["worker_branch"], str)
+            or not isinstance(identity["model_forward_mode"], str)
+            or not isinstance(identity["launch_kind"], str)
+            or type(identity["is_extend"]) is not bool
+        ):
+            raise RuntimeError("EAGLE3 host-span batch identity is incomplete")
+
+        if is_controller_verify:
+            verify_names = (
+                "ready_build_started_ns",
+                "full_wave_ready_ns",
+                "post_input_build_ns",
+                "pre_run_eagle_verify_ns",
+                "post_run_eagle_verify_ns",
+                "post_feature_handoff_ns",
+            )
+            verify = {
+                name: getattr(batch_result, f"dt_eagle3_{name}", None)
+                for name in verify_names
+            }
+            if any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in verify.values()
+            ):
+                raise RuntimeError(
+                    "EAGLE3 controller host-span boundaries are incomplete"
+                )
+            ordered = (
+                verify["ready_build_started_ns"],
+                verify["full_wave_ready_ns"],
+                common["selection_returned_ns"],
+                common["run_batch_entry_ns"],
+                common["before_worker_call_ns"],
+                common["worker_entry_ns"],
+                verify["post_input_build_ns"],
+                verify["pre_run_eagle_verify_ns"],
+                verify["post_run_eagle_verify_ns"],
+                verify["post_feature_handoff_ns"],
+                common["worker_return_ns"],
+                common["after_worker_call_ns"],
+                common["copy_submit_started_ns"],
+                common["copy_submit_returned_ns"],
+                common["run_batch_return_ns"],
+                common["result_processing_entry_ns"],
+                common["copy_ready_ns"],
+                common["park_entry_ns"],
+                common["completed_ns"],
+            )
+            if any(right < left for left, right in zip(ordered, ordered[1:])):
+                raise RuntimeError(
+                    "EAGLE3 controller host-span boundaries are out of order"
+                )
+            lane_id = getattr(batch_result, "dt_pipeline_lane_id", None)
+            transfer_ids = getattr(
+                batch_result, "dt_full_wave_transfer_ids", None
+            )
+            if (
+                identity["scheduler_forward_mode"] != "DECODE"
+                or identity["scheduler_forward_mode_after_worker"]
+                != "TARGET_VERIFY"
+                or identity["worker_branch"] != "remote_eagle3_verify"
+                or identity["model_forward_mode"] != "TARGET_VERIFY"
+                or identity["launch_kind"] != "controller_verify"
+                or not isinstance(lane_id, int)
+                or isinstance(lane_id, bool)
+                or not isinstance(transfer_ids, tuple)
+                or len(transfer_ids) != batch_size
+                or any(not isinstance(value, str) or not value for value in transfer_ids)
+            ):
+                raise RuntimeError("EAGLE3 controller host-span identity is invalid")
+            self._profile_emit(
+                EAGLE3_HOST_SPAN_PROFILE_EVENT,
+                **identity,
+                **verify,
+                wave_id=wave_id,
+                lane_id=lane_id,
+                transfer_ids=transfer_ids,
+                ready_to_complete_ns=(
+                    common["completed_ns"] - verify["full_wave_ready_ns"]
+                ),
+            )
+            if not self._eagle3_host_span_startup_flushed:
+                # Expose the first built-in launch-warmup controller row once.
+                # The separately RID-qualified health flush below then makes
+                # the outer health prefill and all preceding rows visible.
+                self._profile_flush()
+                self._eagle3_host_span_startup_flushed = True
+            self._flush_eagle3_health_host_span(request_ids)
+            return
+
+        self._profile_emit(EAGLE3_HOST_SPAN_PROFILE_EVENT, **identity)
+        self._flush_eagle3_health_host_span(request_ids)
+
+    def _flush_eagle3_health_host_span(
+        self, request_ids: tuple[str, ...] | None
+    ) -> None:
+        """Expose a completed outer health launch to the startup gate once."""
+
+        if request_ids is None:
+            return
+        health_ids = {
+            rid
+            for rid in request_ids
+            if rid.startswith(f"{HEALTH_CHECK_RID_PREFIX}_")
+        }
+        new_health_ids = health_ids - self._eagle3_host_span_flushed_health_ids
+        if new_health_ids:
+            self._profile_flush()
+            self._eagle3_host_span_flushed_health_ids.update(new_health_ids)
+
+    def _record_target_verify_gpu_breakdown(
+        self, batch_result, batch_size: int
+    ) -> None:
+        if not self.is_export_rank or batch_result is None:
+            return
+        events = getattr(batch_result, "dt_target_verify_gpu_events", None)
+        if events is None:
+            return
+        if len(events) != 4:
+            raise RuntimeError("DFlash Target verify GPU profile is incomplete")
+        model_start, model_done, accept_done, finish_done = events
+        self._profile_emit(
+            "target_verify_gpu_breakdown",
+            batch_size=batch_size,
+            wave_id=getattr(batch_result, "dt_full_wave_id", None),
+            lane_id=getattr(batch_result, "dt_pipeline_lane_id", None),
+            model_ns=int(model_start.elapsed_time(model_done) * 1_000_000),
+            accept_ns=int(model_done.elapsed_time(accept_done) * 1_000_000),
+            finish_ns=int(accept_done.elapsed_time(finish_done) * 1_000_000),
+            can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
+        )
+
+    def _record_eagle3_verify_gpu_breakdown(
+        self, batch_result, batch_size: int
+    ) -> None:
+        if not self.is_export_rank or batch_result is None:
+            return
+        events = getattr(batch_result, "dt_eagle3_verify_gpu_events", None)
+        if events is None:
+            return
+        if len(events) != 5:
+            raise RuntimeError("EAGLE3 Target verify GPU profile is incomplete")
+        run_start, model_start, model_done, accept_done, feature_done = events
+        phase_ns = {
+            "prepare_ns": int(run_start.elapsed_time(model_start) * 1_000_000),
+            "model_ns": int(model_start.elapsed_time(model_done) * 1_000_000),
+            "accept_ns": int(model_done.elapsed_time(accept_done) * 1_000_000),
+            "feature_pack_ns": int(
+                accept_done.elapsed_time(feature_done) * 1_000_000
+            ),
+        }
+        # Sum the individually rounded stream-corridor phases so the serialized
+        # record conserves exactly.  Existing copy_done synchronization has
+        # already completed these events before park; do not synchronize here.
+        total_ns = sum(phase_ns.values())
+        self._profile_emit(
+            "target_eagle3_verify_gpu_breakdown",
+            batch_size=batch_size,
+            wave_id=getattr(batch_result, "dt_full_wave_id", None),
+            lane_id=getattr(batch_result, "dt_pipeline_lane_id", None),
+            **phase_ns,
+            total_ns=total_ns,
+            can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
+        )
+
     def _record_full_wave_completion(
-        self, batch: ScheduleBatch, *, batch_size: int
+        self, batch: ScheduleBatch, *, batch_result, batch_size: int
     ) -> None:
         """Record a READY_VERIFY wave after committed features are published.
 
@@ -588,14 +1768,28 @@ class DTTargetController:
         the same frozen lane.
         """
 
-        wave_id = getattr(batch, "dt_full_wave_id", None)
-        ready_ns = getattr(batch, "dt_full_wave_ready_ns", None)
-        lane_id = getattr(batch, "dt_pipeline_lane_id", None)
+        wave_id = getattr(
+            batch_result,
+            "dt_full_wave_id",
+            getattr(batch, "dt_full_wave_id", None),
+        )
+        ready_ns = getattr(
+            batch_result,
+            "dt_full_wave_ready_ns",
+            getattr(batch, "dt_full_wave_ready_ns", None),
+        )
+        lane_id = getattr(
+            batch_result,
+            "dt_pipeline_lane_id",
+            getattr(batch, "dt_pipeline_lane_id", None),
+        )
         if wave_id is None or ready_ns is None or lane_id is None:
             return
         if lane_id < 0 or lane_id >= self.pipeline_lanes:
             raise RuntimeError("DT full-wave completion has an invalid lane")
         completed_ns = time.monotonic_ns()
+        if self.eagle3_host_span_profile_enabled and batch_result is not None:
+            batch_result.dt_eagle3_completed_ns = completed_ns
         previous_completed_ns = self._last_full_wave_completed_ns
         previous_lane_completed_ns = self._last_lane_full_wave_completed_ns[lane_id]
         self._last_full_wave_completed_ns = completed_ns
@@ -610,9 +1804,7 @@ class DTTargetController:
                 completed_ns=completed_ns,
                 ready_to_complete_ns=completed_ns - ready_ns,
                 wave_period_ns=(
-                    completed_ns - previous_completed_ns
-                    if previous_completed_ns
-                    else 0
+                    completed_ns - previous_completed_ns if previous_completed_ns else 0
                 ),
                 lane_period_ns=(
                     completed_ns - previous_lane_completed_ns
@@ -621,6 +1813,7 @@ class DTTargetController:
                 ),
                 parked=len(self._parked),
                 feature_source_free_slots=self._feature_source_free_slots,
+                deferred_feature_stages=self._deferred_dflash_feature_stages,
             )
 
     def _record_measurement_lane_execution(
@@ -664,6 +1857,7 @@ class DTTargetController:
                     "target_instance": self.instance_id,
                     "lane_id": lane_id,
                     "pipeline_lanes": self.pipeline_lanes,
+                    "pipeline_lane_weights": self.pipeline_lane_weights,
                     "execution": execution,
                     "fallback_reason": (
                         None if execution == "graph" else "target_verify_not_graphed"
@@ -680,27 +1874,46 @@ class DTTargetController:
         )
 
     def _park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
-        staged_pinned_pivots = (
-            getattr(batch_result, "dt_staged_pinned_pivots", None)
-            if batch_result is not None
-            else None
-        )
         if not batch.reqs:
+            staged_flash = getattr(batch_result, "dt_staged_flashmtp_pivots", None)
+            if isinstance(staged_flash, StagedFlashMTPPivotBatch):
+                self._cancel_staged_flashmtp_pivots(staged_flash, batch_result)
             return
+        flashmtp_profile_active = bool(
+            getattr(self, "_profile_active", False)
+            and not self.is_token_only
+            and not self.is_feature_backed
+            and batch_result is not None
+        )
+        flashmtp_phase_started_ns = (
+            time.monotonic_ns() if flashmtp_profile_active else 0
+        )
         self._release_target_inflight_batch(batch)
+        if flashmtp_profile_active:
+            batch_result.dt_flashmtp_release_inflight_ns = (
+                time.monotonic_ns() - flashmtp_phase_started_ns
+            )
         if batch.spec_info is None:
             return
         if not isinstance(batch.spec_info, DFlashDraftInputV2):
             raise TypeError("DT Target can park only DFlashDraftInputV2 batches")
 
-        if self.is_dflash:
+        if self.is_feature_backed:
+            feature_stage_started_ns = time.monotonic_ns()
             if getattr(batch_result, "dt_staged_dflash_features", None) is None:
-                self._stage_dflash_feature_copy(batch, batch_result)
+                self._stage_dflash_feature_copy(
+                    batch, batch_result, finalize_deferred=True
+                )
+            batch_result.dt_dflash_feature_stage_ns = (
+                time.monotonic_ns() - feature_stage_started_ns
+            )
             self._park_dflash_completed_batch(
                 batch, batch.spec_info, batch_result=batch_result
             )
             return
 
+        if flashmtp_profile_active:
+            flashmtp_phase_started_ns = time.monotonic_ns()
         original_batch_size = len(batch.reqs)
         draft_input = batch.spec_info
         for req in batch.reqs:
@@ -719,6 +1932,21 @@ class DTTargetController:
                 self._next_round.pop(req.rid, None)
             if req.finished():
                 self._lifecycle_attempt_by_request.pop(req.rid, None)
+        if flashmtp_profile_active:
+            batch_result.dt_flashmtp_retire_ns = (
+                time.monotonic_ns() - flashmtp_phase_started_ns
+            )
+            flashmtp_phase_started_ns = time.monotonic_ns()
+        staged_flash = getattr(batch_result, "dt_staged_flashmtp_pivots", None)
+        if not self.is_token_only and staged_flash is None:
+            # Non-overlap scheduling has no later forward that can replay over
+            # this graph output, so publication at the result boundary is safe.
+            self._stage_flashmtp_pivot_copy(batch, batch_result)
+            staged_flash = getattr(batch_result, "dt_staged_flashmtp_pivots", None)
+        if not self.is_token_only and not isinstance(
+            staged_flash, StagedFlashMTPPivotBatch
+        ):
+            raise RuntimeError("FlashMTP Target result has no staged GPU pivot lease")
         # A long prompt can have multiple prefill chunks.  In non-overlap mode
         # the normal result processor decrements ``inflight_middle_chunks``
         # from one to zero before this hook, but ``batch.chunked_req`` still
@@ -726,158 +1954,159 @@ class DTTargetController:
         # the counter additionally fences older queued results.  Exporting
         # either kind here would give one request two concurrent Draft rounds.
         chunked_req = getattr(batch, "chunked_req", None)
-        active_indices = [
-            index
-            for index, req in enumerate(batch.reqs)
-            if not req.finished()
-            and not req.is_retracted
-            and req is not chunked_req
-            and getattr(req, "inflight_middle_chunks", 0) <= 0
-            and self._target_inflight_count(req.rid) == 0
-        ]
+        if self.is_token_only:
+            active_indices = [
+                index
+                for index, req in enumerate(batch.reqs)
+                if not req.finished()
+                and not req.is_retracted
+                and req is not chunked_req
+                and getattr(req, "inflight_middle_chunks", 0) <= 0
+                and self._target_inflight_count(req.rid) == 0
+            ]
+            active_flash_tasks = ()
+        else:
+            req_by_id = {req.rid: req for req in batch.reqs}
+            active_flash = []
+            for staged_task in staged_flash.tasks:
+                req = req_by_id.get(staged_task.request_id)
+                if req is None:
+                    self._cancel_staged_flashmtp_pivots(staged_flash, batch_result)
+                    raise RuntimeError(
+                        "FlashMTP staged request is absent from result batch"
+                    )
+                if (
+                    staged_task.request_index < 0
+                    or staged_task.request_index >= len(batch.reqs)
+                    or batch.reqs[staged_task.request_index] is not req
+                ):
+                    self._cancel_staged_flashmtp_pivots(staged_flash, batch_result)
+                    raise RuntimeError("FlashMTP staged request index changed")
+                eligible = bool(
+                    not req.finished()
+                    and not req.is_retracted
+                    and req is not chunked_req
+                    and getattr(req, "inflight_middle_chunks", 0) <= 0
+                    and self._target_inflight_count(req.rid) == 0
+                )
+                if not eligible:
+                    if self.is_export_rank:
+                        self._release_source_slot(staged_task.source_lease_id)
+                    continue
+                active_flash.append(staged_task)
+            active_flash_tasks = tuple(active_flash)
+            active_indices = [task.request_index for task in active_flash_tasks]
         tasks = []
         parked_reqs = []
         lane_ids = [
             self._lane_for_request(batch.reqs[index]) for index in active_indices
         ]
-        pivot_payloads = None
-        source_slots = None
-        source_generations = None
-        if self.is_export_rank and active_indices and not self.is_token_only:
-            if staged_pinned_pivots is not None:
-                if staged_pinned_pivots.rows != len(staged_pinned_pivots.request_ids):
-                    raise RuntimeError("DT staged pivot row and request counts differ")
-                staged_index_by_rid = {
-                    rid: index
-                    for index, rid in enumerate(staged_pinned_pivots.request_ids)
-                }
-                if len(staged_index_by_rid) != staged_pinned_pivots.rows:
-                    raise RuntimeError(
-                        "DT staged pivot request order contains duplicates"
-                    )
-                try:
-                    staged_active_indices = tuple(
-                        staged_index_by_rid[batch.reqs[index].rid]
-                        for index in active_indices
-                    )
-                except KeyError as exc:
-                    raise RuntimeError(
-                        "DT completed request is missing from staged pivot batch"
-                    ) from exc
-                buffer_slot = staged_pinned_pivots.buffer_slot
-                if buffer_slot not in self._early_pivot_host_in_use:
-                    raise RuntimeError(
-                        f"DT early pinned staging slot {buffer_slot} is not leased"
-                    )
-                pivot_cpu = self._early_pivot_host_buffers[buffer_slot][
-                    : staged_pinned_pivots.rows
-                ]
-                pivot_rows = pivot_cpu.view(torch.uint8).numpy()
-                pivot_payloads = [
-                    memoryview(pivot_rows[index]) for index in staged_active_indices
-                ]
-            else:
-                pivot_hidden = draft_input.hidden_states
-                if len(active_indices) != original_batch_size:
-                    pivot_hidden = pivot_hidden[active_indices]
-                if pivot_hidden.dtype != torch.bfloat16:
-                    raise TypeError(
-                        f"DT Target expected bfloat16 pivot, got {pivot_hidden.dtype}"
-                    )
-                pivot_gpu = (
-                    pivot_hidden.detach().contiguous().view(len(active_indices), -1)
-                )
-                pivot_cpu = self._pivot_host_staging[: len(active_indices)]
-                pivot_cpu.copy_(pivot_gpu, non_blocking=False)
-                pivot_rows = pivot_cpu.view(torch.uint8).numpy()
-                pivot_payloads = [memoryview(row) for row in pivot_rows]
-
-            acquired_source_slots = []
-            try:
-                if len(self._free_source_slots) < len(active_indices):
-                    raise RuntimeError("DT Target source slot ring is exhausted")
-                for _ in active_indices:
-                    acquired_source_slots.append(self._free_source_slots.popleft())
-                source_slots = tuple(acquired_source_slots)
-                source_generations = self._source_store.write_many(
-                    tuple(zip(source_slots, pivot_payloads))
-                )
-            except Exception:
-                self._free_source_slots.extendleft(reversed(acquired_source_slots))
-                raise
-
-        if active_indices:
-            bonus_values = draft_input.bonus_tokens
-            seq_len_values = draft_input.new_seq_lens
-            if len(active_indices) != original_batch_size:
-                bonus_values = bonus_values[active_indices]
-                seq_len_values = seq_len_values[active_indices]
-            bonus_tokens_cpu = bonus_values.detach().cpu().tolist()
-            seq_lens_cpu = seq_len_values.detach().cpu().tolist()
-        else:
-            bonus_tokens_cpu = []
-            seq_lens_cpu = []
-        for active_index, index in enumerate(active_indices):
-            req = batch.reqs[index]
-            round_id = self._next_round.get(req.rid, 0)
-            self._next_round[req.rid] = round_id + 1
-            attempt = self._ensure_lifecycle_attempt(req.rid)
-            transfer_id = f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
-            previous_transfer_id = None
-            if self.is_token_only and round_id > 0:
-                previous_transfer_id = self._verify_transfer_by_request.pop(
-                    req.rid, None
-                )
-                if previous_transfer_id is None:
-                    raise RuntimeError(
-                        "DT reconcile is missing the previous verified transfer"
-                    )
-            bonus_token = int(bonus_tokens_cpu[active_index])
-            seq_len = int(seq_lens_cpu[active_index])
-            self._parked[transfer_id] = ParkedTargetRound(
-                req=req,
-                transfer_id=transfer_id,
-                round_id=round_id,
-                attempt=attempt,
-                bonus_token=bonus_token,
-                seq_len=seq_len,
-                lane_id=lane_ids[active_index],
+        if flashmtp_profile_active:
+            batch_result.dt_flashmtp_select_ns = (
+                time.monotonic_ns() - flashmtp_phase_started_ns
             )
-            parked_reqs.append(req)
-
-            if self.is_export_rank:
+            flashmtp_phase_started_ns = time.monotonic_ns()
+        (
+            bonus_tokens_cpu,
+            seq_lens_cpu,
+            staged_flashmtp_scalars,
+        ) = _flashmtp_park_scalar_values(
+            batch_result=batch_result,
+            draft_input=draft_input,
+            active_indices=active_indices,
+            original_batch_size=original_batch_size,
+        )
+        if staged_flashmtp_scalars:
+            batch_result.dt_flashmtp_bonus_tokens_cpu = None
+            batch_result.dt_flashmtp_seq_lens_cpu = None
+            batch_result.dt_flashmtp_scalar_copy_done = None
+        if flashmtp_profile_active:
+            batch_result.dt_flashmtp_scalar_copy_ns = (
+                time.monotonic_ns() - flashmtp_phase_started_ns
+            )
+            flashmtp_phase_started_ns = time.monotonic_ns()
+        descriptors_by_transfer = (
+            {} if self.is_token_only else staged_flash.descriptors_by_transfer
+        )
+        control_committed = False
+        try:
+            for active_index, index in enumerate(active_indices):
+                req = batch.reqs[index]
                 if self.is_token_only:
-                    source_slot = None
-                    source_generation = None
-                    pivot_nbytes = 0
+                    round_id = self._next_round.get(req.rid, 0)
+                    attempt = self._ensure_lifecycle_attempt(req.rid)
+                    transfer_id = f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
+                    self._next_round[req.rid] = round_id + 1
                 else:
-                    source_slot = source_slots[active_index]
-                    source_generation = source_generations[active_index]
-                    self._source_slot_by_transfer[transfer_id] = (
-                        source_slot,
-                        source_generation,
+                    staged_task = active_flash_tasks[active_index]
+                    round_id = self._next_round.get(req.rid, 0)
+                    attempt = self._ensure_lifecycle_attempt(req.rid)
+                    transfer_id = staged_task.source_lease_id
+                    self._next_round[req.rid] = round_id + 1
+                previous_transfer_id = None
+                if self.is_token_only and round_id > 0:
+                    previous_transfer_id = self._verify_transfer_by_request.pop(
+                        req.rid, None
                     )
-                    pivot_nbytes = len(pivot_payloads[active_index])
-                tasks.append(
-                    self._make_task(
-                        transfer_id=transfer_id,
-                        req=req,
-                        round_id=round_id,
-                        attempt=attempt,
-                        bonus_token=bonus_token,
-                        source_slot=source_slot,
-                        source_generation=source_generation,
-                        pivot_nbytes=pivot_nbytes,
-                        previous_transfer_id=previous_transfer_id,
-                    )
+                    if previous_transfer_id is None:
+                        raise RuntimeError(
+                            "DT reconcile is missing the previous verified transfer"
+                        )
+                bonus_token = int(bonus_tokens_cpu[active_index])
+                seq_len = int(seq_lens_cpu[active_index])
+                self._parked[transfer_id] = ParkedTargetRound(
+                    req=req,
+                    transfer_id=transfer_id,
+                    round_id=round_id,
+                    attempt=attempt,
+                    bonus_token=bonus_token,
+                    seq_len=seq_len,
+                    lane_id=lane_ids[active_index],
                 )
+                parked_reqs.append(req)
 
-        if tasks:
-            self._queue_task_batch(tuple(tasks))
-            # Source slots are committed at this point, so publish the control
-            # message in the same scheduler turn. Waiting for the next poll
-            # adds a fixed idle bubble before Draft can start the round.
-            self._flush_pending_send()
+                if self.is_export_rank:
+                    tasks.append(
+                        self._make_task(
+                            transfer_id=transfer_id,
+                            req=req,
+                            round_id=round_id,
+                            attempt=attempt,
+                            bonus_token=bonus_token,
+                            previous_transfer_id=previous_transfer_id,
+                            feature_descriptor=descriptors_by_transfer.get(transfer_id),
+                        )
+                    )
+            if flashmtp_profile_active:
+                batch_result.dt_flashmtp_task_build_ns = (
+                    time.monotonic_ns() - flashmtp_phase_started_ns
+                )
+                flashmtp_phase_started_ns = time.monotonic_ns()
+            if tasks:
+                self._queue_task_batch(tuple(tasks))
+                self._staged_flashmtp_source_leases.difference_update(
+                    task.transfer_id for task in tasks
+                )
+                control_committed = True
+                # Source slots are committed at this point, so publish the control
+                # message in the same scheduler turn. Waiting for the next poll
+                # adds a fixed idle bubble before Draft can start the round.
+                self._flush_pending_send()
+            if flashmtp_profile_active:
+                batch_result.dt_flashmtp_queue_flush_ns = (
+                    time.monotonic_ns() - flashmtp_phase_started_ns
+                )
+                flashmtp_phase_started_ns = time.monotonic_ns()
+        except Exception:
+            if (
+                not self.is_token_only
+                and not control_committed
+                and isinstance(staged_flash, StagedFlashMTPPivotBatch)
+            ):
+                self._cancel_staged_flashmtp_pivots(staged_flash, batch_result)
+            raise
+        if not self.is_token_only:
+            batch_result.dt_staged_flashmtp_pivots = None
         if parked_reqs:
             parked_by_lane = Counter(state.lane_id for state in self._parked.values())
             for lane_id, parked_count in parked_by_lane.items():
@@ -900,6 +2129,10 @@ class DTTargetController:
                 batch.reqs = []
             else:
                 batch.filter_batch(chunked_req_to_exclude=parked_reqs)
+        if flashmtp_profile_active:
+            batch_result.dt_flashmtp_finalize_ns = (
+                time.monotonic_ns() - flashmtp_phase_started_ns
+            )
 
     def _park_dflash_completed_batch(
         self,
@@ -913,8 +2146,11 @@ class DTTargetController:
         staged = getattr(batch_result, "dt_staged_dflash_features", None)
         if not isinstance(staged, StagedDFlashFeatureBatch):
             raise RuntimeError("DFLASH Target result has no staged feature lease")
+        phase_started_ns = time.monotonic_ns()
         req_by_id = {req.rid: req for req in batch.reqs}
+        batch_result.dt_dflash_request_index_ns = time.monotonic_ns() - phase_started_ns
 
+        phase_started_ns = time.monotonic_ns()
         for req in batch.reqs:
             if req.finished() or req.is_retracted:
                 self._retire_dflash_rounds_for_request(
@@ -933,10 +2169,12 @@ class DTTargetController:
                 self._next_round.pop(req.rid, None)
             if req.finished():
                 self._lifecycle_attempt_by_request.pop(req.rid, None)
+        batch_result.dt_dflash_retire_ns = time.monotonic_ns() - phase_started_ns
 
         chunked_req = getattr(batch, "chunked_req", None)
         tasks = []
         parked_reqs = []
+        phase_started_ns = time.monotonic_ns()
         for spec in staged.tasks:
             req = req_by_id.get(spec.request_id)
             if req is None:
@@ -960,7 +2198,9 @@ class DTTargetController:
             )
             previous_transfer_id = self._verify_transfer_by_request.pop(req.rid, None)
             if previous_transfer_id != spec.previous_transfer_id:
-                raise RuntimeError("DFLASH previous-round identity changed before routing")
+                raise RuntimeError(
+                    "DFLASH previous-round identity changed before routing"
+                )
             if self.is_export_rank and previous_transfer_id is not None:
                 self._ledger.mark_need_reconcile(previous_transfer_id)
             if requires_proposal:
@@ -994,22 +2234,24 @@ class DTTargetController:
                         round_id=spec.round_id,
                         attempt=spec.attempt,
                         bonus_token=spec.bonus_token,
-                        source_slot=None,
-                        source_generation=None,
-                        pivot_nbytes=descriptor.nbytes,
                         previous_transfer_id=previous_transfer_id,
                         feature_descriptor=descriptor,
                         feature_token_ids=spec.feature_token_ids,
+                        committed_token_ids=spec.committed_token_ids,
                         feature_token_offset=spec.feature_token_offset,
                         requires_proposal=requires_proposal,
                     )
                 )
                 if previous_transfer_id is not None:
                     self._ledger.finish(previous_transfer_id)
+        batch_result.dt_dflash_task_build_ns = time.monotonic_ns() - phase_started_ns
 
+        phase_started_ns = time.monotonic_ns()
         if tasks:
             self._queue_task_batch(tuple(tasks))
             self._flush_pending_send()
+        batch_result.dt_dflash_queue_flush_ns = time.monotonic_ns() - phase_started_ns
+        phase_started_ns = time.monotonic_ns()
         batch_result.dt_staged_dflash_features = None
         if parked_reqs:
             parked_by_lane = Counter(state.lane_id for state in self._parked.values())
@@ -1023,6 +2265,7 @@ class DTTargetController:
                 batch.reqs = []
             else:
                 batch.filter_batch(chunked_req_to_exclude=parked_reqs)
+        batch_result.dt_dflash_release_ns = time.monotonic_ns() - phase_started_ns
 
     def poll(self, *, overlap_result=None) -> None:
         poll_entered_ns = time.monotonic_ns()
@@ -1040,6 +2283,7 @@ class DTTargetController:
                     if self._feature_source_pool is not None
                     else 0
                 ),
+                self._overlap_launch_ns,
             )
             receive_ns = time.monotonic_ns() - receive_start_ns
         broadcast_start_ns = time.monotonic_ns()
@@ -1052,8 +2296,15 @@ class DTTargetController:
             )
         broadcast_ns = time.monotonic_ns() - broadcast_start_ns
         assert packet is not None
-        poll_now_ns, events, result_ready, feature_source_free_slots = packet
+        (
+            poll_now_ns,
+            events,
+            result_ready,
+            feature_source_free_slots,
+            overlap_launch_ns,
+        ) = packet
         self._last_poll_ns = poll_now_ns
+        self._overlap_launch_ns = overlap_launch_ns
         self._overlap_result_ready = result_ready
         self._feature_source_free_slots = feature_source_free_slots
         if self.is_export_rank and events:
@@ -1102,8 +2353,12 @@ class DTTargetController:
                 state.failure = payload
 
     def has_feature_source_capacity(self) -> bool:
-        has_capacity = not self.is_dflash or self._feature_source_free_slots > 0
-        if self.is_export_rank and self.is_dflash:
+        has_capacity = not self.uses_direct_gpu_source or self._feature_source_free_slots > (
+            self._deferred_dflash_feature_stages
+            if self.defer_dflash_feature_stage
+            else 0
+        )
+        if self.is_export_rank and self.uses_direct_gpu_source:
             now_ns = time.monotonic_ns()
             if not has_capacity and not self._feature_source_stall_started_ns:
                 self._feature_source_stall_started_ns = now_ns
@@ -1112,6 +2367,7 @@ class DTTargetController:
                     phase="start",
                     started_ns=now_ns,
                     free_slots=self._feature_source_free_slots,
+                    deferred_feature_stages=self._deferred_dflash_feature_stages,
                     pending_task_batches=len(self._pending_send),
                     parked=len(self._parked),
                 )
@@ -1125,6 +2381,7 @@ class DTTargetController:
                     observed_ns=now_ns,
                     duration_ns=now_ns - started_ns,
                     free_slots=self._feature_source_free_slots,
+                    deferred_feature_stages=self._deferred_dflash_feature_stages,
                     pending_task_batches=len(self._pending_send),
                     parked=len(self._parked),
                 )
@@ -1151,6 +2408,38 @@ class DTTargetController:
         )
         for state in ready:
             ready_by_lane[state.lane_id].append(state)
+
+        if (
+            self.is_export_rank
+            and self.is_persistent
+            and os.environ.get("DT_PROFILE_DIR")
+        ):
+            lane_ids_in_cursor_order = tuple(
+                (self._lane_ready_cursor + offset) % self.pipeline_lanes
+                for offset in range(self.pipeline_lanes)
+            )
+            complete_lane_ids = tuple(
+                lane_id
+                for lane_id in lane_ids_in_cursor_order
+                if ready_by_lane[lane_id]
+                and len(ready_by_lane[lane_id]) == admitted_by_lane[lane_id]
+            )
+            if complete_lane_ids:
+                self._profile_emit(
+                    "target_ready_snapshot",
+                    cursor=self._lane_ready_cursor,
+                    complete_lane_ids=complete_lane_ids,
+                    complete_lane_count=len(complete_lane_ids),
+                    selected_lane_id=complete_lane_ids[0],
+                    aggregate_ready_rows=sum(
+                        len(ready_by_lane[lane_id]) for lane_id in complete_lane_ids
+                    ),
+                    ready_rows_by_lane=tuple(map(len, ready_by_lane)),
+                    admitted_rows_by_lane=tuple(
+                        admitted_by_lane[lane_id]
+                        for lane_id in range(self.pipeline_lanes)
+                    ),
+                )
 
         for offset in range(self.pipeline_lanes):
             lane_id = (self._lane_ready_cursor + offset) % self.pipeline_lanes
@@ -1219,6 +2508,8 @@ class DTTargetController:
         Keep registration next to ``result_queue.append`` so every launched
         forward is visible before any older result can be processed.
         """
+        if self.is_export_rank:
+            self._overlap_launch_ns = time.monotonic_ns()
         for req in launched_batch.reqs:
             self._target_inflight_counts[req.rid] += 1
             self._target_inflight_reqs[req.rid] = req
@@ -1250,7 +2541,6 @@ class DTTargetController:
         # Rebinding only reqs makes this scheduler alias logically empty while
         # leaving the result-queue snapshot and its shared tensors intact.
         launched_batch.reqs = []
-        self._overlap_launch_poll_ns = self._last_poll_ns
 
     def _target_inflight_count(self, rid: str) -> int:
         return int(self._target_inflight_counts.get(rid, 0))
@@ -1371,9 +2661,7 @@ class DTTargetController:
             if state.req.rid in affected_rids
         ]
         parked_states = [
-            state
-            for state in self._parked.values()
-            if state.req.rid in affected_rids
+            state for state in self._parked.values() if state.req.rid in affected_rids
         ]
         for state in control_states:
             self._feature_control_rounds.pop(state.transfer_id, None)
@@ -1420,13 +2708,13 @@ class DTTargetController:
         """Keep the previous result pending while another lane approaches READY.
 
         SGLang's generic overlap loop resolves a result immediately when the
-        next scheduler turn has no batch. DT can have a second full-wave lane
+        next scheduler turn has no batch. DT can have another full-wave lane
         already executing remotely, so bounded polling can turn that otherwise
         blocking result synchronization into useful producer-consumer overlap.
-        ``_last_poll_ns`` and ``_overlap_launch_poll_ns`` come from the TP0 poll
+        ``_last_poll_ns`` and ``_overlap_launch_ns`` come from the TP0 poll
         packet, keeping the defer decision identical on every TP rank.
         """
-        elapsed_ns = max(0, self._last_poll_ns - self._overlap_launch_poll_ns)
+        elapsed_ns = max(0, self._last_poll_ns - self._overlap_launch_ns)
         should_defer = bool(
             self.overlap_result_defer_ns > 0
             and next_batch is None
@@ -1476,37 +2764,84 @@ class DTTargetController:
         )
         batch.dt_pipeline_lane_id = lane_id
         initialized_ns = time.monotonic_ns()
+        breakdown_active = bool(
+            self.is_export_rank and getattr(self, "_profile_active", False)
+        )
+        pin_ready_inputs = is_pin_memory_available(device)
         batch.req_pool_indices_cpu = torch.tensor(
-            [req.req_pool_idx for req in reqs], dtype=torch.int64
+            [req.req_pool_idx for req in reqs],
+            dtype=torch.int64,
+            pin_memory=pin_ready_inputs,
         )
-        batch.req_pool_indices = batch.req_pool_indices_cpu.to(device=device)
+        req_pool_cpu_ns = (
+            time.monotonic_ns() if breakdown_active else initialized_ns
+        )
+        batch.req_pool_indices = _ready_batch_h2d(
+            batch.req_pool_indices_cpu, device=device
+        )
+        req_pool_device_ns = (
+            time.monotonic_ns() if breakdown_active else req_pool_cpu_ns
+        )
         batch.seq_lens_cpu = torch.tensor(
-            [state.seq_len for state in ready], dtype=torch.int64
+            [state.seq_len for state in ready],
+            dtype=torch.int64,
+            pin_memory=pin_ready_inputs,
         )
-        batch.seq_lens = batch.seq_lens_cpu.to(device)
+        seq_lens_cpu_ns = (
+            time.monotonic_ns() if breakdown_active else req_pool_device_ns
+        )
+        batch.seq_lens = _ready_batch_h2d(batch.seq_lens_cpu, device=device)
+        seq_lens_device_ns = (
+            time.monotonic_ns() if breakdown_active else seq_lens_cpu_ns
+        )
         batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        bonus_tokens = torch.tensor(
+        seq_lens_derived_ns = (
+            time.monotonic_ns() if breakdown_active else seq_lens_device_ns
+        )
+        bonus_tokens_cpu = torch.tensor(
             [state.bonus_token for state in ready],
             dtype=torch.int64,
-            device=device,
+            pin_memory=pin_ready_inputs,
+        )
+        bonus_tokens = _ready_batch_h2d(bonus_tokens_cpu, device=device)
+        bonus_tokens_ns = (
+            time.monotonic_ns() if breakdown_active else seq_lens_derived_ns
         )
 
         candidate_blob = b"".join(state.candidate_bytes for state in ready)
         expected_bytes = len(ready) * self.block_size * 4
         if len(candidate_blob) != expected_bytes:
             raise ValueError("DT candidate payload width does not match block size")
-        draft_tokens = torch.frombuffer(
-            bytearray(candidate_blob), dtype=torch.int32
-        ).reshape(len(ready), self.block_size)
-        draft_tokens = draft_tokens.to(device=device, dtype=torch.int64)
+        draft_tokens_cpu = _ready_candidate_host_tensor(
+            candidate_blob,
+            batch_size=len(ready),
+            block_size=self.block_size,
+            pin_memory=pin_ready_inputs,
+        )
+        candidate_cpu_ns = (
+            time.monotonic_ns() if breakdown_active else bonus_tokens_ns
+        )
+        draft_tokens = _ready_batch_h2d(draft_tokens_cpu, device=device)
+        # req_pool_indices_cpu and seq_lens_cpu already live on ScheduleBatch.
+        # Retain the two otherwise-local pinned sources until this batch has
+        # launched, rather than depending on host-allocator reuse fencing.
+        batch.dt_ready_h2d_sources = (bonus_tokens_cpu, draft_tokens_cpu)
+        candidate_device_ns = (
+            time.monotonic_ns() if breakdown_active else candidate_cpu_ns
+        )
         batch.spec_info = DFlashDraftInputV2(
             topk_p=torch.empty((len(ready), 0), dtype=torch.float32, device=device),
             topk_index=torch.empty((len(ready), 0), dtype=torch.int64, device=device),
             bonus_tokens=bonus_tokens,
             new_seq_lens=batch.seq_lens,
+            # The remote EAGLE3 Target verifier consumes only the complete
+            # candidate chain.  Its prefill handoff initializes FutureMap's
+            # otherwise-unused hidden-state relay with width zero, so keep the
+            # READY handoff on that same schema.  The real 3-layer features
+            # travel directly through dt_feature_chunks to the remote Draft.
             hidden_states=torch.empty(
-                (len(ready), self.pivot_width),
+                (len(ready), 0 if self.is_eagle3 else self.pivot_width),
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -1518,6 +2853,12 @@ class DTTargetController:
             batch.req_pool_indices,
             RelayPayload(
                 bonus_tokens=bonus_tokens,
+                # FutureMap derives its relay schema from the configured
+                # speculative algorithm.  EAGLE3 therefore requires top-k
+                # tensors even though this Target receives a complete remote
+                # chain and never consumes local Draft logits.
+                topk_p=batch.spec_info.topk_p,
+                topk_index=batch.spec_info.topk_index,
                 hidden_states=batch.spec_info.hidden_states,
             ),
         )
@@ -1526,18 +2867,60 @@ class DTTargetController:
             batch, self.scheduler.model_config.vocab_size
         )
         finished_ns = time.monotonic_ns()
+        result_received_ns = (
+            [state.result_received_ns for state in ready if state.result_received_ns]
+            if breakdown_active
+            else ()
+        )
+        result_batch_ids = (
+            sorted(
+                {
+                    state.result_batch_id
+                    for state in ready
+                    if state.result_batch_id is not None
+                }
+            )
+            if breakdown_active
+            else ()
+        )
         wave_id = self._next_full_wave_id
         self._next_full_wave_id += 1
         batch.dt_full_wave_id = wave_id
         batch.dt_full_wave_ready_ns = finished_ns
+        if self.eagle3_host_span_profile_enabled:
+            batch.dt_eagle3_ready_build_started_ns = started_ns
+            batch.dt_full_wave_transfer_ids = tuple(
+                state.transfer_id for state in ready
+            )
         if self.is_export_rank:
             self._profile_emit(
                 "target_ready_batch",
                 wave_id=wave_id,
                 lane_id=lane_id,
                 batch_size=len(ready),
+                transfer_ids=tuple(state.transfer_id for state in ready),
+                result_batch_ids=result_batch_ids,
+                oldest_result_age_ns=(
+                    finished_ns - min(result_received_ns)
+                    if result_received_ns
+                    else 0
+                ),
+                newest_result_age_ns=(
+                    finished_ns - max(result_received_ns)
+                    if result_received_ns
+                    else 0
+                ),
                 initialize_ns=initialized_ns - started_ns,
                 tensors_ns=tensors_ready_ns - initialized_ns,
+                req_pool_cpu_ns=req_pool_cpu_ns - initialized_ns,
+                req_pool_device_ns=req_pool_device_ns - req_pool_cpu_ns,
+                seq_lens_cpu_ns=seq_lens_cpu_ns - req_pool_device_ns,
+                seq_lens_device_ns=seq_lens_device_ns - seq_lens_cpu_ns,
+                seq_lens_derived_ns=seq_lens_derived_ns - seq_lens_device_ns,
+                bonus_tokens_ns=bonus_tokens_ns - seq_lens_derived_ns,
+                candidate_cpu_ns=candidate_cpu_ns - bonus_tokens_ns,
+                candidate_device_ns=candidate_device_ns - candidate_cpu_ns,
+                spec_tensors_ns=tensors_ready_ns - candidate_device_ns,
                 relay_ns=relay_ready_ns - tensors_ready_ns,
                 sampling_ns=finished_ns - relay_ready_ns,
                 total_ns=finished_ns - started_ns,
@@ -1553,16 +2936,37 @@ class DTTargetController:
 
     def pop_failures(self) -> list[ParkedTargetRound]:
         failed = [state for state in self._parked.values() if state.failure]
+        if not failed:
+            return []
+
+        # Chunked feature prefill can leave several control/proposal rounds for
+        # one request in the controller at once.  A failure is terminal for the
+        # current request attempt: retire every sibling before the next poll is
+        # allowed to dispatch an unsent successor, and report the Req only once
+        # to Scheduler so its KV allocation is released exactly once.
+        failed_by_lifecycle: dict[tuple[str, int], ParkedTargetRound] = {}
         for state in failed:
-            self._parked.pop(state.transfer_id)
+            failed_by_lifecycle.setdefault((state.req.rid, state.attempt), state)
+
+        current_failures = []
+        for (request_id, attempt), state in failed_by_lifecycle.items():
+            is_current = self._lifecycle_attempt_by_request.get(request_id) == attempt
+            self._retire_dflash_rounds_for_request(
+                request_id,
+                reason="remote_draft_failed",
+                attempt=attempt,
+            )
+            if not is_current:
+                continue
             self._forget_request_lane(state.req)
-            self._next_round.pop(state.req.rid, None)
-            self._finish_verified_request(state.req.rid)
-            self._release_draft_request(state.req.rid)
-            self._lifecycle_attempt_by_request.pop(state.req.rid, None)
-        if failed and self.is_export_rank:
+            self._next_round.pop(request_id, None)
+            self._finish_verified_request(request_id)
+            self._release_draft_request(request_id)
+            self._lifecycle_attempt_by_request.pop(request_id, None)
+            current_failures.append(state)
+        if current_failures and self.is_export_rank:
             self._flush_reliable_outbox()
-        return failed
+        return current_failures
 
     def pop_aborted(self, *, abort_all: bool, rid_prefix: str) -> list[Req]:
         from dt_protocol import (
@@ -1649,11 +3053,12 @@ class DTTargetController:
                 ),
             )
         else:
-            # Before target sizes are learned, balance persistent lanes.
+            # Before target sizes are learned, apply the configured admission
+            # ratio. Request ownership remains immutable after this choice.
             lane_id = min(
                 range(self.pipeline_lanes),
                 key=lambda candidate: (
-                    live_counts[candidate],
+                    live_counts[candidate] / self.pipeline_lane_weights[candidate],
                     (candidate - self._lane_assignment_cursor) % self.pipeline_lanes,
                 ),
             )
@@ -1668,21 +3073,67 @@ class DTTargetController:
             del req.dt_pipeline_lane_id
 
     def close(self) -> None:
+        previous_failure = getattr(
+            self, "_source_shutdown_quarantine_error", None
+        )
+        if previous_failure is not None:
+            raise RuntimeError(
+                "DT Target shutdown remains fenced after an incomplete direct-GPU "
+                "source drain; uncertain pool ownership is retained until process "
+                "teardown"
+            ) from previous_failure
+
+        source_pool = self._feature_source_pool
+        source_pool_fenced = False
+        shutdown_drained = False
         try:
-            if self.is_export_rank and self.is_persistent:
+            if self.is_export_rank and (
+                self.is_persistent or self.uses_direct_gpu_source
+            ):
                 self._drain_token_only_shutdown()
+            if source_pool is not None:
+                # Controller maps are not the complete ownership record. A
+                # publication can fail before descriptors reach this class, or
+                # a later exception can remove those mappings after the pool
+                # quarantines its slot. Fence admission and inspect the pool's
+                # own ownership atomically before dropping its last reference.
+                active_leases, quarantined_slots = source_pool.close()
+                source_pool_fenced = True
+                if active_leases or quarantined_slots:
+                    raise RuntimeError(
+                        "DT Target shutdown found unresolved direct-GPU source "
+                        "pool ownership after controller drain: "
+                        f"active_leases={active_leases}, "
+                        f"quarantined_slots={quarantined_slots}"
+                    )
+            shutdown_drained = True
+        except BaseException as exc:
+            if source_pool is not None and self.uses_direct_gpu_source:
+                # Commit the ownership quarantine before any fallible host-side
+                # cleanup. TargetFeatureSourcePool.close() only fences future
+                # publication; it deliberately retains storage, events, and
+                # active leases. Keep the pool attached to this controller so
+                # none of those objects can be reclaimed before process exit.
+                self._source_shutdown_quarantine_error = exc
+                if not source_pool_fenced:
+                    try:
+                        source_pool.close()
+                    except Exception:
+                        logger.exception(
+                            "failed to fence DT Target source publication after an "
+                            "incomplete shutdown drain; ownership remains retained"
+                        )
+            raise
         finally:
             for store in self._result_stores.values():
                 store.close()
             self._result_stores.clear()
             if self._client is not None:
                 self._client.close()
-            if self._feature_source_pool is not None:
-                self._feature_source_pool.close()
+            if shutdown_drained and self._feature_source_pool is not None:
+                if not source_pool_fenced:
+                    self._feature_source_pool.close()
                 self._feature_source_pool = None
-            if self._source_store is not None:
-                self._source_store.close()
-                self._source_store.unlink()
 
     def _drain_token_only_shutdown(self) -> None:
         from dt_protocol import (
@@ -1692,10 +3143,15 @@ class DTTargetController:
             cancel_transfers_id,
         )
 
+        # These graph-output preservation leases were never submitted to the
+        # Coordinator, so no remote reader can exist and no control ACK can
+        # retire them.  Return them directly to the bounded source pool before
+        # assembling cancellation for Coordinator-owned transfers.
+        for transfer_id in tuple(self._staged_flashmtp_source_leases):
+            self._release_source_slot(transfer_id)
+
         unsent_transfer_ids = {
-            task.transfer_id
-            for batch in self._pending_send
-            for task in batch.entries
+            task.transfer_id for batch in self._pending_send for task in batch.entries
         }
         for transfer_id in unsent_transfer_ids:
             self._release_source_slot(transfer_id)
@@ -1748,12 +3204,12 @@ class DTTargetController:
 
         deadline_ns = time.monotonic_ns() + self.round_timeout_ns
         while len(self._delivery_outbox) or (
-            self.is_dflash and self._source_slot_by_transfer
+            self.uses_direct_gpu_source and self._source_slot_by_transfer
         ):
             self._flush_reliable_outbox()
             self._consume_shutdown_acks()
             if not len(self._delivery_outbox) and not (
-                self.is_dflash and self._source_slot_by_transfer
+                self.uses_direct_gpu_source and self._source_slot_by_transfer
             ):
                 return
             now_ns = time.monotonic_ns()
@@ -1784,7 +3240,13 @@ class DTTargetController:
             if isinstance(message, ControlAck):
                 self._delivery_outbox.ack(message.operation, message.message_id)
                 if message.operation == "source_read_done":
-                    self._source_done_applied_ids.discard(message.message_id)
+                    batch_entries = self._source_done_batch_entries.pop(
+                        message.message_id, ()
+                    )
+                    if batch_entries:
+                        self._source_done_applied_ids.difference_update(batch_entries)
+                    else:
+                        self._source_done_applied_ids.discard(message.message_id)
             elif isinstance(message, TaskBatchAck):
                 # Request work has already been retired locally. A late task
                 # ACK cannot restart it and needs no retry bookkeeping.
@@ -1795,8 +3257,7 @@ class DTTargetController:
             elif isinstance(message, SourceReadDone):
                 self._consume_source_read_done(message)
             elif isinstance(message, SourceReadDoneBatch):
-                for entry in message.entries:
-                    self._consume_source_read_done(entry)
+                self._consume_source_read_done_batch(message)
             elif isinstance(message, ErrorMessage):
                 if message.code == "PermissionError":
                     self._delivery_outbox.retry_all_now()
@@ -1821,12 +3282,10 @@ class DTTargetController:
         round_id: int,
         attempt: int,
         bonus_token: int,
-        source_slot: int | None,
-        source_generation: int | None,
-        pivot_nbytes: int,
         previous_transfer_id: str | None,
         feature_descriptor=None,
         feature_token_ids: tuple[int, ...] = (),
+        committed_token_ids: tuple[int, ...] = (),
         feature_token_offset: int = 0,
         requires_proposal: bool = True,
     ):
@@ -1893,11 +3352,13 @@ class DTTargetController:
                 self._ledger.finish(previous_transfer_id)
             return task
 
-        if self.is_dflash:
+        if self.is_feature_backed:
             if feature_descriptor is None:
-                raise ValueError("DFLASH task requires a CUDA IPC feature descriptor")
-            if not feature_token_ids:
-                raise ValueError("DFLASH task requires feature-row token metadata")
+                raise ValueError("feature-backed task requires a CUDA IPC descriptor")
+            if not feature_token_ids or not committed_token_ids:
+                raise ValueError("feature-backed task requires token metadata")
+            if len(feature_token_ids) != len(committed_token_ids):
+                raise ValueError("feature and committed token counts differ")
             committed_kv_len = feature_token_offset + len(feature_token_ids)
             staged_boundary = self._draft_committed_len.get(req.rid)
             dispatched_boundary = self._draft_dispatched_len.get(req.rid, 0)
@@ -1907,11 +3368,11 @@ class DTTargetController:
                 or dispatched_boundary != feature_token_offset
             ):
                 raise RuntimeError(
-                    "DFLASH task boundary differs from Target committed feature state"
+                    "feature task boundary differs from Target committed state"
                 )
             draft_kv_handle = self._draft_kv_handle_by_request.get(req.rid)
             if draft_kv_handle is None:
-                raise RuntimeError("DFLASH task is missing its persistent KV handle")
+                raise RuntimeError("feature task is missing its persistent KV handle")
             task = DraftTask(
                 transfer_id=transfer_id,
                 request_id=req.rid,
@@ -1930,22 +3391,31 @@ class DTTargetController:
                     else DraftTaskKind.RECONCILE
                 ),
                 draft_kv_handle=draft_kv_handle,
-                committed_token_ids=feature_token_ids,
+                committed_token_ids=committed_token_ids,
+                feature_token_ids=feature_token_ids,
                 committed_kv_len=committed_kv_len,
                 feature_token_offset=feature_token_offset,
                 feature_token_count=len(feature_token_ids),
                 requires_proposal=requires_proposal,
+                pipeline_lane_id=self._lane_for_request(req),
             )
             self._draft_dispatched_len[req.rid] = committed_kv_len
             return task
 
+        if feature_descriptor is None:
+            raise ValueError("FlashMTP task requires a CUDA IPC pivot descriptor")
         expected_bytes = self.pivot_width * 2
-        if pivot_nbytes != expected_bytes:
+        if feature_descriptor.nbytes != expected_bytes:
             raise ValueError(
-                f"DT Target expected {expected_bytes} pivot bytes, got {pivot_nbytes}"
+                "DT Target expected "
+                f"{expected_bytes} pivot bytes, got {feature_descriptor.nbytes}"
             )
-        assert source_slot is not None and source_generation is not None
-        assert self._source_store is not None
+        if (
+            feature_descriptor.transport != "cuda-ipc"
+            or feature_descriptor.dtype != "bfloat16"
+            or tuple(feature_descriptor.shape) != (1, self.pivot_width)
+        ):
+            raise ValueError("FlashMTP task requires one fenced CUDA IPC BF16 pivot")
         return DraftTask(
             transfer_id=transfer_id,
             request_id=req.rid,
@@ -1955,17 +3425,7 @@ class DTTargetController:
             draft_profile_id=self.profile_id,
             k=self.block_size - 1,
             next_token_id=bonus_token,
-            source=SourceRef(
-                target_instance_id=self.instance_id,
-                source_device_id=self.scheduler.ps.gpu_id,
-                source_slot_id=source_slot,
-                slot_generation=source_generation,
-                transfer_id=transfer_id,
-                feature_schema_id=self.feature_schema_id,
-                nbytes=pivot_nbytes,
-                transport="mmap",
-                uri=self._source_store.uri,
-            ),
+            source=SourceRef(**feature_descriptor.source_ref_kwargs()),
             created_ns=now_ns,
             deadline_ns=now_ns + self.round_timeout_ns,
         )
@@ -1981,7 +3441,7 @@ class DTTargetController:
             entries=tasks,
             sent_ns=time.monotonic_ns(),
         )
-        if self.is_dflash:
+        if self.uses_direct_gpu_source:
             for task in tasks:
                 if task.source is not None:
                     self._source_deadline_by_transfer[task.transfer_id] = (
@@ -1990,31 +3450,52 @@ class DTTargetController:
         self._pending_send.append(batch)
 
     def _flush_pending_send(self) -> None:
+        from dt_protocol import TargetTaskBatch
+
         self._flush_reliable_outbox()
         while self._pending_send:
-            batch = self._pending_send[0]
-            blocked = next(
-                (
-                    (task, active)
-                    for task in batch.entries
-                    if (
-                        active := self._ledger.active_transfer_id(task.request_id)
-                    )
-                    is not None
-                    and active != task.transfer_id
-                ),
-                None,
+            dispatchable = []
+            selected_by_request = {}
+            blocked = None
+            pending_batches = (
+                (self._pending_send[0],)
+                if self.whole_batch_task_fifo_ablation
+                else self._pending_send
             )
+            for pending_batch in pending_batches:
+                for task in pending_batch.entries:
+                    active_transfer_id = self._ledger.active_transfer_id(
+                        task.request_id
+                    )
+                    queued_predecessor = selected_by_request.get(task.request_id)
+                    if queued_predecessor is not None or (
+                        active_transfer_id is not None
+                        and active_transfer_id != task.transfer_id
+                    ):
+                        if blocked is None:
+                            blocked = (
+                                pending_batch,
+                                task,
+                                active_transfer_id or queued_predecessor.transfer_id,
+                            )
+                        if self.whole_batch_task_fifo_ablation:
+                            dispatchable.clear()
+                            break
+                        continue
+                    dispatchable.append(task)
+                    selected_by_request[task.request_id] = task
+                if blocked is not None and self.whole_batch_task_fifo_ablation:
+                    break
+
             if blocked is not None:
                 # Chunked DFlash prefill produces the next authoritative
                 # feature range before the remote Draft necessarily finishes
-                # materializing the preceding one.  Preserve FIFO here so the
-                # same request never has two live descriptors and the Draft
-                # sees a contiguous committed prefix.  The fixed source ring
-                # provides bounded backpressure while this batch waits.
-                task, active_transfer_id = blocked
+                # materializing the preceding one.  Preserve FIFO per request,
+                # but do not strand independent descriptors in the same or a
+                # later pending batch behind that request.
+                pending_batch, task, active_transfer_id = blocked
                 block_key = (
-                    batch.batch_id,
+                    pending_batch.batch_id,
                     task.transfer_id,
                     active_transfer_id,
                 )
@@ -2022,8 +3503,10 @@ class DTTargetController:
                     active_state = self._ledger.get(active_transfer_id)
                     self._profile_emit(
                         "target_task_fifo_block",
-                        batch_id=batch.batch_id,
-                        entries=len(batch.entries),
+                        batch_id=pending_batch.batch_id,
+                        entries=len(pending_batch.entries),
+                        eligible_entries=len(dispatchable),
+                        pending_batches=len(self._pending_send),
                         request_id=task.request_id,
                         blocked_transfer_id=task.transfer_id,
                         blocked_round_id=task.round_id,
@@ -2045,16 +3528,80 @@ class DTTargetController:
                         ),
                     )
                     self._last_pending_send_block = block_key
+
+            if not dispatchable:
                 break
-            if not self._client.submit(batch):
+
+            self._batch_sequence += 1
+            dispatch_batch = TargetTaskBatch(
+                protocol_version=self._pending_send[0].protocol_version,
+                batch_id=f"{self.instance_id}:tasks:{self._batch_sequence}",
+                target_instance_id=self.instance_id,
+                entries=tuple(dispatchable),
+                sent_ns=time.monotonic_ns(),
+            )
+            if not self._client.submit(dispatch_batch):
                 break
             submitted_ns = time.monotonic_ns()
-            self._ledger.begin(batch)
+            if self._profile_active:
+                self._profile_emit(
+                    "target_task_submit",
+                    batch_id=dispatch_batch.batch_id,
+                    entries=len(dispatch_batch.entries),
+                    transfer_ids=tuple(
+                        task.transfer_id for task in dispatch_batch.entries
+                    ),
+                    proposal_transfer_ids=tuple(
+                        task.transfer_id
+                        for task in dispatch_batch.entries
+                        if task.requires_proposal
+                    ),
+                    materialization_transfer_ids=tuple(
+                        task.transfer_id
+                        for task in dispatch_batch.entries
+                        if not task.requires_proposal
+                    ),
+                    feature_rows=tuple(
+                        int(task.feature_token_count)
+                        for task in dispatch_batch.entries
+                    ),
+                    submitted_ns=submitted_ns,
+                    submit_call_ns=submitted_ns - dispatch_batch.sent_ns,
+                    oldest_task_age_ns=(
+                        submitted_ns
+                        - min(task.created_ns for task in dispatch_batch.entries)
+                    ),
+                    newest_task_age_ns=(
+                        submitted_ns
+                        - max(task.created_ns for task in dispatch_batch.entries)
+                    ),
+                )
+            self._ledger.begin(dispatch_batch)
             outbox = self._delivery_outbox
-            outbox.add("task_batch", batch.batch_id, batch)
-            outbox.mark_sent("task_batch", batch.batch_id, now_ns=submitted_ns)
-            self._pending_send.popleft()
-            self._last_pending_send_block = None
+            outbox.add("task_batch", dispatch_batch.batch_id, dispatch_batch)
+            outbox.mark_sent("task_batch", dispatch_batch.batch_id, now_ns=submitted_ns)
+
+            dispatched_ids = {task.transfer_id for task in dispatchable}
+            retained = deque()
+            for pending_batch in self._pending_send:
+                entries = tuple(
+                    task
+                    for task in pending_batch.entries
+                    if task.transfer_id not in dispatched_ids
+                )
+                if entries:
+                    retained.append(
+                        TargetTaskBatch(
+                            protocol_version=pending_batch.protocol_version,
+                            batch_id=pending_batch.batch_id,
+                            target_instance_id=pending_batch.target_instance_id,
+                            entries=entries,
+                            sent_ns=pending_batch.sent_ns,
+                        )
+                    )
+            self._pending_send = retained
+            if blocked is None:
+                self._last_pending_send_block = None
 
     def _poll_export_rank(self) -> list[tuple[str, str, object]]:
         from dt_protocol import (
@@ -2094,16 +3641,64 @@ class DTTargetController:
                 if active_retries:
                     self._queue_task_batch(tuple(active_retries))
             elif isinstance(message, TargetResultBatch):
-                events.extend(self._consume_result_batch(message))
+                if self._profile_active:
+                    consume_started_ns = time.monotonic_ns()
+                    result_events = self._consume_result_batch(message)
+                    consume_finished_ns = time.monotonic_ns()
+                    self._profile_emit(
+                        "target_result_receive",
+                        batch_id=message.batch_id,
+                        draft_instance=message.draft_instance_id,
+                        transfer_ids=tuple(
+                            entry.transfer_id for entry in message.entries
+                        ),
+                        ready_transfer_ids=tuple(
+                            transfer_id
+                            for kind, transfer_id, _payload in result_events
+                            if kind == "ready"
+                        ),
+                        materialized_transfer_ids=tuple(
+                            transfer_id
+                            for kind, transfer_id, _payload in result_events
+                            if kind == "materialized"
+                        ),
+                        applied_transfer_ids=tuple(
+                            transfer_id
+                            for _kind, transfer_id, _payload in result_events
+                        ),
+                        entries=len(message.entries),
+                        ready_count=sum(
+                            kind == "ready"
+                            for kind, _transfer_id, _ in result_events
+                        ),
+                        failed_count=sum(
+                            kind == "failed"
+                            for kind, _transfer_id, _ in result_events
+                        ),
+                        materialized_count=sum(
+                            kind == "materialized"
+                            for kind, _transfer_id, _ in result_events
+                        ),
+                        draft_to_target_ns=consume_finished_ns - message.sent_ns,
+                        consume_ns=consume_finished_ns - consume_started_ns,
+                    )
+                else:
+                    result_events = self._consume_result_batch(message)
+                events.extend(result_events)
             elif isinstance(message, SourceReadDone):
                 self._consume_source_read_done(message)
             elif isinstance(message, SourceReadDoneBatch):
-                for entry in message.entries:
-                    self._consume_source_read_done(entry)
+                self._consume_source_read_done_batch(message)
             elif isinstance(message, ControlAck):
                 self._delivery_outbox.ack(message.operation, message.message_id)
                 if message.operation == "source_read_done":
-                    self._source_done_applied_ids.discard(message.message_id)
+                    batch_entries = self._source_done_batch_entries.pop(
+                        message.message_id, ()
+                    )
+                    if batch_entries:
+                        self._source_done_applied_ids.difference_update(batch_entries)
+                    else:
+                        self._source_done_applied_ids.discard(message.message_id)
             elif isinstance(message, ErrorMessage):
                 if message.code == "PermissionError":
                     self._client.register_target(
@@ -2122,7 +3717,118 @@ class DTTargetController:
                 )
         events.extend(self._expire_local_rounds())
         self._expire_source_leases(now_ns=time.monotonic_ns())
+        self._maybe_emit_lifecycle_status()
         return events
+
+    def _lifecycle_status(self) -> dict[str, object]:
+        ledger = (
+            {"rounds": 0, "request_bindings": 0, "submitted_batches": 0}
+            if self._ledger is None
+            else self._ledger.lifecycle_counts()
+        )
+        feature_pool = self._feature_source_pool
+        active = {
+            **{f"ledger_{name}": value for name, value in ledger.items()},
+            "parked_rounds": len(self._parked),
+            "feature_control_rounds": len(self._feature_control_rounds),
+            "target_inflight_forwards": sum(self._target_inflight_counts.values()),
+            "target_inflight_requests": len(self._target_inflight_reqs),
+            "pending_send_batches": len(self._pending_send),
+            "pending_send_tasks": sum(
+                len(batch.entries) for batch in self._pending_send
+            ),
+            "delivery_outbox": len(self._delivery_outbox),
+            "draft_kv_handles": len(self._draft_kv_handle_by_request),
+            "draft_committed_boundaries": len(self._draft_committed_len),
+            "draft_dispatched_boundaries": len(self._draft_dispatched_len),
+            "lifecycle_attempts": len(self._lifecycle_attempt_by_request),
+            "next_round_requests": len(self._next_round),
+            "verify_transfers": len(self._verify_transfer_by_request),
+            "source_leases": len(self._source_slot_by_transfer),
+            "source_deadlines": len(self._source_deadline_by_transfer),
+            "source_done_applied": len(self._source_done_applied_ids),
+            "source_done_batches": len(self._source_done_batch_entries),
+            "cancelled_transfers": len(self._cancelled_transfers),
+            "request_lanes": len(self._lane_by_request),
+            "early_staging_in_use": 0,
+            "deferred_feature_stages": int(self._deferred_dflash_feature_stages),
+            "feature_source_leases": (
+                0 if feature_pool is None else feature_pool.active_lease_count
+            ),
+        }
+        fatal = {
+            "feature_source_quarantined_slots": (
+                0 if feature_pool is None else feature_pool.quarantined_slot_count
+            )
+        }
+        resources = {
+            "source_slots_free": 0,
+            "feature_source_slots_free": (
+                0 if feature_pool is None else feature_pool.free_slot_count
+            ),
+            "feature_source_slots_total": (
+                0 if feature_pool is None else feature_pool.slot_count
+            ),
+            "early_staging_slots_free": 0,
+            "early_staging_slots_total": 0,
+        }
+        return {
+            "schema_version": "dt-lifecycle-status/v1",
+            "role": "target",
+            "instance_id": self.instance_id,
+            "pid": os.getpid(),
+            "observed_ns": time.monotonic_ns(),
+            "sequence": self._lifecycle_status_sequence,
+            "instance_session_id": getattr(self._client, "instance_session_id", ""),
+            "coordinator_session_id": getattr(
+                self._client, "coordinator_session_id", ""
+            ),
+            "source_pool_generation": (
+                "" if feature_pool is None else feature_pool.pool_generation
+            ),
+            "direct_gpu_measurement_epochs": (
+                self._direct_gpu_measurement_epoch_evidence()
+            ),
+            "active": active,
+            "fatal": fatal,
+            "resources": resources,
+            "terminal": {},
+            "quiescent": not any(active.values()) and not any(fatal.values()),
+        }
+
+    def _maybe_emit_lifecycle_status(self) -> None:
+        now_ns = time.monotonic_ns()
+        if (
+            now_ns - self._last_lifecycle_status_sample_ns
+            < DT_LIFECYCLE_STATUS_INTERVAL_NS
+        ):
+            return
+        self._last_lifecycle_status_sample_ns = now_ns
+        status = self._lifecycle_status()
+        quiescent = bool(status["quiescent"])
+        became_quiescent = (
+            quiescent and self._last_lifecycle_quiescent is False
+        )
+        if (
+            quiescent == self._last_lifecycle_quiescent
+            and (not quiescent or now_ns - self._last_lifecycle_status_ns < DT_LIFECYCLE_STATUS_INTERVAL_NS)
+        ):
+            return
+        self._lifecycle_status_sequence += 1
+        status["sequence"] = self._lifecycle_status_sequence
+        status["observed_ns"] = now_ns
+        self._last_lifecycle_status_ns = now_ns
+        self._last_lifecycle_quiescent = quiescent
+        logger.info(
+            "%s%s",
+            DT_LIFECYCLE_STATUS_MARKER,
+            json.dumps(status, sort_keys=True, separators=(",", ":")),
+        )
+        if became_quiescent and self.eagle3_host_span_profile_enabled:
+            # This transition occurs after a workload window has drained, not
+            # in its request hot path.  Expose the final buffered host rows so
+            # the outer analyzer can join the complete warmup/measured window.
+            self._profile_flush()
 
     def _flush_reliable_outbox(self) -> None:
         from dt_protocol import (
@@ -2180,7 +3886,7 @@ class DTTargetController:
         )
 
     def _retire_dflash_rounds_for_request(
-        self, request_id: str, *, reason: str
+        self, request_id: str, *, reason: str, attempt: int | None = None
     ) -> None:
         """Cancel remote rounds superseded by a local terminal request state.
 
@@ -2197,6 +3903,7 @@ class DTTargetController:
                 *self._feature_control_rounds.values(),
             )
             if state.req.rid == request_id
+            and (attempt is None or state.attempt == attempt)
         ]
         if not states:
             return
@@ -2214,7 +3921,12 @@ class DTTargetController:
             cancel_transfers_id,
         )
 
-        self._cancelled_transfers.update(transfer_ids)
+        newly_cancelled = tuple(
+            transfer_id
+            for transfer_id in transfer_ids
+            if transfer_id not in self._cancelled_transfers
+        )
+        self._cancelled_transfers.update(newly_cancelled)
         self._drop_cancelled_unsent()
         for transfer_id in transfer_ids:
             if (
@@ -2223,17 +3935,29 @@ class DTTargetController:
             ):
                 self._ledger.finish(transfer_id)
                 self._cancelled_transfers.discard(transfer_id)
-        cancellation = CancelTransfers(
-            protocol_version=PROTOCOL_VERSION,
-            target_instance_id=self.instance_id,
-            transfer_ids=transfer_ids,
-            reason=reason,
-        )
-        self._delivery_outbox.add(
-            CANCEL_TRANSFERS,
-            cancel_transfers_id(cancellation),
-            cancellation,
-        )
+        if newly_cancelled:
+            cancellation = CancelTransfers(
+                protocol_version=PROTOCOL_VERSION,
+                target_instance_id=self.instance_id,
+                transfer_ids=newly_cancelled,
+                reason=reason,
+            )
+            cancellation_id = cancel_transfers_id(cancellation)
+            # Token-only timeout cleanup intentionally drops its in-memory
+            # cancelled marker immediately, but the reliable timeout message
+            # can still be awaiting ACK. Preserve that authoritative payload
+            # instead of reusing its ID with a different terminal reason.
+            if self._delivery_outbox.get(CANCEL_TRANSFERS, cancellation_id) is None:
+                self._delivery_outbox.add(
+                    CANCEL_TRANSFERS,
+                    cancellation_id,
+                    cancellation,
+                )
+        if self.is_token_only:
+            # Token-only transfers own no source lease and late results are
+            # stale once their ledger entries are finished.  Do not retain an
+            # otherwise-uncollectable cancellation marker after retirement.
+            self._cancelled_transfers.difference_update(transfer_ids)
 
     def _expire_local_rounds(self) -> list[tuple[str, str, object]]:
         from dt_protocol import (
@@ -2249,10 +3973,14 @@ class DTTargetController:
         transfer_ids = tuple(state.task.transfer_id for state in expired)
         for state in expired:
             transfer_id = state.task.transfer_id
-            if self.is_dflash:
+            if self.uses_direct_gpu_source:
                 self._quarantine_source_slot(transfer_id)
             self._ledger.finish(transfer_id)
-            self._release_draft_request(state.task.request_id)
+            if (
+                self._lifecycle_attempt_by_request.get(state.task.request_id)
+                == state.task.attempt
+            ):
+                self._release_draft_request(state.task.request_id)
         self._cancelled_transfers.update(transfer_ids)
         self._drop_cancelled_unsent()
         if self.is_token_only:
@@ -2277,11 +4005,8 @@ class DTTargetController:
             for transfer_id in transfer_ids
         ]
 
-    def _consume_source_read_done(self, message) -> None:
+    def _validate_source_read_done(self, message) -> str:
         from dt_protocol import (
-            PROTOCOL_VERSION,
-            SOURCE_READ_DONE,
-            ControlAck,
             source_read_done_id,
         )
 
@@ -2290,16 +4015,14 @@ class DTTargetController:
         if (
             not message.draft_instance_id
             or not message.instance_session_id
-            or message.coordinator_session_id
-            != self._client.coordinator_session_id
+            or message.coordinator_session_id != self._client.coordinator_session_id
         ):
             raise ValueError(
                 "SourceReadDone lacks the current Coordinator/Draft session fence"
             )
         message_id = source_read_done_id(message)
         if message_id in self._source_done_applied_ids:
-            self._flush_reliable_outbox()
-            return
+            return message_id
         source_ref = self._source_slot_by_transfer.get(message.transfer_id)
         if source_ref is not None and source_ref != (
             message.source_slot_id,
@@ -2308,9 +4031,39 @@ class DTTargetController:
             raise ValueError(
                 "SourceReadDone slot generation does not match the transfer"
             )
-        if self.is_dflash:
+        if self.uses_direct_gpu_source:
             if self._feature_source_pool is None:
-                raise RuntimeError("DFLASH feature source pool is unavailable")
+                raise RuntimeError("direct GPU source pool is unavailable")
+            self._feature_source_pool.validate_read_done(
+                transfer_id=message.transfer_id,
+                source_slot_id=message.source_slot_id,
+                slot_generation=message.slot_generation,
+                source_session_id=message.source_session_id,
+                pool_generation=message.pool_generation,
+            )
+        return message_id
+
+    def _consume_source_read_done(
+        self, message, *, flush: bool = True, prevalidated: bool = False
+    ) -> None:
+        from dt_protocol import (
+            PROTOCOL_VERSION,
+            SOURCE_READ_DONE,
+            ControlAck,
+            source_read_done_id,
+        )
+
+        message_id = (
+            source_read_done_id(message)
+            if prevalidated
+            else self._validate_source_read_done(message)
+        )
+        if message_id in self._source_done_applied_ids:
+            if flush:
+                self._flush_reliable_outbox()
+            return
+        if self.uses_direct_gpu_source:
+            assert self._feature_source_pool is not None
             self._feature_source_pool.read_done(
                 transfer_id=message.transfer_id,
                 source_slot_id=message.source_slot_id,
@@ -2320,6 +4073,11 @@ class DTTargetController:
             )
             self._source_slot_by_transfer.pop(message.transfer_id, None)
             self._source_deadline_by_transfer.pop(message.transfer_id, None)
+            staged_leases = getattr(
+                self, "_staged_flashmtp_source_leases", None
+            )
+            if staged_leases is not None:
+                staged_leases.discard(message.transfer_id)
         else:
             self._release_source_slot(message.transfer_id)
         if message.transfer_id in self._cancelled_transfers:
@@ -2333,7 +4091,67 @@ class DTTargetController:
         )
         self._source_done_applied_ids.add(message_id)
         self._delivery_outbox.add(SOURCE_READ_DONE, message_id, acknowledgement)
+        if flush:
+            self._flush_reliable_outbox()
+
+    def _consume_source_read_done_batch(self, message) -> None:
+        from dt_protocol import (
+            PROTOCOL_VERSION,
+            SOURCE_READ_DONE,
+            SourceReadDoneBatchAck,
+            source_read_done_id,
+        )
+
+        message_ids = tuple(source_read_done_id(entry) for entry in message.entries)
+        if not message_ids or len(set(message_ids)) != len(message_ids):
+            raise ValueError("SourceReadDoneBatch must contain unique entries")
+        profile_source_done = getattr(self, "_profile_active", False)
+        if profile_source_done:
+            first_applied_transfer_ids = tuple(
+                entry.transfer_id
+                for entry, message_id in zip(message.entries, message_ids)
+                if message_id not in self._source_done_applied_ids
+            )
+            duplicate_transfer_ids = tuple(
+                entry.transfer_id
+                for entry, message_id in zip(message.entries, message_ids)
+                if message_id in self._source_done_applied_ids
+            )
+        for entry in message.entries:
+            self._validate_source_read_done(entry)
+        for entry in message.entries:
+            self._consume_source_read_done(
+                entry, flush=False, prevalidated=True
+            )
+            # Replace the per-entry ACK queued by the shared fenced apply path
+            # with one reliable batch ACK.
+            self._delivery_outbox.ack(SOURCE_READ_DONE, source_read_done_id(entry))
+        acknowledgement = SourceReadDoneBatchAck(
+            protocol_version=PROTOCOL_VERSION,
+            batch_id=message.batch_id,
+            draft_instance_id=message.draft_instance_id,
+            message_ids=message_ids,
+        )
+        self._source_done_batch_entries[message.batch_id] = message_ids
+        if self._delivery_outbox.get(SOURCE_READ_DONE, message.batch_id) is None:
+            self._delivery_outbox.add(
+                SOURCE_READ_DONE, message.batch_id, acknowledgement
+            )
+        else:
+            self._delivery_outbox.retry_now(SOURCE_READ_DONE, message.batch_id)
         self._flush_reliable_outbox()
+        if profile_source_done:
+            self._profile_emit(
+                "target_source_done_batch_apply",
+                batch_id=message.batch_id,
+                draft_instance=message.draft_instance_id,
+                transfer_ids=tuple(
+                    entry.transfer_id for entry in message.entries
+                ),
+                first_applied_transfer_ids=first_applied_transfer_ids,
+                duplicate_transfer_ids=duplicate_transfer_ids,
+                entries=len(message.entries),
+            )
 
     def _expire_source_leases(self, *, now_ns: int) -> None:
         """Quarantine source ranges whose remote read never reached an ACK."""
@@ -2397,7 +4215,7 @@ class DTTargetController:
         disposition = self._ledger.apply_results(failure_batch)
         events = []
         for transfer_id in disposition.failed_transfer_ids:
-            if self.is_dflash:
+            if self.uses_direct_gpu_source:
                 self._quarantine_source_slot(transfer_id)
             events.append(("failed", transfer_id, str(exc)))
             self._ledger.finish(transfer_id)
@@ -2436,7 +4254,7 @@ class DTTargetController:
         # result was delivered but before its ordered SourceReadDone reached the
         # Target.  Quarantine first so ledger idempotence cannot hide that late
         # loss of GPU-read quiescence.
-        if self.is_dflash:
+        if self.uses_direct_gpu_source:
             for entry in batch.entries:
                 if entry.status == EntryStatus.OK:
                     continue
@@ -2546,6 +4364,9 @@ class DTTargetController:
                 start = entry.row_index * row_stride_bytes
                 candidate_bytes = payload[start : start + row_stride_bytes]
                 state = self._parked[transfer_id]
+                if self._profile_active:
+                    state.result_batch_id = batch.batch_id
+                    state.result_received_ns = time.monotonic_ns()
                 events.append(
                     (
                         "ready",
@@ -2597,24 +4418,25 @@ class DTTargetController:
         self._pending_send = retained
 
     def _release_source_slot(self, transfer_id: str) -> None:
+        staged_leases = getattr(self, "_staged_flashmtp_source_leases", None)
+        if staged_leases is not None:
+            staged_leases.discard(transfer_id)
         self._source_deadline_by_transfer.pop(transfer_id, None)
         source_ref = self._source_slot_by_transfer.pop(transfer_id, None)
         if source_ref is not None:
             source_slot, _generation = source_ref
-            if self.is_dflash:
-                assert self._feature_source_pool is not None
-                self._feature_source_pool.cancel(
-                    transfer_id=transfer_id,
-                    source_slot_id=source_slot,
-                    slot_generation=_generation,
-                    source_session_id=self._feature_source_pool.source_session_id,
-                    pool_generation=self._feature_source_pool.pool_generation,
-                )
-            else:
-                self._free_source_slots.append(source_slot)
+            if not self.uses_direct_gpu_source or self._feature_source_pool is None:
+                raise RuntimeError("source lease has no direct GPU source pool")
+            self._feature_source_pool.cancel(
+                transfer_id=transfer_id,
+                source_slot_id=source_slot,
+                slot_generation=_generation,
+                source_session_id=self._feature_source_pool.source_session_id,
+                pool_generation=self._feature_source_pool.pool_generation,
+            )
 
     def _quarantine_source_slot(self, transfer_id: str) -> None:
-        """Fence an uncertain DFlash read without ever reusing its GPU range."""
+        """Fence an uncertain direct GPU read without reusing its source range."""
 
         self._source_deadline_by_transfer.pop(transfer_id, None)
         # Keep the transfer-to-slot fence while the reader may still exist.
@@ -2624,8 +4446,8 @@ class DTTargetController:
         source_ref = self._source_slot_by_transfer.get(transfer_id)
         if source_ref is None:
             return
-        if not self.is_dflash or self._feature_source_pool is None:
-            raise RuntimeError("feature quarantine requires a DFlash source pool")
+        if not self.uses_direct_gpu_source or self._feature_source_pool is None:
+            raise RuntimeError("source quarantine requires a direct GPU source pool")
         source_slot, generation = source_ref
         self._feature_source_pool.quarantine(
             source_slot_id=source_slot,

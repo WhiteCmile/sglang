@@ -11,6 +11,7 @@ import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Lock
 
 import torch
 from sglang.srt.speculative.dt_cuda_ipc import (
@@ -70,7 +71,9 @@ class DraftKvP2pTransport:
             zip(pointers, lengths, item_lengths),
         )
         self._fatal_error: TransferQuiescenceError | None = None
+        self._permanent_quarantine_error: RuntimeError | None = None
         self._closed = False
+        self._lock = Lock()
 
     def pool_ref(self, *, instance_session_id: str, profile_id: str):
         from dt_protocol import (
@@ -123,31 +126,65 @@ class DraftKvP2pTransport:
         transfer,
         reservation,
     ) -> Future[TransferMetrics]:
-        if self._closed:
-            raise RuntimeError("DT CUDA IPC transport is closed")
-        if self._fatal_error is not None:
-            raise RuntimeError(
-                "DT CUDA IPC transport is quarantined after an unquiesced "
-                "GPU-copy failure"
-            ) from self._fatal_error
-        return self._executor.submit(
-            self._run_transfer,
-            source_draft_instance_id,
-            source_pool,
-            transfer,
-            reservation,
-        )
+        with self._lock:
+            self._raise_if_admission_fenced_locked()
+            return self._executor.submit(
+                self._run_transfer,
+                source_draft_instance_id,
+                source_pool,
+                transfer,
+                reservation,
+            )
 
     def invalidate_peer(self, peer_instance_id: str) -> None:
+        with self._lock:
+            self._raise_if_admission_fenced_locked()
+            invalidated = self._executor.submit(
+                self._invalidate_peer_if_healthy, peer_instance_id
+            )
+        # Keep mapping retirement in the same FIFO as transfers.  In
+        # particular, never invalidate a generation still referenced by a
+        # preceding copy callback.
+        invalidated.result()
+
+    def _invalidate_peer_if_healthy(self, peer_instance_id: str) -> None:
+        with self._lock:
+            self._raise_if_admission_fenced_locked()
         self._mapping_cache.invalidate(peer_instance_id)
+
+    def quarantine(self) -> None:
+        """Permanently fence migration GPU work without releasing resources.
+
+        This engine-policy fence is deliberately separate from
+        ``_fatal_error``.  The latter represents an individual unquiesced
+        transfer for which the lifecycle layer may explicitly probe
+        quiescence and retire its reservation.  Permanent quarantine admits
+        no probe, invalidation, mapping, copy, or close operation: uncertain
+        mappings and ownership survive until CUDA context/process teardown.
+        """
+
+        with self._lock:
+            if self._permanent_quarantine_error is None:
+                self._permanent_quarantine_error = RuntimeError(
+                    "DT CUDA IPC migration transport was permanently "
+                    "quarantined by engine lifecycle policy"
+                )
 
     def probe_quiescence(self) -> Future[bool]:
         """Fence a quarantined copy stream without blocking the scheduler."""
-        if self._closed:
-            raise RuntimeError("DT CUDA IPC transport is closed")
-        return self._executor.submit(self._probe_quiescence)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DT CUDA IPC transport is closed")
+            self._raise_if_permanently_quarantined_locked(
+                "probe migration-copy quiescence"
+            )
+            return self._executor.submit(self._probe_quiescence)
 
     def _probe_quiescence(self) -> bool:
+        with self._lock:
+            self._raise_if_permanently_quarantined_locked(
+                "run a queued migration-copy quiescence probe"
+            )
         torch.cuda.set_device(self.device)
         try:
             self._copy_stream.synchronize()
@@ -156,15 +193,41 @@ class DraftKvP2pTransport:
         return True
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._raise_if_permanently_quarantined_locked(
+                "close the migration transport"
+            )
+            self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
         # If stream synchronization failed, cudaIpcCloseMemHandle is not safe:
         # an already submitted transfer may still reference the mapping. Leak
         # it until CUDA context teardown instead of recycling remote memory.
-        if self._fatal_error is None:
-            self._mapping_cache.close()
+        with self._lock:
+            if (
+                self._fatal_error is None
+                and self._permanent_quarantine_error is None
+            ):
+                self._mapping_cache.close()
+
+    def _raise_if_permanently_quarantined_locked(self, operation: str) -> None:
+        error = self._permanent_quarantine_error
+        if error is not None:
+            raise RuntimeError(
+                f"permanent DT CUDA IPC migration quarantine prevents {operation}; "
+                "uncertain GPU resources must remain owned until process teardown"
+            ) from error
+
+    def _raise_if_admission_fenced_locked(self) -> None:
+        if self._closed:
+            raise RuntimeError("DT CUDA IPC transport is closed")
+        self._raise_if_permanently_quarantined_locked("migration GPU work")
+        if self._fatal_error is not None:
+            raise RuntimeError(
+                "DT CUDA IPC transport is quarantined after an unquiesced "
+                "GPU-copy failure"
+            ) from self._fatal_error
 
     def _run_transfer(
         self,
@@ -173,6 +236,11 @@ class DraftKvP2pTransport:
         transfer,
         reservation,
     ) -> TransferMetrics:
+        with self._lock:
+            # Submission and execution are separated by an independent
+            # executor queue.  Recheck both fences here before selecting a
+            # device or allowing generation changes to touch the IPC cache.
+            self._raise_if_admission_fenced_locked()
         torch.cuda.set_device(self.device)
         mapping_started_ns = time.monotonic_ns()
         mapped_bases = []
@@ -267,7 +335,8 @@ class DraftKvP2pTransport:
                         "failed CUDA IPC batch may still be writing destination "
                         "pages; transport and reservation must remain quarantined"
                     )
-                    self._fatal_error = fatal
+                    with self._lock:
+                        self._fatal_error = fatal
                     raise fatal from fence_exc
             raise
         completed_ns = time.monotonic_ns()

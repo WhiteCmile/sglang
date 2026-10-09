@@ -297,6 +297,52 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _stamp_eagle3_scheduler_identity(batch: Any) -> None:
+    """Freeze scheduler-owned mode identity before the worker mutates it."""
+
+    mode = batch.forward_mode.name
+    is_extend = batch.forward_mode.is_extend()
+    if not isinstance(mode, str) or not mode or type(is_extend) is not bool:
+        raise RuntimeError("EAGLE3 scheduler identity cannot be frozen")
+    batch.dt_eagle3_scheduler_forward_mode = mode
+    batch.dt_eagle3_is_extend = is_extend
+
+
+def _frozen_eagle3_scheduler_identity(batch: Any) -> tuple[str, bool]:
+    mode = getattr(batch, "dt_eagle3_scheduler_forward_mode", None)
+    is_extend = getattr(batch, "dt_eagle3_is_extend", None)
+    if not isinstance(mode, str) or not mode or type(is_extend) is not bool:
+        raise RuntimeError("EAGLE3 frozen scheduler identity is missing")
+    return mode, is_extend
+
+
+def _stamp_eagle3_request_identity(batch: Any) -> None:
+    """Freeze the ordered scheduler request identity before worker entry."""
+
+    request_ids = tuple(req.rid for req in batch.reqs)
+    if (
+        len(request_ids) != len(batch.reqs)
+        or any(not isinstance(rid, str) or not rid for rid in request_ids)
+        or len(set(request_ids)) != len(request_ids)
+    ):
+        raise RuntimeError("EAGLE3 scheduler request identity cannot be frozen")
+    batch.dt_eagle3_request_ids = request_ids
+
+
+def _frozen_eagle3_request_identity(batch: Any) -> tuple[str, ...]:
+    request_ids = getattr(batch, "dt_eagle3_request_ids", None)
+    current_request_ids = tuple(req.rid for req in batch.reqs)
+    if (
+        not isinstance(request_ids, tuple)
+        or len(request_ids) != len(batch.reqs)
+        or request_ids != current_request_ids
+        or any(not isinstance(rid, str) or not rid for rid in request_ids)
+        or len(set(request_ids)) != len(request_ids)
+    ):
+        raise RuntimeError("EAGLE3 frozen request identity is missing or invalid")
+    return request_ids
+
+
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(warmup_tensor, group=group)
@@ -521,6 +567,9 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
+        # A DT target exports feature payloads to a remote Draft and therefore
+        # intentionally has no local draft runner to describe here.  Its
+        # feature transport has a separate schema from PD hidden-state transfer.
         if (
             self.server_args.disaggregation_mode == "decode"
             and self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -1198,7 +1247,10 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and self.server_args.draft_target_disaggregation_role != "target"
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -2812,7 +2864,11 @@ class Scheduler(
             self.dt_target_controller.detach_parked_requests(running_batch)
             for failed in self.dt_target_controller.pop_failures():
                 prepare_abort(failed.req, f"Remote Draft failed: {failed.failure}")
-                release_kv_cache(failed.req, self.tree_cache, is_insert=False)
+                # A remote control-round failure can race a local retraction
+                # that already returned this request's pool row. Still report
+                # the abort, but never release an allocation twice.
+                if failed.req.req_pool_idx is not None:
+                    release_kv_cache(failed.req, self.tree_cache, is_insert=False)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=failed.req.rid), failed.req
                 )
@@ -2976,6 +3032,22 @@ class Scheduler(
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
+            if (
+                self.dt_target_controller is not None
+                and self.dt_target_controller.eagle3_host_span_profile_enabled
+            ):
+                ret.dt_eagle3_host_span_active = True
+                ret.dt_eagle3_selection_returned_ns = time.monotonic_ns()
+                _stamp_eagle3_scheduler_identity(ret)
+                _stamp_eagle3_request_identity(ret)
+                if getattr(ret, "dt_full_wave_id", None) is not None:
+                    ret.dt_eagle3_launch_kind = "controller_verify"
+                elif ret.forward_mode.is_idle():
+                    ret.dt_eagle3_launch_kind = "idle"
+                elif ret.forward_mode.is_extend():
+                    ret.dt_eagle3_launch_kind = "prefill"
+                else:
+                    ret.dt_eagle3_launch_kind = "other"
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -3486,6 +3558,34 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        eagle3_host_span_active = bool(
+            self.dt_target_controller is not None
+            and self.dt_target_controller.eagle3_host_span_profile_enabled
+            and getattr(batch, "dt_eagle3_host_span_active", False)
+        )
+        if eagle3_host_span_active:
+            (
+                frozen_scheduler_forward_mode,
+                frozen_is_extend,
+            ) = _frozen_eagle3_scheduler_identity(batch)
+            frozen_request_ids = _frozen_eagle3_request_identity(batch)
+            batch.dt_eagle3_run_batch_entry_ns = time.monotonic_ns()
+            predecessor = self.last_batch
+            batch.dt_eagle3_overlap_predecessor_forward_iter = getattr(
+                predecessor, "forward_iter", None
+            )
+            if predecessor is None:
+                predecessor_scheduler_forward_mode = None
+            else:
+                predecessor_scheduler_forward_mode, _ = (
+                    _frozen_eagle3_scheduler_identity(predecessor)
+                )
+            batch.dt_eagle3_overlap_predecessor_scheduler_forward_mode = (
+                predecessor_scheduler_forward_mode
+            )
+            batch.dt_eagle3_overlap_predecessor_launch_kind = getattr(
+                predecessor, "dt_eagle3_launch_kind", None
+            )
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3543,9 +3643,59 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        if eagle3_host_span_active:
+                            batch.dt_eagle3_before_worker_call_ns = time.monotonic_ns()
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if eagle3_host_span_active:
+                            batch.dt_eagle3_after_worker_call_ns = time.monotonic_ns()
+                            batch_result.dt_eagle3_host_span_active = True
+                            batch_result.dt_eagle3_forward_iter = batch.forward_iter
+                            batch_result.dt_eagle3_scheduler_forward_mode = (
+                                frozen_scheduler_forward_mode
+                            )
+                            batch_result.dt_eagle3_scheduler_forward_mode_after_worker = (
+                                batch.forward_mode.name
+                            )
+                            batch_result.dt_eagle3_request_ids = frozen_request_ids
+                            batch_result.dt_eagle3_launch_kind = (
+                                batch.dt_eagle3_launch_kind
+                            )
+                            batch_result.dt_eagle3_is_extend = (
+                                frozen_is_extend
+                            )
+                            batch_result.dt_eagle3_selection_returned_ns = (
+                                batch.dt_eagle3_selection_returned_ns
+                            )
+                            batch_result.dt_eagle3_run_batch_entry_ns = (
+                                batch.dt_eagle3_run_batch_entry_ns
+                            )
+                            batch_result.dt_eagle3_before_worker_call_ns = (
+                                batch.dt_eagle3_before_worker_call_ns
+                            )
+                            batch_result.dt_eagle3_after_worker_call_ns = (
+                                batch.dt_eagle3_after_worker_call_ns
+                            )
+                            batch_result.dt_eagle3_overlap_predecessor_forward_iter = (
+                                batch.dt_eagle3_overlap_predecessor_forward_iter
+                            )
+                            batch_result.dt_eagle3_overlap_predecessor_scheduler_forward_mode = (
+                                batch.dt_eagle3_overlap_predecessor_scheduler_forward_mode
+                            )
+                            batch_result.dt_eagle3_overlap_predecessor_launch_kind = (
+                                batch.dt_eagle3_overlap_predecessor_launch_kind
+                            )
+                            if getattr(batch, "dt_full_wave_id", None) is not None:
+                                batch_result.dt_eagle3_ready_build_started_ns = (
+                                    batch.dt_eagle3_ready_build_started_ns
+                                )
+                                batch_result.dt_eagle3_full_wave_ready_ns = (
+                                    batch.dt_full_wave_ready_ns
+                                )
+                                batch_result.dt_full_wave_transfer_ids = (
+                                    batch.dt_full_wave_transfer_ids
+                                )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3576,10 +3726,18 @@ class Scheduler(
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
+                                if eagle3_host_span_active:
+                                    batch_result.dt_eagle3_copy_submit_started_ns = (
+                                        time.monotonic_ns()
+                                    )
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
+                                if eagle3_host_span_active:
+                                    batch_result.dt_eagle3_copy_submit_returned_ns = (
+                                        time.monotonic_ns()
+                                    )
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf
@@ -3590,10 +3748,18 @@ class Scheduler(
                                         self.dt_target_controller.stage_overlap_pivot_copy(
                                             batch, batch_result
                                         )
+                                    if eagle3_host_span_active:
+                                        batch_result.dt_eagle3_copy_submit_started_ns = (
+                                            time.monotonic_ns()
+                                        )
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
+                                    if eagle3_host_span_active:
+                                        batch_result.dt_eagle3_copy_submit_returned_ns = (
+                                            time.monotonic_ns()
+                                        )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3693,6 +3859,9 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        if eagle3_host_span_active:
+            ret.dt_eagle3_run_batch_return_ns = time.monotonic_ns()
+
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -3769,6 +3938,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if getattr(result, "dt_eagle3_host_span_active", False):
+            result.dt_eagle3_result_processing_entry_ns = time.monotonic_ns()
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():

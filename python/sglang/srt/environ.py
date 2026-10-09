@@ -818,6 +818,9 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Fall back to the standard TP all-gather when the platform cannot safely
+    # execute the symmetric-memory multimem.st implementation.
+    SGLANG_DISABLE_MULTIMEM_ALL_GATHER = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
     # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the

@@ -18,10 +18,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 from dt_client import RetryOutbox
 from dt_profile import cuda_sync_enabled
 from dt_profile import emit as profile_emit
 from dt_profile import enabled as profile_enabled
+from dt_profile import event_enabled as profile_event_enabled
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -53,13 +55,44 @@ COALESCING_POLL_S = 0.0001
 # but slow enough that the Coordinator can drain the original transaction.
 CONTROL_RETRY_INTERVAL_NS = 1_000_000_000
 DT_DRAFT_GRAPH_MEASUREMENT_MARKER = "DT Draft graph measurement evidence: "
+DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
+DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
+DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
+DT_DIRECT_GPU_REQUEST_EVIDENCE_IDLE_NS = 750_000_000
+
+
+def _eagle3_feature_staging_view_bounds(
+    *,
+    requires_proposal: bool,
+    row_ranges: tuple[tuple[int, int], ...],
+) -> tuple[int, int] | None:
+    """Return safe direct-view bounds for a proposal batch's staging rows.
+
+    Proposal completion copies candidates to CPU before the staging slot is
+    released, which fences the same CUDA stream that consumed the feature
+    rows.  Materialization-only batches lack that fence and must retain their
+    owned concatenation even when the source ranges happen to be adjacent.
+    """
+    if not requires_proposal or not row_ranges:
+        return None
+    if any(
+        row_ranges[index][1] != row_ranges[index + 1][0]
+        for index in range(len(row_ranges) - 1)
+    ):
+        return None
+    return row_ranges[0][0], row_ranges[-1][1]
 
 
 @dataclass(slots=True)
 class PendingDraftTask:
     task: object
-    pivot_bytes: bytes | None
-    pivot_row: int = -1
+    pending_before: int = 0
+    pending_after: int = 0
+    taken_ns: int = 0
+    oldest_queue_age_ns: int = 0
+    batch_feature_token_count: int = 0
+    stop_reason: str = "unrecorded"
+    cap_limited: bool = False
 
 
 @dataclass(slots=True)
@@ -114,10 +147,11 @@ class DeferredMigrationGpuControl:
 
 @dataclass(slots=True)
 class PendingFeatureBatch:
+    batch_id: str
     pending: list[PendingDraftTask]
     staging_slot: int
     row_ranges: tuple[tuple[int, int], ...]
-    futures: tuple[Future, ...]
+    future: Future
     submitted_ns: int
 
 
@@ -131,7 +165,48 @@ class PendingDFlashCompletion:
     proposal_done_event: torch.cuda.Event
     proposal_tasks: tuple[object, ...]
     candidates: torch.Tensor | None
+    candidate_rows_cpu: torch.Tensor | None
+    launch_started_ns: int
+    tasks_prepared_ns: int
+    proposal_metadata_ready_ns: int
+    materialize_submitted_ns: int
     launched_ns: int
+    proposal_execution: str | None
+    proposal_fallback_reason: str | None
+    reconcile_prepare_phase_ns: tuple[int, ...]
+    prior_unfinished_proposal_count: int
+    prior_candidate_copy_pending_count: int
+
+
+@dataclass(slots=True)
+class PendingEagle3Completion:
+    pending: list[PendingDraftTask]
+    staging_slot: int
+    completion_event: torch.cuda.Event
+    submitted_ns: int
+
+
+@dataclass(slots=True)
+class PendingFlashMTPCompletion:
+    """Own FlashMTP candidate bytes until same-stream D2H completes."""
+
+    pending: list[PendingDraftTask]
+    staging_slot: int
+    completion_event: torch.cuda.Event
+    bonus_h2d_start_event: torch.cuda.Event | None
+    bonus_h2d_done_event: torch.cuda.Event | None
+    proposal_start_event: torch.cuda.Event | None
+    proposal_done_event: torch.cuda.Event | None
+    candidate_rows_cpu: torch.Tensor
+    execute_started_ns: int
+    inputs_ready_ns: int
+    submitted_ns: int
+    bonus_pack_ns: int
+    bonus_h2d_submit_ns: int
+    bonus_device: str
+    execution: str
+    measurement_rows: int
+    prior_pending_flashmtp_completions: int
 
 
 STANDALONE_DRAFT_DECODE_GRAPH_BATCH_SIZES = (
@@ -157,6 +232,9 @@ STANDALONE_DRAFT_DECODE_GRAPH_BATCH_SIZES = (
     128,
 )
 STANDALONE_DRAFT_PREFILL_GRAPH_BATCH_SIZES = (
+    1,
+    2,
+    3,
     4,
     8,
     12,
@@ -216,6 +294,7 @@ STANDALONE_DRAFT_PREFILL_GRAPH_BATCH_SIZES = (
     7680,
     8192,
 )
+DRAFT_PREFILL_GRAPH_MAX_TOKENS = STANDALONE_DRAFT_PREFILL_GRAPH_BATCH_SIZES[-1]
 
 
 def standalone_draft_decode_graph_batch_sizes(
@@ -264,6 +343,7 @@ class StandaloneDraftCudaGraphRunner:
         mask_token_id: int,
         local_positions: torch.Tensor,
         max_batch_size: int,
+        target_lm_head=None,
     ) -> None:
         self.draft_model = draft_model
         self.token_embedding = token_embedding
@@ -273,8 +353,26 @@ class StandaloneDraftCudaGraphRunner:
         self.block_size = int(block_size)
         self.mask_token_id = int(mask_token_id)
         self.local_positions = local_positions
+        self.target_lm_head = target_lm_head
         self.batch_sizes = draft_cuda_graph_batch_sizes(max_batch_size)
         self._captured: dict[int, CapturedDraftBatch] = {}
+        self._replay_evidence_emitted = False
+
+    def _sample_proposals(
+        self, *, block_hidden: torch.Tensor, bonus_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        if self.draft_model.markov_head is not None:
+            return self.draft_model.sample_draft_tokens(
+                block_hidden=block_hidden,
+                first_prev_token_ids=bonus_tokens,
+            )
+        if self.target_lm_head is None:
+            raise RuntimeError(
+                "legacy FlashMTP requires the Target LM head for proposal sampling"
+            )
+        prediction_hidden = self.draft_model.prediction_hidden(block_hidden)
+        logits = F.linear(prediction_hidden, self.target_lm_head.weight)
+        return torch.argmax(logits, dim=-1)
 
     def capture(self) -> None:
         pool = torch.cuda.graph_pool_handle()
@@ -362,9 +460,8 @@ class StandaloneDraftCudaGraphRunner:
         block_hidden = output.hidden_states.reshape(
             batch_size, self.draft_block_len, -1
         )
-        proposals = self.draft_model.sample_draft_tokens(
-            block_hidden=block_hidden,
-            first_prev_token_ids=bonus_tokens,
+        proposals = self._sample_proposals(
+            block_hidden=block_hidden, bonus_tokens=bonus_tokens
         )
         candidates[:, 0].copy_(bonus_tokens)
         candidates[:, 1:].copy_(proposals)
@@ -398,9 +495,8 @@ class StandaloneDraftCudaGraphRunner:
         block_hidden = output.hidden_states.reshape(
             batch_size, self.draft_block_len, -1
         )
-        return self.draft_model.sample_draft_tokens(
-            block_hidden=block_hidden,
-            first_prev_token_ids=bonus_tokens,
+        return self._sample_proposals(
+            block_hidden=block_hidden, bonus_tokens=bonus_tokens
         )
 
     def replay(
@@ -418,6 +514,14 @@ class StandaloneDraftCudaGraphRunner:
         captured.pivots[:batch_size].copy_(pivots)
         captured.bonus_tokens[:batch_size].copy_(bonus_tokens)
         captured.graph.replay()
+        if not self._replay_evidence_emitted:
+            self._replay_evidence_emitted = True
+            logger.info(
+                "Standalone Draft CUDA graph replay observed: mode=DRAFT_VERIFY "
+                "batch_size=%d padded_batch_size=%d",
+                batch_size,
+                padded_batch_size,
+            )
         return captured.candidates[:batch_size]
 
 
@@ -459,6 +563,7 @@ class FlashMTPDraftEngine:
         migration_backend: str = "disabled",
         feature_buffer_max_tokens: int = 8192,
         feature_buffer_slot_count: int = 2,
+        dflash_submit_pipeline: bool = False,
     ) -> None:
         try:
             from dt_client import DraftCoordinatorClient
@@ -495,13 +600,26 @@ class FlashMTPDraftEngine:
 
         self.EntryStatus = EntryStatus
         self.instance_id = instance_id
+        self._profile_active = profile_enabled()
         self.profile = load_draft_profile(profile_path)
-        if self.profile.method not in {"flashmtp", "standalone", "dflash"}:
+        if self.profile.method not in {
+            "flashmtp",
+            "standalone",
+            "dflash",
+            "eagle3",
+        }:
             raise ValueError(
-                "DT Draft engine supports FlashMTP V1, STANDALONE V2, and DFlash V2"
+                "DT Draft engine supports FlashMTP V1, STANDALONE V2, "
+                "DFlash V2, and EAGLE3 V2"
             )
         self._is_dflash = self.profile.method == "dflash"
-        self._persistent = self.profile.method in {"standalone", "dflash"}
+        self._is_eagle3 = self.profile.method == "eagle3"
+        self._is_feature_backed = self._is_dflash or self._is_eagle3
+        self._persistent = self.profile.method in {
+            "standalone",
+            "dflash",
+            "eagle3",
+        }
         self.gpu_id = gpu_id
         self.max_pending_tasks = max_pending_tasks
         self.max_batch_size = max_batch_size
@@ -513,6 +631,9 @@ class FlashMTPDraftEngine:
         self.migration_backend = migration_backend
         self.feature_buffer_max_tokens = int(feature_buffer_max_tokens)
         self.feature_buffer_slot_count = int(feature_buffer_slot_count)
+        self.dflash_submit_pipeline = bool(dflash_submit_pipeline)
+        if self.dflash_submit_pipeline and not self._is_dflash:
+            raise ValueError("DFLASH submit pipelining requires a DFlash profile")
         self._result_row_width = self.profile.block_size
         self._pending: deque[object] = deque()
         self._pending_ids: set[str] = set()
@@ -542,6 +663,7 @@ class FlashMTPDraftEngine:
         self._feature_source_inflight: set[tuple[str, str]] = set()
         self._feature_source_quiescent: set[tuple[str, str]] = set()
         self._feature_source_unquiescent: set[tuple[str, str]] = set()
+        self._quarantined_feature_draft_handles: set[str] = set()
         self._migration_quiescence_probes: dict[str, Future[bool]] = {}
         self._migration_quiescence_retry_ns: dict[str, int] = {}
         self._p2p_transport = None
@@ -549,7 +671,6 @@ class FlashMTPDraftEngine:
         self._last_batch_size = 0
         self._last_queue_delay_ns = 0
         self._data_dir = Path(data_dir).absolute()
-        self._source_stores: dict[str, object] = {}
         self._published_by_batch: dict[str, PublishedResult] = {}
         self._published_by_range: dict[tuple[str, str, int, int, int, int], str] = {}
         self._delivery_outbox = RetryOutbox[object](
@@ -564,6 +685,26 @@ class FlashMTPDraftEngine:
         self._result_pool_generation = uuid.uuid4().hex
         self._source_done_sequence = 0
         self._stop = False
+        # Ordinary stop requests still run the bounded shutdown/drain path.
+        # This latch is stronger: an unquiesced CUDA operation means stream
+        # ordering and resource ownership can no longer be proven, so no later
+        # GPU query, allocation, export, finalization, or release is allowed.
+        self._fatal_gpu_quarantine_reason: str | None = None
+        self._lifecycle_status_sequence = 0
+        self._last_lifecycle_status_ns = 0
+        self._last_lifecycle_status_sample_ns = 0
+        self._last_lifecycle_quiescent: bool | None = None
+        # One successful measured CUDA-IPC pull is sufficient to admit this
+        # endpoint.  Avoid repeating synchronous evidence logging on every
+        # Draft batch in the measured hot path.
+        self._direct_gpu_measurement_evidence_emitted = False
+        self._direct_gpu_measurement_epochs: dict[
+            tuple[str, str, str, str], list[int]
+        ] = {}
+        self._direct_gpu_measurement_requests: dict[
+            tuple[str, str, str, str, str], list[int]
+        ] = {}
+        self._last_direct_gpu_measurement_ns = 0
         self._graph_measurement_counts: dict[tuple[str, str], list[int]] = {}
         self._quarantined_migration_ids: set[str] = set()
         self._feature_pull_transport = None
@@ -571,6 +712,21 @@ class FlashMTPDraftEngine:
         self._free_feature_staging_slots: deque[int] = deque()
         self._pending_feature_batches: deque[PendingFeatureBatch] = deque()
         self._pending_dflash_completions: deque[PendingDFlashCompletion] = deque()
+        self._quarantined_dflash_completions: list[PendingDFlashCompletion] = []
+        self._pending_eagle3_completions: deque[PendingEagle3Completion] = deque()
+        self._quarantined_eagle3_completions: list[PendingEagle3Completion] = []
+        self._pending_flashmtp_completions: deque[PendingFlashMTPCompletion] = deque()
+        self._quarantined_flashmtp_completions: list[
+            PendingFlashMTPCompletion
+        ] = []
+        self._proposal_req_pool_indices_host_buffers: list[torch.Tensor] = []
+        self._proposal_req_pool_indices_buffers: list[torch.Tensor] = []
+        self._proposal_prefix_lens_host_buffers: list[torch.Tensor] = []
+        self._proposal_prefix_lens_buffers: list[torch.Tensor] = []
+        self._proposal_bonus_tokens_host_buffers: list[torch.Tensor] = []
+        self._proposal_bonus_tokens_buffers: list[torch.Tensor] = []
+        self._candidate_result_host_buffers: list[torch.Tensor] = []
+        self._candidate_result_copy_stream = None
 
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id)
         cleanup_stale_slot_files(Path(data_dir), instance_id=safe_id, kind="results")
@@ -597,6 +753,7 @@ class FlashMTPDraftEngine:
                 mem_fraction_static=mem_fraction_static,
                 disable_cuda_graph=disable_cuda_graph,
             )
+            self._initialize_direct_gpu_source_transport()
             self._initialize_migration_transport()
             self._initialize_pivot_staging()
             self._client.pool = self._kv_pool
@@ -655,25 +812,184 @@ class FlashMTPDraftEngine:
         )
 
     def _initialize_pivot_staging(self) -> None:
+        """Retain legacy attributes without allocating a host pivot data plane."""
+
         self._pivot_host_staging = None
         self._pivot_host_views = ()
         if self._persistent or not self.pinned_pivot_staging:
             return
-        self._pivot_host_staging = torch.empty(
-            (self.max_batch_size, self._pivot_width),
-            dtype=torch.bfloat16,
-            device="cpu",
-            pin_memory=True,
-        )
-        self._pivot_host_views = tuple(
-            memoryview(row.view(torch.uint8).numpy())
-            for row in self._pivot_host_staging
-        )
         logger.info(
-            "Enabled pinned DT pivot staging: shape=%s bytes=%d",
-            tuple(self._pivot_host_staging.shape),
-            self._pivot_host_staging.numel() * self._pivot_host_staging.element_size(),
+            "Ignoring legacy pinned FlashMTP pivot staging: direct CUDA IPC is required"
         )
+
+    @property
+    def _uses_direct_gpu_source(self) -> bool:
+        return self._is_feature_backed or not self._persistent
+
+    def _emit_direct_gpu_measurement_evidence_once(
+        self, payload: dict[str, object]
+    ) -> bool:
+        """Log the first successful measured direct-GPU pull."""
+
+        if getattr(self, "_direct_gpu_measurement_evidence_emitted", False):
+            return False
+        logger.info(
+            "%s%s",
+            DT_DIRECT_GPU_SOURCE_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        self._direct_gpu_measurement_evidence_emitted = True
+        return True
+
+    def _record_direct_gpu_measurement_epoch(
+        self,
+        *,
+        target_instance_id: str,
+        source_session_id: str,
+        pool_generation: str,
+        transport_session: str,
+        measurement_rows: int,
+        measurement_requests: int,
+        measurement_proposal_requests: int,
+    ) -> None:
+        epochs = getattr(self, "_direct_gpu_measurement_epochs", None)
+        if epochs is None:
+            epochs = {}
+            self._direct_gpu_measurement_epochs = epochs
+        key = (
+            target_instance_id,
+            source_session_id,
+            pool_generation,
+            transport_session,
+        )
+        counts = epochs.setdefault(key, [0, 0, 0, 0])
+        counts[0] += 1
+        counts[1] += measurement_rows
+        counts[2] += measurement_requests
+        counts[3] += measurement_proposal_requests
+
+    def _direct_gpu_measurement_epoch_evidence(self) -> list[dict[str, object]]:
+        epochs = getattr(self, "_direct_gpu_measurement_epochs", {})
+        return [
+            {
+                "target_instance_id": key[0],
+                "source_session_id": key[1],
+                "pool_generation": key[2],
+                "transport_session": key[3],
+                "batches": counts[0],
+                "measurement_rows": counts[1],
+                "measurement_requests": counts[2],
+                "measurement_proposal_requests": counts[3],
+            }
+            for key, counts in sorted(epochs.items())
+        ]
+
+    def _record_direct_gpu_measurement_request(
+        self,
+        *,
+        target_instance_id: str,
+        source_session_id: str,
+        pool_generation: str,
+        transport_session: str,
+        request_id: str,
+        measurement_rows: int,
+        measurement_requests: int,
+        measurement_proposal_requests: int,
+    ) -> None:
+        requests = getattr(self, "_direct_gpu_measurement_requests", None)
+        if requests is None:
+            requests = {}
+            self._direct_gpu_measurement_requests = requests
+        key = (
+            target_instance_id,
+            source_session_id,
+            pool_generation,
+            transport_session,
+            request_id,
+        )
+        counts = requests.setdefault(key, [0, 0, 0])
+        counts[0] += measurement_rows
+        counts[1] += measurement_requests
+        counts[2] += measurement_proposal_requests
+        self._last_direct_gpu_measurement_ns = time.monotonic_ns()
+
+    def _direct_gpu_measurement_request_evidence(self) -> list[dict[str, object]]:
+        requests = getattr(self, "_direct_gpu_measurement_requests", {})
+        return [
+            {
+                "target_instance_id": key[0],
+                "source_session_id": key[1],
+                "pool_generation": key[2],
+                "transport_session": key[3],
+                "request_id": key[4],
+                "measurement_rows": counts[0],
+                "measurement_requests": counts[1],
+                "measurement_proposal_requests": counts[2],
+            }
+            for key, counts in sorted(requests.items())
+        ]
+
+    def _initialize_direct_gpu_source_transport(self) -> None:
+        """Allocate the Draft-local destination ring for direct Target GPU pulls."""
+
+        if not self._uses_direct_gpu_source or self._feature_pull_transport is not None:
+            return
+        from sglang.srt.speculative.dt_feature_p2p import DraftFeaturePullTransport
+
+        self._feature_pull_transport = DraftFeaturePullTransport(device=self.device)
+        # FlashMTP transfers exactly one pivot row per request. Unlike DFlash
+        # feature ranges, its staging bound is the Draft batch size, not the
+        # multi-token feature-buffer limit.
+        rows = self.max_batch_size
+        self._feature_staging_buffers = [
+            torch.empty(
+                (rows, self._pivot_width),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._free_feature_staging_slots.extend(range(self.feature_buffer_slot_count))
+        if not self._persistent:
+            self._initialize_flashmtp_bonus_token_staging()
+            self._candidate_result_host_buffers = [
+                torch.empty(
+                    (self.max_batch_size, self.profile.block_size),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for _ in range(self.feature_buffer_slot_count)
+            ]
+        logger.info(
+            "DT FlashMTP direct GPU pivot transport ready: instance=%s "
+            "transport=cuda-ipc slots=%d rows=%d width=%d",
+            self.instance_id,
+            self.feature_buffer_slot_count,
+            rows,
+            self._pivot_width,
+        )
+
+    def _initialize_flashmtp_bonus_token_staging(self) -> None:
+        """Allocate one slot-owned pinned/Device bonus-token pair per pivot slot."""
+
+        self._proposal_bonus_tokens_host_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._proposal_bonus_tokens_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
 
     def _initialize_model(
         self,
@@ -684,6 +1000,13 @@ class FlashMTPDraftEngine:
     ) -> None:
         if self._is_dflash:
             self._initialize_dflash_model(
+                nccl_port=nccl_port,
+                mem_fraction_static=mem_fraction_static,
+                disable_cuda_graph=disable_cuda_graph,
+            )
+            return
+        if self._is_eagle3:
+            self._initialize_eagle3_model(
                 nccl_port=nccl_port,
                 mem_fraction_static=mem_fraction_static,
                 disable_cuda_graph=disable_cuda_graph,
@@ -751,8 +1074,6 @@ class FlashMTPDraftEngine:
         flash_config = parse_flashmtp_draft_config(
             draft_hf_config=self._draft_model_runner.model_config.hf_config
         )
-        if flash_config.markov_output_mode != "direct":
-            raise ValueError("DT V1 requires a direct-output FlashMTP checkpoint")
         self._draft_block_len = int(flash_config.draft_block_len)
         self._num_proposals = int(flash_config.num_proposed_tokens)
         self._mask_token_id = int(flash_config.mask_token_id)
@@ -769,9 +1090,11 @@ class FlashMTPDraftEngine:
         self._token_embedding = self._load_target_embedding(
             self.profile.target_model_path
         )
-
-        if self._draft_model.markov_head is None:
-            raise ValueError("DT V1 requires the FlashMTP Markov direct-output head")
+        self._target_lm_head = (
+            None
+            if self._draft_model.markov_head is not None
+            else self._load_target_lm_head(self.profile.target_model_path)
+        )
         self._draft_cuda_graph = None
         if not disable_cuda_graph:
             capture_start = time.monotonic()
@@ -785,6 +1108,7 @@ class FlashMTPDraftEngine:
                 mask_token_id=self._mask_token_id,
                 local_positions=self._local_positions,
                 max_batch_size=self.max_batch_size,
+                target_lm_head=self._target_lm_head,
             )
             graph_runner.capture()
             self._draft_cuda_graph = graph_runner
@@ -803,7 +1127,6 @@ class FlashMTPDraftEngine:
             tuple(self._token_embedding.weight.shape),
             self._draft_cuda_graph is not None,
         )
-
     def _initialize_dflash_model(
         self,
         *,
@@ -818,14 +1141,19 @@ class FlashMTPDraftEngine:
         )
         from sglang.srt.speculative.draft_worker_common import (
             build_block_pos_offsets,
+            make_draft_sampler_capture_hook,
             make_draft_block_spec_info,
         )
         from sglang.srt.speculative.dt_feature_p2p import DraftFeaturePullTransport
 
         server_args_kwargs = {
-            # The remote process owns the DFlash checkpoint and its KV pool as
-            # a primary worker. There is no co-located Target pool to inherit.
-            "model_path": self.profile.draft_model_path,
+            # Preserve the ordinary DFLASH target/draft ServerArgs contract so
+            # ModelRunner captures the native block-width TARGET_VERIFY graph.
+            # TpModelWorker still loads only the Draft checkpoint below.
+            "model_path": self.profile.target_model_path,
+            "speculative_algorithm": "DFLASH",
+            "speculative_draft_model_path": self.profile.draft_model_path,
+            "speculative_dflash_block_size": self.profile.block_size,
             "tokenizer_path": self.profile.target_model_path,
             "skip_tokenizer_init": True,
             "trust_remote_code": True,
@@ -835,41 +1163,72 @@ class FlashMTPDraftEngine:
             "pp_size": 1,
             "mem_fraction_static": mem_fraction_static,
             "page_size": 1,
-            # The primary worker is not marked as a speculative child, but
-            # DFlash proposal batches still use TARGET_VERIFY attention
-            # geometry.  Seed its fixed block width for the attention backend.
             "speculative_num_draft_tokens": self.profile.block_size,
             "disable_overlap_schedule": True,
-            # Remote proposal currently uses the eager DFlash forward so the
-            # candidate head and persistent row ownership remain explicit.
-            "disable_cuda_graph": True,
+            "disable_radix_cache": True,
+            "disable_cuda_graph": disable_cuda_graph,
+            "cuda_graph_config": (
+                {
+                    "decode": {"backend": "disabled"},
+                    "prefill": {"backend": "disabled"},
+                }
+                if disable_cuda_graph
+                else {
+                    "decode": {
+                        "backend": "full",
+                        "max_bs": self.max_batch_size,
+                    },
+                    "prefill": {"backend": "disabled"},
+                }
+            ),
             "max_running_requests": self.max_pending_tasks,
         }
         if self.enable_deterministic_inference:
             server_args_kwargs["enable_deterministic_inference"] = True
         server_args = ServerArgs(**server_args_kwargs)
         get_context().set_server_args(server_args)
+        target_model_config = ModelConfig.from_server_args(server_args)
         parallel_state = ParallelState.trivial(gpu_id=self.gpu_id)
         torch.get_device_module(server_args.device).set_device(self.gpu_id)
+        # A co-located speculative child inherits the Target's initialized
+        # groups. This standalone process has no Target worker, so establish
+        # the equivalent trivial groups before constructing the Draft child.
+        bootstrap.init_torch_distributed(
+            server_args=server_args,
+            model_config=target_model_config,
+            device=server_args.device,
+            ps=parallel_state,
+            dist_port=nccl_port,
+            is_draft_worker=False,
+            local_omp_cpuid=None,
+        )
         self._draft_worker = TpModelWorker(
             server_args=server_args,
             gpu_id=self.gpu_id,
             ps=parallel_state,
             nccl_port=nccl_port,
-            is_draft_worker=False,
+            is_draft_worker=True,
         )
         self._draft_model_runner = self._draft_worker.model_runner
         self._draft_model = self._draft_model_runner.model
         self.device = self._draft_model_runner.device
         self._draft_model.eval()
-        self._draft_worker.alloc_memory_pool()
+        # A normal speculative child receives its Target's resolved pool
+        # dimensions. The remote Draft owns an independent KV pool, so resolve
+        # the same config from its own post-load memory budget first.
+        self._draft_model_runner.init_kv_cache_configurator()
+        draft_pool_config = (
+            self._draft_model_runner.kv_cache_configurator._resolve_memory_pool_config(
+                self._draft_model_runner.pre_model_load_memory
+            )
+        )
+        self._draft_worker.alloc_memory_pool(memory_pool_config=draft_pool_config)
         self.max_pending_tasks = min(
             self.max_pending_tasks,
             int(self._draft_model_runner.max_running_requests),
         )
         self._client.max_pending_tasks = self.max_pending_tasks
         self._draft_worker.init_attention_backends()
-        self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
 
         config = parse_dflash_draft_config(
             draft_hf_config=self._draft_model_runner.model_config.hf_config
@@ -928,16 +1287,87 @@ class FlashMTPDraftEngine:
             for _ in range(self.feature_buffer_slot_count)
         ]
         self._free_feature_staging_slots.extend(range(self.feature_buffer_slot_count))
-        self._draft_cuda_graph = None
+        self._proposal_req_pool_indices_host_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._proposal_req_pool_indices_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._proposal_prefix_lens_host_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._proposal_prefix_lens_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._proposal_bonus_tokens_host_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._proposal_bonus_tokens_buffers = [
+            torch.empty(
+                self.max_batch_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        if self.dflash_submit_pipeline:
+            self._candidate_result_host_buffers = [
+                torch.empty(
+                    (self.max_batch_size, self.profile.block_size),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for _ in range(self.feature_buffer_slot_count)
+            ]
+        if self.dflash_submit_pipeline:
+            self._candidate_result_copy_stream = torch.cuda.Stream(device=self.device)
+        if not disable_cuda_graph:
+            self._draft_model_runner.capture_tail_hooks.append(
+                make_draft_sampler_capture_hook(self._dflash_sampler)
+            )
+        self._draft_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=not disable_cuda_graph
+        )
+        self._draft_cuda_graph = self._draft_model_runner.decode_cuda_graph_runner
         logger.info(
             "DT DFLASH Draft ready: instance=%s block=%d feature_width=%d "
-            "feature_slots=%d feature_tokens=%d cuda_graph=%s",
+            "feature_slots=%d feature_tokens=%d cuda_graph=%s submit_pipeline=%s",
             self.instance_id,
             self.profile.block_size,
             self._pivot_width,
             self.feature_buffer_slot_count,
             self.feature_buffer_max_tokens,
-            not disable_cuda_graph and False,
+            self._draft_cuda_graph is not None,
+            self.dflash_submit_pipeline,
         )
 
     def _initialize_standalone_model(
@@ -1039,6 +1469,164 @@ class FlashMTPDraftEngine:
             server_args.cuda_graph_config,
         )
 
+    def _initialize_eagle3_model(
+        self,
+        *,
+        nccl_port: int,
+        mem_fraction_static: float,
+        disable_cuda_graph: bool,
+    ) -> None:
+        """Initialize a Target-free TP1 EAGLE3 worker with persistent Draft KV."""
+
+        from sglang.srt.speculative.dt_feature_p2p import DraftFeaturePullTransport
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        if self.profile.draft_k != self.profile.block_size - 1:
+            raise ValueError("EAGLE3 draft_k must equal block_size - 1")
+        server_args = ServerArgs(
+            model_path=self.profile.target_model_path,
+            speculative_algorithm="EAGLE3",
+            speculative_draft_model_path=self.profile.draft_model_path,
+            speculative_num_steps=self.profile.draft_k,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=self.profile.block_size,
+            speculative_draft_attention_backend=(
+                self.profile.draft_attention_backend
+            ),
+            tokenizer_path=self.profile.target_model_path,
+            skip_tokenizer_init=True,
+            trust_remote_code=True,
+            device="cuda",
+            dtype=self.profile.draft_dtype,
+            tp_size=1,
+            pp_size=1,
+            mem_fraction_static=mem_fraction_static,
+            page_size=1,
+            disable_overlap_schedule=True,
+            disable_radix_cache=True,
+            disable_cuda_graph=disable_cuda_graph,
+            cuda_graph_config=(
+                {
+                    "decode": {"backend": "disabled"},
+                    "prefill": {"backend": "disabled"},
+                }
+                if disable_cuda_graph
+                else {
+                    "decode": {
+                        "backend": "full",
+                        "max_bs": self.max_batch_size,
+                    },
+                    "prefill": {
+                        "backend": "breakable",
+                        "max_bs": 8192,
+                        "bs": list(STANDALONE_DRAFT_PREFILL_GRAPH_BATCH_SIZES),
+                    },
+                }
+            ),
+            max_running_requests=self.max_pending_tasks,
+            enable_deterministic_inference=self.enable_deterministic_inference,
+        )
+        get_context().set_server_args(server_args)
+        target_model_config = ModelConfig.from_server_args(server_args)
+        parallel_state = ParallelState.trivial(gpu_id=self.gpu_id)
+        torch.get_device_module(server_args.device).set_device(self.gpu_id)
+        bootstrap.init_torch_distributed(
+            server_args=server_args,
+            model_config=target_model_config,
+            device=server_args.device,
+            ps=parallel_state,
+            dist_port=nccl_port,
+            is_draft_worker=False,
+            local_omp_cpuid=None,
+        )
+
+        self.device = torch.device("cuda", self.gpu_id)
+        target_embedding = self._load_target_embedding(
+            self.profile.target_model_path
+        ).weight
+
+        class _TargetWeights:
+            def get_embed_and_head(self):
+                return target_embedding, None
+
+        target_proxy = SimpleNamespace(
+            device=server_args.device,
+            model_config=target_model_config,
+            model_runner=SimpleNamespace(
+                model_config=target_model_config,
+                model=_TargetWeights(),
+            ),
+        )
+        self._eagle_draft_worker = EagleDraftWorker(
+            server_args,
+            self.gpu_id,
+            parallel_state,
+            nccl_port,
+            target_proxy,
+        )
+        self._draft_worker = self._eagle_draft_worker.draft_worker
+        self._draft_model_runner = self._eagle_draft_worker.draft_runner
+        self._draft_model = self._draft_model_runner.model
+        self.device = self._draft_model_runner.device
+        self._draft_model.eval()
+        self._draft_model_runner.init_kv_cache_configurator()
+        draft_pool_config = (
+            self._draft_model_runner.kv_cache_configurator._resolve_memory_pool_config(
+                self._draft_model_runner.pre_model_load_memory
+            )
+        )
+        self._eagle_draft_worker.alloc_memory_pool(
+            memory_pool_config=draft_pool_config
+        )
+        self.max_pending_tasks = min(
+            self.max_pending_tasks,
+            int(self._draft_model_runner.max_running_requests),
+        )
+        self._client.max_pending_tasks = self.max_pending_tasks
+        self._eagle_draft_worker.init_attention_backends()
+        self._eagle_draft_worker.init_cuda_graphs()
+
+        self._pivot_width = (
+            self.profile.feature_schema.num_feature_layers
+            * self.profile.feature_schema.feature_width
+        )
+        draft_fc = getattr(self._draft_model, "fc", None)
+        if draft_fc is not None and int(draft_fc.in_features) != self._pivot_width:
+            raise ValueError(
+                "EAGLE3 profile feature width does not match the checkpoint"
+            )
+        self._tree_cache = ChunkCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=self._draft_model_runner.req_to_token_pool,
+                token_to_kv_pool_allocator=(
+                    self._draft_model_runner.token_to_kv_pool_allocator
+                ),
+                page_size=1,
+            )
+        )
+        self._feature_pull_transport = DraftFeaturePullTransport(device=self.device)
+        self._feature_staging_buffers = [
+            torch.empty(
+                (self.feature_buffer_max_tokens, self._pivot_width),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            for _ in range(self.feature_buffer_slot_count)
+        ]
+        self._free_feature_staging_slots.extend(range(self.feature_buffer_slot_count))
+        self._draft_cuda_graph = self._eagle_draft_worker.cuda_graph_runner
+        logger.info(
+            "DT EAGLE3 Draft ready: instance=%s profile=%s steps=%d "
+            "feature_width=%d max_requests=%d cuda_graph=%s",
+            self.instance_id,
+            self.profile.profile_id,
+            self.profile.draft_k,
+            self._pivot_width,
+            self.max_pending_tasks,
+            self._draft_cuda_graph is not None,
+        )
+
     def _load_target_embedding(self, model_path: str) -> torch.nn.Embedding:
         from safetensors import safe_open
 
@@ -1090,9 +1678,19 @@ class FlashMTPDraftEngine:
         logger.info("DT Draft engine serving")
         while not self._stop:
             self._poll_messages()
-            if self._is_dflash:
-                self._poll_dflash_completions()
+            if self._uses_direct_gpu_source:
+                self._poll_flashmtp_completions()
+                if self._is_feature_backed:
+                    self._poll_dflash_completions()
+                    self._poll_eagle3_completions()
+                # A failed GPU quiescence fence latches fatal quarantine and
+                # preserves every uncertain resource for process teardown.
+                # Do not submit another feature batch on that CUDA context.
+                if self._stop:
+                    break
                 self._poll_feature_batches()
+                if self._stop:
+                    break
             batch = self._take_batch()
             if batch:
                 self._execute_batch(batch)
@@ -1100,14 +1698,223 @@ class FlashMTPDraftEngine:
                 sleep_s = self._idle_sleep_s()
                 if sleep_s > 0:
                     time.sleep(sleep_s)
+            self._maybe_emit_lifecycle_status()
 
     def stop(self) -> None:
         self._stop = True
 
-    def _quiesce_dflash_shutdown(self) -> None:
+    def _fatal_gpu_quarantine_active(self) -> bool:
+        return bool(getattr(self, "_fatal_gpu_quarantine_reason", None))
+
+    def _enter_fatal_gpu_quarantine(self, reason: str) -> None:
+        """Stop GPU work permanently after a failed quiescence fence.
+
+        This is deliberately distinct from ``stop()``.  A normal stop drains
+        known-complete work and releases owned resources.  Fatal quarantine
+        preserves every uncertain allocation and lease for CUDA context/process
+        teardown instead.
+        """
+
+        if not reason:
+            raise ValueError("fatal GPU quarantine requires a reason")
+        previous = getattr(self, "_fatal_gpu_quarantine_reason", None)
+        if previous is None:
+            self._fatal_gpu_quarantine_reason = reason
+        # Commit the engine state before touching either independently
+        # scheduled copy worker.  Transport notification is deliberately
+        # non-destructive, but it is still fallible; neither a notification nor
+        # logging failure may reopen ordinary serving or shutdown.
+        self._stop = True
+        transports = (
+            ("migration", getattr(self, "_p2p_transport", None)),
+            ("feature-pull", getattr(self, "_feature_pull_transport", None)),
+        )
+        for transport_name, transport in transports:
+            quarantine_transport = (
+                None if transport is None else getattr(transport, "quarantine", None)
+            )
+            if quarantine_transport is None:
+                continue
+            try:
+                quarantine_transport()
+            except Exception:
+                logger.exception(
+                    "failed to notify %s transport of fatal GPU quarantine; "
+                    "engine quarantine remains latched",
+                    transport_name,
+                )
+        if previous is None:
+            logger.critical(
+                "entered fatal GPU quarantine; all later GPU work is disabled: %s",
+                reason,
+            )
+        elif previous != reason:
+            logger.critical(
+                "additional fatal GPU quarantine condition ignored after %s: %s",
+                previous,
+                reason,
+            )
+
+    def _raise_if_fatal_gpu_quarantine(self, operation: str) -> None:
+        reason = getattr(self, "_fatal_gpu_quarantine_reason", None)
+        if reason is None:
+            return
+        raise RuntimeError(
+            f"fatal GPU quarantine prevents {operation}; uncertain GPU resources "
+            f"must remain owned until process teardown: {reason}"
+        )
+
+    def _lifecycle_status(self) -> dict[str, object]:
+        req_pool = getattr(self._draft_model_runner, "req_to_token_pool", None)
+        allocator = getattr(
+            self._draft_model_runner, "token_to_kv_pool_allocator", None
+        )
+        active = {
+            "pending_tasks": len(self._pending),
+            "pending_task_ids": len(self._pending_ids),
+            "received_timestamps": len(self._received_ns_by_transfer),
+            "persistent_requests": len(self._persistent_requests),
+            "published_result_batches": len(self._published_by_batch),
+            "published_result_ranges": len(self._published_by_range),
+            "delivery_outbox": len(self._delivery_outbox),
+            "source_done_pending": len(self._source_done_pending),
+            "source_done_batch_entries": len(self._source_done_batch_by_entry),
+            "source_done_batches": len(self._source_done_batch_remaining),
+            "pending_feature_batches": len(self._pending_feature_batches),
+            "pending_flashmtp_completions": len(
+                getattr(self, "_pending_flashmtp_completions", ())
+            ),
+            "pending_dflash_completions": len(self._pending_dflash_completions),
+            "pending_eagle3_completions": len(self._pending_eagle3_completions),
+            "prepared_migrations": len(self._prepared_migrations),
+            "deferred_migration_gpu_controls": len(
+                self._deferred_migration_gpu_controls
+            ),
+            "migration_source_events": len(self._migration_source_events),
+            "migration_source_handles": len(self._migration_source_handles),
+            "deferred_persistent_releases": len(self._deferred_persistent_releases),
+            "pending_request_release_acks": len(self._pending_request_release_acks),
+            "deferred_migration_finalizations": len(
+                self._deferred_migration_finalizations
+            ),
+            "deferred_feature_source_tasks": len(
+                self._deferred_feature_source_tasks
+            ),
+            "feature_source_inflight": len(self._feature_source_inflight),
+            "feature_source_quiescent": len(self._feature_source_quiescent),
+            "migration_quiescence_probes": len(self._migration_quiescence_probes),
+            "migration_quiescence_retries": len(
+                self._migration_quiescence_retry_ns
+            ),
+        }
+        fatal = {
+            "feature_source_unquiescent": len(self._feature_source_unquiescent),
+            "quarantined_feature_draft_handles": len(
+                self._quarantined_feature_draft_handles
+            ),
+            "quarantined_flashmtp_completions": len(
+                getattr(self, "_quarantined_flashmtp_completions", ())
+            ),
+            "quarantined_dflash_completions": len(
+                self._quarantined_dflash_completions
+            ),
+            "quarantined_eagle3_completions": len(
+                self._quarantined_eagle3_completions
+            ),
+            "quarantined_migrations": len(self._quarantined_migration_ids),
+        }
+        resources = {
+            "free_request_rows": (
+                0 if req_pool is None else int(req_pool.available_size())
+            ),
+            "free_kv_pages": (
+                0 if allocator is None else int(allocator.available_size())
+            ),
+            "free_result_slots": len(self._free_result_slots),
+            "free_feature_staging_slots": len(self._free_feature_staging_slots),
+            "feature_staging_slots_total": len(self._feature_staging_buffers),
+        }
+        observed_ns = time.monotonic_ns()
+        quiescent = not any(active.values()) and not any(fatal.values())
+        last_measurement_ns = getattr(self, "_last_direct_gpu_measurement_ns", 0)
+        request_evidence_ready = bool(
+            quiescent
+            and last_measurement_ns
+            and observed_ns - last_measurement_ns
+            >= DT_DIRECT_GPU_REQUEST_EVIDENCE_IDLE_NS
+        )
+        return {
+            "schema_version": "dt-lifecycle-status/v1",
+            "role": "draft",
+            "instance_id": self.instance_id,
+            "pid": os.getpid(),
+            "observed_ns": observed_ns,
+            "sequence": self._lifecycle_status_sequence,
+            "instance_session_id": self._client.instance_session_id,
+            "coordinator_session_id": self._client.coordinator_session_id,
+            "result_pool_generation": self._result_pool_generation,
+            "kv_pool_generation": (
+                "" if self._kv_pool is None else self._kv_pool.pool_generation
+            ),
+            "direct_gpu_measurement_epochs": (
+                self._direct_gpu_measurement_epoch_evidence()
+            ),
+            "direct_gpu_measurement_requests": (
+                self._direct_gpu_measurement_request_evidence()
+                if request_evidence_ready
+                else []
+            ),
+            "active": active,
+            "fatal": fatal,
+            "resources": resources,
+            "terminal": {
+                "cancelled_transfers": len(self._cancelled_ids),
+                "completed_pull_done": len(self._pull_done_applied_ids),
+                "migration_roles": len(self._migration_roles),
+                "migration_decisions": len(self._migration_decisions),
+                "source_store_count": 0,
+            },
+            "quiescent": quiescent,
+        }
+
+    def _maybe_emit_lifecycle_status(self) -> None:
+        now_ns = time.monotonic_ns()
+        if (
+            now_ns - self._last_lifecycle_status_sample_ns
+            < DT_LIFECYCLE_STATUS_INTERVAL_NS
+        ):
+            return
+        self._last_lifecycle_status_sample_ns = now_ns
+        status = self._lifecycle_status()
+        quiescent = bool(status["quiescent"])
+        if (
+            quiescent == self._last_lifecycle_quiescent
+            and (
+                not quiescent
+                or now_ns - self._last_lifecycle_status_ns
+                < DT_LIFECYCLE_STATUS_INTERVAL_NS
+            )
+        ):
+            return
+        self._lifecycle_status_sequence += 1
+        status["sequence"] = self._lifecycle_status_sequence
+        status["observed_ns"] = now_ns
+        self._last_lifecycle_status_ns = now_ns
+        self._last_lifecycle_quiescent = quiescent
+        logger.info(
+            "%s%s",
+            DT_LIFECYCLE_STATUS_MARKER,
+            json.dumps(status, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _quiesce_direct_gpu_source_shutdown(self) -> None:
         # Fence new coordinator admission before retiring already-dispatched
         # source leases.
         self._publish_capacity()
+        # Publishing unhealthy capacity is control-only.  Everything below can
+        # fence, query, close, or release CUDA-owned state and is forbidden once
+        # an earlier fence failed.
+        self._raise_if_fatal_gpu_quarantine("direct-GPU-source shutdown")
         queued = tuple(self._pending)
         for task in queued:
             self._cancelled_ids.add(task.transfer_id)
@@ -1118,22 +1925,103 @@ class FlashMTPDraftEngine:
         self._pending.clear()
         for batch in self._pending_feature_batches:
             self._cancelled_ids.update(item.task.transfer_id for item in batch.pending)
+        for completion in getattr(self, "_pending_flashmtp_completions", ()):
+            self._cancelled_ids.update(
+                item.task.transfer_id for item in completion.pending
+            )
         for completion in self._pending_dflash_completions:
+            self._cancelled_ids.update(
+                item.task.transfer_id for item in completion.pending
+            )
+        for completion in self._pending_eagle3_completions:
             self._cancelled_ids.update(
                 item.task.transfer_id for item in completion.pending
             )
         if self._feature_pull_transport is not None:
             self._feature_pull_transport.close()
-        # The normal scheduler admits only one materialization/proposal batch
-        # at a time.  Preserve that ordering during shutdown while draining
-        # every already-copied batch and its source read-done lifecycle.
-        while self._pending_feature_batches or self._pending_dflash_completions:
+        if getattr(self, "_quarantined_eagle3_completions", ()):
+            raise RuntimeError(
+                "feature-backed Draft shutdown requires process teardown after "
+                "an EAGLE3 completion fence failure"
+            )
+        if getattr(self, "_quarantined_flashmtp_completions", ()):
+            raise RuntimeError(
+                "FlashMTP Draft shutdown requires process teardown after a "
+                "candidate completion fence failure"
+            )
+        # Drain every already-copied batch and its source read-done lifecycle.
+        # Serial mode preserves its single-completion ordering; pipeline mode
+        # retains the same per-slot ownership used by the serving loop.
+        while (
+            self._pending_feature_batches
+            or getattr(self, "_pending_flashmtp_completions", ())
+            or self._pending_dflash_completions
+            or self._pending_eagle3_completions
+        ):
             self._poll_feature_batches()
+            self._raise_if_fatal_gpu_quarantine("shutdown feature-batch drain")
+            if getattr(self, "_pending_flashmtp_completions", ()):
+                completion = self._pending_flashmtp_completions[0]
+                try:
+                    completion.completion_event.synchronize()
+                except Exception:
+                    self._enter_fatal_gpu_quarantine(
+                        "unquiesced FlashMTP shutdown completion-event failure"
+                    )
+                    self._pending_flashmtp_completions.popleft()
+                    self._quarantined_flashmtp_completions.append(completion)
+                    raise
+                self._poll_flashmtp_completions()
+                self._raise_if_fatal_gpu_quarantine(
+                    "shutdown FlashMTP completion drain"
+                )
             if self._pending_dflash_completions:
-                self._pending_dflash_completions[
-                    0
-                ].completion_event.synchronize()
+                completion = self._pending_dflash_completions[0]
+                try:
+                    completion.completion_event.synchronize()
+                except Exception:
+                    # The event failed to prove that model-stream writes have
+                    # stopped.  Latch both executor fences before inspecting
+                    # or reporting task state; the completion stays at the
+                    # head of the queue and retains its staging/KV ownership.
+                    self._enter_fatal_gpu_quarantine(
+                        "unquiesced DFlash shutdown completion-event failure"
+                    )
+                    self._quarantined_feature_draft_handles.update(
+                        item.task.draft_kv_handle for item in completion.pending
+                    )
+                    raise
                 self._poll_dflash_completions()
+                self._raise_if_fatal_gpu_quarantine(
+                    "shutdown DFlash completion drain"
+                )
+            if self._pending_eagle3_completions:
+                completion = self._pending_eagle3_completions[0]
+                try:
+                    completion.completion_event.synchronize()
+                except Exception:
+                    # As with the normal EAGLE3 query-failure path, move the
+                    # uncertain completion to permanent quarantine.  Enter the
+                    # common fatal state first so a concurrent migration
+                    # callback cannot reach CUDA while ownership is recorded.
+                    self._enter_fatal_gpu_quarantine(
+                        "unquiesced EAGLE3 shutdown completion-event failure"
+                    )
+                    self._pending_eagle3_completions.popleft()
+                    self._quarantined_eagle3_completions.append(completion)
+                    self._quarantined_feature_draft_handles.update(
+                        item.task.draft_kv_handle for item in completion.pending
+                    )
+                    raise
+                self._poll_eagle3_completions()
+                self._raise_if_fatal_gpu_quarantine(
+                    "shutdown EAGLE3 completion drain"
+                )
+                if self._quarantined_eagle3_completions:
+                    raise RuntimeError(
+                        "feature-backed Draft shutdown requires process teardown "
+                        "after an EAGLE3 completion fence failure"
+                    )
         while self._poll_deferred_migration_gpu_controls():
             pass
         for deferred_key, task in tuple(self._deferred_feature_source_tasks.items()):
@@ -1164,36 +2052,75 @@ class FlashMTPDraftEngine:
             self._flush_source_done()
             if time.monotonic_ns() >= deadline_ns:
                 raise RuntimeError(
-                    "DFLASH shutdown timed out waiting for source read-done ACKs"
+                    "direct GPU source shutdown timed out waiting for read-done ACKs"
                 )
             time.sleep(IDLE_POLL_S)
         self._feature_pull_transport = None
-        if self._feature_source_unquiescent:
+        if (
+            self._feature_source_unquiescent
+            or self._quarantined_feature_draft_handles
+        ):
             raise RuntimeError(
-                "DFLASH shutdown requires process teardown for unquiesced feature reads"
+                "feature-backed Draft shutdown requires process teardown after "
+                "an unquiesced GPU operation"
             )
 
+    def _fence_unresolved_migration_shutdown(self) -> None:
+        """Fail closed while any Draft-KV migration ownership is unresolved.
+
+        A prepared destination remains authoritative until completion and
+        finalization retire its reservation.  A source event/handle remains a
+        remote-reader lease over the persistent request's backing KV.  Closing
+        the local executor proves neither lifecycle, so shutdown must retain
+        all of these objects for process teardown instead of clearing maps or
+        releasing request rows/pages.
+        """
+
+        ownership = {
+            "prepared": tuple(sorted(getattr(self, "_prepared_migrations", {}))),
+            "source_events": tuple(
+                sorted(getattr(self, "_migration_source_events", {}))
+            ),
+            "source_handles": tuple(
+                sorted(getattr(self, "_migration_source_handles", {}))
+            ),
+            "quarantined": tuple(
+                sorted(getattr(self, "_quarantined_migration_ids", ()))
+            ),
+            "deferred_finalizations": tuple(
+                sorted(getattr(self, "_deferred_migration_finalizations", {}))
+            ),
+            "quiescence_probes": tuple(
+                sorted(getattr(self, "_migration_quiescence_probes", {}))
+            ),
+        }
+        unresolved = {name: ids for name, ids in ownership.items() if ids}
+        if not unresolved:
+            return
+        reason = (
+            "unresolved Draft KV migration ownership during shutdown: "
+            + json.dumps(unresolved, sort_keys=True, separators=(",", ":"))
+        )
+        # Latch and fence both independently scheduled GPU transports before
+        # raising or reporting. No map, event, handle, request, reservation, or
+        # backing allocation is modified by this transition.
+        self._enter_fatal_gpu_quarantine(reason)
+        self._raise_if_fatal_gpu_quarantine("Draft migration shutdown")
+
     def close(self) -> None:
-        if self._is_dflash:
-            self._quiesce_dflash_shutdown()
+        if self._uses_direct_gpu_source:
+            self._quiesce_direct_gpu_source_shutdown()
+        # Direct-source shutdown checks this immediately after its control-only
+        # capacity publication.  Keep the same fail-closed guarantee for any
+        # future/non-feature path that enters the common fatal state: neither
+        # migration transport shutdown nor request cleanup may touch uncertain
+        # GPU-owned resources.
+        self._raise_if_fatal_gpu_quarantine("Draft engine shutdown")
+        self._fence_unresolved_migration_shutdown()
         if self._p2p_transport is not None:
             self._p2p_transport.close()
-        for migration_id, prepared in tuple(self._prepared_migrations.items()):
-            if (
-                migration_id not in self._quarantined_migration_ids
-                and prepared.transfer_future is None
-                and prepared.message.draft_kv_handle not in self._persistent_requests
-                and prepared.req.req_pool_idx is not None
-            ):
-                self._cleanup_partial_migration_request(prepared.req)
-        self._prepared_migrations.clear()
         for draft_kv_handle in tuple(self._persistent_requests):
             self._release_persistent_request(draft_kv_handle)
-        for store in self._source_stores.values():
-            store.close()
-        self._source_stores.clear()
-        self._migration_source_events.clear()
-        self._migration_source_handles.clear()
         self._client.close()
         self._result_store.close()
         self._result_store.unlink()
@@ -1211,6 +2138,7 @@ class FlashMTPDraftEngine:
             ErrorMessage,
             PullDone,
             ResultBatchAck,
+            SourceReadDoneBatchAck,
         )
 
         capacity_changed = False
@@ -1277,6 +2205,13 @@ class FlashMTPDraftEngine:
                     if item.task.draft_kv_handle == message.draft_kv_handle
                     and item.task.request_id == message.request_id
                 )
+                self._cancelled_ids.update(
+                    item.task.transfer_id
+                    for batch in self._pending_eagle3_completions
+                    for item in batch.pending
+                    if item.task.draft_kv_handle == message.draft_kv_handle
+                    and item.task.request_id == message.request_id
+                )
                 self._release_persistent_request(
                     message.draft_kv_handle, request_id=message.request_id
                 )
@@ -1316,6 +2251,8 @@ class FlashMTPDraftEngine:
                     self._delivery_outbox.ack(message.operation, message.message_id)
                     if message.operation == "pull_done":
                         self._pull_done_applied_ids.discard(message.message_id)
+            elif isinstance(message, SourceReadDoneBatchAck):
+                self._handle_source_done_batch_ack(message)
             elif isinstance(message, ErrorMessage):
                 if message.code == "PermissionError":
                     self._client.register_draft(timeout_s=2.0)
@@ -1351,7 +2288,14 @@ class FlashMTPDraftEngine:
                 continue
             active_feature_tasks = sum(
                 len(batch.pending) for batch in self._pending_feature_batches
-            ) + sum(len(batch.pending) for batch in self._pending_dflash_completions)
+            ) + sum(
+                len(batch.pending)
+                for batch in getattr(self, "_pending_flashmtp_completions", ())
+            ) + sum(
+                len(batch.pending) for batch in self._pending_dflash_completions
+            ) + sum(
+                len(batch.pending) for batch in self._pending_eagle3_completions
+            )
             if len(self._pending) + active_feature_tasks >= self.max_pending_tasks:
                 raise RuntimeError(
                     "Coordinator exceeded advertised Draft queue capacity"
@@ -1375,12 +2319,9 @@ class FlashMTPDraftEngine:
     def _take_batch(self) -> list[PendingDraftTask]:
         if not self._pending:
             return []
-        if self._is_dflash:
-            if not self._free_feature_staging_slots:
-                return []
-            if self._pending[0].requires_proposal and not self._free_result_slots:
-                return []
-        elif not self._free_result_slots:
+        if self._uses_direct_gpu_source and not self._free_feature_staging_slots:
+            return []
+        if not self._is_feature_backed and not self._free_result_slots:
             return []
         if len(self._pending) < self.batch_ready_threshold and self.batch_wait_s > 0:
             oldest = self._pending[0]
@@ -1394,17 +2335,54 @@ class FlashMTPDraftEngine:
 
         queued: list[PendingDraftTask] = []
         take_ns = time.monotonic_ns()
+        profile_eagle3_batch = self._is_eagle3 and profile_event_enabled(
+            "draft_eagle3_batch"
+        )
+        pending_before = len(self._pending) if profile_eagle3_batch else 0
         queue_delays = []
         feature_token_count = 0
+        persistent_prefill_token_count = 0
+        reserves_result_slot = False
+        result_slot_available = self._available_dflash_result_slots() > 0
+        stop_reason = "queue_exhausted"
         while self._pending and len(queued) < self.max_batch_size:
             next_task = self._pending[0]
-            if self._is_dflash:
-                if next_task.requires_proposal and not self._free_result_slots:
+            if self._uses_direct_gpu_source:
+                if (
+                    self._is_eagle3
+                    and queued
+                    and bool(next_task.requires_proposal)
+                    != bool(queued[0].task.requires_proposal)
+                ):
+                    if profile_eagle3_batch:
+                        stop_reason = "proposal_materialization_boundary"
                     break
-                next_feature_tokens = int(next_task.feature_token_count)
+                if (
+                    next_task.requires_proposal
+                    and not reserves_result_slot
+                    and not result_slot_available
+                ):
+                    if profile_eagle3_batch:
+                        stop_reason = "result_slot_unavailable"
+                    break
+                next_feature_tokens = (
+                    int(next_task.feature_token_count)
+                    if self._is_feature_backed
+                    else int(next_task.source.shape[0])
+                )
                 if (
                     feature_token_count + next_feature_tokens
                     > self.feature_buffer_max_tokens
+                ):
+                    if profile_eagle3_batch:
+                        stop_reason = "feature_token_capacity"
+                    break
+            elif self._persistent:
+                next_prefill_tokens = len(next_task.committed_token_ids)
+                if (
+                    queued
+                    and persistent_prefill_token_count + next_prefill_tokens
+                    > DRAFT_PREFILL_GRAPH_MAX_TOKENS
                 ):
                     break
             task = self._pending.popleft()
@@ -1414,67 +2392,108 @@ class FlashMTPDraftEngine:
                 queue_delays.append(take_ns - received_ns)
             if task.transfer_id in self._cancelled_ids:
                 self._cancelled_ids.discard(task.transfer_id)
-                if self._is_dflash and not task.source_read_migration_id:
+                if self._uses_direct_gpu_source and not task.source_read_migration_id:
                     self._publish_source_done(task)
                 continue
-            if self._is_dflash and take_ns >= task.deadline_ns:
+            if self._uses_direct_gpu_source and take_ns >= task.deadline_ns:
                 if not task.source_read_migration_id:
                     self._publish_source_done(task)
-                self._release_persistent_request(task.draft_kv_handle)
+                if self._persistent:
+                    self._release_persistent_request(task.draft_kv_handle)
                 self._publish_failures(
-                    [(task, TimeoutError("DFLASH feature task deadline expired"))]
+                    [(task, TimeoutError("direct GPU source task deadline expired"))]
                 )
                 continue
-            feature_token_count += int(task.feature_token_count)
+            if self._uses_direct_gpu_source:
+                feature_token_count += (
+                    int(task.feature_token_count)
+                    if self._is_feature_backed
+                    else int(task.source.shape[0])
+                )
+            if self._persistent and not self._is_feature_backed:
+                persistent_prefill_token_count += len(task.committed_token_ids)
             queued.append(
-                PendingDraftTask(
-                    task=task,
-                    pivot_bytes=None,
+                PendingDraftTask(task=task)
+            )
+            reserves_result_slot = reserves_result_slot or bool(task.requires_proposal)
+        pending_after = len(self._pending)
+        cap_limited = False
+        if (
+            profile_eagle3_batch
+            and len(queued) == self.max_batch_size
+            and self._pending
+        ):
+            next_task = self._pending[0]
+            compatible = not (
+                self._is_eagle3
+                and queued
+                and bool(next_task.requires_proposal)
+                != bool(queued[0].task.requires_proposal)
+            )
+            result_available = not (
+                self._uses_direct_gpu_source
+                and next_task.requires_proposal
+                and not reserves_result_slot
+                and not result_slot_available
+            )
+            next_feature_tokens = (
+                int(next_task.feature_token_count)
+                if self._is_feature_backed
+                else (
+                    int(next_task.source.shape[0])
+                    if self._uses_direct_gpu_source
+                    else 0
                 )
             )
+            feature_available = not (
+                self._uses_direct_gpu_source
+                and feature_token_count + next_feature_tokens
+                > self.feature_buffer_max_tokens
+            )
+            cap_limited = compatible and result_available and feature_available
+            if cap_limited:
+                stop_reason = "max_batch_size"
+            elif not compatible:
+                stop_reason = "proposal_materialization_boundary"
+            elif not result_available:
+                stop_reason = "result_slot_unavailable"
+            elif not feature_available:
+                stop_reason = "feature_token_capacity"
+        if profile_eagle3_batch:
+            oldest_queue_age_ns = max(queue_delays, default=0)
+            for item in queued:
+                item.pending_before = pending_before
+                item.pending_after = pending_after
+                item.taken_ns = take_ns
+                item.oldest_queue_age_ns = oldest_queue_age_ns
+                item.batch_feature_token_count = feature_token_count
+                item.stop_reason = stop_reason
+                item.cap_limited = cap_limited
         if queue_delays:
             self._last_queue_delay_ns = max(queue_delays)
 
-        # The result publisher needs rows grouped by Target. Sort before direct
-        # mmap reads so pinned staging is already laid out in publish order.
+        # The result publisher needs rows grouped by Target before assigning
+        # Draft-local destination and result rows.
         queued = target_major(queued)
-        if self._is_dflash:
+        if self._uses_direct_gpu_source:
             return queued
         if self._persistent:
             return queued
-        pinned_staging = self._pivot_host_staging
-        tasks: list[PendingDraftTask] = []
-        for item in queued:
-            task = item.task
-            try:
-                pivot_row = -1
-                pivot_bytes = None
-                if pinned_staging is None:
-                    pivot_bytes = self._read_pivot(task)
-                else:
-                    pivot_row = len(tasks)
-                    self._read_pivot_into(task, self._pivot_host_views[pivot_row])
-            except Exception as exc:
-                logger.exception("failed to read DT pivot for %s", task.transfer_id)
-                self._publish_source_done(task)
-                self._publish_failures([(task, exc)])
-                continue
-            self._publish_source_done(task)
-            tasks.append(
-                PendingDraftTask(
-                    task=task,
-                    pivot_bytes=pivot_bytes,
-                    pivot_row=pivot_row,
-                )
-            )
-        if self.batch_source_read_done:
-            self._flush_source_done()
-        return tasks
+        raise RuntimeError("nonpersistent Draft task lacks direct GPU source transport")
 
     def _idle_sleep_s(self) -> float:
         if (
             not self._pending
-            or not self._free_result_slots
+            or (
+                self._uses_direct_gpu_source
+                and self._pending[0].requires_proposal
+                and self._available_dflash_result_slots() <= 0
+            )
+            or (
+                self._uses_direct_gpu_source
+                and not self._free_feature_staging_slots
+            )
+            or (not self._is_feature_backed and not self._free_result_slots)
             or len(self._pending) >= self.batch_ready_threshold
             or self.batch_wait_s == 0
         ):
@@ -1486,46 +2505,193 @@ class FlashMTPDraftEngine:
         remaining_s = max(0.0, self.batch_wait_s - age_s)
         return min(COALESCING_POLL_S, remaining_s)
 
+    def _available_dflash_result_slots(self) -> int:
+        """Count result slots after bounded reservations by submitted work."""
+        if not self._uses_direct_gpu_source:
+            return len(self._free_result_slots)
+        reserved = sum(
+            any(item.task.requires_proposal for item in batch.pending)
+            for batch in self._pending_feature_batches
+        ) + len(
+            getattr(self, "_pending_flashmtp_completions", ())
+        ) + sum(
+            bool(completion.proposal_tasks)
+            for completion in self._pending_dflash_completions
+        )
+        return max(0, len(self._free_result_slots) - reserved)
+
     @torch.inference_mode()
     def _execute_batch(self, pending: list[PendingDraftTask]) -> None:
         self._last_batch_size = len(pending)
-        if self._is_dflash:
+        if self._uses_direct_gpu_source:
             self._submit_dflash_feature_batch(pending)
             return
         if self._persistent:
             self._execute_standalone_batch(pending)
             return
+        raise RuntimeError("FlashMTP proposal execution requires a pulled GPU pivot")
+
+    def _canonical_draft_device(self, device: object) -> torch.device:
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and resolved.index is None:
+            return torch.device("cuda", self.gpu_id)
+        return resolved
+
+    def _require_flashmtp_pivot_layout(
+        self, pivots: torch.Tensor, *, batch_size: int
+    ) -> torch.device:
+        if not self._feature_staging_buffers:
+            raise RuntimeError("FlashMTP GPU pivot staging is not initialized")
+        staging_device = self._canonical_draft_device(
+            self._feature_staging_buffers[0].device
+        )
+        configured_device = self._canonical_draft_device(self.device)
+        if staging_device.type != "cuda" or staging_device.index is None:
+            raise RuntimeError(
+                "FlashMTP pivot staging must use an explicitly indexed CUDA device"
+            )
+        if configured_device != staging_device or any(
+            self._canonical_draft_device(staging.device) != staging_device
+            for staging in self._feature_staging_buffers[1:]
+        ):
+            raise RuntimeError("FlashMTP GPU pivot staging device is inconsistent")
+        if (
+            self._canonical_draft_device(pivots.device) != staging_device
+            or pivots.dtype != torch.bfloat16
+            or tuple(pivots.shape) != (batch_size, self._pivot_width)
+        ):
+            raise ValueError("FlashMTP pulled pivots have an invalid GPU layout")
+        return staging_device
+
+    def _stage_flashmtp_bonus_tokens(
+        self,
+        tasks: list[object],
+        *,
+        staging_slot: int,
+        execution_device: torch.device,
+    ) -> tuple[
+        torch.Tensor,
+        torch.cuda.Event | None,
+        torch.cuda.Event | None,
+        int,
+        int,
+    ]:
+        """Pack roots into the slot-owned pinned buffer and enqueue H2D."""
+
+        if (
+            len(self._proposal_bonus_tokens_host_buffers)
+            != len(self._feature_staging_buffers)
+            or len(self._proposal_bonus_tokens_buffers)
+            != len(self._feature_staging_buffers)
+            or not 0 <= staging_slot < len(self._feature_staging_buffers)
+        ):
+            raise RuntimeError("FlashMTP bonus-token staging slots are inconsistent")
+        batch_size = len(tasks)
+        if not 0 < batch_size <= self.max_batch_size:
+            raise ValueError("FlashMTP bonus-token batch size is invalid")
+        host_buffer = self._proposal_bonus_tokens_host_buffers[staging_slot]
+        device_buffer = self._proposal_bonus_tokens_buffers[staging_slot]
+        if (
+            host_buffer.dtype != torch.int64
+            or tuple(host_buffer.shape) != (self.max_batch_size,)
+            or torch.device(host_buffer.device).type != "cpu"
+            or not host_buffer.is_pinned()
+        ):
+            raise RuntimeError(
+                "FlashMTP bonus-token host staging must be pinned CPU int64"
+            )
+        if (
+            device_buffer.dtype != torch.int64
+            or tuple(device_buffer.shape) != (self.max_batch_size,)
+            or self._canonical_draft_device(device_buffer.device) != execution_device
+        ):
+            raise RuntimeError(
+                "FlashMTP bonus-token device staging has an invalid layout"
+            )
+
+        host_view = host_buffer[:batch_size]
+        device_view = device_buffer[:batch_size]
+        profile = self._profile_active
+        pack_started_ns = time.monotonic_ns() if profile else 0
+        host_view.copy_(
+            torch.tensor(
+                [task.next_token_id for task in tasks],
+                dtype=torch.int64,
+                device="cpu",
+            )
+        )
+        bonus_pack_ns = time.monotonic_ns() - pack_started_ns if profile else 0
+
+        stream = torch.cuda.current_stream(self.device)
+        h2d_start_event = None
+        h2d_done_event = None
+        if profile:
+            h2d_start_event = torch.cuda.Event(enable_timing=True)
+            h2d_done_event = torch.cuda.Event(enable_timing=True)
+            h2d_start_event.record(stream)
+        submit_started_ns = time.monotonic_ns() if profile else 0
+        device_view.copy_(host_view, non_blocking=True)
+        bonus_h2d_submit_ns = (
+            time.monotonic_ns() - submit_started_ns if profile else 0
+        )
+        if h2d_done_event is not None:
+            h2d_done_event.record(stream)
+        return (
+            device_view,
+            h2d_start_event,
+            h2d_done_event,
+            bonus_pack_ns,
+            bonus_h2d_submit_ns,
+        )
+
+    @torch.inference_mode()
+    def _execute_flashmtp_batch(
+        self,
+        pending: list[PendingDraftTask],
+        pivots: torch.Tensor,
+        *,
+        staging_slot: int,
+    ) -> None:
         tasks = [item.task for item in pending]
         batch_size = len(tasks)
-        if self._pivot_host_staging is None:
-            pivot_blob = b"".join(item.pivot_bytes for item in pending)
-            pivots = torch.frombuffer(
-                bytearray(pivot_blob), dtype=torch.bfloat16
-            ).reshape(batch_size, self._pivot_width)
-        else:
-            if any(item.pivot_row != index for index, item in enumerate(pending)):
-                raise RuntimeError("pinned DT pivot rows are not contiguous")
-            pivots = self._pivot_host_staging[:batch_size]
-        pivots = pivots.to(
-            self.device,
-            non_blocking=self._pivot_host_staging is not None,
+        profile = self._profile_active
+        execute_started_ns = time.monotonic_ns() if profile else 0
+        execution_device = self._require_flashmtp_pivot_layout(
+            pivots, batch_size=batch_size
         )
-        bonus_tokens = torch.tensor(
-            [task.next_token_id for task in tasks],
-            dtype=torch.int64,
-            device=self.device,
+        prior_pending_flashmtp_completions = len(
+            self._pending_flashmtp_completions
         )
+        (
+            bonus_tokens,
+            bonus_h2d_start_event,
+            bonus_h2d_done_event,
+            bonus_pack_ns,
+            bonus_h2d_submit_ns,
+        ) = self._stage_flashmtp_bonus_tokens(
+            tasks,
+            staging_slot=staging_slot,
+            execution_device=execution_device,
+        )
+        inputs_ready_ns = time.monotonic_ns() if profile else 0
+        proposal_start_event = None
+        proposal_done_event = None
+        if profile:
+            proposal_start_event = torch.cuda.Event(enable_timing=True)
+            proposal_done_event = torch.cuda.Event(enable_timing=True)
+            proposal_start_event.record(torch.cuda.current_stream(self.device))
         if self._draft_cuda_graph is not None:
             candidates = self._draft_cuda_graph.replay(
                 pivots=pivots,
                 bonus_tokens=bonus_tokens,
             )
+            flashmtp_execution = "graph"
         else:
             block_ids = torch.full(
                 (batch_size, self._draft_block_len),
                 self._mask_token_id,
                 dtype=torch.int64,
-                device=self.device,
+                device=execution_device,
             )
             block_ids[:, 0].copy_(bonus_tokens)
             input_embeds = self._token_embedding(block_ids)
@@ -1547,10 +2713,20 @@ class FlashMTPDraftEngine:
             block_hidden = output.hidden_states.reshape(
                 batch_size, self._draft_block_len, -1
             )
-            proposals = self._draft_model.sample_draft_tokens(
-                block_hidden=block_hidden,
-                first_prev_token_ids=bonus_tokens,
-            )
+            if self._draft_model.markov_head is not None:
+                proposals = self._draft_model.sample_draft_tokens(
+                    block_hidden=block_hidden,
+                    first_prev_token_ids=bonus_tokens,
+                )
+            else:
+                if self._target_lm_head is None:
+                    raise RuntimeError(
+                        "legacy FlashMTP requires the Target LM head for proposal sampling"
+                    )
+                prediction_hidden = self._draft_model.prediction_hidden(block_hidden)
+                proposals = torch.argmax(
+                    F.linear(prediction_hidden, self._target_lm_head.weight), dim=-1
+                )
             if tuple(proposals.shape) != (batch_size, self._num_proposals):
                 raise RuntimeError(
                     f"FlashMTP proposal shape mismatch: got {tuple(proposals.shape)}"
@@ -1558,31 +2734,236 @@ class FlashMTPDraftEngine:
             candidates = torch.empty(
                 (batch_size, self.profile.block_size),
                 dtype=torch.int32,
-                device=self.device,
+                device=execution_device,
             )
             candidates[:, 0].copy_(bonus_tokens)
             candidates[:, 1:].copy_(proposals)
-        candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
-        self._publish_successes(tasks, candidate_bytes)
-        self._publish_capacity()
+            flashmtp_execution = "eager"
+        if proposal_done_event is not None:
+            proposal_done_event.record(torch.cuda.current_stream(self.device))
+        measurement_rows = sum(
+            task.request_id.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+            for task in tasks
+        )
+        if measurement_rows:
+            self._record_graph_measurement(
+                path="flashmtp_proposal",
+                execution=flashmtp_execution,
+                measurement_rows=measurement_rows,
+                measurement_batch_rows=measurement_rows,
+                batch_size=batch_size,
+                graph_replays=int(flashmtp_execution == "graph"),
+                expected_graph_replays=1,
+                fallback_reason=(
+                    None
+                    if flashmtp_execution == "graph"
+                    else "flashmtp_cuda_graph_unavailable"
+                ),
+            )
+        if not 0 <= staging_slot < len(self._candidate_result_host_buffers):
+            raise RuntimeError("FlashMTP candidate staging slot is unavailable")
+        candidate_rows_cpu = self._candidate_result_host_buffers[staging_slot][
+            :batch_size
+        ]
+        candidate_rows_cpu.copy_(candidates, non_blocking=True)
+        completion_event = torch.cuda.Event(enable_timing=profile)
+        completion_event.record(torch.cuda.current_stream(self.device))
+        submitted_ns = time.monotonic_ns()
+        self._pending_flashmtp_completions.append(
+            PendingFlashMTPCompletion(
+                pending=pending,
+                staging_slot=staging_slot,
+                completion_event=completion_event,
+                bonus_h2d_start_event=bonus_h2d_start_event,
+                bonus_h2d_done_event=bonus_h2d_done_event,
+                proposal_start_event=proposal_start_event,
+                proposal_done_event=proposal_done_event,
+                candidate_rows_cpu=candidate_rows_cpu,
+                execute_started_ns=execute_started_ns,
+                inputs_ready_ns=inputs_ready_ns,
+                submitted_ns=submitted_ns,
+                bonus_pack_ns=bonus_pack_ns,
+                bonus_h2d_submit_ns=bonus_h2d_submit_ns,
+                bonus_device=str(bonus_tokens.device),
+                execution=flashmtp_execution,
+                measurement_rows=measurement_rows,
+                prior_pending_flashmtp_completions=(
+                    prior_pending_flashmtp_completions
+                ),
+            )
+        )
+
+    def _poll_flashmtp_completions(self) -> None:
+        """Publish same-stream candidate copies only after their event retires."""
+
+        if self._fatal_gpu_quarantine_active():
+            return
+        capacity_changed = False
+        while self._pending_flashmtp_completions:
+            completion = self._pending_flashmtp_completions[0]
+            try:
+                ready = completion.completion_event.query()
+            except Exception as exc:
+                # A failed query cannot prove that either the graph output read
+                # or the pinned D2H has stopped.  Retain the staging slot and
+                # host buffer until process teardown and prohibit later CUDA.
+                self._pending_flashmtp_completions.popleft()
+                self._quarantined_flashmtp_completions.append(completion)
+                exc.resources_quiescent = False
+                logger.critical(
+                    "quarantined FlashMTP candidate completion after event "
+                    "query failure: transfers=%s",
+                    [item.task.transfer_id for item in completion.pending],
+                    exc_info=True,
+                )
+                self._enter_fatal_gpu_quarantine(
+                    "unquiesced FlashMTP completion-event failure"
+                )
+                self._publish_failures(
+                    [(item.task, exc) for item in completion.pending]
+                )
+                self._publish_capacity()
+                break
+            if not ready:
+                break
+
+            self._pending_flashmtp_completions.popleft()
+            tasks = [item.task for item in completion.pending]
+            completed_ns = time.monotonic_ns()
+            expired = [
+                task
+                for task in tasks
+                if task.transfer_id not in self._cancelled_ids
+                and completed_ns >= task.deadline_ns
+            ]
+            expired_ids = {task.transfer_id for task in expired}
+            active_indices = [
+                index
+                for index, task in enumerate(tasks)
+                if task.transfer_id not in self._cancelled_ids
+                and task.transfer_id not in expired_ids
+            ]
+            cancelled = [
+                task for task in tasks if task.transfer_id in self._cancelled_ids
+            ]
+
+            if self._profile_active:
+                if (
+                    completion.bonus_h2d_start_event is None
+                    or completion.bonus_h2d_done_event is None
+                    or completion.proposal_start_event is None
+                    or completion.proposal_done_event is None
+                ):
+                    raise RuntimeError(
+                        "profiled FlashMTP completion lost GPU timing events"
+                    )
+                profile_emit(
+                    "draft_flashmtp_proposal",
+                    draft_instance=self.instance_id,
+                    batch_size=len(tasks),
+                    transfer_ids=tuple(task.transfer_id for task in tasks),
+                    execution=completion.execution,
+                    measurement_rows=completion.measurement_rows,
+                    input_prepare_ns=(
+                        completion.inputs_ready_ns - completion.execute_started_ns
+                    ),
+                    proposal_to_host_ns=(
+                        completed_ns - completion.inputs_ready_ns
+                    ),
+                    total_ns=completed_ns - completion.execute_started_ns,
+                    candidate_bytes=(
+                        len(tasks) * self.profile.block_size * 4
+                    ),
+                    proposal_gpu_ns=int(
+                        completion.proposal_start_event.elapsed_time(
+                            completion.proposal_done_event
+                        )
+                        * 1_000_000
+                    ),
+                    candidate_d2h_gpu_ns=int(
+                        completion.proposal_done_event.elapsed_time(
+                            completion.completion_event
+                        )
+                        * 1_000_000
+                    ),
+                    completion_poll_ns=completed_ns - completion.submitted_ns,
+                    asynchronous_completion=True,
+                    bonus_stage_async=True,
+                    bonus_tokens_pinned_h2d=True,
+                    bonus_staging_slot=completion.staging_slot,
+                    bonus_token_rows=len(tasks),
+                    bonus_token_bytes=len(tasks) * 8,
+                    bonus_host_pinned=True,
+                    bonus_host_dtype=str(torch.int64),
+                    bonus_device_dtype=str(torch.int64),
+                    bonus_device=completion.bonus_device,
+                    bonus_pack_ns=completion.bonus_pack_ns,
+                    bonus_h2d_submit_ns=completion.bonus_h2d_submit_ns,
+                    bonus_h2d_gpu_ns=int(
+                        completion.bonus_h2d_start_event.elapsed_time(
+                            completion.bonus_h2d_done_event
+                        )
+                        * 1_000_000
+                    ),
+                    prior_pending_flashmtp_completions=(
+                        completion.prior_pending_flashmtp_completions
+                    ),
+                )
+
+            if active_indices:
+                candidate_rows = (
+                    completion.candidate_rows_cpu
+                    if active_indices == list(range(len(tasks)))
+                    else completion.candidate_rows_cpu[active_indices]
+                )
+                self._publish_successes(
+                    [tasks[index] for index in active_indices],
+                    candidate_rows.contiguous().numpy().tobytes(),
+                )
+            for task in cancelled:
+                self._cancelled_ids.discard(task.transfer_id)
+            if expired:
+                self._publish_failures(
+                    [
+                        (
+                            task,
+                            TimeoutError(
+                                "FlashMTP candidate completed after its deadline"
+                            ),
+                        )
+                        for task in expired
+                    ]
+                )
+
+            self._free_feature_staging_slots.append(completion.staging_slot)
+            capacity_changed = True
+
+        if capacity_changed:
+            self._publish_capacity()
 
     def _submit_dflash_feature_batch(self, pending: list[PendingDraftTask]) -> None:
         from sglang.srt.speculative.dt_feature_p2p import FeatureSourceDescriptor
 
         if self._feature_pull_transport is None:
-            raise RuntimeError("DFLASH feature transport is not initialized")
+            raise RuntimeError("direct GPU source transport is not initialized")
         if not self._free_feature_staging_slots:
-            raise RuntimeError("DFLASH feature staging admission was violated")
+            raise RuntimeError("direct GPU staging admission was violated")
         staging_slot = self._free_feature_staging_slots.popleft()
         staging = self._feature_staging_buffers[staging_slot]
-        futures = []
+        sources = []
+        destinations = []
         row_ranges = []
         row_offset = 0
         submitted_ns = time.monotonic_ns()
+        batch_id = uuid.uuid4().hex
         for item in pending:
             task = item.task
             source = task.source
-            row_count = int(task.feature_token_count)
+            row_count = (
+                int(task.feature_token_count)
+                if self._is_feature_backed
+                else int(source.shape[0])
+            )
             row_end = row_offset + row_count
             descriptor = FeatureSourceDescriptor(
                 target_instance_id=source.target_instance_id,
@@ -1605,15 +2986,8 @@ class FlashMTPDraftEngine:
                 shape=tuple(source.shape),
                 producer_event_handle=source.producer_event_handle,
             )
-            try:
-                future = self._feature_pull_transport.submit(
-                    source=descriptor,
-                    destination=staging[row_offset:row_end],
-                )
-            except Exception as exc:
-                future = Future()
-                future.set_exception(exc)
-            futures.append(future)
+            sources.append(descriptor)
+            destinations.append(staging[row_offset:row_end])
             if task.source_read_migration_id:
                 self._feature_source_inflight.add(
                     (task.source_read_migration_id, task.transfer_id)
@@ -1623,76 +2997,137 @@ class FlashMTPDraftEngine:
             profile_emit(
                 "draft_feature_pull_submit",
                 draft_instance=self.instance_id,
+                feature_batch_id=batch_id,
                 transfer_id=task.transfer_id,
                 request_id=task.request_id,
                 round_id=task.round_id,
                 feature_bytes=source.nbytes,
                 submitted_ns=submitted_ns,
             )
+        try:
+            future = self._feature_pull_transport.submit_batch(
+                sources=sources,
+                destinations=destinations,
+            )
+        except Exception as exc:
+            future = Future()
+            future.set_exception(exc)
+        profile_emit(
+            "draft_feature_pull_batch_submit",
+            draft_instance=self.instance_id,
+            feature_batch_id=batch_id,
+            segment_count=len(sources),
+            peer_count=len({source.target_instance_id for source in sources}),
+            feature_bytes=sum(source.nbytes for source in sources),
+            submitted_ns=submitted_ns,
+        )
         self._pending_feature_batches.append(
             PendingFeatureBatch(
+                batch_id=batch_id,
                 pending=pending,
                 staging_slot=staging_slot,
                 row_ranges=tuple(row_ranges),
-                futures=tuple(futures),
+                future=future,
                 submitted_ns=submitted_ns,
             )
         )
         self._publish_capacity()
 
     def _poll_feature_batches(self) -> None:
+        if self._fatal_gpu_quarantine_active():
+            return
         capacity_changed = False
         while self._pending_feature_batches:
-            # CUDA construction from pageable request metadata can wait for
-            # earlier work on the materialization/proposal stream.  Keep at
-            # most one such batch submitted: feature-copy workers may continue
-            # filling the other staging slots, while the outer scheduler loop
-            # remains free to poll control messages and the completion event.
-            if self._pending_dflash_completions:
+            # Serial mode waits for the prior completion.  Pipeline mode uses
+            # per-slot pinned metadata and preallocated device buffers, so it
+            # may queue another proposal without a pageable H2D synchronization;
+            # the outer scheduler then remains free to poll controls/events.
+            if self._pending_dflash_completions and not self.dflash_submit_pipeline:
                 break
             feature_batch = self._pending_feature_batches[0]
-            if not all(future.done() for future in feature_batch.futures):
+            if self._pending_eagle3_completions and any(
+                item.task.requires_proposal for item in feature_batch.pending
+            ):
+                # A proposal performs a blocking candidate D2H copy. Do not let
+                # it wait behind an earlier async materialization while the
+                # scheduler should remain available for control/lifecycle work.
+                break
+            if not feature_batch.future.done():
                 break
             self._pending_feature_batches.popleft()
             failures = []
             resources_quiescent = True
-            for item, future in zip(feature_batch.pending, feature_batch.futures):
+            try:
+                batch_metrics = feature_batch.future.result()
+            except Exception as exc:
+                batch_metrics = None
+                resources_quiescent = bool(
+                    getattr(exc, "resources_quiescent", True)
+                )
+                failures = [(item.task, exc) for item in feature_batch.pending]
+            else:
+                if profile_event_enabled("draft_feature_pull_batch_complete"):
+                    profile_emit(
+                        "draft_feature_pull_batch_complete",
+                        draft_instance=self.instance_id,
+                        feature_batch_id=feature_batch.batch_id,
+                        transfer_ids=tuple(
+                            item.task.transfer_id
+                            for item in feature_batch.pending
+                        ),
+                        feature_rows=tuple(
+                            int(item.task.feature_token_count)
+                            for item in feature_batch.pending
+                        ),
+                        submitted_ns=batch_metrics.submitted_ns,
+                        gpu_completed_ns=batch_metrics.gpu_completed_ns,
+                        mapping_ns=batch_metrics.mapping_ns,
+                        driver_submit_ns=batch_metrics.driver_submit_ns,
+                        gpu_copy_ns=batch_metrics.gpu_copy_ns,
+                        feature_bytes=batch_metrics.feature_bytes,
+                        cold_mapping_count=batch_metrics.cold_mapping_count,
+                        segment_count=batch_metrics.segment_count,
+                        peer_count=batch_metrics.peer_count,
+                    )
+            direct_gpu_measurement_tasks = []
+            for item in feature_batch.pending:
                 task = item.task
                 deferred_key = (
                     (task.source_read_migration_id, task.transfer_id)
                     if task.source_read_migration_id
                     else None
                 )
-                source_safe = True
-                copy_succeeded = False
-                try:
-                    metrics = future.result()
-                except Exception as exc:
-                    failures.append((task, exc))
-                    source_safe = bool(getattr(exc, "resources_quiescent", True))
-                    resources_quiescent = resources_quiescent and source_safe
-                else:
-                    copy_succeeded = True
+                source_safe = resources_quiescent
+                copy_succeeded = batch_metrics is not None
+                if copy_succeeded:
                     profile_emit(
                         "draft_feature_pull_complete",
                         draft_instance=self.instance_id,
+                        feature_batch_id=feature_batch.batch_id,
                         transfer_id=task.transfer_id,
                         request_id=task.request_id,
                         round_id=task.round_id,
-                        submitted_ns=metrics.submitted_ns,
-                        gpu_completed_ns=metrics.gpu_completed_ns,
-                        mapping_ns=metrics.mapping_ns,
-                        driver_submit_ns=metrics.driver_submit_ns,
-                        gpu_copy_ns=metrics.gpu_copy_ns,
-                        feature_bytes=metrics.feature_bytes,
-                        cold_mapping_count=metrics.cold_mapping_count,
+                        gpu_completed_ns=batch_metrics.gpu_completed_ns,
+                        feature_bytes=task.source.nbytes,
+                        target_instance=task.source.target_instance_id,
+                        source_session_id=task.source.source_session_id,
+                        pool_generation=task.source.pool_generation,
+                        transport_session=task.source.transport_session,
                     )
+                    if task.request_id.startswith(
+                        DT_BENCHMARK_MEASUREMENT_RID_PREFIX
+                    ):
+                        direct_gpu_measurement_tasks.append(task)
                 if deferred_key is not None:
                     self._feature_source_inflight.discard(deferred_key)
                     if source_safe:
                         self._feature_source_quiescent.add(deferred_key)
                     else:
                         self._feature_source_unquiescent.add(deferred_key)
+                elif not source_safe:
+                    self._feature_source_unquiescent.add(
+                        (task.source.source_session_id, task.transfer_id)
+                    )
                 if copy_succeeded and deferred_key is not None:
                     previous = self._deferred_feature_source_tasks.get(deferred_key)
                     if previous is not None and previous != task:
@@ -1703,17 +3138,108 @@ class FlashMTPDraftEngine:
                 elif source_safe and not task.source_read_migration_id:
                     self._publish_source_done(task)
 
+            if direct_gpu_measurement_tasks:
+                grouped_sources: dict[tuple[str, str, str, str], list[int]] = {}
+                for task in direct_gpu_measurement_tasks:
+                    source = task.source
+                    key = (
+                        source.target_instance_id,
+                        source.source_session_id,
+                        source.pool_generation,
+                        source.transport_session,
+                    )
+                    counts = grouped_sources.setdefault(key, [0, 0, 0])
+                    counts[0] += int(source.shape[0])
+                    counts[1] += 1
+                    counts[2] += int(task.requires_proposal)
+                    self._record_direct_gpu_measurement_request(
+                        target_instance_id=source.target_instance_id,
+                        source_session_id=source.source_session_id,
+                        pool_generation=source.pool_generation,
+                        transport_session=source.transport_session,
+                        request_id=task.request_id,
+                        measurement_rows=int(source.shape[0]),
+                        measurement_requests=1,
+                        measurement_proposal_requests=int(task.requires_proposal),
+                    )
+                sources = []
+                for key, counts in sorted(grouped_sources.items()):
+                    self._record_direct_gpu_measurement_epoch(
+                        target_instance_id=key[0],
+                        source_session_id=key[1],
+                        pool_generation=key[2],
+                        transport_session=key[3],
+                        measurement_rows=counts[0],
+                        measurement_requests=counts[1],
+                        measurement_proposal_requests=counts[2],
+                    )
+                    sources.append(
+                        {
+                            "target_instance_id": key[0],
+                            "source_session_id": key[1],
+                            "pool_generation": key[2],
+                            "transport_session": key[3],
+                            "measurement_rows": counts[0],
+                            "measurement_requests": counts[1],
+                            "measurement_proposal_requests": counts[2],
+                        }
+                    )
+                if not getattr(
+                    self, "_direct_gpu_measurement_evidence_emitted", False
+                ):
+                    primary = sources[0]
+                    self._emit_direct_gpu_measurement_evidence_once(
+                        {
+                            "role": "draft",
+                            "method": self.profile.method,
+                            "transport": "cuda-ipc",
+                            "measurement_rows": sum(
+                                counts[0] for counts in grouped_sources.values()
+                            ),
+                            "measurement_requests": len(
+                                direct_gpu_measurement_tasks
+                            ),
+                            "measurement_proposal_requests": sum(
+                                counts[2] for counts in grouped_sources.values()
+                            ),
+                            "batch_rows": len(feature_batch.pending),
+                            "source_peer_count": len(sources),
+                            "sources": sources,
+                            "source_session_id": primary["source_session_id"],
+                            "pool_generation": primary["pool_generation"],
+                            "transport_session": primary["transport_session"],
+                        }
+                    )
+
             if failures:
                 first_error = failures[0][1]
                 tasks = [item.task for item in feature_batch.pending]
-                for handle in {task.draft_kv_handle for task in tasks}:
-                    self._release_persistent_request(handle)
+                if resources_quiescent and self._persistent:
+                    for handle in {task.draft_kv_handle for task in tasks}:
+                        self._release_persistent_request(handle)
+                elif not resources_quiescent and self._persistent:
+                    self._quarantined_feature_draft_handles.update(
+                        task.draft_kv_handle for task in tasks
+                    )
+                    logger.critical(
+                        "quarantined feature staging and Draft KV after an "
+                        "unquiesced batch copy failure: transfers=%s",
+                        [task.transfer_id for task in tasks],
+                    )
+                if not resources_quiescent:
+                    # Latch before reporting the error.  Result publication is
+                    # control-plane work but can still raise; the finally-close
+                    # path must already know that no CUDA-owned state is safe to
+                    # drain or release if that happens.
+                    self._enter_fatal_gpu_quarantine(
+                        "unquiesced feature-copy failure"
+                    )
                 self._publish_failures([(task, first_error) for task in tasks])
                 if resources_quiescent:
                     self._free_feature_staging_slots.append(feature_batch.staging_slot)
-                else:
-                    self._stop = True
                 capacity_changed = True
+                if not resources_quiescent:
+                    break
                 continue
 
             completed_ns = time.monotonic_ns()
@@ -1739,16 +3265,18 @@ class FlashMTPDraftEngine:
             ]
             for task in cancelled:
                 self._cancelled_ids.discard(task.transfer_id)
-                self._release_persistent_request(task.draft_kv_handle)
+                if self._persistent:
+                    self._release_persistent_request(task.draft_kv_handle)
             for task in expired:
-                self._release_persistent_request(task.draft_kv_handle)
+                if self._persistent:
+                    self._release_persistent_request(task.draft_kv_handle)
             if expired:
                 self._publish_failures(
                     [
                         (
                             task,
                             TimeoutError(
-                                "DFLASH feature pull completed after its deadline"
+                                "direct GPU source pull completed after its deadline"
                             ),
                         )
                         for task in expired
@@ -1761,26 +3289,57 @@ class FlashMTPDraftEngine:
             active_pending = [item for item, _row_range in active]
             active_ranges = tuple(row_range for _item, row_range in active)
             try:
-                self._launch_dflash_materialization(
-                    pending=active_pending,
-                    staging_slot=feature_batch.staging_slot,
-                    row_ranges=active_ranges,
-                )
+                if not self._persistent:
+                    staging = self._feature_staging_buffers[
+                        feature_batch.staging_slot
+                    ]
+                    rows = [staging[start:end] for start, end in active_ranges]
+                    if any(int(row.shape[0]) != 1 for row in rows):
+                        raise RuntimeError(
+                            "FlashMTP direct GPU source must provide one pivot row"
+                        )
+                    pivots = (
+                        staging[active_ranges[0][0] : active_ranges[-1][1]]
+                        if all(
+                            active_ranges[index][1]
+                            == active_ranges[index + 1][0]
+                            for index in range(len(active_ranges) - 1)
+                        )
+                        else torch.cat(rows, dim=0)
+                    )
+                    self._execute_flashmtp_batch(
+                        active_pending,
+                        pivots,
+                        staging_slot=feature_batch.staging_slot,
+                    )
+                elif self._is_eagle3:
+                    self._execute_eagle3_feature_batch(
+                        pending=active_pending,
+                        staging_slot=feature_batch.staging_slot,
+                        row_ranges=active_ranges,
+                    )
+                else:
+                    self._launch_dflash_materialization(
+                        pending=active_pending,
+                        staging_slot=feature_batch.staging_slot,
+                        row_ranges=active_ranges,
+                    )
             except Exception as exc:
-                logger.exception("failed to launch DT DFLASH materialization")
+                logger.exception("failed to execute DT feature-backed Draft batch")
                 resources_quiescent = bool(getattr(exc, "resources_quiescent", True))
                 if resources_quiescent:
                     try:
                         torch.cuda.current_stream(self.device).synchronize()
                     except Exception:
                         resources_quiescent = False
-                if not resources_quiescent:
-                    self._stop = True
                 tasks = [item.task for item in active_pending]
-                if resources_quiescent:
+                if resources_quiescent and self._persistent:
                     for handle in {task.draft_kv_handle for task in tasks}:
                         self._release_persistent_request(handle)
-                else:
+                elif not resources_quiescent and self._persistent:
+                    self._quarantined_feature_draft_handles.update(
+                        task.draft_kv_handle for task in tasks
+                    )
                     # A failed stream fence cannot prove that queued projection
                     # or proposal writes have stopped.  Keep both the staging
                     # range and every touched KV row quarantined until process
@@ -1791,13 +3350,501 @@ class FlashMTPDraftEngine:
                         "unquiesced GPU failure: transfers=%s",
                         [task.transfer_id for task in tasks],
                     )
+                elif not resources_quiescent:
+                    self._feature_source_unquiescent.update(
+                        (task.source.source_session_id, task.transfer_id)
+                        for task in tasks
+                    )
+                    logger.critical(
+                        "quarantined FlashMTP GPU staging after an unquiesced "
+                        "proposal failure: transfers=%s",
+                        [task.transfer_id for task in tasks],
+                    )
+                if not resources_quiescent:
+                    self._enter_fatal_gpu_quarantine(
+                        "unquiesced feature proposal/materialization failure"
+                    )
                 self._publish_failures([(task, exc) for task in tasks])
                 if resources_quiescent:
                     self._free_feature_staging_slots.append(feature_batch.staging_slot)
             capacity_changed = True
+            if not resources_quiescent:
+                break
         if self.batch_source_read_done:
             self._flush_source_done()
+        # Failure/capacity publication above is control-only.  A fatal latch
+        # must retain deferred finalizations because they can release or mutate
+        # CUDA-backed request/migration ownership.
         self._resume_feature_finalizations()
+        if capacity_changed:
+            self._publish_capacity()
+
+    def _execute_eagle3_feature_batch(
+        self,
+        *,
+        pending: list[PendingDraftTask],
+        staging_slot: int,
+        row_ranges: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Reconcile authoritative Target features, then run remote EAGLE3."""
+
+        from sglang.srt.speculative.eagle_worker_common import prepare_for_draft
+
+        tasks = [item.task for item in pending]
+        if not tasks:
+            raise ValueError("EAGLE3 feature batch must not be empty")
+        if len({bool(task.requires_proposal) for task in tasks}) != 1:
+            raise RuntimeError("EAGLE3 feature batch mixed proposal boundaries")
+
+        batch_started_ns = time.monotonic_ns()
+        states, grouped_reconcile = self._prepare_eagle3_persistent_tasks(tasks)
+        batch = ScheduleBatch.init_new(
+            reqs=[state.req for state in states],
+            req_to_token_pool=self._draft_model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=(
+                self._draft_model_runner.token_to_kv_pool_allocator
+            ),
+            tree_cache=self._tree_cache,
+            model_config=self._draft_model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+        )
+        batch.prepare_for_extend()
+        self._resolve_prefill_inputs(batch)
+        batch_prepared_ns = time.monotonic_ns()
+        # Target sends the exact token aligned with each auxiliary-hidden row
+        # (the output-token stream used by stock EAGLE draft-extend), while the
+        # request itself retains the authoritative committed input tokens.
+        # Consume that stream directly. Reconstructing a per-request preimage
+        # only for the stock helper to rotate it back adds a host loop and a GPU
+        # kernel to every remote round without changing the model input.
+        feature_input_ids: list[int] = []
+        tail_token_ids: list[int] = []
+        for task in tasks:
+            feature_ids = list(task.feature_token_ids)
+            if not feature_ids:
+                raise ValueError("EAGLE3 feature token stream must not be empty")
+            feature_input_ids.extend(int(token_id) for token_id in feature_ids)
+            tail_token_ids.append(int(feature_ids[-1]))
+            if task.requires_proposal and int(feature_ids[-1]) != int(
+                task.next_token_id
+            ):
+                raise ValueError(
+                    "EAGLE3 proposal root differs from the feature-aligned tail"
+                )
+        batch.input_ids = torch.tensor(
+            feature_input_ids, dtype=torch.int64, device=self.device
+        )
+        staging = self._feature_staging_buffers[staging_slot]
+        staging_view_bounds = _eagle3_feature_staging_view_bounds(
+            requires_proposal=bool(tasks[0].requires_proposal),
+            row_ranges=row_ranges,
+        )
+        if staging_view_bounds is None:
+            target_hidden = torch.cat(
+                [staging[start:end] for start, end in row_ranges], dim=0
+            )
+        else:
+            target_hidden = staging[
+                staging_view_bounds[0] : staging_view_bounds[1]
+            ]
+        if int(target_hidden.shape[0]) != int(batch.extend_num_tokens):
+            raise RuntimeError(
+                "EAGLE3 Target feature rows do not match the committed delta"
+            )
+        feature_tail_tokens = torch.tensor(
+            tail_token_ids,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        inputs_ready_ns = time.monotonic_ns()
+        draft_input = self._eagle_draft_worker._draft_extend_for_prefill(
+            batch,
+            target_hidden,
+            feature_tail_tokens,
+            input_ids_are_feature_aligned=True,
+        )
+        extend_done_ns = time.monotonic_ns()
+        extend_execution = (
+            self._draft_model_runner._last_cuda_graph_measurement_execution
+            or "missing"
+        )
+        extend_fallback_reason = (
+            self._draft_model_runner._last_cuda_graph_measurement_fallback_reason
+            or (
+                "model_runner_measurement_event_missing"
+                if extend_execution == "missing"
+                else None
+            )
+        )
+        extend_event_id = self._draft_model_runner._last_cuda_graph_measurement_event_id
+        measurement_tasks = [
+            task
+            for task in tasks
+            if task.request_id.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+        ]
+        if measurement_tasks:
+            measurement_bootstrap = sum(
+                task.round_id == 0 for task in measurement_tasks
+            )
+            measurement_reconcile = len(measurement_tasks) - measurement_bootstrap
+            if measurement_bootstrap:
+                self._record_graph_measurement(
+                    path="eagle3_bootstrap_extend",
+                    execution=extend_execution,
+                    measurement_rows=measurement_bootstrap,
+                    measurement_batch_rows=len(measurement_tasks),
+                    batch_size=len(tasks),
+                    model_runner_event_id=extend_event_id,
+                    fallback_reason=extend_fallback_reason,
+                )
+            if measurement_reconcile:
+                self._record_graph_measurement(
+                    path="eagle3_reconcile_extend",
+                    execution=extend_execution,
+                    measurement_rows=measurement_reconcile,
+                    measurement_batch_rows=len(measurement_tasks),
+                    batch_size=len(tasks),
+                    model_runner_event_id=extend_event_id,
+                    fallback_reason=extend_fallback_reason,
+                )
+
+        for state in states:
+            state.req.kv_committed_len = state.valid_committed_len
+            state.proposal_base_len = state.valid_committed_len
+
+        if not tasks[0].requires_proposal:
+            if profile_event_enabled("draft_eagle3_batch"):
+                batch_finished_ns = time.monotonic_ns()
+                profile_emit(
+                    "draft_eagle3_batch",
+                    draft_instance=self.instance_id,
+                    batch_size=len(tasks),
+                    transfer_ids=tuple(task.transfer_id for task in tasks),
+                    measurement_rows=sum(
+                        task.request_id.startswith(
+                            DT_BENCHMARK_MEASUREMENT_RID_PREFIX
+                        )
+                        for task in tasks
+                    ),
+                    proposal_rows=0,
+                    materialization_only_rows=len(tasks),
+                    feature_tokens=int(batch.extend_num_tokens),
+                    requires_proposal=False,
+                    feature_staging_view=staging_view_bounds is not None,
+                    grouped_reconcile=grouped_reconcile,
+                    extend_execution=extend_execution,
+                    extend_fallback_reason=extend_fallback_reason,
+                    proposal_execution=None,
+                    proposal_fallback_reason=None,
+                    pending_before=pending[0].pending_before,
+                    pending_after=pending[0].pending_after,
+                    taken_ns=pending[0].taken_ns,
+                    oldest_queue_age_ns=pending[0].oldest_queue_age_ns,
+                    max_batch_size=self.max_batch_size,
+                    batch_feature_token_count=(
+                        pending[0].batch_feature_token_count
+                    ),
+                    stop_reason=pending[0].stop_reason,
+                    cap_limited=pending[0].cap_limited,
+                    execute_started_ns=batch_started_ns,
+                    proposal_enqueued_ns=0,
+                    candidate_host_ready_ns=0,
+                    stream_fence_completed_ns=0,
+                    batch_started_ns=batch_started_ns,
+                    batch_finished_ns=batch_finished_ns,
+                    state_batch_prepare_ns=(
+                        batch_prepared_ns - batch_started_ns
+                    ),
+                    input_pack_ns=inputs_ready_ns - batch_prepared_ns,
+                    extend_ns=extend_done_ns - inputs_ready_ns,
+                    post_extend_host_ns=batch_finished_ns - extend_done_ns,
+                    proposal_prepare_ns=0,
+                    proposal_execute_ns=0,
+                    candidate_d2h_ns=0,
+                    candidate_completion_wait_ns=0,
+                    candidate_completion_wait_semantics="not_applicable",
+                    stream_fence_ns=0,
+                    total_ns=batch_finished_ns - batch_started_ns,
+                )
+            self._enqueue_eagle3_materialization_completion(
+                pending, staging_slot
+            )
+            return
+
+        batch.spec_info = draft_input
+        bonus_tokens = torch.tensor(
+            [task.next_token_id for task in tasks],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        # The co-located scheduler crosses an iteration boundary between draft
+        # extend and proposal decode.  The remote engine performs both within
+        # one task, so it must make the same ScheduleBatch mode transition here;
+        # calling the allocation helper alone leaves ForwardMode.EXTEND and the
+        # logits processor then indexes a one-row decode output as a prefill.
+        batch.prepare_for_decode()
+        forward_batch, can_cuda_graph = prepare_for_draft(
+            draft_input,
+            self._draft_model_runner.req_to_token_pool,
+            batch,
+            self._eagle_draft_worker.cuda_graph_runner,
+            self._draft_model_runner,
+            self._eagle_draft_worker.topk,
+            self._eagle_draft_worker.speculative_num_steps,
+        )
+        proposal_prepared_ns = time.monotonic_ns()
+        if can_cuda_graph:
+            _parents, _scores, proposals, _draft_probs = (
+                self._eagle_draft_worker.cuda_graph_runner.execute(forward_batch)
+            )
+            if not self.__dict__.get("_eagle3_graph_replay_evidence_emitted", False):
+                self._eagle3_graph_replay_evidence_emitted = True
+                logger.info(
+                    "DT EAGLE3 Draft CUDA graph replay observed: "
+                    "mode=DRAFT_DECODE batch_size=%d",
+                    len(tasks),
+                )
+            execution = "graph"
+            fallback_reason = None
+        else:
+            if self._eagle_draft_worker.speculative_num_steps > 1:
+                self._eagle_draft_worker.draft_attn_backend.init_forward_metadata(
+                    forward_batch
+                )
+                forward_batch.mark_forward_metadata_ready()
+            _parents, _scores, proposals, _draft_probs = (
+                self._eagle_draft_worker.draft_forward(forward_batch)
+            )
+            execution = "eager"
+            fallback_reason = "draft_decode_runner_rejected"
+        proposal_done_ns = time.monotonic_ns()
+
+        candidates = torch.cat(
+            [bonus_tokens.view(-1, 1), proposals.to(torch.int64)], dim=1
+        ).to(torch.int32)
+        expected_shape = (len(tasks), self.profile.block_size)
+        if tuple(candidates.shape) != expected_shape:
+            raise RuntimeError(
+                "EAGLE3 proposal shape mismatch: "
+                f"expected {expected_shape}, got {tuple(candidates.shape)}"
+            )
+        measurement_rows = sum(
+            task.request_id.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+            for task in tasks
+        )
+        if measurement_rows:
+            self._record_graph_measurement(
+                path="eagle3_proposal_decode",
+                execution=execution,
+                measurement_rows=measurement_rows,
+                measurement_batch_rows=measurement_rows,
+                batch_size=len(tasks),
+                fallback_reason=fallback_reason,
+        )
+        candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
+        candidate_ready_ns = time.monotonic_ns()
+        self._fence_eagle3_feature_staging_reads()
+        if profile_event_enabled("draft_eagle3_batch"):
+            stream_fence_completed_ns = time.monotonic_ns()
+            profile_emit(
+                "draft_eagle3_batch",
+                draft_instance=self.instance_id,
+                batch_size=len(tasks),
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                measurement_rows=measurement_rows,
+                proposal_rows=len(tasks),
+                materialization_only_rows=0,
+                feature_tokens=int(batch.extend_num_tokens),
+                requires_proposal=True,
+                feature_staging_view=staging_view_bounds is not None,
+                grouped_reconcile=grouped_reconcile,
+                extend_execution=extend_execution,
+                extend_fallback_reason=extend_fallback_reason,
+                proposal_execution=execution,
+                proposal_fallback_reason=fallback_reason,
+                pending_before=pending[0].pending_before,
+                pending_after=pending[0].pending_after,
+                taken_ns=pending[0].taken_ns,
+                oldest_queue_age_ns=pending[0].oldest_queue_age_ns,
+                max_batch_size=self.max_batch_size,
+                batch_feature_token_count=(
+                    pending[0].batch_feature_token_count
+                ),
+                stop_reason=pending[0].stop_reason,
+                cap_limited=pending[0].cap_limited,
+                execute_started_ns=batch_started_ns,
+                proposal_enqueued_ns=proposal_done_ns,
+                candidate_host_ready_ns=candidate_ready_ns,
+                stream_fence_completed_ns=stream_fence_completed_ns,
+                batch_started_ns=batch_started_ns,
+                batch_finished_ns=stream_fence_completed_ns,
+                state_batch_prepare_ns=batch_prepared_ns - batch_started_ns,
+                input_pack_ns=inputs_ready_ns - batch_prepared_ns,
+                extend_ns=extend_done_ns - inputs_ready_ns,
+                post_extend_host_ns=0,
+                proposal_prepare_ns=proposal_prepared_ns - extend_done_ns,
+                proposal_execute_ns=proposal_done_ns - proposal_prepared_ns,
+                candidate_d2h_ns=candidate_ready_ns - proposal_done_ns,
+                candidate_completion_wait_ns=(
+                    candidate_ready_ns - proposal_done_ns
+                ),
+                candidate_completion_wait_semantics=(
+                    "blocking_cpu_materialization_after_same_stream_proposal; "
+                    "not isolated D2H"
+                ),
+                stream_fence_ns=(
+                    stream_fence_completed_ns - candidate_ready_ns
+                ),
+                total_ns=stream_fence_completed_ns - batch_started_ns,
+            )
+        completed_ns = time.monotonic_ns()
+        expired = [task for task in tasks if completed_ns >= task.deadline_ns]
+        if expired:
+            for task in expired:
+                self._release_persistent_request(task.draft_kv_handle)
+            self._publish_failures(
+                [
+                    (
+                        task,
+                        TimeoutError("EAGLE3 proposal completed after its deadline"),
+                    )
+                    for task in expired
+                ]
+            )
+            active_indices = [
+                index for index, task in enumerate(tasks) if task not in expired
+            ]
+            if active_indices:
+                active_rows = candidates[active_indices].cpu().contiguous()
+                self._publish_successes(
+                    [tasks[index] for index in active_indices],
+                    active_rows.numpy().tobytes(),
+                )
+        else:
+            self._publish_successes(tasks, candidate_bytes)
+        self._free_feature_staging_slots.append(staging_slot)
+
+    def _fence_eagle3_feature_staging_reads(self) -> None:
+        """Fence every consumer before the independent pull stream can overwrite."""
+
+        try:
+            torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:
+            error = RuntimeError(
+                "failed to fence EAGLE3 feature staging before slot reuse"
+            )
+            error.resources_quiescent = False
+            raise error from exc
+
+    def _enqueue_eagle3_materialization_completion(
+        self, pending: list[PendingDraftTask], staging_slot: int
+    ) -> None:
+        """Keep staging and Draft KV owned until async EAGLE3 extend completes."""
+
+        completion_event = torch.cuda.Event()
+        completion_event.record(torch.cuda.current_stream(self.device))
+        self._pending_eagle3_completions.append(
+            PendingEagle3Completion(
+                pending=pending,
+                staging_slot=staging_slot,
+                completion_event=completion_event,
+                submitted_ns=time.monotonic_ns(),
+            )
+        )
+
+    def _poll_eagle3_completions(self) -> None:
+        if self._fatal_gpu_quarantine_active():
+            return
+        capacity_changed = False
+        while self._pending_eagle3_completions:
+            completion = self._pending_eagle3_completions[0]
+            try:
+                ready = completion.completion_event.query()
+            except Exception as exc:
+                self._pending_eagle3_completions.popleft()
+                self._quarantined_eagle3_completions.append(completion)
+                tasks = [item.task for item in completion.pending]
+                self._quarantined_feature_draft_handles.update(
+                    task.draft_kv_handle for task in tasks
+                )
+                exc.resources_quiescent = False
+                logger.critical(
+                    "quarantined EAGLE3 staging and KV after completion-event "
+                    "query failure: transfers=%s",
+                    [task.transfer_id for task in tasks],
+                    exc_info=True,
+                )
+                self._enter_fatal_gpu_quarantine(
+                    "unquiesced EAGLE3 completion-event failure"
+                )
+                # Publication may raise.  Fatal quarantine and resource
+                # ownership must already be permanent before attempting it.
+                self._publish_failures([(task, exc) for task in tasks])
+                self._publish_capacity()
+                break
+            if not ready:
+                break
+            self._pending_eagle3_completions.popleft()
+            tasks = [item.task for item in completion.pending]
+            completed_ns = time.monotonic_ns()
+            expired = [
+                task
+                for task in tasks
+                if task.transfer_id not in self._cancelled_ids
+                and completed_ns >= task.deadline_ns
+            ]
+            expired_ids = {task.transfer_id for task in expired}
+            active = [
+                task
+                for task in tasks
+                if task.transfer_id not in self._cancelled_ids
+                and task.transfer_id not in expired_ids
+            ]
+            cancelled = [
+                task for task in tasks if task.transfer_id in self._cancelled_ids
+            ]
+            if active:
+                self._publish_materialization_successes(active)
+            for task in cancelled:
+                self._cancelled_ids.discard(task.transfer_id)
+                self._release_persistent_request(task.draft_kv_handle)
+            for task in expired:
+                self._release_persistent_request(task.draft_kv_handle)
+            if expired:
+                self._publish_failures(
+                    [
+                        (
+                            task,
+                            TimeoutError(
+                                "EAGLE3 materialization completed after its deadline"
+                            ),
+                        )
+                        for task in expired
+                    ]
+                )
+            if profile_event_enabled("draft_eagle3_materialization_complete"):
+                profile_emit(
+                    "draft_eagle3_materialization_complete",
+                    draft_instance=self.instance_id,
+                    batch_size=len(tasks),
+                    transfer_ids=tuple(task.transfer_id for task in tasks),
+                    measurement_rows=sum(
+                        task.request_id.startswith(
+                            DT_BENCHMARK_MEASUREMENT_RID_PREFIX
+                        )
+                        for task in tasks
+                    ),
+                    active_task_count=len(active),
+                    cancelled_task_count=len(cancelled),
+                    expired_task_count=len(expired),
+                    submitted_ns=completion.submitted_ns,
+                    gpu_completed_ns=completed_ns,
+                )
+            self._free_feature_staging_slots.append(completion.staging_slot)
+            for handle in {task.draft_kv_handle for task in tasks}:
+                self._drain_deferred_persistent_release(handle)
+            capacity_changed = True
         if capacity_changed:
             self._publish_capacity()
 
@@ -1808,27 +3855,113 @@ class FlashMTPDraftEngine:
         staging_slot: int,
         row_ranges: tuple[tuple[int, int], ...],
     ) -> None:
-        if self._pending_dflash_completions:
+        if self._pending_dflash_completions and not self.dflash_submit_pipeline:
             raise RuntimeError(
                 "DFLASH materialization submission must wait for the prior "
                 "completion event"
             )
+        prior_unfinished_proposal_count = 0
+        prior_candidate_copy_pending_count = 0
+        for completion in self._pending_dflash_completions:
+            if not completion.proposal_done_event.query():
+                prior_unfinished_proposal_count += 1
+            elif not completion.completion_event.query():
+                prior_candidate_copy_pending_count += 1
+        launch_started_ns = time.monotonic_ns()
         tasks = [item.task for item in pending]
         states = []
         cache_locs = []
-        positions = []
-        for task in tasks:
-            state, cache_loc = self._prepare_dflash_task(task)
+        reconcile_prepare_phase_ns = [0] * 6 if profile_enabled() else None
+        grouped_discarded = self._free_dflash_reconcile_suffixes(
+            tasks, reconcile_prepare_phase_ns
+        )
+        grouped_rows = self._allocate_dflash_reconcile_rows(
+            tasks, grouped_discarded, reconcile_prepare_phase_ns
+        )
+        grouped_cache_locs = None if grouped_rows is None else grouped_rows[0]
+        batch_prefix_refresh = len(
+            {task.draft_kv_handle for task in tasks}
+        ) == len(tasks)
+        prior_prefix_indices = []
+        for task_index, task in enumerate(tasks):
+            prior_state = self._persistent_requests.get(task.draft_kv_handle)
+            prior_prefix_indices.append(
+                None
+                if not batch_prefix_refresh or prior_state is None
+                else prior_state.req.prefix_indices
+            )
+            state, cache_loc = self._prepare_dflash_task(
+                task,
+                reconcile_prepare_phase_ns,
+                suffix_already_freed=(
+                    grouped_discarded is not None
+                    and task.draft_kv_handle in grouped_discarded
+                ),
+                discarded_tokens_override=(
+                    None
+                    if grouped_discarded is None
+                    else grouped_discarded.get(task.draft_kv_handle)
+                ),
+                refresh_prefix_indices=not batch_prefix_refresh,
+                cache_loc_override=(
+                    None
+                    if grouped_cache_locs is None
+                    else grouped_cache_locs[task_index]
+                ),
+                row_already_written=grouped_cache_locs is not None,
+            )
             states.append(state)
             cache_locs.append(cache_loc)
-            positions.append(
-                torch.arange(
-                    task.feature_token_offset,
-                    task.committed_kv_len,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+        # Preserve Req's committed-prefix view with one GPU concatenation for
+        # the whole batch.  Proposal suffixes never extend prefix_indices; the
+        # prior tensor therefore ends exactly at feature_token_offset.
+        if batch_prefix_refresh:
+            prefix_refresh_started_ns = (
+                time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
             )
+            prefix_parts = []
+            prefix_lengths = []
+            for task, prior_prefix, cache_loc in zip(
+                tasks, prior_prefix_indices, cache_locs, strict=True
+            ):
+                if task.feature_token_offset:
+                    if (
+                        prior_prefix is None
+                        or int(prior_prefix.numel()) != task.feature_token_offset
+                    ):
+                        raise RuntimeError(
+                            "DFLASH committed prefix indices differ from feature offset"
+                        )
+                    prefix_parts.append(prior_prefix)
+                prefix_parts.append(cache_loc)
+                prefix_lengths.append(task.committed_kv_len)
+            packed_prefix_indices = torch.cat(prefix_parts, dim=0)
+            for state, prefix_indices in zip(
+                states,
+                torch.split(packed_prefix_indices, prefix_lengths),
+                strict=True,
+            ):
+                state.req.prefix_indices = prefix_indices
+            if reconcile_prepare_phase_ns is not None:
+                reconcile_prepare_phase_ns[4] += (
+                    time.monotonic_ns() - prefix_refresh_started_ns
+                )
+        if grouped_rows is None:
+            packed_cache_locs = torch.cat(cache_locs, dim=0)
+            positions = torch.tensor(
+                [
+                    position
+                    for task in tasks
+                    for position in range(
+                        task.feature_token_offset, task.committed_kv_len
+                    )
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            _grouped_cache_locs, packed_cache_locs, positions = grouped_rows
+        tasks_prepared_ns = time.monotonic_ns()
         staging = self._feature_staging_buffers[staging_slot]
         hidden_rows = [staging[start:end] for start, end in row_ranges]
         if all(
@@ -1851,45 +3984,77 @@ class FlashMTPDraftEngine:
         proposal_seq_lens_cpu = None
         proposal_bonus_tokens = None
         if proposal_indices:
-            # Build every CPU-derived proposal tensor before materialization is
-            # enqueued.  Creating a CUDA tensor from pageable CPU data after the
-            # append can wait for preceding work on this stream and stall the
-            # Draft scheduler loop.  The committed lengths are already
-            # authoritative CPU state, so seq_lens_cpu never needs a GPU
-            # round-trip.
+            # Stage CPU-derived proposal metadata through per-slot pinned host
+            # buffers.  The corresponding nonblocking H2D copies may be queued
+            # behind a prior proposal without synchronizing the scheduler
+            # thread, and the staging slot owns the buffers until completion.
+            # Committed lengths are already authoritative CPU state, so
+            # seq_lens_cpu never needs a GPU round-trip.
             committed_lens = [state.valid_committed_len for state in proposal_states]
-            proposal_req_pool_indices = torch.tensor(
-                [state.req.req_pool_idx for state in proposal_states],
-                dtype=torch.int64,
-                device=self.device,
+            proposal_count = len(proposal_states)
+            req_pool_indices_host = self._proposal_req_pool_indices_host_buffers[
+                staging_slot
+            ][:proposal_count]
+            req_pool_indices_host.copy_(
+                torch.tensor(
+                    [state.req.req_pool_idx for state in proposal_states],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
             )
-            proposal_prefix_lens = torch.tensor(
-                committed_lens,
-                dtype=torch.int64,
-                device=self.device,
+            proposal_req_pool_indices = self._proposal_req_pool_indices_buffers[
+                staging_slot
+            ][:proposal_count]
+            proposal_req_pool_indices.copy_(req_pool_indices_host, non_blocking=True)
+            prefix_lens_host = self._proposal_prefix_lens_host_buffers[staging_slot][
+                :proposal_count
+            ]
+            prefix_lens_host.copy_(
+                torch.tensor(committed_lens, dtype=torch.int64, device="cpu")
             )
+            proposal_prefix_lens = self._proposal_prefix_lens_buffers[staging_slot][
+                :proposal_count
+            ]
+            proposal_prefix_lens.copy_(prefix_lens_host, non_blocking=True)
             proposal_seq_lens_cpu = torch.tensor(
                 [length + int(self.profile.block_size) for length in committed_lens],
                 dtype=torch.int32,
                 device="cpu",
             )
-            proposal_bonus_tokens = torch.tensor(
-                [task.next_token_id for task in proposal_tasks],
-                dtype=torch.int64,
-                device=self.device,
+            bonus_tokens_host = self._proposal_bonus_tokens_host_buffers[staging_slot][
+                :proposal_count
+            ]
+            bonus_tokens_host.copy_(
+                torch.tensor(
+                    [task.next_token_id for task in proposal_tasks],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
             )
+            proposal_bonus_tokens = self._proposal_bonus_tokens_buffers[staging_slot][
+                :proposal_count
+            ]
+            proposal_bonus_tokens.copy_(bonus_tokens_host, non_blocking=True)
+        proposal_metadata_ready_ns = time.monotonic_ns()
 
         materialize_start.record(torch.cuda.current_stream(self.device))
         self._dflash_materializer.append(
             target_hidden=target_hidden,
-            cache_loc=torch.cat(cache_locs, dim=0),
-            positions=torch.cat(positions, dim=0),
+            cache_loc=packed_cache_locs,
+            positions=positions,
         )
         materialize_done.record(torch.cuda.current_stream(self.device))
+        materialize_submitted_ns = time.monotonic_ns()
 
         candidates = None
+        proposal_execution = None
+        proposal_fallback_reason = None
         if proposal_indices:
-            candidates = self._run_dflash_proposal(
+            (
+                candidates,
+                proposal_execution,
+                proposal_fallback_reason,
+            ) = self._run_dflash_proposal(
                 states=proposal_states,
                 req_pool_indices=proposal_req_pool_indices,
                 prefix_lens=proposal_prefix_lens,
@@ -1897,21 +4062,295 @@ class FlashMTPDraftEngine:
                 bonus_tokens=proposal_bonus_tokens,
             )
         proposal_done.record(torch.cuda.current_stream(self.device))
-        self._pending_dflash_completions.append(
-            PendingDFlashCompletion(
-                pending=pending,
-                staging_slot=staging_slot,
-                completion_event=proposal_done,
-                materialize_start_event=materialize_start,
-                materialize_done_event=materialize_done,
-                proposal_done_event=proposal_done,
-                proposal_tasks=proposal_tasks,
-                candidates=candidates,
-                launched_ns=time.monotonic_ns(),
-            )
+        candidate_rows_cpu = None
+        copy_stream = None
+        if candidates is not None and self.dflash_submit_pipeline:
+            copy_stream = self._candidate_result_copy_stream
+            if copy_stream is None:
+                raise RuntimeError("DFLASH candidate copy stream is unavailable")
+            candidate_rows_cpu = self._candidate_result_host_buffers[staging_slot][
+                : len(proposal_tasks)
+            ]
+        completion = PendingDFlashCompletion(
+            pending=pending,
+            staging_slot=staging_slot,
+            # The candidate-copy path replaces this with its own event after
+            # ownership is registered and before submitting work to that stream.
+            completion_event=proposal_done,
+            materialize_start_event=materialize_start,
+            materialize_done_event=materialize_done,
+            proposal_done_event=proposal_done,
+            proposal_tasks=proposal_tasks,
+            candidates=candidates,
+            candidate_rows_cpu=candidate_rows_cpu,
+            launch_started_ns=launch_started_ns,
+            tasks_prepared_ns=tasks_prepared_ns,
+            proposal_metadata_ready_ns=proposal_metadata_ready_ns,
+            materialize_submitted_ns=materialize_submitted_ns,
+            launched_ns=0,
+            proposal_execution=proposal_execution,
+            proposal_fallback_reason=proposal_fallback_reason,
+            reconcile_prepare_phase_ns=tuple(reconcile_prepare_phase_ns or ()),
+            prior_unfinished_proposal_count=prior_unfinished_proposal_count,
+            prior_candidate_copy_pending_count=prior_candidate_copy_pending_count,
+        )
+        self._register_dflash_completion(
+            completion=completion,
+            copy_stream=copy_stream,
         )
 
-    def _prepare_dflash_task(self, task) -> tuple[PersistentDraftRequest, torch.Tensor]:
+    def _register_dflash_completion(
+        self,
+        *,
+        completion: PendingDFlashCompletion,
+        copy_stream,
+    ) -> None:
+        """Own a DFlash completion before an asynchronous candidate copy.
+
+        A failed event record does not prove that the preceding D2H copy was
+        rejected.  Registering first ensures that a failed recovery fence can
+        permanently retain the device candidates, timing/completion events, and
+        pinned destination buffer independently of exception tracebacks.
+        """
+
+        self._pending_dflash_completions.append(completion)
+
+        def remove_pending_owner() -> None:
+            # This method runs on the single Draft scheduler thread, but use
+            # identity rather than dataclass equality because tensor fields do
+            # not have scalar equality semantics.
+            self._pending_dflash_completions = deque(
+                item
+                for item in self._pending_dflash_completions
+                if item is not completion
+            )
+
+        try:
+            if copy_stream is not None:
+                if (
+                    completion.candidates is None
+                    or completion.candidate_rows_cpu is None
+                ):
+                    raise RuntimeError(
+                        "DFLASH candidate copy ownership is incomplete"
+                    )
+                completion.completion_event = torch.cuda.Event()
+                with torch.cuda.stream(copy_stream):
+                    copy_stream.wait_event(completion.proposal_done_event)
+                    completion.candidate_rows_cpu.copy_(
+                        completion.candidates, non_blocking=True
+                    )
+                    completion.completion_event.record(copy_stream)
+            completion.launched_ns = time.monotonic_ns()
+        except Exception as exc:
+            # Registered ownership may be retired only after every stream that
+            # could reference it is proven quiescent.
+            if copy_stream is not None:
+                try:
+                    copy_stream.synchronize()
+                except Exception as sync_exc:
+                    # Move ownership before latching or reporting.  The fatal
+                    # path never queries these events or releases their tensors;
+                    # repeated close calls stop at the common latch.
+                    self._quarantined_dflash_completions.append(completion)
+                    remove_pending_owner()
+                    exc.resources_quiescent = False
+                    sync_exc.resources_quiescent = False
+                    self._enter_fatal_gpu_quarantine(
+                        "unquiesced DFlash candidate-copy failure"
+                    )
+                    raise sync_exc from exc
+            remove_pending_owner()
+            raise
+
+    def _free_dflash_reconcile_suffixes(
+        self, tasks, reconcile_prepare_phase_ns: list[int] | None = None
+    ) -> dict[str, int] | None:
+        """Batch-free unique reconcile suffixes before any page-table overwrite."""
+
+        from dt_protocol import DraftTaskKind
+
+        if not tasks or any(task.kind != DraftTaskKind.RECONCILE for task in tasks):
+            return None
+        handles = [task.draft_kv_handle for task in tasks]
+        if len(set(handles)) != len(handles):
+            return None
+
+        validated = []
+        for task in tasks:
+            state = self._persistent_requests.get(task.draft_kv_handle)
+            if state is None:
+                raise ValueError("DFLASH reconcile KV handle does not exist")
+            if (
+                state.request_id != task.request_id
+                or state.target_instance_id != task.target_instance_id
+            ):
+                raise ValueError("DFLASH reconcile identity does not match KV owner")
+            if task.round_id != state.last_round_id + 1:
+                raise ValueError("DFLASH reconcile round is not the next request round")
+            if task.feature_token_offset != state.valid_committed_len:
+                raise ValueError("DFLASH reconcile has a committed-prefix gap")
+            if state.proposal_base_len != state.valid_committed_len:
+                raise RuntimeError(
+                    "DFLASH proposal base diverged from committed boundary"
+                )
+            req = state.req
+            if req.kv is None or req.req_pool_idx is None:
+                raise RuntimeError("DFLASH reconcile lost its persistent KV handle")
+            allocated_len = req.kv.kv_allocated_len
+            if allocated_len < state.valid_committed_len:
+                raise RuntimeError(
+                    "DFLASH allocated KV is shorter than its committed prefix"
+                )
+            validated.append((state, allocated_len))
+
+        phase_started_ns = (
+            time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
+        )
+        allocator = self._draft_model_runner.token_to_kv_pool_allocator
+        allocator.free_group_begin()
+        try:
+            for state, allocated_len in validated:
+                self._free_persistent_kv_suffix(
+                    state.req, state.valid_committed_len, allocated_len
+                )
+            allocator.free_group_end()
+        except Exception as exc:
+            # The allocator's ownership is indeterminate if a grouped update
+            # fails.  The outer feature-batch guard must quarantine the rows
+            # and stop instead of attempting a second free.
+            setattr(exc, "resources_quiescent", False)
+            raise
+        discarded = {}
+        for state, allocated_len in validated:
+            discarded[state.draft_kv_handle] = (
+                allocated_len - state.valid_committed_len
+            )
+            state.req.kv.kv_allocated_len = state.valid_committed_len
+        if reconcile_prepare_phase_ns is not None:
+            reconcile_prepare_phase_ns[1] += time.monotonic_ns() - phase_started_ns
+        return discarded
+
+    def _allocate_dflash_reconcile_rows(
+        self,
+        tasks,
+        grouped_discarded: dict[str, int] | None,
+        reconcile_prepare_phase_ns: list[int] | None = None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        """Allocate and install one packed set of DFlash reconcile KV rows.
+
+        The grouped suffix release has already shortened every request's
+        ownership boundary.  One allocator call and one page-table write now
+        establish the replacement ownership for the whole wave.  The returned
+        packed cache and position tensors are also the materializer inputs, so
+        the caller does not repack the same rows a second time.
+        """
+
+        if grouped_discarded is None:
+            return None
+        req_pool = self._draft_model_runner.req_to_token_pool
+        allocator = self._draft_model_runner.token_to_kv_pool_allocator
+        validated = []
+        token_counts = []
+        for task in tasks:
+            state = self._persistent_requests.get(task.draft_kv_handle)
+            if state is None or task.draft_kv_handle not in grouped_discarded:
+                raise RuntimeError("DFLASH grouped allocation lost reconcile state")
+            req = state.req
+            if req.kv is None or req.req_pool_idx is None:
+                raise RuntimeError("DFLASH grouped allocation lost KV ownership")
+            token_count = int(task.feature_token_count)
+            if (
+                token_count <= 0
+                or task.committed_kv_len - task.feature_token_offset != token_count
+            ):
+                raise ValueError("DFLASH grouped allocation token range mismatch")
+            if req.kv.kv_allocated_len != task.feature_token_offset:
+                raise RuntimeError(
+                    "DFLASH grouped allocation did not observe the released suffix"
+                )
+            validated.append((task, req))
+            token_counts.append(token_count)
+
+        phase_started_ns = (
+            time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
+        )
+        packed_cache_locs = allocator.alloc(sum(token_counts))
+        if packed_cache_locs is None:
+            raise RuntimeError("DFLASH grouped reconcile KV-page OOM")
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[2] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
+        try:
+            cache_locs = list(torch.split(packed_cache_locs, token_counts))
+            row_indices = torch.tensor(
+                [
+                    req.req_pool_idx
+                    for (_task, req), token_count in zip(
+                        validated, token_counts, strict=True
+                    )
+                    for _ in range(token_count)
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            positions = torch.tensor(
+                [
+                    position
+                    for task, _req in validated
+                    for position in range(
+                        task.feature_token_offset, task.committed_kv_len
+                    )
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            req_pool.req_to_token[row_indices, positions] = packed_cache_locs.to(
+                req_pool.req_to_token.dtype
+            )
+        except Exception as exc:
+            try:
+                allocator.free(packed_cache_locs)
+            except Exception:
+                setattr(exc, "resources_quiescent", False)
+            raise
+        # The page-table write and any later cleanup use the same CUDA stream.
+        # Publish all CPU ownership boundaries only after the write is queued;
+        # from here, outer failure cleanup owns every packed replacement page.
+        for task, req in validated:
+            req.kv.kv_allocated_len = task.committed_kv_len
+        grouped_batches = (
+            self.__dict__.get("_dflash_grouped_reconcile_batches", 0) + 1
+        )
+        grouped_rows = self.__dict__.get("_dflash_grouped_reconcile_rows", 0) + len(
+            tasks
+        )
+        self._dflash_grouped_reconcile_batches = grouped_batches
+        self._dflash_grouped_reconcile_rows = grouped_rows
+        if grouped_batches & (grouped_batches - 1) == 0:
+            logger.info(
+                "DT DFLASH grouped reconcile allocation observed: batches=%d rows=%d",
+                grouped_batches,
+                grouped_rows,
+            )
+        if reconcile_prepare_phase_ns is not None:
+            reconcile_prepare_phase_ns[3] += (
+                time.monotonic_ns() - phase_started_ns
+            )
+        return cache_locs, packed_cache_locs, positions
+
+    def _prepare_dflash_task(
+        self,
+        task,
+        reconcile_prepare_phase_ns: list[int] | None = None,
+        *,
+        suffix_already_freed: bool = False,
+        discarded_tokens_override: int | None = None,
+        refresh_prefix_indices: bool = True,
+        cache_loc_override: torch.Tensor | None = None,
+        row_already_written: bool = False,
+    ) -> tuple[PersistentDraftRequest, torch.Tensor]:
         from dt_protocol import DraftTaskKind
 
         req_pool = self._draft_model_runner.req_to_token_pool
@@ -1942,9 +4381,10 @@ class FlashMTPDraftEngine:
                 swa_evicted_seqlen=0,
             )
             req.kv_committed_len = task.committed_kv_len
-            req.prefix_indices = cache_loc.to(torch.int64)
+            if refresh_prefix_indices:
+                req.prefix_indices = cache_loc.to(torch.int64)
             req_pool.req_to_token[req.req_pool_idx, : task.committed_kv_len] = (
-                cache_loc.to(torch.int32)
+                cache_loc
             )
             state = PersistentDraftRequest(
                 req=req,
@@ -1959,6 +4399,9 @@ class FlashMTPDraftEngine:
             self._persistent_requests[task.draft_kv_handle] = state
             return state, cache_loc.to(torch.int64)
 
+        phase_started_ns = (
+            time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
+        )
         state = self._persistent_requests.get(task.draft_kv_handle)
         if state is None:
             raise ValueError("DFLASH reconcile KV handle does not exist")
@@ -1981,20 +4424,60 @@ class FlashMTPDraftEngine:
             raise RuntimeError(
                 "DFLASH allocated KV is shorter than its committed prefix"
             )
-        discarded_tokens = allocated_len - state.valid_committed_len
-        self._free_persistent_kv_suffix(req, state.valid_committed_len, allocated_len)
-        req.kv.kv_allocated_len = state.valid_committed_len
-        cache_loc = allocator.alloc(token_count)
-        if cache_loc is None:
-            raise RuntimeError("DFLASH reconcile KV-page OOM")
-        req_pool.req_to_token[
-            req.req_pool_idx, task.feature_token_offset : task.committed_kv_len
-        ] = cache_loc.to(torch.int32)
+        discarded_tokens = (
+            allocated_len - state.valid_committed_len
+            if discarded_tokens_override is None
+            else discarded_tokens_override
+        )
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[0] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
+        if not suffix_already_freed:
+            self._free_persistent_kv_suffix(
+                req, state.valid_committed_len, allocated_len
+            )
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[1] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
+        if cache_loc_override is None:
+            req.kv.kv_allocated_len = state.valid_committed_len
+            cache_loc = allocator.alloc(token_count)
+            if cache_loc is None:
+                raise RuntimeError("DFLASH reconcile KV-page OOM")
+        else:
+            if not suffix_already_freed or not row_already_written:
+                raise RuntimeError(
+                    "DFLASH grouped allocation requires released suffix and row ownership"
+                )
+            cache_loc = cache_loc_override
+            if int(cache_loc.numel()) != token_count:
+                raise RuntimeError("DFLASH grouped allocation length mismatch")
+            if req.kv.kv_allocated_len != task.committed_kv_len:
+                raise RuntimeError("DFLASH grouped allocation ownership mismatch")
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[2] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
+        if not row_already_written:
+            req_pool.req_to_token[
+                req.req_pool_idx, task.feature_token_offset : task.committed_kv_len
+            ] = cache_loc
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[3] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
         req.kv.kv_allocated_len = task.committed_kv_len
         req.kv_committed_len = task.committed_kv_len
-        req.prefix_indices = req_pool.req_to_token[
-            req.req_pool_idx, : task.committed_kv_len
-        ].to(torch.int64)
+        if refresh_prefix_indices:
+            req.prefix_indices = req_pool.req_to_token[
+                req.req_pool_idx, : task.committed_kv_len
+            ].to(torch.int64)
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[4] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
         req.output_ids.extend(task.committed_token_ids)
         req._refresh_fill_ids()
         req.set_extend_range(task.feature_token_offset, task.committed_kv_len)
@@ -2011,6 +4494,8 @@ class FlashMTPDraftEngine:
             materialized_tokens=token_count,
             committed_kv_len=task.committed_kv_len,
         )
+        if reconcile_prepare_phase_ns is not None:
+            reconcile_prepare_phase_ns[5] += time.monotonic_ns() - phase_started_ns
         return state, cache_loc.to(torch.int64)
 
     def _run_dflash_proposal(
@@ -2021,7 +4506,7 @@ class FlashMTPDraftEngine:
         prefix_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         bonus_tokens: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, str, str | None]:
         batch_size = len(states)
         block_size = int(self.profile.block_size)
         req_pool = self._draft_model_runner.req_to_token_pool
@@ -2031,11 +4516,13 @@ class FlashMTPDraftEngine:
             raise RuntimeError("DFLASH proposal KV-page OOM")
         try:
             out_cache_loc_2d = out_cache_loc.view(batch_size, block_size)
-            for row, state in enumerate(states):
+            positions = prefix_lens.unsqueeze(1) + self._block_pos_offsets
+            req_rows = req_pool_indices.unsqueeze(1).expand_as(positions)
+            req_pool.req_to_token[req_rows, positions] = out_cache_loc_2d.to(
+                req_pool.req_to_token.dtype
+            )
+            for state in states:
                 end = state.valid_committed_len + block_size
-                req_pool.req_to_token[
-                    state.req.req_pool_idx, state.valid_committed_len : end
-                ] = out_cache_loc_2d[row].to(torch.int32)
                 state.req.kv.kv_allocated_len = end
                 state.req.kv_committed_len = state.valid_committed_len
                 state.proposal_base_len = state.valid_committed_len
@@ -2047,7 +4534,6 @@ class FlashMTPDraftEngine:
                 device=self.device,
             )
             block_ids[:, 0].copy_(bonus_tokens)
-            positions = prefix_lens.unsqueeze(1) + self._block_pos_offsets
             input_embeds = self._token_embedding(block_ids).reshape(
                 batch_size * block_size, -1
             )
@@ -2066,21 +4552,47 @@ class FlashMTPDraftEngine:
                 spec_info=self._draft_block_spec_info,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 device_timer_category="draft_proposal",
+                rids=[state.request_id for state in states],
             )
             draft_out = self._draft_model_runner.forward(forward_batch)
-            hidden_states = draft_out.logits_output.hidden_states
-            if hidden_states is None:
-                raise RuntimeError("DFLASH Draft forward returned no hidden states")
-            self._dflash_sampler(hidden_states)
+            proposal_execution = "graph" if draft_out.can_run_graph else "eager"
+            proposal_fallback_reason = (
+                None
+                if draft_out.can_run_graph
+                else self._draft_model_runner._cuda_graph_fallback_reason(forward_batch)
+            )
+            if not draft_out.can_run_graph:
+                hidden_states = draft_out.logits_output.hidden_states
+                if hidden_states is None:
+                    raise RuntimeError("DFLASH Draft forward returned no hidden states")
+                self._dflash_sampler(hidden_states)
             proposals = self._dflash_sampler.out[: batch_size * (block_size - 1)].view(
                 batch_size, block_size - 1
             )
+            measurement_rows = sum(
+                state.request_id.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+                for state in states
+            )
+            if measurement_rows:
+                self._record_graph_measurement(
+                    path="dflash_proposal",
+                    execution=proposal_execution,
+                    measurement_rows=measurement_rows,
+                    measurement_batch_rows=measurement_rows,
+                    batch_size=batch_size,
+                    model_runner_event_id=(
+                        self._draft_model_runner._last_cuda_graph_measurement_event_id
+                    ),
+                    graph_replays=int(draft_out.can_run_graph),
+                    expected_graph_replays=1,
+                    fallback_reason=proposal_fallback_reason,
+                )
             candidates = torch.empty(
                 (batch_size, block_size), dtype=torch.int32, device=self.device
             )
             candidates[:, 0].copy_(bonus_tokens)
             candidates[:, 1:].copy_(proposals)
-            return candidates
+            return candidates, proposal_execution, proposal_fallback_reason
         except Exception as exc:
             # No successful completion event will own this allocation.  Fence
             # exceptional GPU work before making the pages reusable; if that
@@ -2088,9 +4600,15 @@ class FlashMTPDraftEngine:
             # caller quarantines every affected request instead.
             try:
                 torch.cuda.current_stream(self.device).synchronize()
-            except Exception:
+            except Exception as sync_exc:
+                # Propagate the failed recovery fence, not the original
+                # proposal error.  Both exceptions carry the ownership marker
+                # so every caller in the chain must retain the touched Draft-KV
+                # pages and staging range.  Chaining preserves the proposal
+                # failure that required this otherwise-fallible fence.
                 setattr(exc, "resources_quiescent", False)
-                raise
+                setattr(sync_exc, "resources_quiescent", False)
+                raise sync_exc from exc
             allocator.free(out_cache_loc)
             for state in states:
                 if state.req.kv is not None:
@@ -2100,10 +4618,39 @@ class FlashMTPDraftEngine:
             raise
 
     def _poll_dflash_completions(self) -> None:
+        if self._fatal_gpu_quarantine_active():
+            return
         capacity_changed = False
         while self._pending_dflash_completions:
             completion = self._pending_dflash_completions[0]
-            if not completion.completion_event.query():
+            try:
+                ready = completion.completion_event.query()
+            except Exception as exc:
+                # Leave the completion in place: it owns the staging slot and
+                # every touched Draft-KV row until CUDA context teardown.  A
+                # failed event query cannot prove that proposal/materialization
+                # writes have stopped, so neither shutdown nor another poll may
+                # touch this completion again.
+                tasks = [item.task for item in completion.pending]
+                self._quarantined_feature_draft_handles.update(
+                    task.draft_kv_handle for task in tasks
+                )
+                exc.resources_quiescent = False
+                logger.critical(
+                    "quarantined DFlash completion, staging, and KV after "
+                    "completion-event query failure: transfers=%s",
+                    [task.transfer_id for task in tasks],
+                    exc_info=True,
+                )
+                self._enter_fatal_gpu_quarantine(
+                    "unquiesced DFlash completion-event failure"
+                )
+                # As above, reporting is best-effort and may itself raise; the
+                # fatal latch and retained ownership must not depend on it.
+                self._publish_failures([(task, exc) for task in tasks])
+                self._publish_capacity()
+                break
+            if not ready:
                 break
             self._pending_dflash_completions.popleft()
             tasks = [item.task for item in completion.pending]
@@ -2133,11 +4680,102 @@ class FlashMTPDraftEngine:
                 if task.transfer_id not in self._cancelled_ids
                 and task.transfer_id not in expired_ids
             ]
+            gpu_materialization_ns = int(
+                completion.materialize_start_event.elapsed_time(
+                    completion.materialize_done_event
+                )
+                * 1_000_000
+            )
+            proposal_gpu_ns = int(
+                completion.materialize_done_event.elapsed_time(
+                    completion.proposal_done_event
+                )
+                * 1_000_000
+            )
+            profile_emit(
+                "draft_dflash_batch_complete",
+                draft_instance=self.instance_id,
+                batch_size=len(tasks),
+                active_task_count=len(active_tasks),
+                cancelled_task_count=len(cancelled_tasks),
+                expired_task_count=len(expired_tasks),
+                proposal_count=len(completion.proposal_tasks),
+                active_proposal_count=len(active_proposal_indices),
+                materialize_only_count=len(materialize_only),
+                bootstrap_count=sum(task.round_id == 0 for task in tasks),
+                reconcile_count=sum(task.round_id > 0 for task in tasks),
+                materialized_tokens=sum(task.feature_token_count for task in tasks),
+                submitted_ns=completion.launched_ns,
+                gpu_completed_ns=completed_ns,
+                host_task_prepare_ns=(
+                    completion.tasks_prepared_ns - completion.launch_started_ns
+                ),
+                host_proposal_metadata_ns=(
+                    completion.proposal_metadata_ready_ns - completion.tasks_prepared_ns
+                ),
+                host_materialize_submit_ns=(
+                    completion.materialize_submitted_ns
+                    - completion.proposal_metadata_ready_ns
+                ),
+                host_proposal_submit_ns=(
+                    completion.launched_ns - completion.materialize_submitted_ns
+                ),
+                host_total_submit_ns=(
+                    completion.launched_ns - completion.launch_started_ns
+                ),
+                gpu_materialization_ns=gpu_materialization_ns,
+                proposal_gpu_ns=proposal_gpu_ns,
+                proposal_execution=completion.proposal_execution,
+                proposal_fallback_reason=completion.proposal_fallback_reason,
+                prior_unfinished_proposal_count=(
+                    completion.prior_unfinished_proposal_count
+                ),
+                prior_candidate_copy_pending_count=(
+                    completion.prior_candidate_copy_pending_count
+                ),
+                host_reconcile_validate_ns=(
+                    completion.reconcile_prepare_phase_ns[0]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_free_ns=(
+                    completion.reconcile_prepare_phase_ns[1]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_alloc_ns=(
+                    completion.reconcile_prepare_phase_ns[2]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_row_write_ns=(
+                    completion.reconcile_prepare_phase_ns[3]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_prefix_refresh_ns=(
+                    completion.reconcile_prepare_phase_ns[4]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_state_refresh_ns=(
+                    completion.reconcile_prepare_phase_ns[5]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+            )
             if materialize_only:
                 self._publish_materialization_successes(materialize_only)
             if active_proposal_indices:
-                candidate_rows = completion.candidates[active_proposal_indices]
-                candidate_bytes = candidate_rows.cpu().contiguous().numpy().tobytes()
+                if completion.candidate_rows_cpu is None:
+                    candidate_rows = completion.candidates[
+                        active_proposal_indices
+                    ].cpu()
+                else:
+                    candidate_rows = completion.candidate_rows_cpu[
+                        active_proposal_indices
+                    ]
+                candidate_bytes = candidate_rows.contiguous().numpy().tobytes()
                 self._publish_successes(
                     [
                         completion.proposal_tasks[index]
@@ -2146,12 +4784,6 @@ class FlashMTPDraftEngine:
                     candidate_bytes,
                 )
             for task in active_tasks:
-                proposal_gpu_ns = int(
-                    completion.materialize_done_event.elapsed_time(
-                        completion.proposal_done_event
-                    )
-                    * 1_000_000
-                )
                 profile_emit(
                     "draft_kv_materialization",
                     draft_instance=self.instance_id,
@@ -2160,12 +4792,7 @@ class FlashMTPDraftEngine:
                     round_id=task.round_id,
                     committed_kv_len=task.committed_kv_len,
                     materialized_tokens=task.feature_token_count,
-                    gpu_materialization_ns=int(
-                        completion.materialize_start_event.elapsed_time(
-                            completion.materialize_done_event
-                        )
-                        * 1_000_000
-                    ),
+                    gpu_materialization_ns=gpu_materialization_ns,
                     proposal_gpu_ns=proposal_gpu_ns,
                     completed_ns=time.monotonic_ns(),
                 )
@@ -2213,26 +4840,95 @@ class FlashMTPDraftEngine:
         extend_done_ns = batch_start_ns
         decode_done_ns: list[int] = []
         extend_cuda_graph = False
+        extend_graph_replays = 0
+        expected_extend_graph_replays = 1
         decode_graph_replays = 0
         try:
             states = [self._prepare_persistent_task(task) for task in tasks]
-            batch = ScheduleBatch.init_new(
-                reqs=[state.req for state in states],
-                req_to_token_pool=self._draft_model_runner.req_to_token_pool,
-                token_to_kv_pool_allocator=(
-                    self._draft_model_runner.token_to_kv_pool_allocator
-                ),
-                tree_cache=self._tree_cache,
-                model_config=self._draft_model_runner.model_config,
-                enable_overlap=False,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
+            oversized_bootstrap = (
+                len(tasks) == 1
+                and tasks[0].round_id == 0
+                and len(tasks[0].committed_token_ids)
+                > DRAFT_PREFILL_GRAPH_MAX_TOKENS
             )
-            batch.prepare_for_extend()
-            self._resolve_prefill_inputs(batch)
             prepare_done_ns = time.monotonic_ns()
-            extend_result = self._draft_worker.forward_batch_generation(batch)
-            next_tokens = extend_result.next_token_ids
-            extend_cuda_graph = bool(extend_result.can_run_cuda_graph)
+            if oversized_bootstrap:
+                task = tasks[0]
+                state = states[0]
+                if len(task.committed_token_ids) != task.committed_kv_len:
+                    raise RuntimeError(
+                        "STANDALONE bootstrap committed tokens do not cover its KV"
+                    )
+                expected_extend_graph_replays = (
+                    len(task.committed_token_ids)
+                    + DRAFT_PREFILL_GRAPH_MAX_TOKENS
+                    - 1
+                ) // DRAFT_PREFILL_GRAPH_MAX_TOKENS
+                for chunk_start in range(
+                    0,
+                    len(task.committed_token_ids),
+                    DRAFT_PREFILL_GRAPH_MAX_TOKENS,
+                ):
+                    chunk_end = min(
+                        chunk_start + DRAFT_PREFILL_GRAPH_MAX_TOKENS,
+                        len(task.committed_token_ids),
+                    )
+                    if chunk_start:
+                        req = state.req
+                        req.kv_committed_len = chunk_start
+                        req.prefix_indices = (
+                            self._draft_model_runner.req_to_token_pool.req_to_token[
+                                req.req_pool_idx, :chunk_start
+                            ].to(torch.int64)
+                        )
+                    state.req.set_extend_range(chunk_start, chunk_end)
+                    batch = ScheduleBatch.init_new(
+                        reqs=[state.req],
+                        req_to_token_pool=self._draft_model_runner.req_to_token_pool,
+                        token_to_kv_pool_allocator=(
+                            self._draft_model_runner.token_to_kv_pool_allocator
+                        ),
+                        tree_cache=self._tree_cache,
+                        model_config=self._draft_model_runner.model_config,
+                        enable_overlap=False,
+                        spec_algorithm=SpeculativeAlgorithm.NONE,
+                    )
+                    batch.prepare_for_extend()
+                    self._resolve_prefill_inputs(batch)
+                    extend_result = self._draft_worker.forward_batch_generation(batch)
+                    next_tokens = extend_result.next_token_ids
+                    extend_graph_replays += int(
+                        extend_result.can_run_cuda_graph
+                    )
+                extend_cuda_graph = (
+                    extend_graph_replays == expected_extend_graph_replays
+                )
+                logger.info(
+                    "DT STANDALONE chunked bootstrap: request=%s tokens=%d "
+                    "chunks=%d graph_replays=%d",
+                    task.request_id,
+                    len(task.committed_token_ids),
+                    expected_extend_graph_replays,
+                    extend_graph_replays,
+                )
+            else:
+                batch = ScheduleBatch.init_new(
+                    reqs=[state.req for state in states],
+                    req_to_token_pool=self._draft_model_runner.req_to_token_pool,
+                    token_to_kv_pool_allocator=(
+                        self._draft_model_runner.token_to_kv_pool_allocator
+                    ),
+                    tree_cache=self._tree_cache,
+                    model_config=self._draft_model_runner.model_config,
+                    enable_overlap=False,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                )
+                batch.prepare_for_extend()
+                self._resolve_prefill_inputs(batch)
+                extend_result = self._draft_worker.forward_batch_generation(batch)
+                next_tokens = extend_result.next_token_ids
+                extend_graph_replays = int(extend_result.can_run_cuda_graph)
+                extend_cuda_graph = bool(extend_result.can_run_cuda_graph)
             extend_measurement_event_id = (
                 self._draft_model_runner._last_cuda_graph_measurement_event_id
             )
@@ -2255,6 +4951,20 @@ class FlashMTPDraftEngine:
                 decode_done_ns.append(time.monotonic_ns())
                 proposals.append(next_tokens)
 
+            if (
+                decode_graph_replays == max(self.profile.draft_k - 1, 0)
+                and not self.__dict__.get(
+                    "_standalone_graph_replay_evidence_emitted", False
+                )
+            ):
+                self._standalone_graph_replay_evidence_emitted = True
+                logger.info(
+                    "DT STANDALONE Draft CUDA graph replay observed: "
+                    "mode=PROPOSAL_DECODE batch_size=%d replays=%d",
+                    len(tasks),
+                    decode_graph_replays,
+                )
+
             measurement_tasks = [
                 task
                 for task in tasks
@@ -2262,23 +4972,33 @@ class FlashMTPDraftEngine:
             ]
             measurement_reconcile = sum(task.round_id > 0 for task in measurement_tasks)
             measurement_bootstrap = len(measurement_tasks) - measurement_reconcile
+            if extend_graph_replays == expected_extend_graph_replays:
+                extend_execution = "graph"
+            elif extend_graph_replays == 0:
+                extend_execution = "eager"
+            else:
+                extend_execution = "mixed"
             if measurement_bootstrap:
                 self._record_graph_measurement(
                     path="bootstrap_prefill",
-                    execution="graph" if extend_cuda_graph else "eager",
+                    execution=extend_execution,
                     measurement_rows=measurement_bootstrap,
                     measurement_batch_rows=len(measurement_tasks),
                     batch_size=len(tasks),
                     model_runner_event_id=extend_measurement_event_id,
+                    graph_replays=extend_graph_replays,
+                    expected_graph_replays=expected_extend_graph_replays,
                 )
             if measurement_reconcile:
                 self._record_graph_measurement(
                     path="reconcile_prefill",
-                    execution="graph" if extend_cuda_graph else "eager",
+                    execution=extend_execution,
                     measurement_rows=measurement_reconcile,
                     measurement_batch_rows=len(measurement_tasks),
                     batch_size=len(tasks),
                     model_runner_event_id=extend_measurement_event_id,
+                    graph_replays=extend_graph_replays,
+                    expected_graph_replays=expected_extend_graph_replays,
                 )
             if measurement_tasks:
                 expected_decode_replays = max(self.profile.draft_k - 1, 0)
@@ -2352,6 +5072,8 @@ class FlashMTPDraftEngine:
             bootstrap_count=sum(task.round_id == 0 for task in tasks),
             reconcile_count=sum(task.round_id > 0 for task in tasks),
             extend_cuda_graph=extend_cuda_graph,
+            extend_graph_replays=extend_graph_replays,
+            expected_extend_graph_replays=expected_extend_graph_replays,
             decode_graph_replays=decode_graph_replays,
             prepare_ns=prepare_done_ns - batch_start_ns,
             extend_ns=extend_done_ns - prepare_done_ns,
@@ -2372,6 +5094,7 @@ class FlashMTPDraftEngine:
         model_runner_event_id: int | None = None,
         graph_replays: int | None = None,
         expected_graph_replays: int | None = None,
+        fallback_reason: str | None = None,
     ) -> None:
         key = (path, execution)
         counts = self._graph_measurement_counts.setdefault(key, [0, 0])
@@ -2384,7 +5107,9 @@ class FlashMTPDraftEngine:
             "path": path,
             "execution": execution,
             "fallback_reason": (
-                None if execution == "graph" else "model_runner_reported"
+                None
+                if execution == "graph"
+                else fallback_reason or "model_runner_reported"
             ),
             "batches": counts[0],
             "measurement_rows": counts[1],
@@ -2500,6 +5225,154 @@ class FlashMTPDraftEngine:
         )
         return state
 
+    def _prepare_eagle3_persistent_tasks(
+        self, tasks: list[object]
+    ) -> tuple[list[PersistentDraftRequest], bool]:
+        """Batch the GPU bookkeeping shared by an EAGLE3 reconcile wave.
+
+        ``_prepare_persistent_task`` intentionally remains the general,
+        per-request path used by STANDALONE and by mixed bootstrap/reconcile
+        batches.  A normal EAGLE3 steady-state batch, however, contains unique
+        reconcile handles.  Freeing every rejected proposal suffix as one
+        allocator group and packing all committed-prefix rows with one dtype
+        conversion avoids two GPU launches per request without changing any
+        request's persistent KV ownership.
+        """
+
+        from dt_protocol import DraftTaskKind
+
+        if not tasks or any(task.kind != DraftTaskKind.RECONCILE for task in tasks):
+            return [self._prepare_persistent_task(task) for task in tasks], False
+        handles = [task.draft_kv_handle for task in tasks]
+        if len(set(handles)) != len(handles):
+            return [self._prepare_persistent_task(task) for task in tasks], False
+
+        validated: list[tuple[object, PersistentDraftRequest, Req, int, int]] = []
+        for task in tasks:
+            state = self._persistent_requests.get(task.draft_kv_handle)
+            if state is None:
+                raise ValueError("Draft reconcile KV handle does not exist")
+            if (
+                state.request_id != task.request_id
+                or state.target_instance_id != task.target_instance_id
+            ):
+                raise ValueError(
+                    "Draft reconcile request identity does not match KV owner"
+                )
+            if task.round_id != state.last_round_id + 1:
+                raise ValueError("Draft reconcile round is not the next request round")
+            if state.proposal_base_len != state.valid_committed_len:
+                raise RuntimeError(
+                    "Draft proposal base diverged from committed boundary"
+                )
+            if not task.committed_token_ids:
+                raise ValueError("Draft reconcile requires a non-empty committed delta")
+            expected_len = state.valid_committed_len + len(task.committed_token_ids)
+            if task.committed_kv_len != expected_len:
+                raise ValueError(
+                    "Draft reconcile delta does not end at committed length"
+                )
+            req = state.req
+            if req.kv is None or req.req_pool_idx is None:
+                raise RuntimeError("Draft reconcile lost its persistent KV handle")
+            old_allocated_len = req.kv.kv_allocated_len
+            if old_allocated_len < state.valid_committed_len:
+                raise RuntimeError(
+                    "Draft allocated KV is shorter than committed prefix"
+                )
+            validated.append(
+                (
+                    task,
+                    state,
+                    req,
+                    state.valid_committed_len,
+                    old_allocated_len,
+                )
+            )
+
+        allocator = self._draft_model_runner.token_to_kv_pool_allocator
+        allocator.free_group_begin()
+        try:
+            for _task, _state, req, committed_len, allocated_len in validated:
+                self._free_persistent_kv_suffix(req, committed_len, allocated_len)
+            allocator.free_group_end()
+        except Exception as exc:
+            # A failed grouped allocator update cannot prove which suffix pages
+            # remain owned.  The outer feature-batch guard must quarantine the
+            # affected rows rather than attempting a second free.
+            setattr(exc, "resources_quiescent", False)
+            raise
+
+        # Publish the shortened ownership boundary before allocating the packed
+        # prefix view.  If that allocation fails, outer cleanup must free only
+        # the still-owned committed pages, never the suffixes released above.
+        for _task, _state, req, committed_len, _allocated_len in validated:
+            req.kv.kv_allocated_len = committed_len
+
+        req_to_token = self._draft_model_runner.req_to_token_pool.req_to_token
+        prefix_lengths = [item[3] for item in validated]
+        packed_prefix_indices = torch.cat(
+            [
+                req_to_token[req.req_pool_idx, :committed_len]
+                for _task, _state, req, committed_len, _allocated_len in validated
+            ],
+            dim=0,
+        ).to(torch.int64)
+        prefix_views = torch.split(packed_prefix_indices, prefix_lengths)
+
+        states = []
+        for (
+            task,
+            state,
+            req,
+            committed_len,
+            old_allocated_len,
+        ), prefix_indices in zip(validated, prefix_views, strict=True):
+            discarded_tokens = old_allocated_len - committed_len
+            logger.debug(
+                "DT Draft grouped reconcile: request=%s round=%d stable=%d "
+                "discarded=%d refill=%d committed=%d",
+                state.request_id,
+                task.round_id,
+                committed_len,
+                discarded_tokens,
+                len(task.committed_token_ids),
+                task.committed_kv_len,
+            )
+            req.kv_committed_len = committed_len
+            req.prefix_indices = prefix_indices
+            req.output_ids.extend(task.committed_token_ids)
+            req._refresh_fill_ids()
+            req.set_extend_range(committed_len, task.committed_kv_len)
+            state.valid_committed_len = task.committed_kv_len
+            state.proposal_base_len = task.committed_kv_len
+            state.last_round_id = task.round_id
+            state.committed_token_ids.extend(task.committed_token_ids)
+            profile_emit(
+                "draft_reconciliation",
+                draft_instance=self.instance_id,
+                request_id=state.request_id,
+                round_id=task.round_id,
+                discarded_tokens=discarded_tokens,
+                refilled_tokens=len(task.committed_token_ids),
+                committed_kv_len=task.committed_kv_len,
+                grouped=True,
+            )
+            states.append(state)
+        grouped_batches = self.__dict__.get("_eagle3_grouped_reconcile_batches", 0) + 1
+        grouped_rows = self.__dict__.get("_eagle3_grouped_reconcile_rows", 0) + len(
+            tasks
+        )
+        self._eagle3_grouped_reconcile_batches = grouped_batches
+        self._eagle3_grouped_reconcile_rows = grouped_rows
+        if grouped_batches & (grouped_batches - 1) == 0:
+            logger.info(
+                "DT EAGLE3 grouped reconcile observed: batches=%d rows=%d",
+                grouped_batches,
+                grouped_rows,
+            )
+        return states, True
+
     @staticmethod
     def _migration_status_key(migration_id: str, phase) -> str:
         return f"{migration_id}:{phase.value}"
@@ -2548,11 +5421,26 @@ class FlashMTPDraftEngine:
             pending_dflash_batches=len(
                 getattr(self, "_pending_dflash_completions", ())
             ),
+            pending_flashmtp_batches=len(
+                getattr(self, "_pending_flashmtp_completions", ())
+            ),
+            pending_eagle3_batches=len(
+                getattr(self, "_pending_eagle3_completions", ())
+            ),
+        )
+
+    def _has_pending_feature_gpu_completions(self) -> bool:
+        return bool(
+            getattr(self, "_pending_flashmtp_completions", ())
+            or getattr(self, "_pending_dflash_completions", ())
+            or getattr(self, "_pending_eagle3_completions", ())
         )
 
     def _poll_deferred_migration_gpu_controls(self) -> bool:
+        if self._fatal_gpu_quarantine_active():
+            return False
         controls = getattr(self, "_deferred_migration_gpu_controls", None)
-        if not controls or getattr(self, "_pending_dflash_completions", ()):
+        if not controls or self._has_pending_feature_gpu_completions():
             return False
         key = next(iter(controls))
         deferred = controls.pop(key)
@@ -2605,7 +5493,7 @@ class FlashMTPDraftEngine:
                 self._migration_cleanup_ids.get(message.migration_id, ""),
             )
             return
-        if self._is_dflash and getattr(self, "_pending_dflash_completions", ()):
+        if self._is_feature_backed and self._has_pending_feature_gpu_completions():
             # Reservation writes the request page table and then reads the
             # allocated GPU indices into its transport descriptor.  On the
             # shared model stream that CPU read would wait for an unrelated
@@ -2732,7 +5620,7 @@ class FlashMTPDraftEngine:
                 self._migration_cleanup_ids.get(message.migration_id, ""),
             )
             return
-        if self._is_dflash and getattr(self, "_pending_dflash_completions", ()):
+        if self._is_feature_backed and self._has_pending_feature_gpu_completions():
             # Export snapshots GPU page-table indices into the CUDA-IPC
             # descriptor.  Guard against every outstanding DFlash batch, not
             # just work for the handle being migrated, so another request's
@@ -2970,6 +5858,8 @@ class FlashMTPDraftEngine:
             raise ValueError("KV migration control does not match its reservation")
 
     def _poll_migration_transfers(self) -> bool:
+        if self._fatal_gpu_quarantine_active():
+            return False
         changed = False
         for prepared in tuple(self._prepared_migrations.values()):
             future = prepared.transfer_future
@@ -3008,6 +5898,8 @@ class FlashMTPDraftEngine:
         self._migration_quiescence_probes[migration_id] = transport.probe_quiescence()
 
     def _poll_migration_quiescence_probes(self) -> bool:
+        if self._fatal_gpu_quarantine_active():
+            return False
         changed = False
         now_ns = time.monotonic_ns()
         for migration_id, future in tuple(self._migration_quiescence_probes.items()):
@@ -3193,6 +6085,8 @@ class FlashMTPDraftEngine:
             self._publish_capacity()
 
     def _resume_feature_finalizations(self) -> None:
+        if self._fatal_gpu_quarantine_active():
+            return
         for migration_id, message in tuple(
             self._deferred_migration_finalizations.items()
         ):
@@ -3654,6 +6548,15 @@ class FlashMTPDraftEngine:
             return False
         if request_id is not None and state.request_id != request_id:
             raise ValueError("Draft release request identity does not match KV owner")
+        if draft_kv_handle in self._quarantined_feature_draft_handles:
+            self._deferred_persistent_releases[draft_kv_handle] = state.request_id
+            profile_emit(
+                "draft_request_release_quarantined",
+                request_id=state.request_id,
+                draft_kv_handle=draft_kv_handle,
+                reason="unquiesced_feature_gpu_operation",
+            )
+            return False
         active_feature_consumer = self._dflash_handle_has_active_consumer(
             draft_kv_handle
         )
@@ -3688,6 +6591,7 @@ class FlashMTPDraftEngine:
             state.request_id,
             state.draft_kv_handle,
         )
+        self._ack_applied_request_releases(draft_kv_handle)
         return True
 
     def _dflash_handle_has_active_consumer(self, draft_kv_handle: str) -> bool:
@@ -3702,6 +6606,10 @@ class FlashMTPDraftEngine:
         return any(
             item.task.draft_kv_handle == draft_kv_handle
             for completion in self._pending_dflash_completions
+            for item in completion.pending
+        ) or any(
+            item.task.draft_kv_handle == draft_kv_handle
+            for completion in getattr(self, "_pending_eagle3_completions", ())
             for item in completion.pending
         )
 
@@ -3726,7 +6634,10 @@ class FlashMTPDraftEngine:
             ControlAck,
         )
 
-        for release_id, message in tuple(self._pending_request_release_acks.items()):
+        acknowledged = False
+        for release_id, message in tuple(
+            getattr(self, "_pending_request_release_acks", {}).items()
+        ):
             if message.draft_kv_handle != draft_kv_handle:
                 continue
             self._pending_request_release_acks.pop(release_id)
@@ -3739,7 +6650,9 @@ class FlashMTPDraftEngine:
                     message_id=release_id,
                 ),
             )
-        self._flush_reliable_outbox()
+            acknowledged = True
+        if acknowledged:
+            self._flush_reliable_outbox()
 
     def _free_persistent_kv_suffix(self, req: Req, start: int, end: int) -> None:
         """Free an intentionally uncommitted proposal suffix from Draft KV."""
@@ -3764,10 +6677,13 @@ class FlashMTPDraftEngine:
             ResultBufferRef,
         )
 
+        profile = self._profile_active
+        publish_started_ns = time.monotonic_ns() if profile else 0
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
         slot_id = self._free_result_slots.popleft()
         generation = self._result_store.write(slot_id, candidate_bytes)
+        result_written_ns = time.monotonic_ns() if profile else 0
         self._result_sequence += 1
         batch_id = f"{self.instance_id}:result:{self._result_sequence}"
         entries = tuple(
@@ -3832,7 +6748,37 @@ class FlashMTPDraftEngine:
             range_transfer_ids=range_transfer_ids,
         )
         self._published_by_batch[batch_id] = published
+        send_started_ns = time.monotonic_ns() if profile else 0
         self._send_result(message)
+        if profile:
+            send_done_ns = time.monotonic_ns()
+            profile_emit(
+                "draft_result_publish",
+                draft_instance=self.instance_id,
+                batch_id=batch_id,
+                result_kind="proposal",
+                entries=len(tasks),
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                candidate_rows=len(tasks),
+                publish_started_ns=publish_started_ns,
+                result_publish_completed_ns=send_done_ns,
+                batch_completed_ns=send_done_ns,
+                enqueue_flush_ns=send_done_ns - send_started_ns,
+            )
+            profile_emit(
+                "draft_flashmtp_result_publish",
+                draft_instance=self.instance_id,
+                batch_id=batch_id,
+                batch_size=len(tasks),
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                slot_id=slot_id,
+                generation=generation,
+                candidate_bytes=len(candidate_bytes),
+                mmap_write_ns=result_written_ns - publish_started_ns,
+                message_build_ns=send_started_ns - result_written_ns,
+                enqueue_flush_ns=send_done_ns - send_started_ns,
+                total_ns=send_done_ns - publish_started_ns,
+            )
 
     def _publish_materialization_successes(self, tasks: list[object]) -> None:
         from dt_protocol import (
@@ -3843,10 +6789,13 @@ class FlashMTPDraftEngine:
 
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
+        profile = self._profile_active
+        publish_started_ns = time.monotonic_ns() if profile else 0
         self._result_sequence += 1
+        batch_id = f"{self.instance_id}:materialized:{self._result_sequence}"
         message = DraftExecutionResultBatch(
             protocol_version=PROTOCOL_VERSION,
-            batch_id=f"{self.instance_id}:materialized:{self._result_sequence}",
+            batch_id=batch_id,
             draft_instance_id=self.instance_id,
             entries=tuple(
                 DraftResultEntry(
@@ -3862,6 +6811,21 @@ class FlashMTPDraftEngine:
             sent_ns=time.monotonic_ns(),
         )
         self._send_result(message)
+        if profile:
+            publish_completed_ns = time.monotonic_ns()
+            profile_emit(
+                "draft_result_publish",
+                draft_instance=self.instance_id,
+                batch_id=batch_id,
+                result_kind="materialization",
+                entries=len(tasks),
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                candidate_rows=0,
+                publish_started_ns=publish_started_ns,
+                result_publish_completed_ns=publish_completed_ns,
+                batch_completed_ns=publish_completed_ns,
+                enqueue_flush_ns=publish_completed_ns - publish_started_ns,
+            )
 
     def _publish_failures(self, failures: list[tuple[object, Exception]]) -> None:
         from dt_protocol import (
@@ -3897,39 +6861,6 @@ class FlashMTPDraftEngine:
         )
         self._send_result(message)
 
-    def _read_pivot(self, task) -> bytes:
-        source = task.source
-        store = self._get_source_store(source.uri)
-        payload = store.read(source.source_slot_id, source.slot_generation)
-        if len(payload) != source.nbytes:
-            raise ValueError(
-                f"pivot byte size mismatch: descriptor={source.nbytes}, "
-                f"actual={len(payload)}"
-            )
-        return payload
-
-    def _read_pivot_into(self, task, destination: memoryview) -> None:
-        source = task.source
-        store = self._get_source_store(source.uri)
-        length = store.read_into(
-            source.source_slot_id,
-            source.slot_generation,
-            destination,
-        )
-        if length != source.nbytes:
-            raise ValueError(
-                f"pivot byte size mismatch: descriptor={source.nbytes}, actual={length}"
-            )
-
-    def _get_source_store(self, uri: str):
-        from dt_transport import MmapSlotStore
-
-        store = self._source_stores.get(uri)
-        if store is None:
-            store = MmapSlotStore.open(uri)
-            self._source_stores[uri] = store
-        return store
-
     def _validate_task(self, task) -> None:
         from dt_protocol import DraftTaskKind
 
@@ -3938,51 +6869,52 @@ class FlashMTPDraftEngine:
             raise ValueError("Draft task profile mismatch")
         if task.k != self.profile.draft_k:
             raise ValueError("Draft task k mismatch")
-        if self._is_dflash:
+        if self._is_feature_backed:
             if task.kind not in {
                 DraftTaskKind.BOOTSTRAP,
                 DraftTaskKind.RECONCILE,
             }:
-                raise ValueError("DFLASH Draft requires a persistent task kind")
+                raise ValueError("feature-backed Draft requires a persistent task kind")
             if not task.draft_kv_handle:
-                raise ValueError("DFLASH Draft task requires a KV handle")
+                raise ValueError("feature-backed Draft task requires a KV handle")
             if source is None:
-                raise ValueError("DFLASH Draft task requires Target hidden states")
+                raise ValueError("feature-backed Draft requires Target hidden states")
             if (
                 source.target_instance_id != task.target_instance_id
                 or source.transfer_id != task.transfer_id
             ):
-                raise ValueError("DFLASH feature source identity mismatch")
+                raise ValueError("feature source identity mismatch")
             if source.feature_schema_id != self.profile.feature_schema.schema_id:
-                raise ValueError("DFLASH feature schema mismatch")
+                raise ValueError("feature schema mismatch")
             if source.transport != "cuda-ipc":
-                raise ValueError("DFLASH features require CUDA IPC transport")
+                raise ValueError("features require CUDA IPC transport")
             if source.dtype != "bfloat16":
-                raise ValueError("DFLASH feature source must be BF16")
+                raise ValueError("feature source must be BF16")
             if tuple(source.shape) != (
                 task.feature_token_count,
                 self._pivot_width,
             ):
-                raise ValueError("DFLASH feature source shape mismatch")
+                raise ValueError("feature source shape mismatch")
             expected_nbytes = task.feature_token_count * self._pivot_width * 2
             if source.nbytes != expected_nbytes:
-                raise ValueError("DFLASH feature source byte length mismatch")
+                raise ValueError("feature source byte length mismatch")
             if (
                 task.feature_token_count <= 0
                 or task.feature_token_count > self.feature_buffer_max_tokens
                 or len(task.committed_token_ids) != task.feature_token_count
+                or len(task.feature_token_ids) != task.feature_token_count
             ):
-                raise ValueError("DFLASH feature/token count is invalid")
+                raise ValueError("feature/token count is invalid")
             if (
                 task.feature_token_offset < 0
                 or task.committed_kv_len
                 != task.feature_token_offset + task.feature_token_count
             ):
-                raise ValueError("DFLASH committed-length invariant failed")
+                raise ValueError("feature committed-length invariant failed")
             if task.kind == DraftTaskKind.BOOTSTRAP and (
                 task.round_id != 0 or task.feature_token_offset != 0
             ):
-                raise ValueError("DFLASH bootstrap must begin at round/offset zero")
+                raise ValueError("feature bootstrap must begin at round/offset zero")
             if not (
                 source.source_session_id
                 and source.pool_generation
@@ -3991,7 +6923,7 @@ class FlashMTPDraftEngine:
                 and source.ipc_handle
                 and source.producer_event_handle
             ):
-                raise ValueError("DFLASH CUDA IPC descriptor fence is incomplete")
+                raise ValueError("CUDA IPC feature descriptor fence is incomplete")
             if (
                 source.allocation_length <= 0
                 or source.allocation_offset < 0
@@ -3999,12 +6931,12 @@ class FlashMTPDraftEngine:
                 or source.allocation_offset + source.byte_offset + source.nbytes
                 > source.allocation_length
             ):
-                raise ValueError("DFLASH CUDA IPC source range is invalid")
+                raise ValueError("CUDA IPC feature source range is invalid")
             if any(
                 token_id < 0 or token_id >= self.profile.vocab_size
                 for token_id in (*task.committed_token_ids, task.next_token_id)
             ):
-                raise ValueError("DFLASH token ID is outside vocabulary")
+                raise ValueError("feature-backed token ID is outside vocabulary")
             return
         if self._persistent:
             if task.kind not in {
@@ -4030,8 +6962,15 @@ class FlashMTPDraftEngine:
             return
         if task.kind != DraftTaskKind.PROPOSE:
             raise ValueError("FlashMTP V1 accepts only pivot proposal tasks")
+        if not task.requires_proposal or task.source_read_migration_id:
+            raise ValueError("FlashMTP proposal must be immediate and non-migrating")
         if source is None:
             raise ValueError("FlashMTP V1 requires a Target feature source")
+        if (
+            source.target_instance_id != task.target_instance_id
+            or source.transfer_id != task.transfer_id
+        ):
+            raise ValueError("FlashMTP source identity mismatch")
         if source.feature_schema_id != self.profile.feature_schema.schema_id:
             raise ValueError("Draft task feature schema mismatch")
         expected_nbytes = self._pivot_width * 2
@@ -4039,24 +6978,62 @@ class FlashMTPDraftEngine:
             raise ValueError(
                 f"Draft pivot nbytes mismatch: {source.nbytes} != {expected_nbytes}"
             )
-        if source.transport != "mmap" or not source.uri:
-            raise ValueError("DT V1 Draft supports only mmap source descriptors")
+        if (
+            source.transport != "cuda-ipc"
+            or source.uri
+            or source.dtype != "bfloat16"
+            or tuple(source.shape) != (1, self._pivot_width)
+            or not source.source_session_id
+            or not source.pool_generation
+            or not source.transport_session
+            or not source.device_uuid
+            or not source.ipc_handle
+            or not source.producer_event_handle
+        ):
+            raise ValueError(
+                "FlashMTP requires a complete fenced CUDA IPC pivot descriptor"
+            )
+        if (
+            source.source_device_id < 0
+            or source.source_slot_id < 0
+            or source.slot_generation < 0
+            or source.byte_offset < 0
+            or source.allocation_offset < 0
+            or source.allocation_length <= 0
+            or source.allocation_offset + source.byte_offset + source.nbytes
+            > source.allocation_length
+        ):
+            raise ValueError("FlashMTP CUDA IPC pivot range is invalid")
+        if (
+            task.draft_kv_handle
+            or task.committed_token_ids
+            or task.committed_kv_len
+            or task.feature_token_ids
+            or task.feature_token_offset
+            or task.feature_token_count
+        ):
+            raise ValueError("FlashMTP proposal must not carry persistent KV metadata")
 
     def _drop_cancelled_pending(self) -> None:
         if not self._cancelled_ids or not self._pending:
             return
         kept = deque()
+        retired_handles: set[str] = set()
         for task in self._pending:
             if task.transfer_id in self._cancelled_ids:
                 self._pending_ids.discard(task.transfer_id)
                 self._cancelled_ids.discard(task.transfer_id)
                 self._received_ns_by_transfer.pop(task.transfer_id, None)
-                if not self._persistent or self._is_dflash:
+                if not self._persistent or self._is_feature_backed:
                     if not getattr(task, "source_read_migration_id", ""):
                         self._publish_source_done(task)
+                if self._persistent:
+                    retired_handles.add(task.draft_kv_handle)
             else:
                 kept.append(task)
         self._pending = kept
+        for draft_kv_handle in retired_handles:
+            self._drain_deferred_persistent_release(draft_kv_handle)
 
     def _release_result(self, published: PublishedResult) -> None:
         if self._published_by_batch.pop(published.batch_id, None) is None:
@@ -4078,19 +7055,51 @@ class FlashMTPDraftEngine:
             or message.result_pool_generation != self._result_pool_generation
         ):
             return False
-        key = (
+        released = False
+        identity = (
             message.draft_session_id,
             message.result_pool_generation,
             message.buffer_id,
             message.generation,
-            message.row_offset,
-            message.row_count,
         )
-        batch_id = self._published_by_range.pop(key, None)
-        released = False
-        if batch_id is not None:
-            published = self._published_by_batch[batch_id]
-            published.range_transfer_ids.pop(key, None)
+        batch_ids = {
+            batch_id
+            for candidate, batch_id in self._published_by_range.items()
+            if candidate[:4] == identity
+        }
+        if len(batch_ids) > 1:
+            raise RuntimeError("result buffer generation belongs to multiple batches")
+        published = (
+            self._published_by_batch[next(iter(batch_ids))] if batch_ids else None
+        )
+        if published is not None:
+            # PullDone can release a coalesced Target range, a migration
+            # singleton inside that range, or a covering range after another
+            # cleanup already punched a hole in it. Validate against immutable
+            # publication rows, then monotonically subtract every still-live
+            # row in the acknowledged interval.
+            row_start = message.row_offset
+            row_end = row_start + message.row_count
+            interval_transfer_ids = {
+                transfer_id
+                for transfer_id, (target_instance_id, row_index) in (
+                    published.transfer_rows.items()
+                )
+                if target_instance_id == message.target_instance_id
+                and row_start <= row_index < row_end
+            }
+            if len(interval_transfer_ids) != message.row_count:
+                raise ValueError(
+                    "PullDone range does not match published Target result rows"
+                )
+            live_transfer_ids = {
+                transfer_id
+                for transfer_ids in published.range_transfer_ids.values()
+                for transfer_id in transfer_ids
+            }
+            self._rebuild_accepted_ranges(
+                published, live_transfer_ids - interval_transfer_ids
+            )
             if not published.range_transfer_ids:
                 self._release_result(published)
                 released = True
@@ -4108,6 +7117,16 @@ class FlashMTPDraftEngine:
     def _rebuild_accepted_ranges(
         self, published: PublishedResult, accepted: set[str]
     ) -> None:
+        # ResultBatchAck is delivered reliably and may be repeated after one
+        # or more Targets have already returned PullDone.  Keep range state
+        # monotonic: an ACK may discard rejected rows, but it must never
+        # recreate a row whose reader has already released it.
+        live_transfer_ids = {
+            transfer_id
+            for transfer_ids in published.range_transfer_ids.values()
+            for transfer_id in transfer_ids
+        }
+        accepted.intersection_update(live_transfer_ids)
         for key in published.range_transfer_ids:
             self._published_by_range.pop(key, None)
         by_target: dict[str, list[tuple[int, str]]] = {}
@@ -4152,14 +7171,25 @@ class FlashMTPDraftEngine:
         )
         active_feature_tasks = sum(
             len(batch.pending) for batch in self._pending_feature_batches
-        ) + sum(len(batch.pending) for batch in self._pending_dflash_completions)
+        ) + sum(
+            len(batch.pending)
+            for batch in getattr(self, "_pending_flashmtp_completions", ())
+        ) + sum(
+            len(batch.pending) for batch in self._pending_dflash_completions
+        ) + sum(
+            len(batch.pending) for batch in self._pending_eagle3_completions
+        )
         pending_tasks = len(self._pending) + active_feature_tasks
         update = DraftCapacityUpdate(
             protocol_version=PROTOCOL_VERSION,
             draft_instance_id=self.instance_id,
             pending_tasks=pending_tasks,
             max_pending_tasks=self.max_pending_tasks,
-            free_result_rows=len(self._free_result_slots) * self.max_batch_size,
+            free_result_rows=(
+                self._available_dflash_result_slots() * self.max_batch_size
+                if self._uses_direct_gpu_source
+                else len(self._free_result_slots) * self.max_batch_size
+            ),
             healthy=not self._stop,
             observed_ns=time.monotonic_ns(),
             free_request_rows=(
@@ -4190,7 +7220,20 @@ class FlashMTPDraftEngine:
         now_ns = time.monotonic_ns()
         for operation, message_id, message in self._delivery_outbox.due(now_ns=now_ns):
             if operation == "result":
+                result_send_started_ns = (
+                    time.monotonic_ns() if self._profile_active else 0
+                )
                 sent = self._client.publish_results(message)
+                if self._profile_active and not self._persistent:
+                    result_send_done_ns = time.monotonic_ns()
+                    profile_emit(
+                        "draft_flashmtp_result_send",
+                        draft_instance=self.instance_id,
+                        batch_id=message.batch_id,
+                        batch_size=len(message.entries),
+                        sent=bool(sent),
+                        send_ns=result_send_done_ns - result_send_started_ns,
+                    )
             elif operation == "source_read_done":
                 sent = (
                     self._client.source_reads_done(message)
@@ -4289,6 +7332,27 @@ class FlashMTPDraftEngine:
         self._source_done_batch_remaining.pop(batch_id, None)
         self._delivery_outbox.ack("source_read_done", batch_id)
 
+    def _handle_source_done_batch_ack(self, message) -> bool:
+        """Apply only an ACK fenced to this live Draft and Coordinator epoch."""
+
+        if message.draft_instance_id != self.instance_id:
+            raise ValueError("SourceReadDoneBatchAck belongs to another Draft instance")
+        if (
+            message.instance_session_id != self._client.instance_session_id
+            or message.coordinator_session_id != self._client.coordinator_session_id
+        ):
+            logger.warning(
+                "ignoring stale SourceReadDoneBatchAck: batch=%s", message.batch_id
+            )
+            return False
+        if not message.message_ids or len(set(message.message_ids)) != len(
+            message.message_ids
+        ):
+            raise ValueError("SourceReadDoneBatchAck must contain unique message IDs")
+        for message_id in message.message_ids:
+            self._ack_source_done(message_id)
+        return True
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SGLang external DT Draft engine")
@@ -4308,9 +7372,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument("--enable-deterministic-inference", action="store_true")
     parser.add_argument("--batch-source-read-done", action="store_true")
-    parser.add_argument("--pinned-pivot-staging", action="store_true")
+    parser.add_argument(
+        "--pinned-pivot-staging",
+        action="store_true",
+        help="deprecated compatibility flag; FlashMTP pivots always use CUDA IPC",
+    )
     parser.add_argument("--feature-buffer-max-tokens", type=int, default=8192)
     parser.add_argument("--feature-buffer-slot-count", type=int, default=2)
+    parser.add_argument("--dflash-submit-pipeline", action="store_true")
     parser.add_argument(
         "--migration-backend",
         choices=("disabled", "cuda-ipc"),
@@ -4347,6 +7416,7 @@ def main() -> None:
         migration_backend=args.migration_backend,
         feature_buffer_max_tokens=args.feature_buffer_max_tokens,
         feature_buffer_slot_count=args.feature_buffer_slot_count,
+        dflash_submit_pipeline=args.dflash_submit_pipeline,
     )
 
     def stop(_signum, _frame) -> None:

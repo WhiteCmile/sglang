@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 from dataclasses import replace
@@ -26,6 +27,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     compute_position,
+)
+from sglang.srt.model_executor.model_runner import (
+    CUDA_GRAPH_MEASUREMENT_MARKER,
+    DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -151,7 +156,7 @@ class _DflashDraftSampler:
         num_org,
         org_vocab_start,
         max_bs,
-        sample_from_anchor,
+        sample_from_anchor=False,
         tp_group=None,
     ):
         self.weight = weight
@@ -405,6 +410,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        self._draft_graph_measurement_counts = {}
+        self._draft_graph_measurement_event_seq = 0
         capture_decode_cuda_graph = (
             self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
         )
@@ -426,6 +433,52 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+
+    def _record_draft_graph_measurement(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        execution: str,
+        fallback_reason: str = "",
+    ) -> None:
+        measurement_rows = sum(
+            rid.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
+            for rid in (forward_batch.rids or ())
+        )
+        if not measurement_rows:
+            return
+        self._draft_graph_measurement_event_seq += 1
+        event_id = self._draft_graph_measurement_event_seq
+        key = (execution, fallback_reason)
+        counts = self._draft_graph_measurement_counts.setdefault(key, [0, 0])
+        counts[0] += 1
+        counts[1] += measurement_rows
+        if execution == "graph" and counts[0] & (counts[0] - 1):
+            return
+        payload = {
+            "event_namespace": "colocated_draft",
+            "worker": {
+                "role": "draft",
+                "tp_rank": self.ps.tp_rank,
+                "tp_size": self.ps.tp_size,
+                "pp_rank": self.ps.pp_rank,
+                "pp_size": self.ps.pp_size,
+            },
+            "mode": "DRAFT_VERIFY",
+            "execution": execution,
+            "fallback_reason": fallback_reason or None,
+            "event_id": event_id,
+            "batches": counts[0],
+            "measurement_rows": counts[1],
+            "batch_measurement_rows": measurement_rows,
+            "batch_size": forward_batch.batch_size,
+            "num_tokens": int(forward_batch.input_ids.numel()),
+        }
+        logger.info(
+            "%s%s",
+            CUDA_GRAPH_MEASUREMENT_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
     def _maybe_build_draft_sampler(self):
@@ -1708,11 +1761,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            rids=[req.rid for req in batch.reqs],
         )
 
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+        if draft_out.can_run_graph and self._draft_sampler is not None:
+            draft_execution = "graph"
+            draft_fallback_reason = ""
+        elif draft_out.can_run_graph:
+            draft_execution = "mixed"
+            draft_fallback_reason = "draft_sampler_eager"
+        else:
+            draft_execution = "eager"
+            draft_fallback_reason = "draft_verify_runner_rejected"
+        self._record_draft_graph_measurement(
+            forward_batch,
+            execution=draft_execution,
+            fallback_reason=draft_fallback_reason,
+        )
+        if (
+            draft_out.can_run_graph
+            and self.ps.tp_rank == 0
+            and not self.__dict__.get("_draft_graph_replay_evidence_emitted", False)
+        ):
+            self._draft_graph_replay_evidence_emitted = True
+            logger.info(
+                "Draft verify CUDA graph replay observed: mode=DRAFT_VERIFY "
+                "batch_size=%d",
+                bs,
+            )
 
         if self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[

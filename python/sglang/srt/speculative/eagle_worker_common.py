@@ -475,6 +475,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    gpu_profile_events: tuple[Any, ...] | None = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -488,6 +489,13 @@ def run_eagle_verify(
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     """
+    # This is the start of the internal verify CUDA-stream corridor.  Candidate
+    # casting, parent tensors, and build_eagle_verify_input happen before it.
+    if gpu_profile_events is not None:
+        if len(gpu_profile_events) != 5:
+            raise ValueError("EAGLE verify GPU profile requires five CUDA events")
+        gpu_profile_events[0].record()
+
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -562,11 +570,15 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
+    if gpu_profile_events is not None:
+        gpu_profile_events[1].record()
     forward_batch_output = target_worker.forward_batch_generation(
         batch=None,
         forward_batch=verify_forward_batch,
         is_verify=True,
     )
+    if gpu_profile_events is not None:
+        gpu_profile_events[2].record()
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
@@ -644,6 +656,8 @@ def run_eagle_verify(
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    if gpu_profile_events is not None:
+        gpu_profile_events[3].record()
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent

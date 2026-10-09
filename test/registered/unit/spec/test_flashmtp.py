@@ -14,10 +14,12 @@ from sglang.srt.models.flashmtp import (
     FlashMTPMarkovHead,
 )
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.flashmtp_utils import (
     gather_flashmtp_next_pivot,
     parse_flashmtp_draft_config,
 )
+from sglang.srt.speculative.flashmtp_worker_v2 import FlashMTPWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from torch import nn
 
@@ -155,6 +157,22 @@ def test_flashmtp_prediction_hidden_alignment(left_shift, draft_block_len, expec
     hidden = torch.arange(2 * draft_block_len).view(2, draft_block_len, 1)
     actual = model.prediction_hidden(hidden).squeeze(-1)
     torch.testing.assert_close(actual, torch.tensor(expected))
+
+
+def test_flashmtp_legacy_graph_sampler_uses_post_anchor_hidden(monkeypatch):
+    worker = FlashMTPWorkerV2.__new__(FlashMTPWorkerV2)
+    worker.draft_model = SimpleNamespace(markov_head=None, left_shift=False)
+    sentinel = object()
+
+    def build_parent_sampler(self):
+        assert self._sample_from_anchor is False
+        return sentinel
+
+    monkeypatch.setattr(
+        DFlashWorkerV2, "_maybe_build_draft_sampler", build_parent_sampler
+    )
+
+    assert worker._maybe_build_draft_sampler() is sentinel
 
 
 def test_flashmtp_rejects_unsupported_modes():

@@ -147,6 +147,15 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+SIGTERM_WATCHDOG_POLL_INTERVAL_S = 5
+SIGTERM_SCHEDULER_GRACE_TIMEOUT_S = 15
+SIGTERM_CHILD_REAP_TIMEOUT_S = 5
+SIGTERM_ZERO_WORK_SHUTDOWN_BUDGET_S = (
+    SIGTERM_WATCHDOG_POLL_INTERVAL_S
+    + SIGTERM_SCHEDULER_GRACE_TIMEOUT_S
+    + SIGTERM_CHILD_REAP_TIMEOUT_S
+)
+
 
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
@@ -2845,9 +2854,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
-            await asyncio.sleep(5)
+            await asyncio.sleep(SIGTERM_WATCHDOG_POLL_INTERVAL_S)
 
         # Drain requests
+        abnormal_shutdown_reasons: list[str] = []
         while True:
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
@@ -2859,6 +2869,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.dump_requests_before_crash()
                 self.force_exit_handler()
+                abnormal_shutdown_reasons.append("server health check failed")
                 break
 
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
@@ -2867,13 +2878,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 self.force_exit_handler()
+                abnormal_shutdown_reasons.append("SGL_FORCE_SHUTDOWN is set")
                 break
 
             logger.info(
                 f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
             )
             if remain_num_req > 0:
-                await asyncio.sleep(5)
+                await asyncio.sleep(SIGTERM_WATCHDOG_POLL_INTERVAL_S)
             else:
                 break
 
@@ -2883,10 +2895,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
-        kill_process_tree(os.getpid(), include_parent=True)
+        deadline = time.monotonic() + SIGTERM_SCHEDULER_GRACE_TIMEOUT_S
+        remaining_schedulers = collect_scheduler_processes()
+        while remaining_schedulers:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            time.sleep(min(0.1, remaining_s))
+            remaining_schedulers = collect_scheduler_processes()
+        # Take one final snapshot at/after the grace deadline so a scheduler
+        # that exited during the last sleep is not reported as stuck.
+        remaining_schedulers = collect_scheduler_processes()
+        if remaining_schedulers:
+            scheduler_pids = [process.pid for process in remaining_schedulers]
+            logger.error(
+                "Scheduler processes did not exit within %.1fs after ShutdownReq; "
+                "pids=%s.",
+                SIGTERM_SCHEDULER_GRACE_TIMEOUT_S,
+                scheduler_pids,
+            )
+            abnormal_shutdown_reasons.append(
+                "scheduler grace deadline expired with live processes "
+                f"{scheduler_pids}"
+            )
+        try:
+            # Schedulers have already received ShutdownReq. Reap any remaining
+            # descendants before letting this server parent report a clean exit
+            # to its supervisor; killing the parent here would turn every normal
+            # shutdown into return code -SIGKILL.
+            kill_process_tree(
+                os.getpid(),
+                include_parent=False,
+                wait_timeout=SIGTERM_CHILD_REAP_TIMEOUT_S,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to reap SGLang child processes during graceful shutdown; "
+                "forcing a non-clean process-tree exit."
+            )
+            try:
+                kill_process_tree(os.getpid(), include_parent=True)
+            finally:
+                # The helper normally SIGKILLs this process and never returns.
+                # Preserve fail-closed behavior even if its psutil walk fails.
+                os.kill(os.getpid(), signal.SIGKILL)
+        if abnormal_shutdown_reasons:
+            logger.error(
+                "SGLang shutdown completed child cleanup but is not clean: %s",
+                "; ".join(abnormal_shutdown_reasons),
+            )
+            sys.exit(1)
         sys.exit(0)
 
     def force_exit_handler(self):

@@ -51,6 +51,10 @@ class DFlashDraftInputV2(SpecInput):
     # DTTargetController publishes them through its registered GPU ring.
     dt_feature_chunks: Optional[List[torch.Tensor]] = None
     dt_feature_token_chunks: Optional[List[torch.Tensor]] = None
+    # EAGLE3 keeps the unshifted Target-KV token stream separate from the
+    # next-token stream paired with its feature rows.  DFlash does not need a
+    # second stream because both are identical.
+    dt_committed_token_chunks: Optional[List[torch.Tensor]] = None
     dt_feature_offsets: Optional[List[int]] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
@@ -238,6 +242,11 @@ class DFlashDraftInputV2(SpecInput):
             self.dt_feature_token_chunks = [
                 self.dt_feature_token_chunks[index] for index in new_indices_cpu
             ]
+            if self.dt_committed_token_chunks is not None:
+                self.dt_committed_token_chunks = [
+                    self.dt_committed_token_chunks[index]
+                    for index in new_indices_cpu
+                ]
             self.dt_feature_offsets = [
                 self.dt_feature_offsets[index] for index in new_indices_cpu
             ]
@@ -278,6 +287,19 @@ class DFlashDraftInputV2(SpecInput):
             assert spec_info.dt_feature_offsets is not None
             self.dt_feature_chunks.extend(spec_info.dt_feature_chunks)
             self.dt_feature_token_chunks.extend(spec_info.dt_feature_token_chunks)
+            if self.dt_committed_token_chunks is None:
+                if spec_info.dt_committed_token_chunks is not None:
+                    raise ValueError(
+                        "cannot merge feature chunks with only one committed-token stream"
+                    )
+            else:
+                if spec_info.dt_committed_token_chunks is None:
+                    raise ValueError(
+                        "cannot merge committed-token chunks with a missing stream"
+                    )
+                self.dt_committed_token_chunks.extend(
+                    spec_info.dt_committed_token_chunks
+                )
             self.dt_feature_offsets.extend(spec_info.dt_feature_offsets)
 
         if self.reserved_seq_lens_cpu is not None:

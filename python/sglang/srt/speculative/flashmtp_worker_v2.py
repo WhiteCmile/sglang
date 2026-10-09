@@ -220,6 +220,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                         "legacy graph sampler assumes an anchor-inclusive draft block."
                     )
                 return None
+            # Legacy FlashMTP seeds slot 0 with the bonus/anchor token and
+            # predicts proposals from slots 1..block_size-1. The inherited
+            # target-LM-head sampler otherwise gets this alignment switch only
+            # from DFlashWorkerV2.__init__, which FlashMTP does not call.
+            self._sample_from_anchor = False
             return super()._maybe_build_draft_sampler()
         if self.ps.tp_rank == 0:
             logger.info("FLASHMTP v2 Markov head folded into the draft cuda graph.")
@@ -231,6 +236,8 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         )
 
     def init_cuda_graphs(self):
+        self._draft_graph_measurement_counts = {}
+        self._draft_graph_measurement_event_seq = 0
         capture_decode_cuda_graph = (
             self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
         )
@@ -481,9 +488,35 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             device_timer_category="flashmtp_draft",
             spec_info=draft_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            rids=[req.rid for req in batch.reqs],
         )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        if draft_out.can_run_graph and self._draft_sampler is not None:
+            draft_execution = "graph"
+            draft_fallback_reason = ""
+        elif draft_out.can_run_graph:
+            draft_execution = "mixed"
+            draft_fallback_reason = "draft_sampler_eager"
+        else:
+            draft_execution = "eager"
+            draft_fallback_reason = "draft_verify_runner_rejected"
+        self._record_draft_graph_measurement(
+            draft_forward_batch,
+            execution=draft_execution,
+            fallback_reason=draft_fallback_reason,
+        )
+        if (
+            draft_out.can_run_graph
+            and self.ps.tp_rank == 0
+            and not self.__dict__.get("_draft_graph_replay_evidence_emitted", False)
+        ):
+            self._draft_graph_replay_evidence_emitted = True
+            logger.info(
+                "Draft verify CUDA graph replay observed: mode=DRAFT_VERIFY "
+                "batch_size=%d",
+                batch_size,
+            )
         if self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : batch_size * self.num_proposed_tokens
@@ -548,6 +581,14 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
 
             sync_profile = cuda_sync_enabled()
         started_ns = time.monotonic_ns()
+        gpu_profile_events = None
+        if bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
+            self, "_is_dflash", False
+        ):
+            event_type = torch.get_device_module(self.device).Event
+            gpu_profile_events = tuple(
+                event_type(enable_timing=True) for _ in range(4)
+            )
         batch_size = int(candidates.shape[0])
         if tuple(candidates.shape) != (batch_size, self.block_size):
             raise ValueError(
@@ -588,12 +629,16 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         prepared_ns = time.monotonic_ns()
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        if gpu_profile_events is not None:
+            gpu_profile_events[0].record()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        if gpu_profile_events is not None:
+            gpu_profile_events[1].record()
         if sync_profile:
             torch.get_device_module(self.device).synchronize()
         target_done_ns = time.monotonic_ns()
@@ -709,7 +754,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
+        if gpu_profile_events is not None:
+            gpu_profile_events[2].record()
 
+        deferred_feature_hidden = None
+        deferred_feature_tokens = None
         if self._num_pivot_layers:
             packed_hidden = logits_output.hidden_states
             if packed_hidden is None:
@@ -717,12 +766,23 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                     "FLASHMTP verify requires captured target auxiliary hidden states."
                 )
             if getattr(self, "_is_dflash", False):
-                feature_chunks, feature_token_chunks = split_dflash_committed_rows(
-                    packed_hidden=packed_hidden,
-                    candidates=candidates,
-                    commit_lens=commit_lens,
-                    block_size=self.block_size,
-                )
+                if self.server_args.draft_target_defer_dflash_feature_stage:
+                    # Target CUDA graphs reuse their output buffers.  Preserve
+                    # this wave on the forward stream so the overlap scheduler
+                    # can launch the other lane before committed-row splitting.
+                    # Candidate rows also come from a reusable block buffer.
+                    if self.ps.tp_rank == 0:
+                        deferred_feature_hidden = packed_hidden.clone()
+                        deferred_feature_tokens = candidates.clone()
+                    feature_chunks = None
+                    feature_token_chunks = None
+                else:
+                    feature_chunks, feature_token_chunks = split_dflash_committed_rows(
+                        packed_hidden=packed_hidden,
+                        candidates=candidates,
+                        commit_lens=commit_lens,
+                        block_size=self.block_size,
+                    )
                 next_pivot = torch.empty(
                     (batch_size, 0), dtype=packed_hidden.dtype, device=self.device
                 )
@@ -756,7 +816,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             else:
                 next_input.dt_feature_offsets = [
                     int(value)
-                    for value in prefix_lens.to(device="cpu", dtype=torch.int64).tolist()
+                    for value in prefix_lens.to(
+                        device="cpu", dtype=torch.int64
+                    ).tolist()
                 ]
         if profile:
             from dt_profile import emit as profile_emit
@@ -783,8 +845,20 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         batch_result.dt_cuda_graph_measurement_event_id = (
             self.target_worker.model_runner._last_cuda_graph_measurement_event_id
         )
+        batch_result.dt_full_wave_id = getattr(batch, "dt_full_wave_id", None)
+        batch_result.dt_full_wave_ready_ns = getattr(
+            batch, "dt_full_wave_ready_ns", None
+        )
+        batch_result.dt_pipeline_lane_id = getattr(batch, "dt_pipeline_lane_id", None)
         if getattr(self, "_is_dflash", False):
             batch_result.dt_hidden_produced_ns = target_done_ns
+            if self.server_args.draft_target_defer_dflash_feature_stage:
+                batch_result.dt_deferred_dflash_feature_stage = True
+                batch_result.dt_dflash_packed_hidden = deferred_feature_hidden
+                batch_result.dt_dflash_candidate_tokens = deferred_feature_tokens
+            if gpu_profile_events is not None:
+                gpu_profile_events[3].record()
+                batch_result.dt_target_verify_gpu_events = gpu_profile_events
         return batch_result
 
     def _prepare_draft_block_eager(

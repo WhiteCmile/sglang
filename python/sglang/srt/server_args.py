@@ -2097,6 +2097,12 @@ class ServerArgs:
         "overlap scheduler behavior.",
         NS("spec"),
     ] = 0.0
+    draft_target_defer_dflash_feature_stage: A[
+        bool,
+        "Defer DFlash committed-row splitting and source publication until "
+        "overlap result processing, after the next Target wave can launch.",
+        NS("spec"),
+    ] = False
     draft_target_full_wave: A[
         bool,
         "Verify a Draft-Target wave only after every parked row is ready, while "
@@ -2109,6 +2115,12 @@ class ServerArgs:
         "with remote Draft execution.",
         NS("spec"),
     ] = 1
+    draft_target_pipeline_lane_weights: A[
+        Optional[str],
+        "Comma-separated positive admission weights for persistent full-wave "
+        "lanes. Omit for equal admission.",
+        NS("spec"),
+    ] = None
     draft_target_registration_timeout_s: A[
         float,
         "Startup registration timeout for the shared Draft Coordinator.",

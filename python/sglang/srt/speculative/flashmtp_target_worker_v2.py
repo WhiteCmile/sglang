@@ -283,6 +283,7 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
                 batch_size=batch_size,
                 verify_completed_ns=verify_completed_ns,
                 total_ns=verify_completed_ns - started_ns,
+                can_run_cuda_graph=bool(result.can_run_cuda_graph),
                 cuda_synchronized=sync_profile,
                 timing_scope=("gpu_complete" if sync_profile else "host_submission"),
             )

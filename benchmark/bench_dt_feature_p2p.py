@@ -336,6 +336,57 @@ class _InjectedFeatureRuntime:
             return self._enqueued.is_set(), self._enqueued_ns
 
 
+def _initialize_dflash_submission_fixture(
+    engine,
+    *,
+    device: torch.device,
+    slot_count: int,
+    max_batch_size: int,
+    block_size: int,
+    submit_pipeline: bool,
+) -> None:
+    """Install the production submission buffers on an extracted engine shell."""
+
+    engine.dflash_submit_pipeline = submit_pipeline
+    engine._proposal_req_pool_indices_host_buffers = [
+        torch.empty(max_batch_size, dtype=torch.int64, device="cpu", pin_memory=True)
+        for _ in range(slot_count)
+    ]
+    engine._proposal_req_pool_indices_buffers = [
+        torch.empty(max_batch_size, dtype=torch.int64, device=device)
+        for _ in range(slot_count)
+    ]
+    engine._proposal_prefix_lens_host_buffers = [
+        torch.empty(max_batch_size, dtype=torch.int64, device="cpu", pin_memory=True)
+        for _ in range(slot_count)
+    ]
+    engine._proposal_prefix_lens_buffers = [
+        torch.empty(max_batch_size, dtype=torch.int64, device=device)
+        for _ in range(slot_count)
+    ]
+    engine._proposal_bonus_tokens_host_buffers = [
+        torch.empty(max_batch_size, dtype=torch.int64, device="cpu", pin_memory=True)
+        for _ in range(slot_count)
+    ]
+    engine._proposal_bonus_tokens_buffers = [
+        torch.empty(max_batch_size, dtype=torch.int64, device=device)
+        for _ in range(slot_count)
+    ]
+    engine._candidate_result_host_buffers = []
+    engine._candidate_result_copy_stream = None
+    if submit_pipeline:
+        engine._candidate_result_host_buffers = [
+            torch.empty(
+                (max_batch_size, block_size),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(slot_count)
+        ]
+        engine._candidate_result_copy_stream = torch.cuda.Stream(device=device)
+
+
 def _dflash_launch_liveness_gate(device: torch.device, delay_cycles: int) -> dict:
     from sglang.srt.speculative.dt_draft_engine import (
         FlashMTPDraftEngine,
@@ -354,11 +405,19 @@ def _dflash_launch_liveness_gate(device: torch.device, delay_cycles: int) -> dic
     engine._feature_staging_buffers = [
         torch.zeros((rows, feature_width), dtype=torch.bfloat16, device=device)
     ]
+    _initialize_dflash_submission_fixture(
+        engine,
+        device=device,
+        slot_count=1,
+        max_batch_size=1,
+        block_size=block_size,
+        submit_pipeline=False,
+    )
     state = SimpleNamespace(
         req=SimpleNamespace(req_pool_idx=7), valid_committed_len=committed_len
     )
     cache_loc = torch.arange(rows, dtype=torch.int64, device=device)
-    engine._prepare_dflash_task = lambda _task: (state, cache_loc)
+    engine._prepare_dflash_task = lambda _task, _phase_ns: (state, cache_loc)
     captured: dict[str, Any] = {}
 
     class _DelayedMaterializer:
@@ -386,7 +445,7 @@ def _dflash_launch_liveness_gate(device: torch.device, delay_cycles: int) -> dic
         captured["seq_lens_cpu_device"] = seq_lens_cpu.device.type
         captured["seq_lens_cpu"] = seq_lens_cpu.tolist()
         captured["bonus_tokens_device"] = bonus_tokens.device.type
-        return candidates
+        return candidates, "eager", "fixture"
 
     engine._dflash_materializer = _DelayedMaterializer()
     engine._run_dflash_proposal = MethodType(_proposal, engine)
@@ -462,8 +521,10 @@ def _dflash_launch_liveness_gate(device: torch.device, delay_cycles: int) -> dic
     }
 
 
-def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> dict:
-    """Keep a second ready batch staged while the first GPU event is pending."""
+def _dflash_two_batch_liveness_gate(
+    device: torch.device, delay_cycles: int, *, submit_pipeline: bool
+) -> dict:
+    """Exercise two ready batches while the first proposal is still pending."""
 
     from sglang.srt.speculative.dt_draft_engine import (
         FlashMTPDraftEngine,
@@ -484,6 +545,23 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
         torch.zeros((rows, feature_width), dtype=torch.bfloat16, device=device)
         for _ in range(2)
     ]
+    _initialize_dflash_submission_fixture(
+        engine,
+        device=device,
+        slot_count=2,
+        max_batch_size=1,
+        block_size=block_size,
+        submit_pipeline=submit_pipeline,
+    )
+    metadata_host_buffers_pinned = all(
+        buffer.is_pinned()
+        for buffers in (
+            engine._proposal_req_pool_indices_host_buffers,
+            engine._proposal_prefix_lens_host_buffers,
+            engine._proposal_bonus_tokens_host_buffers,
+        )
+        for buffer in buffers
+    )
     states = {
         f"two-batch-{index}": SimpleNamespace(
             req=SimpleNamespace(req_pool_idx=7 + index),
@@ -495,7 +573,7 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
         transfer_id: torch.arange(rows, dtype=torch.int64, device=device)
         for transfer_id in states
     }
-    engine._prepare_dflash_task = lambda task: (
+    engine._prepare_dflash_task = lambda task, _phase_ns: (
         states[task.transfer_id],
         cache_locs[task.transfer_id],
     )
@@ -534,7 +612,7 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
                 "bonus_tokens_device": bonus_tokens.device.type,
             }
         )
-        return candidates
+        return candidates, "eager", "fixture"
 
     now_ns = _now_ns()
     tasks = [
@@ -565,22 +643,32 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
                 gpu_copy_ns=0,
                 feature_bytes=rows * feature_width * 2,
                 cold_mapping_count=0,
+                segment_count=1,
+                peer_count=1,
             )
         )
         return future
 
     engine._pending_feature_batches = deque(
         PendingFeatureBatch(
+            batch_id=f"two-batch-{index}",
             pending=[PendingDraftTask(task=task, pivot_bytes=None)],
             staging_slot=index,
             row_ranges=((0, rows),),
-            futures=(_ready_future(),),
+            future=_ready_future(),
             submitted_ns=now_ns,
         )
         for index, task in enumerate(tasks)
     )
     engine._dflash_materializer = _FirstBatchDelayedMaterializer()
     engine._run_dflash_proposal = MethodType(_proposal, engine)
+    if submit_pipeline:
+        # Keep candidate copy completion observably separate from proposal
+        # readiness.  Submission safety is evaluated while the first proposal
+        # is unfinished; completion ownership is evaluated afterward while
+        # only the copy stream remains pending.
+        with torch.cuda.stream(engine._candidate_result_copy_stream):
+            torch.cuda._sleep(delay_cycles * 2)
     engine.batch_source_read_done = False
     engine._free_feature_staging_slots = deque()
     engine._cancelled_ids = set()
@@ -619,25 +707,39 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
     FlashMTPDraftEngine._poll_feature_batches(engine)
     first_poll_returned_ns = _now_ns()
     first_completion = engine._pending_dflash_completions[0]
-    first_event_pending = not first_completion.completion_event.query()
+    first_proposal_pending = not first_completion.proposal_done_event.query()
+    first_completion_pending = not first_completion.completion_event.query()
     second_ready_while_first_pending = bool(
-        len(engine._pending_feature_batches) == 1
-        and engine._pending_feature_batches[0].futures[0].done()
-        and captured["materializer_calls"] == 1
+        (submit_pipeline and len(engine._pending_dflash_completions) == 2)
+        or (
+            not submit_pipeline
+            and len(engine._pending_feature_batches) == 1
+            and engine._pending_feature_batches[0].future.done()
+        )
+    )
+    second_submitted_while_first_proposal_pending = bool(
+        submit_pipeline
+        and first_proposal_pending
+        and not engine._pending_feature_batches
+        and len(engine._pending_dflash_completions) == 2
+        and captured["materializer_calls"] == 2
     )
 
-    guard_started_ns = _now_ns()
+    guard_started_ns = 0
+    guard_returned_ns = 0
     guard_error = ""
-    try:
-        FlashMTPDraftEngine._launch_dflash_materialization(
-            engine,
-            pending=[PendingDraftTask(task=tasks[1], pivot_bytes=None)],
-            staging_slot=1,
-            row_ranges=((0, rows),),
-        )
-    except RuntimeError as exc:
-        guard_error = str(exc)
-    guard_returned_ns = _now_ns()
+    if not submit_pipeline:
+        guard_started_ns = _now_ns()
+        try:
+            FlashMTPDraftEngine._launch_dflash_materialization(
+                engine,
+                pending=[PendingDraftTask(task=tasks[1], pivot_bytes=None)],
+                staging_slot=1,
+                row_ranges=((0, rows),),
+            )
+        except RuntimeError as exc:
+            guard_error = str(exc)
+        guard_returned_ns = _now_ns()
 
     engine._client.messages.append(
         CancelTransfers(
@@ -652,8 +754,10 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
     feature_poll_durations_ns = []
     completion_poll_durations_ns = []
     second_remained_staged = True
+    completion_ownership_preserved = True
+    candidate_copy_pending_polls = 0
     deadline = time.monotonic() + 10
-    while not first_completion.completion_event.query():
+    while not first_completion.proposal_done_event.query():
         if time.monotonic() >= deadline:
             raise TimeoutError("two-batch DFlash liveness gate timed out")
         poll_started_ns = _now_ns()
@@ -662,64 +766,147 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
         poll_started_ns = _now_ns()
         FlashMTPDraftEngine._poll_dflash_completions(engine)
         completion_poll_durations_ns.append(_now_ns() - poll_started_ns)
+        if not first_completion.completion_event.query():
+            completion_ownership_preserved = (
+                completion_ownership_preserved
+                and any(
+                    completion is first_completion
+                    for completion in engine._pending_dflash_completions
+                )
+                and 0 not in engine._free_feature_staging_slots
+            )
         poll_started_ns = _now_ns()
         FlashMTPDraftEngine._poll_feature_batches(engine)
         feature_poll_durations_ns.append(_now_ns() - poll_started_ns)
-        second_remained_staged = second_remained_staged and bool(
-            len(engine._pending_feature_batches) == 1
-            and captured["materializer_calls"] == 1
-        )
+        if not submit_pipeline:
+            second_remained_staged = second_remained_staged and bool(
+                len(engine._pending_feature_batches) == 1
+                and captured["materializer_calls"] == 1
+            )
         scheduler_ticks += 1
         time.sleep(0.0001)
 
-    first_event_ready_ns = _now_ns()
+    first_proposal_ready_ns = _now_ns()
+    proposal_ready_while_copy_pending = bool(
+        first_completion.proposal_done_event.query()
+        and not first_completion.completion_event.query()
+    )
+    while not first_completion.completion_event.query():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("two-batch DFlash copy completion timed out")
+        poll_started_ns = _now_ns()
+        FlashMTPDraftEngine._poll_messages(engine)
+        control_poll_durations_ns.append(_now_ns() - poll_started_ns)
+        poll_started_ns = _now_ns()
+        FlashMTPDraftEngine._poll_dflash_completions(engine)
+        completion_poll_durations_ns.append(_now_ns() - poll_started_ns)
+        if not first_completion.completion_event.query():
+            completion_ownership_preserved = (
+                completion_ownership_preserved
+                and any(
+                    completion is first_completion
+                    for completion in engine._pending_dflash_completions
+                )
+                and 0 not in engine._free_feature_staging_slots
+            )
+            candidate_copy_pending_polls += 1
+        scheduler_ticks += 1
+        time.sleep(0.0001)
+
     FlashMTPDraftEngine._poll_dflash_completions(engine)
+    second_poll_started_ns = 0
+    second_poll_returned_ns = 0
+    if not submit_pipeline:
+        if engine._pending_dflash_completions:
+            raise RuntimeError("first DFlash completion did not drain after readiness")
+        second_poll_started_ns = _now_ns()
+        FlashMTPDraftEngine._poll_feature_batches(engine)
+        second_poll_returned_ns = _now_ns()
+        if len(engine._pending_dflash_completions) != 1:
+            raise RuntimeError("second ready feature batch was not submitted")
     if engine._pending_dflash_completions:
-        raise RuntimeError("first DFlash completion did not drain after readiness")
-    second_poll_started_ns = _now_ns()
-    FlashMTPDraftEngine._poll_feature_batches(engine)
-    second_poll_returned_ns = _now_ns()
-    if len(engine._pending_dflash_completions) != 1:
-        raise RuntimeError("second ready feature batch was not submitted")
-    second_completion = engine._pending_dflash_completions[0]
-    second_completion.completion_event.synchronize()
-    FlashMTPDraftEngine._poll_dflash_completions(engine)
+        engine._pending_dflash_completions[-1].completion_event.synchronize()
+        FlashMTPDraftEngine._poll_dflash_completions(engine)
 
     first_poll_ms = (first_poll_returned_ns - first_poll_started_ns) / 1_000_000
-    second_poll_ms = (second_poll_returned_ns - second_poll_started_ns) / 1_000_000
+    second_poll_ms = (
+        (second_poll_returned_ns - second_poll_started_ns) / 1_000_000
+        if second_poll_started_ns
+        else 0.0
+    )
     first_gpu_ms = first_completion.materialize_start_event.elapsed_time(
         first_completion.materialize_done_event
     )
+    direct_guard_ok = bool(
+        submit_pipeline
+        or (
+            "must wait for the prior completion event" in guard_error
+            and (guard_returned_ns - guard_started_ns) < 10_000_000
+        )
+    )
+    mode_submission_ok = bool(
+        (
+            submit_pipeline
+            and second_submitted_while_first_proposal_pending
+            and proposal_ready_while_copy_pending
+            and first_poll_ms < first_gpu_ms / 4
+        )
+        or (
+            not submit_pipeline
+            and second_remained_staged
+            and second_poll_started_ns >= first_proposal_ready_ns
+            and second_poll_ms < first_gpu_ms / 4
+        )
+    )
+    exact_slot_reclamation = bool(
+        len(engine._free_feature_staging_slots) == 2
+        and sorted(engine._free_feature_staging_slots) == [0, 1]
+    )
     gate_passed = bool(
-        first_event_pending
+        first_proposal_pending
+        and first_completion_pending
+        and metadata_host_buffers_pinned
         and second_ready_while_first_pending
-        and second_remained_staged
         and scheduler_ticks > 0
         and "unrelated-control" in engine._cancelled_ids
-        and "must wait for the prior completion event" in guard_error
-        and (guard_returned_ns - guard_started_ns) < 10_000_000
+        and direct_guard_ok
+        and mode_submission_ok
+        and completion_ownership_preserved
+        and (not submit_pipeline or candidate_copy_pending_polls > 0)
         and max(feature_poll_durations_ns, default=0) < 10_000_000
         and max(control_poll_durations_ns, default=0) < 10_000_000
+        and max(completion_poll_durations_ns, default=0) < 10_000_000
         and captured["materializer_calls"] == 2
         and len(captured["metadata"]) == 2
         and all(
             item["seq_lens_cpu"] == [committed_len + block_size]
             for item in captured["metadata"]
         )
-        and second_poll_started_ns >= first_event_ready_ns
-        and second_poll_ms < first_gpu_ms / 4
         and not engine._pending_feature_batches
         and not engine._pending_dflash_completions
+        and exact_slot_reclamation
     )
     return {
+        "submit_pipeline": submit_pipeline,
         "first_poll_ms": first_poll_ms,
         "first_gpu_ms": first_gpu_ms,
-        "first_event_pending_at_poll_return": first_event_pending,
+        "first_proposal_pending_at_poll_return": first_proposal_pending,
+        "first_completion_pending_at_poll_return": first_completion_pending,
+        "metadata_host_buffers_pinned": metadata_host_buffers_pinned,
         "second_ready_while_first_pending": second_ready_while_first_pending,
         "second_remained_staged": second_remained_staged,
+        "second_submitted_while_first_proposal_pending": (
+            second_submitted_while_first_proposal_pending
+        ),
+        "proposal_ready_while_candidate_copy_pending": (
+            proposal_ready_while_copy_pending
+        ),
+        "candidate_copy_pending_polls": candidate_copy_pending_polls,
+        "completion_ownership_preserved": completion_ownership_preserved,
         "second_poll_ms": second_poll_ms,
         "second_submitted_after_first_ready": (
-            second_poll_started_ns >= first_event_ready_ns
+            bool(second_poll_started_ns)
+            and second_poll_started_ns >= first_proposal_ready_ns
         ),
         "scheduler_ticks_while_first_pending": scheduler_ticks,
         "control_message_processed_while_first_pending": (
@@ -728,9 +915,15 @@ def _dflash_two_batch_liveness_gate(device: torch.device, delay_cycles: int) -> 
         "max_control_poll_ns": max(control_poll_durations_ns, default=0),
         "max_completion_poll_ns": max(completion_poll_durations_ns, default=0),
         "max_feature_poll_ns": max(feature_poll_durations_ns, default=0),
-        "direct_launch_guard_ms": (guard_returned_ns - guard_started_ns) / 1_000_000,
+        "direct_launch_guard_ms": (
+            (guard_returned_ns - guard_started_ns) / 1_000_000
+            if guard_started_ns
+            else None
+        ),
         "direct_launch_guard_error": guard_error,
         "materializer_calls": captured["materializer_calls"],
+        "free_feature_staging_slots": list(engine._free_feature_staging_slots),
+        "exact_slot_reclamation": exact_slot_reclamation,
         "metadata": captured["metadata"],
         "gate_passed": gate_passed,
     }
@@ -870,6 +1063,14 @@ def _dflash_migration_control_liveness_gate(
                 device=device,
             )
         ]
+        _initialize_dflash_submission_fixture(
+            engine,
+            device=device,
+            slot_count=1,
+            max_batch_size=1,
+            block_size=block_size,
+            submit_pipeline=False,
+        )
         engine.batch_source_read_done = False
         statuses = []
         engine._publish_migration_status = statuses.append
@@ -881,7 +1082,7 @@ def _dflash_migration_control_liveness_gate(
             valid_committed_len=committed_len,
         )
         cache_loc = torch.arange(feature_rows, dtype=torch.int64, device=device)
-        engine._prepare_dflash_task = lambda _task: (state, cache_loc)
+        engine._prepare_dflash_task = lambda _task, _phase_ns: (state, cache_loc)
         engine._dflash_materializer = _DelayedMaterializer()
         candidates = torch.empty((1, block_size), dtype=torch.int32, device=device)
 
@@ -895,7 +1096,7 @@ def _dflash_migration_control_liveness_gate(
             bonus_tokens,
         ):
             del states, req_pool_indices, prefix_lens, seq_lens_cpu, bonus_tokens
-            return candidates
+            return candidates, "eager", "fixture"
 
         engine._run_dflash_proposal = MethodType(_proposal, engine)
         task = SimpleNamespace(
@@ -1107,7 +1308,18 @@ def _draft_worker(
         torch.cuda.set_device(config["destination_gpu"])
         device = torch.device("cuda", config["destination_gpu"])
         launch_gate = _dflash_launch_liveness_gate(device, config["delay_cycles"])
-        two_batch_gate = _dflash_two_batch_liveness_gate(device, config["delay_cycles"])
+        two_batch_gate = {
+            "off": _dflash_two_batch_liveness_gate(
+                device, config["delay_cycles"], submit_pipeline=False
+            ),
+            "on": _dflash_two_batch_liveness_gate(
+                device, config["delay_cycles"], submit_pipeline=True
+            ),
+        }
+        two_batch_gate["gate_passed"] = bool(
+            two_batch_gate["off"]["gate_passed"]
+            and two_batch_gate["on"]["gate_passed"]
+        )
         migration_control_gate = _dflash_migration_control_liveness_gate(
             device, config["delay_cycles"]
         )
@@ -1147,9 +1359,9 @@ def _draft_worker(
                     ),
                 )
                 submit_started_ns = _now_ns()
-                future = transport.submit(
-                    source=descriptor,
-                    destination=destination,
+                future = transport.submit_batch(
+                    sources=(descriptor,),
+                    destinations=(destination,),
                 )
                 submit_return_ns = _now_ns()
                 lifecycle_engine = None
@@ -1189,6 +1401,7 @@ def _draft_worker(
                     lifecycle_engine._pending_feature_batches = deque(
                         [
                             PendingFeatureBatch(
+                                batch_id=f"bench-{descriptor.transfer_id}",
                                 pending=[
                                     PendingDraftTask(
                                         task=lifecycle_task, pivot_bytes=None
@@ -1196,7 +1409,7 @@ def _draft_worker(
                                 ],
                                 staging_slot=0,
                                 row_ranges=((0, int(descriptor.shape[0])),),
-                                futures=(future,),
+                                future=future,
                                 submitted_ns=submit_started_ns,
                             )
                         ]

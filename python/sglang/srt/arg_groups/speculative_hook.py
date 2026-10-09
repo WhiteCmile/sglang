@@ -265,6 +265,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+    if server_args.draft_target_disaggregation_role is not None:
+        _validate_dflash_draft_target(server_args)
 
 
 def _handle_flashmtp(server_args: ServerArgs) -> None:
@@ -828,10 +830,24 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         and server_args.draft_target_disaggregation_role is None
     ):
         raise ValueError("STANDALONE_DT is internal to the disaggregated Target role")
-    if server_args.speculative_algorithm in ("STANDALONE", "STANDALONE_DT") and (
-        server_args.draft_target_disaggregation_role is not None
+    if (
+        server_args.speculative_algorithm == "STANDALONE"
+        and server_args.draft_target_disaggregation_role is not None
+    ):
+        raise ValueError(
+            "disaggregated token-only Target requires the internal "
+            "STANDALONE_DT algorithm"
+        )
+    if (
+        server_args.speculative_algorithm == "STANDALONE_DT"
+        and server_args.draft_target_disaggregation_role is not None
     ):
         _validate_standalone_draft_target(server_args)
+    if (
+        server_args.speculative_algorithm == "EAGLE3"
+        and server_args.draft_target_disaggregation_role is not None
+    ):
+        _validate_eagle3_draft_target(server_args)
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
@@ -904,6 +920,124 @@ def _validate_standalone_draft_target(server_args: ServerArgs) -> None:
             "disaggregated STANDALONE V2 milestone 1 requires "
             "--speculative-eagle-topk=1"
         )
+
+
+def _validate_dflash_draft_target(server_args: ServerArgs) -> None:
+    """Fail closed on the CUDA-only feature-conditioned DFlash Target role."""
+
+    if server_args.draft_target_disaggregation_role != "target":
+        raise ValueError(
+            "--draft-target-disaggregation-role currently accepts only target"
+        )
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("disaggregated DFLASH requires CUDA direct feature transport")
+    if server_args.dp_size != 1:
+        raise ValueError("disaggregated DFLASH requires dp_size == 1")
+    if server_args.disable_overlap_schedule:
+        raise ValueError(
+            "disaggregated DFLASH requires overlap scheduling; "
+            "--disable-overlap-schedule is unsupported"
+        )
+    if not server_args.draft_target_overlap_schedule:
+        raise ValueError(
+            "disaggregated DFLASH Target overlap requires the explicit "
+            "--draft-target-overlap-schedule opt-in"
+        )
+    if not server_args.draft_target_defer_dflash_feature_stage:
+        raise ValueError(
+            "disaggregated DFLASH requires "
+            "--draft-target-defer-dflash-feature-stage"
+        )
+    missing = [
+        flag
+        for flag, value in (
+            (
+                "--draft-target-coordinator-endpoint",
+                server_args.draft_target_coordinator_endpoint,
+            ),
+            ("--draft-target-instance-id", server_args.draft_target_instance_id),
+            ("--draft-target-profile-id", server_args.draft_target_profile_id),
+            (
+                "--draft-target-feature-schema-id",
+                server_args.draft_target_feature_schema_id,
+            ),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError("disaggregated DFLASH Target requires " + ", ".join(missing))
+    if server_args.draft_target_round_timeout_ms <= 0:
+        raise ValueError("--draft-target-round-timeout-ms must be positive")
+    if server_args.draft_target_registration_timeout_s <= 0:
+        raise ValueError("--draft-target-registration-timeout-s must be positive")
+
+
+def _validate_eagle3_draft_target(server_args: ServerArgs) -> None:
+    """Validate the target-only side of feature-conditioned EAGLE3 DT."""
+    if server_args.draft_target_disaggregation_role != "target":
+        raise ValueError(
+            "--draft-target-disaggregation-role currently accepts only target"
+        )
+    if server_args.dp_size != 1:
+        raise ValueError("disaggregated EAGLE3 requires dp_size == 1")
+    if server_args.enable_multi_layer_eagle:
+        raise ValueError("disaggregated EAGLE3 does not support multi-layer EAGLE")
+    if server_args.speculative_use_rejection_sampling:
+        raise ValueError(
+            "disaggregated EAGLE3 currently supports exact greedy verification only"
+        )
+    if server_args.speculative_eagle_topk != 1:
+        raise ValueError("disaggregated EAGLE3 requires --speculative-eagle-topk=1")
+    if (
+        server_args.speculative_num_draft_tokens
+        != server_args.speculative_num_steps + 1
+    ):
+        raise ValueError(
+            "disaggregated EAGLE3 requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1"
+        )
+    if (
+        not server_args.disable_overlap_schedule
+        and not server_args.draft_target_overlap_schedule
+    ):
+        raise ValueError(
+            "disaggregated EAGLE3 Target overlap requires the explicit "
+            "--draft-target-overlap-schedule opt-in"
+        )
+    if (
+        server_args.disable_overlap_schedule
+        and server_args.draft_target_overlap_schedule
+    ):
+        raise ValueError(
+            "--draft-target-overlap-schedule is incompatible with "
+            "--disable-overlap-schedule"
+        )
+    if server_args.draft_target_defer_dflash_feature_stage:
+        raise ValueError(
+            "--draft-target-defer-dflash-feature-stage is specific to DFlash"
+        )
+    missing = [
+        flag
+        for flag, value in (
+            (
+                "--draft-target-coordinator-endpoint",
+                server_args.draft_target_coordinator_endpoint,
+            ),
+            ("--draft-target-instance-id", server_args.draft_target_instance_id),
+            ("--draft-target-profile-id", server_args.draft_target_profile_id),
+            (
+                "--draft-target-feature-schema-id",
+                server_args.draft_target_feature_schema_id,
+            ),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError("disaggregated EAGLE3 Target requires " + ", ".join(missing))
+    if server_args.draft_target_round_timeout_ms <= 0:
+        raise ValueError("--draft-target-round-timeout-ms must be positive")
+    if server_args.draft_target_registration_timeout_s <= 0:
+        raise ValueError("--draft-target-registration-timeout-s must be positive")
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:

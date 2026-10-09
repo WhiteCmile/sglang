@@ -328,6 +328,15 @@ class SpeculativeAlgorithm(Enum):
             return MultiLayerEagleWorkerV2
 
         elif self.is_eagle():
+            if (
+                self.is_eagle3()
+                and server_args.draft_target_disaggregation_role == "target"
+            ):
+                from sglang.srt.speculative.eagle3_target_worker_v2 import (
+                    EAGLE3DisaggregatedTargetWorkerV2,
+                )
+
+                return EAGLE3DisaggregatedTargetWorkerV2
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
             return EAGLEWorkerV2

@@ -789,6 +789,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
+        *,
+        input_ids_are_feature_aligned: bool = False,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -799,7 +801,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_token_ids: Next token ids generated from the target forward.
         """
         # Construct input_ids
-        if not batch.forward_mode.is_idle():
+        if not batch.forward_mode.is_idle() and not input_ids_are_feature_aligned:
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
             new_input_ids = torch.empty_like(batch.input_ids)

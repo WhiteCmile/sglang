@@ -299,6 +299,8 @@ class ModelRunner:
         ] = {}
         self._cuda_graph_measurement_event_seq = 0
         self._last_cuda_graph_measurement_event_id: int | None = None
+        self._last_cuda_graph_measurement_execution: str | None = None
+        self._last_cuda_graph_measurement_fallback_reason: str | None = None
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -1646,6 +1648,8 @@ class ModelRunner:
         fallback_reason: str = "",
     ) -> None:
         self._last_cuda_graph_measurement_event_id = None
+        self._last_cuda_graph_measurement_execution = None
+        self._last_cuda_graph_measurement_fallback_reason = None
         measurement_rows = sum(
             rid.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX)
             for rid in (forward_batch.rids or ())
@@ -1655,6 +1659,8 @@ class ModelRunner:
         self._cuda_graph_measurement_event_seq += 1
         event_id = self._cuda_graph_measurement_event_seq
         self._last_cuda_graph_measurement_event_id = event_id
+        self._last_cuda_graph_measurement_execution = execution
+        self._last_cuda_graph_measurement_fallback_reason = fallback_reason or None
         mode = forward_batch.forward_mode.name
         pipeline_lane_id = getattr(forward_batch, "dt_pipeline_lane_id", None)
         key = (mode, execution, fallback_reason, pipeline_lane_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -188,6 +189,8 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            if getattr(result, "dt_eagle3_host_span_active", False):
+                result.dt_eagle3_copy_ready_ns = time.monotonic_ns()
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -716,6 +719,8 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if getattr(result, "dt_eagle3_host_span_active", False):
+            result.dt_eagle3_copy_ready_ns = time.monotonic_ns()
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -728,6 +733,8 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if getattr(result, "dt_eagle3_host_span_active", False):
+            result.dt_eagle3_copy_ready_ns = time.monotonic_ns()
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
