@@ -15,6 +15,7 @@ cover feature and KV transfers consistently.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -285,14 +286,16 @@ class TargetFeatureSourcePool:
         feature_schema_id: str,
         transfers: Sequence[FeatureTransferSlice],
         hidden_produced_ns: int | None = None,
+        stream: torch.cuda.Stream | None = None,
     ) -> FeaturePublish:
         """Copy packed BF16 features into a free source slot and publish leases.
 
         The copy and producer event are enqueued on the current Target CUDA
-        stream.  This method never synchronizes that stream and never stages
-        feature bytes on the CPU.  If every fixed slot is leased, it raises
-        ``FeatureTransportError`` so the caller can apply scheduler-level
-        backpressure rather than allocating an unbounded buffer.
+        stream, or on ``stream`` when the caller has already proven on the host
+        that every chunk is complete.  This method never synchronizes a stream
+        and never stages feature bytes on the CPU.  If every fixed slot is
+        leased, it raises ``FeatureTransportError`` so the caller can apply
+        scheduler-level backpressure rather than allocating an unbounded buffer.
         """
         if self._closed:
             raise FeatureTransportError("feature source pool is closed")
@@ -350,29 +353,36 @@ class TargetFeatureSourcePool:
                 self._active[item.transfer_id] = (slot_id, generation)
 
         producer_event = None
+        if stream is not None:
+            for chunk in chunks:
+                chunk.record_stream(stream)
+        publish_stream = (
+            torch.cuda.current_stream(self.device) if stream is None else stream
+        )
         try:
-            target = self._storage[slot_id]
-            cat = getattr(torch, "cat", None)
-            if len(chunks) > 1 and callable(cat):
-                # Pack ragged request chunks directly into the leased,
-                # registered slot. ``out=`` avoids a transient packed tensor
-                # while replacing one D2D enqueue per request with one ordered
-                # CUDA operation. The producer event below fences the complete
-                # pack exactly as it fenced the former copy loop.
-                cat(chunks, dim=0, out=target[:token_count])
-                pack_strategy = "cat-out"
-            else:
-                # A single chunk is already one enqueue. Keep the original
-                # loop as the capability fallback for runtimes without cat.
-                row_offset = 0
-                for chunk in chunks:
-                    row_end = row_offset + int(chunk.shape[0])
-                    target[row_offset:row_end].copy_(chunk, non_blocking=True)
-                    row_offset = row_end
-                pack_strategy = "copy-loop"
-            producer_event = torch.cuda.Event(interprocess=True)
-            producer_event.record(torch.cuda.current_stream(self.device))
-            event_handle = producer_event.ipc_handle()
+            with torch.cuda.stream(publish_stream):
+                target = self._storage[slot_id]
+                cat = getattr(torch, "cat", None)
+                if len(chunks) > 1 and callable(cat):
+                    # Pack ragged request chunks directly into the leased,
+                    # registered slot. ``out=`` avoids a transient packed tensor
+                    # while replacing one D2D enqueue per request with one ordered
+                    # CUDA operation. The producer event below fences the complete
+                    # pack exactly as it fenced the former copy loop.
+                    cat(chunks, dim=0, out=target[:token_count])
+                    pack_strategy = "cat-out"
+                else:
+                    # A single chunk is already one enqueue. Keep the original
+                    # loop as the capability fallback for runtimes without cat.
+                    row_offset = 0
+                    for chunk in chunks:
+                        row_end = row_offset + int(chunk.shape[0])
+                        target[row_offset:row_end].copy_(chunk, non_blocking=True)
+                        row_offset = row_end
+                    pack_strategy = "copy-loop"
+                producer_event = torch.cuda.Event(interprocess=True)
+                producer_event.record(publish_stream)
+                event_handle = producer_event.ipc_handle()
         except Exception:
             # A failed enqueue is not safe to reuse: CUDA may have accepted a
             # prefix of work.  Keep the fixed slot quarantined until process
@@ -749,6 +759,60 @@ class TargetFeatureSourcePool:
         slot.state = FeatureSlotState.QUARANTINED
 
 
+@dataclass(slots=True)
+class _InlinePull:
+    copy_stream: torch.cuda.Stream
+    gpu_queued: torch.cuda.Event
+    gpu_start: torch.cuda.Event
+    gpu_done: torch.cuda.Event
+    submitted_ns: int
+    mapping_started_ns: int
+    mapping_done_ns: int
+    driver_submit_started_ns: int
+    driver_submit_done_ns: int
+    feature_bytes: int
+    cold_mapping_count: int
+    gpu_start_observed_ns: int = 0
+
+
+class _InlinePullFuture:
+    """Future-compatible handle for a pull enqueued on the caller's thread.
+
+    ``done()`` is a nonblocking CUDA event query, so the serving loop observes
+    copy completion directly instead of waiting for a helper thread to win the
+    GIL from the busy-polling scheduler loop.
+    """
+
+    __slots__ = ("_transport", "_pending", "_result", "_exception", "_done")
+
+    def __init__(self, transport: "DraftFeaturePullTransport", pending: _InlinePull):
+        self._transport = transport
+        self._pending = pending
+        self._result: FeaturePullMetrics | None = None
+        self._exception: BaseException | None = None
+        self._done = False
+
+    def done(self) -> bool:
+        if not self._done:
+            self._transport._reap_inline(self)
+        return self._done
+
+    def result(self, timeout: float | None = None) -> FeaturePullMetrics:
+        if not self.done():
+            # Only shutdown/worker paths block; the scheduler polls done().
+            self._pending.gpu_done.synchronize()
+            self._transport._reap_inline(self)
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        if not self.done():
+            self._pending.gpu_done.synchronize()
+            self._transport._reap_inline(self)
+        return self._exception
+
+
 class DraftFeaturePullTransport:
     """Asynchronously pull one Target feature range into Draft-local VRAM."""
 
@@ -786,6 +850,19 @@ class DraftFeaturePullTransport:
         self._admission = Condition(self._lock)
         self._admitted_pulls = 0
         self._lifecycle_fence = False
+        # Inline mode enqueues the copy on the calling scheduler thread and
+        # completes it by event query. No helper thread is on the hot path.
+        self._inline_submit = os.environ.get("DT_FEATURE_PULL_INLINE", "1") == "1"
+        self._inline_inflight: set[_InlinePullFuture] = set()
+        self._inline_streams: list[torch.cuda.Stream] = []
+        self._inline_last_done: list[torch.cuda.Event | None] = []
+        self._inline_cursor = 0
+        if self._inline_submit:
+            for _ in range(min(max_workers, 8)):
+                stream = torch.cuda.Stream(device=self.device)
+                self._inline_streams.append(stream)
+                self._inline_last_done.append(None)
+                self._copy_streams.append(stream)
 
     def submit(
         self,
@@ -795,6 +872,8 @@ class DraftFeaturePullTransport:
     ) -> Future[FeaturePullMetrics]:
         """Queue a direct source-to-destination pull and return immediately."""
         self._validate_submission(source, destination)
+        if getattr(self, "_inline_submit", False):
+            return self._submit_inline(source, destination)
         admission = getattr(self, "_admission", None)
         lock = self._lock if admission is None else admission
         with lock:
@@ -896,8 +975,7 @@ class DraftFeaturePullTransport:
                 ) from self._fatal_error
             self._lifecycle_fence = True
             try:
-                while self._admitted_pulls:
-                    admission.wait()
+                self._wait_admitted_drained_locked()
                 self._mapping_cache.invalidate(target_instance_id)
             finally:
                 self._lifecycle_fence = False
@@ -950,8 +1028,7 @@ class DraftFeaturePullTransport:
     def _run_quiescence_probe(self) -> bool:
         try:
             with self._admission:
-                while self._admitted_pulls:
-                    self._admission.wait()
+                self._wait_admitted_drained_locked()
             return self._probe_stream_quiescence()
         finally:
             with self._admission:
@@ -964,6 +1041,15 @@ class DraftFeaturePullTransport:
                 return
             self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if getattr(self, "_inline_inflight", None):
+            try:
+                for stream in self._inline_streams:
+                    stream.synchronize()
+            except Exception:
+                with self._lock:
+                    self._fatal_error = FeatureTransportQuiescenceError(
+                        "inline feature pull did not quiesce at close"
+                    )
         # Do not close mappings after an unquiesced failure: CUDA could still
         # access them. Context teardown is safer than remote-memory reuse.
         if self._fatal_error is None:
@@ -982,6 +1068,192 @@ class DraftFeaturePullTransport:
         except Exception:
             return False
         return True
+
+    def _wait_admitted_drained_locked(self) -> None:
+        """Wait (holding ``_admission``) until no admitted pull remains."""
+        while self._admitted_pulls:
+            handles = tuple(getattr(self, "_inline_inflight", ()))
+            if not handles:
+                self._admission.wait()
+                continue
+            self._admission.release()
+            try:
+                for handle in handles:
+                    self._reap_inline(handle)
+            finally:
+                self._admission.acquire()
+            if self._admitted_pulls:
+                self._admission.wait(0.0002)
+
+    def _next_inline_stream(self) -> int:
+        """Prefer an idle copy stream so one producer wait does not block others."""
+        count = len(self._inline_streams)
+        for offset in range(count):
+            index = (self._inline_cursor + offset) % count
+            last = self._inline_last_done[index]
+            if last is None or last.query():
+                self._inline_cursor = (index + 1) % count
+                return index
+        index = self._inline_cursor
+        self._inline_cursor = (index + 1) % count
+        return index
+
+    def _submit_inline(
+        self, source: FeatureSourceDescriptor, destination: torch.Tensor
+    ) -> Future[FeaturePullMetrics] | _InlinePullFuture:
+        with self._admission:
+            if self._closed:
+                raise FeatureTransportError("feature pull transport is closed")
+            if self._fatal_error is not None:
+                raise FeatureTransportError(
+                    "feature pull transport is quarantined after an unquiesced GPU-copy failure"
+                ) from self._fatal_error
+            if self._lifecycle_fence:
+                raise FeatureTransportError(
+                    "feature pull admission is fenced by peer lifecycle work"
+                )
+            self._admitted_pulls += 1
+        try:
+            pending = self._enqueue_inline(source, destination)
+        except BaseException as exc:
+            with self._admission:
+                self._admitted_pulls -= 1
+                self._admission.notify_all()
+            failed: Future[FeaturePullMetrics] = Future()
+            failed.set_exception(exc)
+            return failed
+        handle = _InlinePullFuture(self, pending)
+        with self._admission:
+            self._inline_inflight.add(handle)
+        return handle
+
+    def _enqueue_inline(
+        self, source: FeatureSourceDescriptor, destination: torch.Tensor
+    ) -> _InlinePull:
+        mapping_started_ns = time.monotonic_ns()
+        mapped_base, warm = self._mapping_cache.map(
+            peer_instance_id=source.target_instance_id,
+            peer_session_id=source.source_session_id,
+            pool_generation=source.pool_generation,
+            ipc_handle=source.ipc_handle,
+        )
+        segment = CopySegment(
+            source_address=mapped_base + source.allocation_offset + source.byte_offset,
+            destination_address=destination.data_ptr(),
+            length=source.nbytes,
+        )
+        source_ready = torch.cuda.Event.from_ipc_handle(
+            self.device_index, source.producer_event_handle
+        )
+        mapping_done_ns = time.monotonic_ns()
+        index = self._next_inline_stream()
+        copy_stream = self._inline_streams[index]
+        timing = self._profile_timing
+        gpu_queued = torch.cuda.Event(enable_timing=timing)
+        gpu_start = torch.cuda.Event(enable_timing=timing)
+        gpu_done = torch.cuda.Event(enable_timing=timing)
+        submitted_ns = time.monotonic_ns()
+        stream_may_reference_source = False
+        try:
+            with torch.cuda.stream(copy_stream):
+                stream_may_reference_source = True
+                gpu_queued.record(copy_stream)
+                copy_stream.wait_event(source_ready)
+                gpu_start.record(copy_stream)
+                driver_submit_started_ns = time.monotonic_ns()
+                self._runtime.copy_batch_async((segment,), copy_stream.cuda_stream)
+                driver_submit_done_ns = time.monotonic_ns()
+                gpu_done.record(copy_stream)
+        except Exception:
+            if stream_may_reference_source:
+                try:
+                    copy_stream.synchronize()
+                except Exception as fence_exc:
+                    fatal = FeatureTransportQuiescenceError(
+                        "failed feature pull may still access source or destination VRAM"
+                    )
+                    with self._lock:
+                        self._fatal_error = fatal
+                    raise fatal from fence_exc
+            raise
+        self._inline_last_done[index] = gpu_done
+        return _InlinePull(
+            copy_stream=copy_stream,
+            gpu_queued=gpu_queued,
+            gpu_start=gpu_start,
+            gpu_done=gpu_done,
+            submitted_ns=submitted_ns,
+            mapping_started_ns=mapping_started_ns,
+            mapping_done_ns=mapping_done_ns,
+            driver_submit_started_ns=driver_submit_started_ns,
+            driver_submit_done_ns=driver_submit_done_ns,
+            feature_bytes=source.nbytes,
+            cold_mapping_count=int(not warm),
+        )
+
+    def _reap_inline(self, handle: _InlinePullFuture) -> None:
+        """Resolve ``handle`` if its copy finished; never blocks."""
+        if handle._done:
+            return
+        pending = handle._pending
+        result = None
+        error = None
+        try:
+            if (
+                self._profile_timing
+                and not pending.gpu_start_observed_ns
+                and pending.gpu_start.query()
+            ):
+                pending.gpu_start_observed_ns = time.monotonic_ns()
+            if not pending.gpu_done.query():
+                return
+            completed_ns = time.monotonic_ns()
+            if not pending.gpu_start_observed_ns:
+                pending.gpu_start_observed_ns = completed_ns
+            timing = self._profile_timing
+            result = FeaturePullMetrics(
+                submitted_ns=pending.submitted_ns,
+                gpu_completed_ns=completed_ns,
+                mapping_ns=pending.mapping_done_ns - pending.mapping_started_ns,
+                driver_submit_ns=(
+                    pending.driver_submit_done_ns - pending.driver_submit_started_ns
+                ),
+                gpu_copy_ns=(
+                    int(pending.gpu_start.elapsed_time(pending.gpu_done) * 1_000_000)
+                    if timing
+                    else 0
+                ),
+                feature_bytes=pending.feature_bytes,
+                cold_mapping_count=pending.cold_mapping_count,
+                worker_started_ns=pending.mapping_started_ns,
+                mapping_done_ns=pending.mapping_done_ns,
+                driver_submit_started_ns=pending.driver_submit_started_ns,
+                driver_submit_done_ns=pending.driver_submit_done_ns,
+                cuda_pre_copy_ns=(
+                    int(pending.gpu_queued.elapsed_time(pending.gpu_start) * 1_000_000)
+                    if timing
+                    else 0
+                ),
+                gpu_start_observed_ns=(
+                    pending.gpu_start_observed_ns if timing else 0
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed query proves nothing
+            error = FeatureTransportQuiescenceError(
+                "feature pull completion could not be observed"
+            )
+            error.__cause__ = exc
+            with self._lock:
+                self._fatal_error = error
+        with self._admission:
+            if handle._done:
+                return
+            handle._result = result
+            handle._exception = error
+            handle._done = True
+            self._inline_inflight.discard(handle)
+            self._admitted_pulls -= 1
+            self._admission.notify_all()
 
     def _worker_stream(self):
         """Return one bounded CUDA stream owned by the current copy worker."""

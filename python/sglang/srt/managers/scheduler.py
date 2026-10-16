@@ -1696,6 +1696,8 @@ class Scheduler(
                 len(self.result_queue) if target_phase_profile_enabled else 0
             )
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if self.dt_target_controller is not None:
+                self.dt_target_controller.note_overlap_result_done(tmp_result)
             result_process_started_ns = (
                 time.monotonic_ns()
                 if target_phase_profile_enabled
@@ -1749,16 +1751,24 @@ class Scheduler(
                 if target_phase_profile_enabled
                 else 0
             )
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            if (
+                self.dt_target_controller is not None
+                and self.dt_target_controller.hold_next_batch
+            ):
+                # The launched batch has GPU work left; keep the next batch
+                # unfrozen and keep receiving (TP-consistent poll decision).
+                batch = None
+            else:
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
+                self.running_batch = plan.running_batch
+                batch = plan.batch_to_run
             selection_finished_ns = (
                 time.monotonic_ns()
                 if target_phase_profile_enabled
                 else 0
             )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch

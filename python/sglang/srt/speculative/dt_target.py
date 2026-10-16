@@ -506,6 +506,21 @@ class DTTargetController:
         self._measurement_lane_counts: dict[tuple[int, str], int] = {}
         self._overlap_launch_ns = 0
         self._overlap_result_ready: bool | None = None
+        # Late batch freezing: while a launched batch still has more remaining
+        # GPU time than it takes to form and submit the next one, hold the next
+        # batch open so READY work and new requests arriving meanwhile join it.
+        self._late_freeze = bool(
+            self.continuous_batching
+            and os.environ.get("DT_TARGET_LATE_FREEZE", "1") == "1"
+        )
+        self._freeze_margin_ns = int(
+            float(os.environ.get("DT_TARGET_FREEZE_MARGIN_MS", "1.0")) * 1_000_000
+        )
+        self._freeze_inflight: deque[list] = deque()
+        self._freeze_busy_ema_ns: dict[tuple[bool, int], float] = {}
+        self._freeze_lead_ema_ns: dict[bool, float] = {}
+        self._freeze_last_done_ns = 0
+        self.hold_next_batch = False
         self._client = None
         self._ledger = None
         self._feature_source_pool = None
@@ -1300,7 +1315,20 @@ class DTTargetController:
                     )
 
                     phase_started_ns = time.monotonic_ns()
+                    # Deferred rows are clones whose completion the host has
+                    # already observed. Publishing them on schedule_stream would
+                    # queue the copy behind the next verify (WAR barrier), so
+                    # the Draft pull would wait for that whole forward.
+                    publish_stream = None
+                    if deferred and all(row.is_contiguous() for row in hidden_rows):
+                        publish_stream = getattr(self, "_feature_publish_stream", None)
+                        if publish_stream is None:
+                            publish_stream = torch.cuda.Stream(
+                                device=hidden_rows[0].device
+                            )
+                            self._feature_publish_stream = publish_stream
                     published = self._feature_source_pool.publish(
+                        stream=publish_stream,
                         hidden_states=tuple(hidden_rows),
                         feature_schema_id=self.feature_schema_id,
                         transfers=tuple(
@@ -2475,6 +2503,7 @@ class DTTargetController:
                 ),
                 self._overlap_launch_ns,
             )
+            packet = (*packet, self._late_freeze_hold(overlap_result, packet[2]))
             receive_ns = time.monotonic_ns() - receive_start_ns
         broadcast_start_ns = time.monotonic_ns()
         if self.scheduler.ps.tp_size > 1:
@@ -2492,10 +2521,12 @@ class DTTargetController:
             result_ready,
             feature_source_free_slots,
             overlap_launch_ns,
+            hold_next_batch,
         ) = packet
         self._last_poll_ns = poll_now_ns
         self._overlap_launch_ns = overlap_launch_ns
         self._overlap_result_ready = result_ready
+        self.hold_next_batch = bool(hold_next_batch)
         self._feature_source_free_slots = feature_source_free_slots
         if self.is_export_rank and events:
             poll_finished_ns = time.monotonic_ns()
@@ -2992,6 +3023,7 @@ class DTTargetController:
         self._target_compute_batches_inflight = inflight_batches + 1
         if self.is_export_rank:
             self._overlap_launch_ns = time.monotonic_ns()
+            self._record_freeze_launch(launched_batch)
         for req in launched_batch.reqs:
             self._target_inflight_counts[req.rid] += 1
             self._target_inflight_reqs[req.rid] = req
@@ -3193,6 +3225,90 @@ class DTTargetController:
                 self._advance_lifecycle_attempt(req.rid)
         if unique and self.is_export_rank:
             self._flush_reliable_outbox()
+
+    @staticmethod
+    def _freeze_key(batch: ScheduleBatch) -> tuple[bool, int]:
+        if batch.forward_mode.is_extend():
+            return True, int(batch.extend_num_tokens or 0).bit_length()
+        return False, len(batch.reqs)
+
+    def _record_freeze_launch(self, launched_batch: ScheduleBatch) -> None:
+        """Remember a launch so its GPU busy time can be learned (TP0 only)."""
+        if not self._late_freeze or not self.scheduler.result_queue:
+            return
+        result = self.scheduler.result_queue[-1][1]
+        if getattr(result, "copy_done", None) is None:
+            return
+        launch_ns = self._overlap_launch_ns
+        key = self._freeze_key(launched_batch)
+        if self._last_poll_ns:
+            # Poll packet -> launch covers selection, build and submission:
+            # the time the next batch needs once its members are frozen.
+            # Prefill and decode differ by several milliseconds.
+            lead = launch_ns - self._last_poll_ns
+            previous = self._freeze_lead_ema_ns.get(key[0])
+            self._freeze_lead_ema_ns[key[0]] = (
+                lead if previous is None else 0.8 * previous + 0.2 * lead
+            )
+        self._freeze_inflight.append([result, launch_ns, key, 0])
+        while len(self._freeze_inflight) > 4:
+            self._freeze_inflight.popleft()
+
+    def _freeze_record(self, result) -> list | None:
+        for record in self._freeze_inflight:
+            if record[0] is result:
+                return record
+        return None
+
+    def _late_freeze_hold(self, overlap_result, result_ready) -> bool:
+        """Return whether the next batch should stay unfrozen (TP0 decision)."""
+        if not self._late_freeze or overlap_result is None:
+            return False
+        record = self._freeze_record(overlap_result)
+        if record is None:
+            return False
+        now_ns = time.monotonic_ns()
+        if result_ready:
+            if not record[3]:
+                record[3] = now_ns
+            return False
+        busy_ns = self._freeze_busy_ema_ns.get(record[2])
+        if busy_ns is None:
+            return False
+        start_ns = max(record[1], self._freeze_last_done_ns)
+        if now_ns - start_ns > 2 * busy_ns:
+            return False
+        # The next batch is normally another decode wave.
+        lead_ns = self._freeze_lead_ema_ns.get(False)
+        if lead_ns is None:
+            return False
+        lead_ns += self._freeze_margin_ns
+        return now_ns < start_ns + busy_ns - lead_ns
+
+    def note_overlap_result_done(self, result) -> None:
+        """Learn a batch's GPU busy time when its result is consumed (TP0)."""
+        if not self.is_export_rank or not self._late_freeze:
+            return
+        record = self._freeze_record(result)
+        if record is None:
+            return
+        while self._freeze_inflight and self._freeze_inflight[0] is not record:
+            self._freeze_inflight.popleft()
+        self._freeze_inflight.popleft()
+        copy_done = result.copy_done
+        exact = not copy_done.query()
+        if exact:
+            copy_done.synchronize()
+        done_ns = record[3] or time.monotonic_ns()
+        exact = exact or bool(record[3])
+        busy_ns = done_ns - max(record[1], self._freeze_last_done_ns)
+        self._freeze_last_done_ns = done_ns
+        previous = self._freeze_busy_ema_ns.get(record[2])
+        if previous is None:
+            self._freeze_busy_ema_ns[record[2]] = float(busy_ns)
+        elif exact or busy_ns < previous:
+            # A late observation is only an upper bound on the busy time.
+            self._freeze_busy_ema_ns[record[2]] = 0.8 * previous + 0.2 * busy_ns
 
     def should_defer_overlap_result(
         self, *, next_batch: ScheduleBatch | None, last_batch: ScheduleBatch | None

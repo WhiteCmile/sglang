@@ -49,6 +49,23 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.0005
+
+
+def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tensor:
+    """Select ordered candidate rows without blocking the serving loop.
+
+    Indexing a CUDA tensor with a Python list uploads the index from pageable
+    memory, which waits for all work already queued on the stream, i.e. the
+    next compute batch. Keep the common all-active case copy-free and stage
+    partial indices through pinned memory.
+    """
+    if len(indices) == int(rows.shape[0]) and indices == list(range(len(indices))):
+        return rows
+    if not rows.is_cuda:
+        return rows[indices].contiguous()
+    index_cpu = torch.tensor(indices, dtype=torch.int64, pin_memory=True)
+    index = index_cpu.to(rows.device, non_blocking=True)
+    return rows.index_select(0, index)
 COALESCING_POLL_S = 0.0001
 # Initial control delivery is immediate.  Retrying every scheduler tick-scale
 # interval amplifies delayed ACKs under full-wave load; keep retries reliable
@@ -3424,11 +3441,7 @@ class FlashMTPDraftEngine:
                 )
                 if source_rows is None:
                     raise RuntimeError("FlashMTP candidate rows are unavailable")
-                candidate_rows = (
-                    source_rows
-                    if active_indices == list(range(len(tasks)))
-                    else source_rows[active_indices].contiguous()
-                )
+                candidate_rows = _select_candidate_rows(source_rows, active_indices)
                 self._publish_successes(
                     [tasks[index] for index in active_indices],
                     (
@@ -4542,7 +4555,7 @@ class FlashMTPDraftEngine:
                     )
                     if source_rows is None:
                         raise RuntimeError("persistent candidate rows are unavailable")
-                    rows = source_rows[indices].contiguous()
+                    rows = _select_candidate_rows(source_rows, indices)
                     self._publish_successes(
                         active,
                         (
@@ -5548,9 +5561,9 @@ class FlashMTPDraftEngine:
                 if self.candidate_transport == "cuda-ipc":
                     if completion.candidates is None:
                         raise RuntimeError("DFLASH GPU candidates are unavailable")
-                    candidate_rows = completion.candidates[
-                        active_proposal_indices
-                    ].contiguous()
+                    candidate_rows = _select_candidate_rows(
+                        completion.candidates, active_proposal_indices
+                    )
                     candidate_payload = candidate_rows
                 elif completion.candidate_rows_cpu is not None:
                     candidate_rows = completion.candidate_rows_cpu[

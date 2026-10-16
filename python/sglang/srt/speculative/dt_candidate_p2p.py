@@ -668,7 +668,12 @@ class TargetCandidateArena:
                     raise CandidateTransportError("candidate completion is stale")
                 slot.state = CandidateSlotState.READING
                 slot_ids.append(slot_id)
-        indices = torch.tensor(slot_ids, dtype=torch.int64, device=self.device)
+        # A pageable list upload would block the scheduler until the verify
+        # already queued on this stream finishes; stage it in pinned memory.
+        indices_cpu = torch.tensor(
+            slot_ids, dtype=torch.int64, pin_memory=torch.cuda.is_available()
+        )
+        indices = indices_cpu.to(self.device, non_blocking=indices_cpu.is_pinned())
         rows = self.storage.index_select(0, indices)
         return rows
 
