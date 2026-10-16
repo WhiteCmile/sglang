@@ -777,7 +777,17 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                     # Candidate rows also come from a reusable block buffer.
                     if self.ps.tp_rank == 0:
                         try:
-                            deferred_feature_hidden = packed_hidden.clone()
+                            # DT Target writes the wave straight into a leased
+                            # feature-source slot when one is free, so the
+                            # Draft pull needs no later publication copy.
+                            reserve = getattr(
+                                self, "dt_deferred_hidden_destination", None
+                            )
+                            deferred_feature_hidden = (
+                                reserve(packed_hidden) if reserve is not None else None
+                            )
+                            if deferred_feature_hidden is None:
+                                deferred_feature_hidden = packed_hidden.clone()
                             deferred_feature_tokens = candidates.clone()
                         except torch.cuda.OutOfMemoryError as exc:
                             # Join peers at the existing ordered result-side

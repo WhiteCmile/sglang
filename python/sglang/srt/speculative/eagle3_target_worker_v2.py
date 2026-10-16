@@ -60,7 +60,9 @@ def _new_target_verify_gpu_profile_events(
     return tuple(event_type(enable_timing=True) for _ in range(5))
 
 
-def _freeze_eagle3_verify_features(result, *, packed_hidden, candidates, export_rank):
+def _freeze_eagle3_verify_features(
+    result, *, packed_hidden, candidates, export_rank, reserve=None
+):
     """Preserve one bounded verify wave before the next graph replay."""
     # Freeze every replay-owned output on the producing forward stream.
     # D2H is later submitted on copy_stream; retaining graph views alone
@@ -76,7 +78,11 @@ def _freeze_eagle3_verify_features(result, *, packed_hidden, candidates, export_
     result.dt_eagle3_committed_tokens = None
     if export_rank:
         try:
-            result.dt_dflash_packed_hidden = packed_hidden.clone()
+            # DT Target may lease a feature-source slot and write in place.
+            reserved = reserve(packed_hidden) if reserve is not None else None
+            result.dt_dflash_packed_hidden = (
+                packed_hidden.clone() if reserved is None else reserved
+            )
             # Predicted tokens condition features; the candidate prefix
             # is the distinct authoritative committed input sequence.
             result.dt_dflash_candidate_tokens = result.next_token_ids.view(
@@ -310,6 +316,7 @@ class EAGLE3DisaggregatedTargetWorkerV2(BaseSpecWorker):
             bonus_tokens = _freeze_eagle3_verify_features(
                 result, packed_hidden=packed_hidden, candidates=candidates,
                 export_rank=self.ps.tp_rank == 0,
+                reserve=getattr(self, "dt_deferred_hidden_destination", None),
             )
             feature_chunks = token_chunks = committed_token_chunks = None
         else:

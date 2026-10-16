@@ -865,6 +865,9 @@ class DraftCandidatePushTransport:
         )
         self._zmq_context = zmq.Context.instance()
         self._notice_encoder = msgspec.msgpack.Encoder()
+        # Completed candidates are pushed here rather than on the compute
+        # stream, where they would queue behind the next Draft batch.
+        self.push_stream = torch.cuda.Stream(device=self.device)
         self._closed = False
 
     @staticmethod

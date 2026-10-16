@@ -514,7 +514,7 @@ class DTTargetController:
             and os.environ.get("DT_TARGET_LATE_FREEZE", "1") == "1"
         )
         self._freeze_margin_ns = int(
-            float(os.environ.get("DT_TARGET_FREEZE_MARGIN_MS", "1.0")) * 1_000_000
+            float(os.environ.get("DT_TARGET_FREEZE_MARGIN_MS", "0")) * 1_000_000
         )
         self._freeze_inflight: deque[list] = deque()
         self._freeze_busy_ema_ns: dict[tuple[bool, int], float] = {}
@@ -533,6 +533,9 @@ class DTTargetController:
         self._source_shutdown_quarantine_error: BaseException | None = None
         self._feature_source_free_slots = 0
         self._deferred_dflash_feature_stages = 0
+        # data_ptr -> (slot_id, generation, ready_event) for verify waves whose
+        # hidden rows were written in place into a reserved source slot.
+        self._inplace_hidden: dict[int, tuple[int, int, torch.cuda.Event]] = {}
         self._feature_source_stall_started_ns = 0
         self._last_empty_prefill_arbitration_profile = None
         if self.is_export_rank:
@@ -573,6 +576,12 @@ class DTTargetController:
                     self._feature_source_free_slots = (
                         self._feature_source_pool.free_slot_count
                     )
+                    if self.is_feature_backed and os.environ.get(
+                        "DT_INPLACE_DEFERRED_HIDDEN", "1"
+                    ) == "1":
+                        scheduler.draft_worker.dt_deferred_hidden_destination = (
+                            self._reserve_deferred_hidden
+                        )
                 if self.candidate_transport == "cuda-ipc":
                     from sglang.srt.speculative.dt_candidate_p2p import (
                         TargetCandidateArena,
@@ -1056,6 +1065,50 @@ class DTTargetController:
                 self._release_source_slot(task.source_lease_id)
         batch_result.dt_staged_flashmtp_pivots = None
 
+    def _reserve_deferred_hidden(self, packed_hidden: torch.Tensor):
+        """Write a verify wave's hidden rows into a leased source slot (TP0).
+
+        Runs on the forward stream inside the verify, replacing the defensive
+        clone.  Returns the slot rows, or ``None`` to fall back to a clone.
+        """
+        pool = self._feature_source_pool
+        if (
+            pool is None
+            or packed_hidden.ndim != 2
+            or packed_hidden.dtype is not pool.dtype
+            or int(packed_hidden.shape[1]) != pool.feature_width
+            or not packed_hidden.is_contiguous()
+        ):
+            return None
+        reservation = pool.reserve(int(packed_hidden.shape[0]))
+        if reservation is None:
+            return None
+        slot_id, generation, rows = reservation
+        try:
+            rows.copy_(packed_hidden)
+            ready_event = torch.cuda.Event(interprocess=True)
+            ready_event.record()
+        except Exception:
+            pool.quarantine_reserved(slot_id, generation)
+            raise
+        self._inplace_hidden[rows.data_ptr()] = (slot_id, generation, ready_event)
+        return rows
+
+    def _release_inplace_hidden(self, batch_result) -> None:
+        """Return an in-place reservation that was not published."""
+        packed = getattr(batch_result, "dt_dflash_packed_hidden", None)
+        inplace = getattr(self, "_inplace_hidden", None)
+        if packed is None or not inplace:
+            return
+        reservation = inplace.pop(packed.data_ptr(), None)
+        if reservation is None:
+            return
+        slot_id, generation, ready_event = reservation
+        # The deferred stage already waited for this wave's copies; this only
+        # proves the in-place write itself finished before reuse.
+        ready_event.synchronize()
+        self._feature_source_pool.release_reserved(slot_id, generation)
+
     def _stage_dflash_feature_copy(
         self, batch: ScheduleBatch, batch_result, *, finalize_deferred: bool = False
     ) -> None:
@@ -1075,6 +1128,7 @@ class DTTargetController:
             )
         finally:
             if release_credit:
+                self._release_inplace_hidden(batch_result)
                 for name in (
                     "dt_dflash_packed_hidden", "dt_dflash_candidate_tokens",
                     "dt_dflash_candidate_tokens_cpu", "dt_dflash_bonus_tokens_cpu",
@@ -1320,31 +1374,76 @@ class DTTargetController:
                     # queue the copy behind the next verify (WAR barrier), so
                     # the Draft pull would wait for that whole forward.
                     publish_stream = None
-                    if deferred and all(row.is_contiguous() for row in hidden_rows):
+                    if (
+                        deferred
+                        and hidden_rows
+                        and torch.cuda.is_available()
+                        and all(row.is_contiguous() for row in hidden_rows)
+                    ):
                         publish_stream = getattr(self, "_feature_publish_stream", None)
                         if publish_stream is None:
                             publish_stream = torch.cuda.Stream(
                                 device=hidden_rows[0].device
                             )
                             self._feature_publish_stream = publish_stream
-                    published = self._feature_source_pool.publish(
-                        stream=publish_stream,
-                        hidden_states=tuple(hidden_rows),
-                        feature_schema_id=self.feature_schema_id,
-                        transfers=tuple(
-                            FeatureTransferSlice(
-                                transfer_id=transfer_id,
-                                row_offset=row_offset,
-                                row_count=row_count,
-                            )
-                            for transfer_id, row_offset, row_count in transfers
-                        ),
-                        hidden_produced_ns=getattr(
-                            batch_result,
-                            "dt_hidden_produced_ns",
-                            time.monotonic_ns(),
-                        ),
+                    packed = (
+                        getattr(batch_result, "dt_dflash_packed_hidden", None)
+                        if deferred
+                        else None
                     )
+                    inplace = getattr(self, "_inplace_hidden", None) or {}
+                    reservation = (
+                        None if packed is None else inplace.get(packed.data_ptr())
+                    )
+                    if reservation is not None:
+                        # Rows already live in the leased slot; describe them
+                        # where the verify wrote them.
+                        slot_id, generation, ready_event = reservation
+                        row_bytes = self.pivot_width * packed.element_size()
+                        published = self._feature_source_pool.publish_reserved(
+                            slot_id=slot_id,
+                            generation=generation,
+                            token_count=int(packed.shape[0]),
+                            feature_schema_id=self.feature_schema_id,
+                            transfers=tuple(
+                                FeatureTransferSlice(
+                                    transfer_id=transfer_id,
+                                    row_offset=(
+                                        row.data_ptr() - packed.data_ptr()
+                                    ) // row_bytes,
+                                    row_count=row_count,
+                                )
+                                for (transfer_id, _offset, row_count), row in zip(
+                                    transfers, hidden_rows, strict=True
+                                )
+                            ),
+                            producer_event=ready_event,
+                            hidden_produced_ns=getattr(
+                                batch_result,
+                                "dt_hidden_produced_ns",
+                                time.monotonic_ns(),
+                            ),
+                        )
+                        inplace.pop(packed.data_ptr(), None)
+                    else:
+                        published = self._feature_source_pool.publish(
+                            stream=publish_stream,
+                            hidden_states=tuple(hidden_rows),
+                            feature_schema_id=self.feature_schema_id,
+                            transfers=tuple(
+                                FeatureTransferSlice(
+                                    transfer_id=transfer_id,
+                                    row_offset=row_offset,
+                                    row_count=row_count,
+                                )
+                                for transfer_id, row_offset, row_count in transfers
+                            ),
+                            hidden_produced_ns=getattr(
+                                batch_result,
+                                "dt_hidden_produced_ns",
+                                time.monotonic_ns(),
+                            ),
+                        )
                     batch_result.dt_dflash_feature_publish_strategy = (
                         published.pack_strategy
                     )
@@ -2497,7 +2596,10 @@ class DTTargetController:
                 self._poll_export_rank(),
                 self._query_overlap_result_ready(overlap_result),
                 (
+                    # A reserved slot belongs to a deferred stage that already
+                    # holds a source credit; count it once, as before.
                     self._feature_source_pool.free_slot_count
+                    + self._feature_source_pool.reserved_slot_count
                     if self._feature_source_pool is not None
                     else 0
                 ),

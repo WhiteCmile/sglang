@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.0005
+DIRECT_PUSH_SPIN_NS = 200_000
 
 
 def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tensor:
@@ -1975,6 +1977,32 @@ class FlashMTPDraftEngine:
                     time.sleep(sleep_s)
             self._maybe_emit_lifecycle_status()
 
+    @contextlib.contextmanager
+    def _direct_push_scope(self, ready_event, *sources: torch.Tensor):
+        """Select and push completed candidates on the push stream.
+
+        ``ready_event`` is the producer completion the caller has already
+        observed. Afterwards spin briefly for the tiny push so its READY notice
+        leaves now instead of one Draft loop iteration (one batch launch) later.
+        """
+        transport = getattr(self, "_candidate_push_transport", None)
+        stream = getattr(transport, "push_stream", None)
+        if self.candidate_transport != "cuda-ipc" or stream is None:
+            yield
+            return
+        stream.wait_event(ready_event)
+        for source in sources:
+            source.record_stream(stream)
+        before = len(self._pending_candidate_pushes)
+        with torch.cuda.stream(stream):
+            yield
+        if len(self._pending_candidate_pushes) > before:
+            event = self._pending_candidate_pushes[-1].push.event
+            deadline_ns = time.monotonic_ns() + DIRECT_PUSH_SPIN_NS
+            while not event.query() and time.monotonic_ns() < deadline_ns:
+                pass
+            self._poll_candidate_pushes()
+
     def _draft_compute_batches_inflight(self) -> int:
         count = (
             len(self._pending_flashmtp_completions)
@@ -3441,15 +3469,16 @@ class FlashMTPDraftEngine:
                 )
                 if source_rows is None:
                     raise RuntimeError("FlashMTP candidate rows are unavailable")
-                candidate_rows = _select_candidate_rows(source_rows, active_indices)
-                self._publish_successes(
-                    [tasks[index] for index in active_indices],
-                    (
-                        candidate_rows
-                        if self.candidate_transport == "cuda-ipc"
-                        else candidate_rows.contiguous().numpy().tobytes()
-                    ),
-                )
+                with self._direct_push_scope(completion.completion_event, source_rows):
+                    candidate_rows = _select_candidate_rows(source_rows, active_indices)
+                    self._publish_successes(
+                        [tasks[index] for index in active_indices],
+                        (
+                            candidate_rows
+                            if self.candidate_transport == "cuda-ipc"
+                            else candidate_rows.contiguous().numpy().tobytes()
+                        ),
+                    )
             for task in cancelled:
                 self._retire_cancelled_transfer_identity(task)
             if expired:
@@ -4555,16 +4584,19 @@ class FlashMTPDraftEngine:
                     )
                     if source_rows is None:
                         raise RuntimeError("persistent candidate rows are unavailable")
-                    rows = _select_candidate_rows(source_rows, indices)
-                    self._publish_successes(
-                        active,
-                        (
-                            rows
-                            if self.candidate_transport == "cuda-ipc"
-                            else rows.numpy().tobytes()
-                        ),
-                        result_slot=result_slot,
-                    )
+                    with self._direct_push_scope(
+                        completion.completion_event, source_rows
+                    ):
+                        rows = _select_candidate_rows(source_rows, indices)
+                        self._publish_successes(
+                            active,
+                            (
+                                rows
+                                if self.candidate_transport == "cuda-ipc"
+                                else rows.numpy().tobytes()
+                            ),
+                            result_slot=result_slot,
+                        )
             elif result_slot is not None:
                 self._free_result_slots.append(result_slot)
             for task in cancelled:
@@ -5558,30 +5590,39 @@ class FlashMTPDraftEngine:
             if materialize_only:
                 self._publish_materialization_successes(materialize_only)
             if active_proposal_indices:
-                if self.candidate_transport == "cuda-ipc":
-                    if completion.candidates is None:
-                        raise RuntimeError("DFLASH GPU candidates are unavailable")
-                    candidate_rows = _select_candidate_rows(
-                        completion.candidates, active_proposal_indices
+                push_scope = (
+                    self._direct_push_scope(
+                        completion.completion_event, completion.candidates
                     )
-                    candidate_payload = candidate_rows
-                elif completion.candidate_rows_cpu is not None:
-                    candidate_rows = completion.candidate_rows_cpu[
-                        active_proposal_indices
-                    ]
-                    candidate_payload = candidate_rows.contiguous().numpy().tobytes()
-                else:
-                    candidate_rows = completion.candidates[
-                        active_proposal_indices
-                    ].cpu()
-                    candidate_payload = candidate_rows.contiguous().numpy().tobytes()
-                self._publish_successes(
-                    [
-                        completion.proposal_tasks[index]
-                        for index in active_proposal_indices
-                    ],
-                    candidate_payload,
+                    if self.candidate_transport == "cuda-ipc"
+                    and completion.candidates is not None
+                    else contextlib.nullcontext()
                 )
+                with push_scope:
+                    if self.candidate_transport == "cuda-ipc":
+                        if completion.candidates is None:
+                            raise RuntimeError("DFLASH GPU candidates are unavailable")
+                        candidate_rows = _select_candidate_rows(
+                            completion.candidates, active_proposal_indices
+                        )
+                        candidate_payload = candidate_rows
+                    elif completion.candidate_rows_cpu is not None:
+                        candidate_rows = completion.candidate_rows_cpu[
+                            active_proposal_indices
+                        ]
+                        candidate_payload = candidate_rows.contiguous().numpy().tobytes()
+                    else:
+                        candidate_rows = completion.candidates[
+                            active_proposal_indices
+                        ].cpu()
+                        candidate_payload = candidate_rows.contiguous().numpy().tobytes()
+                    self._publish_successes(
+                        [
+                            completion.proposal_tasks[index]
+                            for index in active_proposal_indices
+                        ],
+                        candidate_payload,
+                    )
             for task in active_tasks:
                 profile_emit(
                     "draft_kv_materialization",

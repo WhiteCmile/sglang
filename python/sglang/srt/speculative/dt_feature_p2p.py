@@ -47,6 +47,8 @@ class FeatureTransportQuiescenceError(FeatureTransportError):
 
 class FeatureSlotState(StrEnum):
     FREE = "free"
+    # Leased to an in-flight verify that writes its hidden rows in place.
+    RESERVED = "reserved"
     PUBLISHED = "published"
     QUARANTINED = "quarantined"
 
@@ -395,6 +397,138 @@ class TargetFeatureSourcePool:
                 self._quarantine_locked(slot_id, generation)
             raise
 
+        return self._commit_publication(
+            slot_id=slot_id,
+            generation=generation,
+            slices=slices,
+            feature_schema_id=feature_schema_id,
+            producer_event=producer_event,
+            event_handle=event_handle,
+            hidden_produced_ns=hidden_produced_ns,
+            pack_strategy=pack_strategy,
+            pack_chunk_count=len(chunks),
+        )
+
+    def reserve(self, token_count: int) -> tuple[int, int, torch.Tensor] | None:
+        """Lease a free slot whose rows a producer will write in place.
+
+        Returns ``(slot_id, generation, rows)`` or ``None`` when no slot is
+        free or the request exceeds slot capacity.  The caller must later call
+        :meth:`publish_reserved` or :meth:`release_reserved`.
+        """
+        if token_count <= 0 or token_count > self.max_tokens:
+            return None
+        with self._lock:
+            if self._closed:
+                return None
+            slot_id = next(
+                (
+                    index
+                    for index, slot in enumerate(self._slots)
+                    if slot.state is FeatureSlotState.FREE
+                ),
+                None,
+            )
+            if slot_id is None:
+                return None
+            slot = self._slots[slot_id]
+            slot.generation += 1
+            slot.state = FeatureSlotState.RESERVED
+            return slot_id, slot.generation, self._storage[slot_id][:token_count]
+
+    def release_reserved(self, slot_id: int, generation: int) -> None:
+        """Return an unpublished reservation once its producer write finished."""
+        with self._lock:
+            slot = self._slots[slot_id]
+            if slot.generation == generation and slot.state is FeatureSlotState.RESERVED:
+                slot.state = FeatureSlotState.FREE
+
+    def quarantine_reserved(self, slot_id: int, generation: int) -> None:
+        """Fence a reservation whose in-place write may be incomplete."""
+        with self._lock:
+            slot = self._slots[slot_id]
+            if slot.generation == generation and slot.state is FeatureSlotState.RESERVED:
+                slot.state = FeatureSlotState.QUARANTINED
+
+    @property
+    def reserved_slot_count(self) -> int:
+        with self._lock:
+            return sum(slot.state is FeatureSlotState.RESERVED for slot in self._slots)
+
+    def publish_reserved(
+        self,
+        *,
+        slot_id: int,
+        generation: int,
+        token_count: int,
+        feature_schema_id: str,
+        transfers: Sequence[FeatureTransferSlice],
+        producer_event: torch.cuda.Event,
+        hidden_produced_ns: int | None = None,
+    ) -> FeaturePublish:
+        """Publish rows already written into a reserved slot.
+
+        ``producer_event`` is an interprocess event recorded after the in-place
+        write; Draft pulls order on it exactly as on a publication copy.
+        """
+        if self._closed:
+            raise FeatureTransportError("feature source pool is closed")
+        if not feature_schema_id:
+            raise ValueError("feature schema id must not be empty")
+        slices = tuple(transfers)
+        if not slices:
+            raise ValueError("a published feature range needs at least one transfer")
+        self._validate_slices(slices, token_count)
+        with self._lock:
+            if self._closed:
+                raise FeatureTransportError("feature source pool is closed")
+            slot = self._slots[slot_id]
+            if slot.generation != generation or slot.state is not FeatureSlotState.RESERVED:
+                raise FeatureTransportError("feature source reservation is stale")
+            duplicate = next(
+                (item.transfer_id for item in slices if item.transfer_id in self._active),
+                None,
+            )
+            if duplicate is not None:
+                raise FeatureTransportError(
+                    f"feature transfer {duplicate!r} is already active"
+                )
+            slot.state = FeatureSlotState.PUBLISHED
+            slot.active_transfers = {item.transfer_id for item in slices}
+            for item in slices:
+                self._active[item.transfer_id] = (slot_id, generation)
+            slot.producer_event = producer_event
+        try:
+            event_handle = producer_event.ipc_handle()
+        except Exception:
+            with self._lock:
+                self._quarantine_locked(slot_id, generation)
+            raise
+        return self._commit_publication(
+            slot_id=slot_id,
+            generation=generation,
+            slices=slices,
+            feature_schema_id=feature_schema_id,
+            producer_event=producer_event,
+            event_handle=event_handle,
+            hidden_produced_ns=hidden_produced_ns,
+            pack_strategy="in-place",
+            pack_chunk_count=0,
+        )
+
+    def _commit_publication(
+        self,
+        *,
+        slot_id: int,
+        generation: int,
+        slices: tuple[FeatureTransferSlice, ...],
+        feature_schema_id: str,
+        producer_event: torch.cuda.Event,
+        event_handle: bytes,
+        hidden_produced_ns: int | None,
+        pack_strategy: str,
+        pack_chunk_count: int,
+    ) -> FeaturePublish:
         descriptor_published_ns = time.monotonic_ns()
         allocation = self._allocations[self._buffer.allocation_index]
         slot_allocation_offset = self._buffer.allocation_offset + slot_id * self._slot_nbytes
@@ -439,7 +573,7 @@ class TargetFeatureSourcePool:
             ),
             descriptor_published_ns=descriptor_published_ns,
             pack_strategy=pack_strategy,
-            pack_chunk_count=len(chunks),
+            pack_chunk_count=pack_chunk_count,
         )
 
     def read_done(
