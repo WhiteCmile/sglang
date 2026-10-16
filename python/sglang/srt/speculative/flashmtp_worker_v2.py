@@ -759,6 +759,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
 
         deferred_feature_hidden = None
         deferred_feature_tokens = None
+        deferred_feature_error = None
         if self._num_pivot_layers:
             packed_hidden = logits_output.hidden_states
             if packed_hidden is None:
@@ -766,14 +767,22 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                     "FLASHMTP verify requires captured target auxiliary hidden states."
                 )
             if getattr(self, "_is_dflash", False):
-                if self.server_args.draft_target_defer_dflash_feature_stage:
+                if getattr(
+                    self, "_defer_dflash_feature_stage",
+                    self.server_args.draft_target_defer_dflash_feature_stage,
+                ):
                     # Target CUDA graphs reuse their output buffers.  Preserve
                     # this wave on the forward stream so the overlap scheduler
                     # can launch the other lane before committed-row splitting.
                     # Candidate rows also come from a reusable block buffer.
                     if self.ps.tp_rank == 0:
-                        deferred_feature_hidden = packed_hidden.clone()
-                        deferred_feature_tokens = candidates.clone()
+                        try:
+                            deferred_feature_hidden = packed_hidden.clone()
+                            deferred_feature_tokens = candidates.clone()
+                        except torch.cuda.OutOfMemoryError as exc:
+                            # Join peers at the existing ordered result-side
+                            # failure broadcast; retain any submitted clone.
+                            deferred_feature_error = f"{type(exc).__name__}: {exc}"
                     feature_chunks = None
                     feature_token_chunks = None
                 else:
@@ -852,10 +861,15 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         batch_result.dt_pipeline_lane_id = getattr(batch, "dt_pipeline_lane_id", None)
         if getattr(self, "_is_dflash", False):
             batch_result.dt_hidden_produced_ns = target_done_ns
-            if self.server_args.draft_target_defer_dflash_feature_stage:
+            if getattr(
+                self, "_defer_dflash_feature_stage",
+                self.server_args.draft_target_defer_dflash_feature_stage,
+            ):
                 batch_result.dt_deferred_dflash_feature_stage = True
                 batch_result.dt_dflash_packed_hidden = deferred_feature_hidden
                 batch_result.dt_dflash_candidate_tokens = deferred_feature_tokens
+                if deferred_feature_error is not None:
+                    batch_result.dt_deferred_feature_error = deferred_feature_error
             if gpu_profile_events is not None:
                 gpu_profile_events[3].record()
                 batch_result.dt_target_verify_gpu_events = gpu_profile_events

@@ -60,6 +60,35 @@ def _new_target_verify_gpu_profile_events(
     return tuple(event_type(enable_timing=True) for _ in range(5))
 
 
+def _freeze_eagle3_verify_features(result, *, packed_hidden, candidates, export_rank):
+    """Preserve one bounded verify wave before the next graph replay."""
+    # Freeze every replay-owned output on the producing forward stream.
+    # D2H is later submitted on copy_stream; retaining graph views alone
+    # would not protect them against the other lane's replay.
+    result.next_token_ids = result.next_token_ids.clone()
+    result.accept_lens = result.accept_lens.clone()
+    result.new_seq_lens = result.new_seq_lens.clone()
+    bonus_tokens = result.next_draft_input.bonus_tokens.clone()
+    result.dt_deferred_dflash_feature_stage = True
+    result.dt_deferred_eagle3_feature_stage = True
+    result.dt_dflash_packed_hidden = None
+    result.dt_dflash_candidate_tokens = None
+    result.dt_eagle3_committed_tokens = None
+    if export_rank:
+        try:
+            result.dt_dflash_packed_hidden = packed_hidden.clone()
+            # Predicted tokens condition features; the candidate prefix
+            # is the distinct authoritative committed input sequence.
+            result.dt_dflash_candidate_tokens = result.next_token_ids.view(
+                candidates.shape[0], candidates.shape[1]
+            )
+            result.dt_eagle3_committed_tokens = candidates.clone()
+        except torch.cuda.OutOfMemoryError as exc:
+            # Reach the same owner-side TP error broadcast as peers.
+            result.dt_deferred_feature_error = f"{type(exc).__name__}: {exc}"
+    return bonus_tokens
+
+
 class EAGLE3DisaggregatedTargetWorkerV2(BaseSpecWorker):
     """Target-only EAGLE3 verifier fed by remotely produced top-k=1 chains."""
 
@@ -271,25 +300,39 @@ class EAGLE3DisaggregatedTargetWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "disaggregated EAGLE3 verify requires target auxiliary hidden states"
             )
-        committed_tokens = result.next_token_ids.view(batch_size, self.block_size)
-        feature_chunks, token_chunks = split_dflash_committed_rows(
-            packed_hidden=packed_hidden,
-            candidates=committed_tokens,
-            commit_lens=result.accept_lens,
-            block_size=self.block_size,
+        deferred = (
+            self.server_args.draft_target_overlap_schedule
+            and not self.server_args.disable_overlap_schedule
+            and not self.server_args.draft_target_disable_eagle3_deferred_handoff
         )
-        committed_token_chunks = [
-            candidates[row, : int(hidden.shape[0])]
-            for row, hidden in enumerate(feature_chunks)
-        ]
+        feature_offsets = [int(value) for value in prefix_lens.tolist()]
+        if deferred:
+            bonus_tokens = _freeze_eagle3_verify_features(
+                result, packed_hidden=packed_hidden, candidates=candidates,
+                export_rank=self.ps.tp_rank == 0,
+            )
+            feature_chunks = token_chunks = committed_token_chunks = None
+        else:
+            bonus_tokens = result.next_draft_input.bonus_tokens
+            committed_tokens = result.next_token_ids.view(batch_size, self.block_size)
+            feature_chunks, token_chunks = split_dflash_committed_rows(
+                packed_hidden=packed_hidden,
+                candidates=committed_tokens,
+                commit_lens=result.accept_lens,
+                block_size=self.block_size,
+            )
+            committed_token_chunks = [
+                candidates[row, : int(hidden.shape[0])]
+                for row, hidden in enumerate(feature_chunks)
+            ]
         result.logits_output.hidden_states = None
         result.next_draft_input = self._make_handoff(
-            bonus_tokens=result.next_draft_input.bonus_tokens,
+            bonus_tokens=bonus_tokens,
             new_seq_lens=result.new_seq_lens,
             feature_chunks=feature_chunks,
             token_chunks=token_chunks,
             committed_token_chunks=committed_token_chunks,
-            feature_offsets=[int(value) for value in prefix_lens.tolist()],
+            feature_offsets=feature_offsets,
         )
         post_feature_handoff_ns = (
             time.monotonic_ns() if host_span_active else None

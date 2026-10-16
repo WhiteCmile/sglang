@@ -60,6 +60,14 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         )
         self._is_token_only = server_args.speculative_algorithm == "STANDALONE_DT"
         self._is_dflash = server_args.speculative_algorithm == "DFLASH"
+        self._defer_dflash_feature_stage = self._is_dflash and (
+            server_args.draft_target_defer_dflash_feature_stage
+            or (
+                not getattr(server_args, "draft_target_disable_continuous_batching", False)
+                and server_args.draft_target_overlap_schedule
+                and not server_args.disable_overlap_schedule
+            )
+        )
         self.block_size = int(server_args.speculative_num_draft_tokens)
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1

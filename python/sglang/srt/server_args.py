@@ -2103,6 +2103,18 @@ class ServerArgs:
         "overlap result processing, after the next Target wave can launch.",
         NS("spec"),
     ] = False
+    draft_target_disable_eagle3_deferred_handoff: A[
+        bool,
+        "Use synchronous EAGLE3 Target feature handoff for matched ablation. "
+        "By default remote EAGLE3 overlap defers splitting until result processing.",
+        NS("spec"),
+    ] = False
+    draft_target_disable_continuous_batching: A[
+        bool,
+        "Use fixed-lane READY barriers for old/deferred-only ablation. "
+        "By default select eligible READY requests across routing lanes.",
+        NS("spec"),
+    ] = False
     draft_target_full_wave: A[
         bool,
         "Verify a Draft-Target wave only after every parked row is ready, while "

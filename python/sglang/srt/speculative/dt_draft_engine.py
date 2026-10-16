@@ -288,10 +288,15 @@ class PendingDFlashCompletion:
 
 @dataclass(slots=True)
 class PendingEagle3Completion:
+    """Existing persistent completion owner, shared by EAGLE3 and AR."""
+
     pending: list[PendingDraftTask]
-    staging_slot: int
+    staging_slot: int | None
     completion_event: torch.cuda.Event
     submitted_ns: int
+    candidates: torch.Tensor | None = None
+    candidate_rows_cpu: torch.Tensor | None = None
+    result_slot: int | None = None
 
 
 @dataclass(slots=True)
@@ -672,6 +677,7 @@ class FlashMTPDraftEngine:
         feature_buffer_max_tokens: int = 8192,
         feature_buffer_slot_count: int = 2,
         dflash_submit_pipeline: bool = False,
+        continuous_batching: bool = True,
     ) -> None:
         try:
             from dt_client import DraftCoordinatorClient
@@ -732,6 +738,7 @@ class FlashMTPDraftEngine:
         self.max_pending_tasks = max_pending_tasks
         self.max_batch_size = max_batch_size
         self.batch_ready_threshold = batch_ready_threshold
+        self.continuous_batching = bool(continuous_batching)
         self.batch_wait_s = batch_wait_ms / 1_000
         self.batch_source_read_done = batch_source_read_done
         self.pinned_pivot_staging = pinned_pivot_staging
@@ -739,8 +746,10 @@ class FlashMTPDraftEngine:
         self.migration_backend = migration_backend
         self.feature_buffer_max_tokens = int(feature_buffer_max_tokens)
         self.feature_buffer_slot_count = int(feature_buffer_slot_count)
-        self.dflash_submit_pipeline = bool(dflash_submit_pipeline)
-        if self.dflash_submit_pipeline and not self._is_dflash:
+        self.dflash_submit_pipeline = bool(
+            dflash_submit_pipeline or (getattr(self, "continuous_batching", False) and self._is_dflash)
+        )
+        if dflash_submit_pipeline and not self._is_dflash:
             raise ValueError("DFLASH submit pipelining requires a DFlash profile")
         self._result_row_width = self.profile.block_size
         self._pending: deque[object] = deque()
@@ -846,6 +855,8 @@ class FlashMTPDraftEngine:
             slot_count=result_slot_count,
             slot_bytes=max_batch_size * self._result_row_width * 4,
         )
+        self._received_tasks = 0
+        self._capacity_sequence = 0
         self._client = None
         try:
             self._client = DraftCoordinatorClient(
@@ -862,6 +873,18 @@ class FlashMTPDraftEngine:
                 disable_cuda_graph=disable_cuda_graph,
             )
             self._initialize_direct_gpu_source_transport()
+            if getattr(self, "continuous_batching", False) and self.profile.method in {"eagle3", "standalone"}:
+                # EAGLE3 uses its feature slots; AR reserves an existing result
+                # slot. Both retain pinned storage until the completion event.
+                self._candidate_result_host_buffers = [
+                    torch.empty(
+                        (self.max_batch_size, self.profile.block_size),
+                        dtype=torch.int32, device="cpu", pin_memory=True,
+                    )
+                    for _ in range(
+                        self.feature_buffer_slot_count if self._is_eagle3 else result_slot_count
+                    )
+                ]
             self._initialize_migration_transport()
             self._initialize_pivot_staging()
             self._client.pool = self._kv_pool
@@ -1784,13 +1807,24 @@ class FlashMTPDraftEngine:
 
     def run(self) -> None:
         logger.info("DT Draft engine serving")
+        observer = None
+        if os.environ.get("DT_OVERLAP_FIX_OBSERVER_DIR"):
+            from overlap_observer import create
+
+            observer = create(self.instance_id, "draft", 0, 1)
+        self._overlap_fix_observer = observer
         while not self._stop:
+            if observer is not None:
+                observer.checkpoint()
             self._poll_messages()
+            if getattr(self, "_pending_eagle3_completions", ()):
+                self._poll_eagle3_completions()
+            if self._stop:
+                break
             if self._uses_direct_gpu_source:
                 self._poll_flashmtp_completions()
                 if self._is_feature_backed:
                     self._poll_dflash_completions()
-                    self._poll_eagle3_completions()
                 # A failed GPU quiescence fence latches fatal quarantine and
                 # preserves every uncertain resource for process teardown.
                 # Do not submit another feature batch on that CUDA context.
@@ -1993,6 +2027,9 @@ class FlashMTPDraftEngine:
         ):
             return
         self._last_lifecycle_status_sample_ns = now_ns
+        # Capacity sends are nonblocking. Refresh cumulative credit evidence so
+        # a locally backpressured final snapshot cannot strand all admission.
+        self._publish_capacity()
         status = self._lifecycle_status()
         quiescent = bool(status["quiescent"])
         if (
@@ -2026,7 +2063,7 @@ class FlashMTPDraftEngine:
         queued = tuple(self._pending)
         for task in queued:
             self._cancelled_ids.add(task.transfer_id)
-            if not task.source_read_migration_id:
+            if self._uses_direct_gpu_source and not task.source_read_migration_id:
                 self._publish_source_done(task)
             self._pending_ids.discard(task.transfer_id)
             self._received_ns_by_transfer.pop(task.transfer_id, None)
@@ -2216,7 +2253,7 @@ class FlashMTPDraftEngine:
         self._raise_if_fatal_gpu_quarantine("Draft migration shutdown")
 
     def close(self) -> None:
-        if self._uses_direct_gpu_source:
+        if self._uses_direct_gpu_source or getattr(self, "continuous_batching", False):
             self._quiesce_direct_gpu_source_shutdown()
         # Direct-source shutdown checks this immediately after its control-only
         # capacity publication.  Keep the same fail-closed guarantee for any
@@ -2419,19 +2456,51 @@ class FlashMTPDraftEngine:
                     raise ValueError("migration feature lease changed before execution")
                 self._deferred_feature_source_tasks[deferred_key] = task
             self._pending.append(task)
+            self._received_tasks += 1
             self._pending_ids.add(task.transfer_id)
             self._received_ns_by_transfer[task.transfer_id] = received_ns
             accepted = True
         return accepted
 
+    def _persistent_task_allocation(self, task) -> tuple[int, int]:
+        """Request rows and net page-1 KV needed by this existing model path."""
+        state = self._persistent_requests.get(task.draft_kv_handle)
+        allocated = (
+            int(state.req.kv.kv_allocated_len)
+            if state is not None and state.req.kv is not None else 0
+        )
+        rows = int(state is None or state.req.req_pool_idx is None)
+        proposal_tokens = 0
+        if task.requires_proposal or not self._is_feature_backed:
+            if self._is_eagle3:
+                from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+
+                proposal_tokens = get_alloc_reserve_per_decode(
+                    self._draft_model_runner.server_args
+                )
+            elif self._is_dflash:
+                proposal_tokens = self.profile.block_size
+            else:
+                # Extend samples the first AR token; only k-1 decode inputs
+                # are subsequently written into persistent KV.
+                proposal_tokens = max(self.profile.draft_k - 1, 0)
+        return rows, int(task.committed_kv_len) + proposal_tokens - allocated
+
     def _take_batch(self) -> list[PendingDraftTask]:
+        observer = getattr(self, "_overlap_fix_observer", None)
+        if observer is not None:
+            observer.draft_decision(self, "admission")
         if not self._pending:
             return []
         if self._uses_direct_gpu_source and not self._free_feature_staging_slots:
             return []
         if not self._is_feature_backed and not self._free_result_slots:
             return []
-        if len(self._pending) < self.batch_ready_threshold and self.batch_wait_s > 0:
+        if (
+            not getattr(self, "continuous_batching", False)
+            and len(self._pending) < self.batch_ready_threshold
+            and self.batch_wait_s > 0
+        ):
             oldest = self._pending[0]
             received_ns = self._received_ns_by_transfer.get(oldest.transfer_id)
             if (
@@ -2443,6 +2512,8 @@ class FlashMTPDraftEngine:
 
         queued: list[PendingDraftTask] = []
         take_ns = time.monotonic_ns()
+        trace_selection = profile_event_enabled("draft_ready_select")
+        selected_received = {} if trace_selection else None
         profile_eagle3_batch = self._is_eagle3 and profile_event_enabled(
             "draft_eagle3_batch"
         )
@@ -2453,17 +2524,75 @@ class FlashMTPDraftEngine:
         reserves_result_slot = False
         result_slot_available = self._available_dflash_result_slots() > 0
         stop_reason = "queue_exhausted"
+        # Examine each currently queued row once. Incompatible or temporarily
+        # blocked rows retain their relative FIFO order for the next round.
+        deferred = []
+        busy_handles = {
+            item.task.draft_kv_handle
+            for owner in (
+                *self._pending_feature_batches,
+                *self._pending_dflash_completions,
+                *self._pending_eagle3_completions,
+            )
+            for item in owner.pending
+        } if getattr(self, "continuous_batching", False) and self._persistent else set()
+        selected_handles = set()
+        if getattr(self, "continuous_batching", False) and self._persistent:
+            available_rows = self._draft_model_runner.req_to_token_pool.available_size()
+            available_kv = self._draft_model_runner.token_to_kv_pool_allocator.available_size()
+            # Pulled/preparing batches own a reservation before allocation;
+            # submitted GPU batches already appear in allocator availability.
+            for owner in self._pending_feature_batches:
+                for item in owner.pending:
+                    rows, tokens = self._persistent_task_allocation(item.task)
+                    available_rows -= rows
+                    available_kv -= max(tokens, 0)
         while self._pending and len(queued) < self.max_batch_size:
             next_task = self._pending[0]
+            if getattr(self, "continuous_batching", False) and self._persistent and (
+                next_task.draft_kv_handle in busy_handles
+                or next_task.draft_kv_handle in selected_handles
+            ):
+                deferred.append(self._pending.popleft())
+                continue
+            if getattr(self, "continuous_batching", False) and next_task.transfer_id in self._cancelled_ids:
+                task = self._pending.popleft()
+                self._pending_ids.discard(task.transfer_id)
+                self._received_ns_by_transfer.pop(task.transfer_id, None)
+                self._cancelled_ids.discard(task.transfer_id)
+                if self._uses_direct_gpu_source and not task.source_read_migration_id:
+                    self._publish_source_done(task)
+                if self._persistent:
+                    self._drain_deferred_persistent_release(task.draft_kv_handle)
+                continue
+            if getattr(self, "continuous_batching", False) and take_ns >= next_task.deadline_ns:
+                task = self._pending.popleft()
+                self._pending_ids.discard(task.transfer_id)
+                self._received_ns_by_transfer.pop(task.transfer_id, None)
+                if self._uses_direct_gpu_source and not task.source_read_migration_id:
+                    self._publish_source_done(task)
+                if self._persistent:
+                    self._release_persistent_request(task.draft_kv_handle)
+                self._publish_failures([(task, TimeoutError("Draft task deadline expired"))])
+                continue
+            if getattr(self, "continuous_batching", False) and self._persistent:
+                row_cost, kv_cost = self._persistent_task_allocation(next_task)
+                if row_cost > available_rows or kv_cost > available_kv:
+                    deferred.append(self._pending.popleft())
+                    stop_reason = "persistent_capacity"
+                    continue
             if self._uses_direct_gpu_source:
                 if (
-                    self._is_eagle3
+                    (self._is_eagle3 or (getattr(self, "continuous_batching", False) and self._is_dflash))
                     and queued
                     and bool(next_task.requires_proposal)
                     != bool(queued[0].task.requires_proposal)
                 ):
                     if profile_eagle3_batch:
                         stop_reason = "proposal_materialization_boundary"
+                    if getattr(self, "continuous_batching", False):
+                        deferred.append(self._pending.popleft())
+                        continue
                     break
                 if (
                     next_task.requires_proposal
@@ -2472,6 +2601,9 @@ class FlashMTPDraftEngine:
                 ):
                     if profile_eagle3_batch:
                         stop_reason = "result_slot_unavailable"
+                    if getattr(self, "continuous_batching", False):
+                        deferred.append(self._pending.popleft())
+                        continue
                     break
                 next_feature_tokens = (
                     int(next_task.feature_token_count)
@@ -2484,6 +2616,9 @@ class FlashMTPDraftEngine:
                 ):
                     if profile_eagle3_batch:
                         stop_reason = "feature_token_capacity"
+                    if getattr(self, "continuous_batching", False):
+                        deferred.append(self._pending.popleft())
+                        continue
                     break
             elif self._persistent:
                 next_prefill_tokens = len(next_task.committed_token_ids)
@@ -2492,6 +2627,9 @@ class FlashMTPDraftEngine:
                     and persistent_prefill_token_count + next_prefill_tokens
                     > DRAFT_PREFILL_GRAPH_MAX_TOKENS
                 ):
+                    if getattr(self, "continuous_batching", False):
+                        deferred.append(self._pending.popleft())
+                        continue
                     break
             task = self._pending.popleft()
             self._pending_ids.discard(task.transfer_id)
@@ -2520,10 +2658,18 @@ class FlashMTPDraftEngine:
                 )
             if self._persistent and not self._is_feature_backed:
                 persistent_prefill_token_count += len(task.committed_token_ids)
+            if trace_selection:
+                selected_received[task.transfer_id] = received_ns
             queued.append(
                 PendingDraftTask(task=task)
             )
             reserves_result_slot = reserves_result_slot or bool(task.requires_proposal)
+            if self._persistent:
+                selected_handles.add(task.draft_kv_handle)
+                if getattr(self, "continuous_batching", False):
+                    available_rows -= row_cost
+                    available_kv -= kv_cost
+        self._pending.extendleft(reversed(deferred))
         pending_after = len(self._pending)
         cap_limited = False
         if (
@@ -2583,6 +2729,23 @@ class FlashMTPDraftEngine:
         # The result publisher needs rows grouped by Target before assigning
         # Draft-local destination and result rows.
         queued = target_major(queued)
+        if trace_selection and queued:
+            profile_emit(
+                "draft_ready_select",
+                draft_instance=self.instance_id,
+                started_ns=take_ns,
+                finished_ns=time.monotonic_ns(),
+                # This is input admission. Feature-backed rows become compute
+                # eligible only after their existing pull-completion event.
+                requires_feature_copy=self._uses_direct_gpu_source,
+                persistent_kv=self._persistent,
+                rows=tuple(dict(
+                    transfer_id=item.task.transfer_id,
+                    request_id=item.task.request_id,
+                    round_id=item.task.round_id,
+                    received_ns=selected_received[item.task.transfer_id],
+                ) for item in queued),
+            )
         if self._uses_direct_gpu_source:
             return queued
         if self._persistent:
@@ -2591,7 +2754,8 @@ class FlashMTPDraftEngine:
 
     def _idle_sleep_s(self) -> float:
         if (
-            not self._pending
+            getattr(self, "continuous_batching", False)
+            or not self._pending
             or (
                 self._uses_direct_gpu_source
                 and self._pending[0].requires_proposal
@@ -2625,6 +2789,9 @@ class FlashMTPDraftEngine:
         ) + sum(
             bool(completion.proposal_tasks)
             for completion in self._pending_dflash_completions
+        ) + sum(
+            getattr(completion, "candidate_rows_cpu", None) is not None
+            for completion in getattr(self, "_pending_eagle3_completions", ())
         )
         return max(0, len(self._free_result_slots) - reserved)
 
@@ -2968,6 +3135,9 @@ class FlashMTPDraftEngine:
                 profile_emit(
                     "draft_flashmtp_proposal",
                     draft_instance=self.instance_id,
+                    execute_started_ns=completion.execute_started_ns,
+                    inputs_ready_ns=completion.inputs_ready_ns,
+                    proposal_enqueued_ns=completion.submitted_ns,
                     batch_size=len(tasks),
                     transfer_ids=tuple(task.transfer_id for task in tasks),
                     execution=completion.execution,
@@ -3142,10 +3312,15 @@ class FlashMTPDraftEngine:
         self._publish_capacity()
 
     def _poll_feature_batches(self) -> None:
+        observer = getattr(self, "_overlap_fix_observer", None)
+        if observer is not None:
+            observer.draft_decision(self, "compute")
         if self._fatal_gpu_quarantine_active():
             return
         capacity_changed = False
-        while self._pending_feature_batches:
+        scans_remaining = len(self._pending_feature_batches)
+        while self._pending_feature_batches and scans_remaining:
+            scans_remaining -= 1
             # Serial mode waits for the prior completion.  Pipeline mode uses
             # per-slot pinned metadata and preallocated device buffers, so it
             # may queue another proposal without a pageable H2D synchronization;
@@ -3153,7 +3328,7 @@ class FlashMTPDraftEngine:
             if self._pending_dflash_completions and not self.dflash_submit_pipeline:
                 break
             feature_batch = self._pending_feature_batches[0]
-            if self._pending_eagle3_completions and any(
+            if not getattr(self, "continuous_batching", False) and self._pending_eagle3_completions and any(
                 item.task.requires_proposal for item in feature_batch.pending
             ):
                 # A proposal performs a blocking candidate D2H copy. Do not let
@@ -3161,6 +3336,9 @@ class FlashMTPDraftEngine:
                 # scheduler should remain available for control/lifecycle work.
                 break
             if not feature_batch.future.done():
+                if getattr(self, "continuous_batching", False):
+                    self._pending_feature_batches.rotate(-1)
+                    continue
                 break
             self._pending_feature_batches.popleft()
             failures = []
@@ -3394,6 +3572,9 @@ class FlashMTPDraftEngine:
                 self._free_feature_staging_slots.append(feature_batch.staging_slot)
                 capacity_changed = True
                 continue
+            # Freeze membership/order after pull readiness, cancellation and
+            # deadline filtering. The single owner does not poll controls or
+            # select more rows between reconciliation and proposal submission.
             active_pending = [item for item, _row_range in active]
             active_ranges = tuple(row_range for _item, row_range in active)
             try:
@@ -3540,9 +3721,18 @@ class FlashMTPDraftEngine:
                 raise ValueError(
                     "EAGLE3 proposal root differs from the feature-aligned tail"
                 )
+        # Keep the existing ablation paths intact. Continuous batches must not
+        # host-wait for the previous batch when uploading independent inputs.
+        # Pinned tensor lifetime is tracked by PyTorch's async-copy allocator;
+        # the existing bounded feature slots still limit in-flight batches.
+        async_inputs = getattr(self, "continuous_batching", False)
+        input_device = "cpu" if async_inputs else self.device
         batch.input_ids = torch.tensor(
-            feature_input_ids, dtype=torch.int64, device=self.device
-        )
+            feature_input_ids,
+            dtype=torch.int64,
+            device=input_device,
+            pin_memory=async_inputs,
+        ).to(self.device, non_blocking=async_inputs)
         # EAGLE3 consumes the authoritative feature-aligned stream above.
         # The committed-ID buffer from generic extend preparation has no
         # consumer here; do not upload it or let deferred resolution replace
@@ -3568,8 +3758,9 @@ class FlashMTPDraftEngine:
         feature_tail_tokens = torch.tensor(
             tail_token_ids,
             dtype=torch.int64,
-            device=self.device,
-        )
+            device=input_device,
+            pin_memory=async_inputs,
+        ).to(self.device, non_blocking=async_inputs)
         inputs_ready_ns = time.monotonic_ns()
         draft_input = self._eagle_draft_worker._draft_extend_for_prefill(
             batch,
@@ -3686,10 +3877,16 @@ class FlashMTPDraftEngine:
             return
 
         batch.spec_info = draft_input
-        bonus_tokens = torch.tensor(
-            [task.next_token_id for task in tasks],
-            dtype=torch.int64,
-            device=self.device,
+        # The feature-aligned tail was checked against next_token_id above.
+        # Extend does not mutate it; reuse avoids an H2D host fence after extend.
+        bonus_tokens = (
+            feature_tail_tokens
+            if async_inputs
+            else torch.tensor(
+                [task.next_token_id for task in tasks],
+                dtype=torch.int64,
+                device=self.device,
+            )
         )
         # The co-located scheduler crosses an iteration boundary between draft
         # extend and proposal decode.  The remote engine performs both within
@@ -3755,6 +3952,32 @@ class FlashMTPDraftEngine:
                 batch_size=len(tasks),
                 fallback_reason=fallback_reason,
         )
+        if getattr(self, "continuous_batching", False):
+            # cat/to above snapshots graph-owned proposals on the forward
+            # stream. The slot owns candidates, pinned rows, and feature reads
+            # until this stream's D2H event; no host stream fence is needed.
+            profile_emit(
+                "draft_eagle3_batch",
+                draft_instance=self.instance_id,
+                batch_size=len(tasks),
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                execute_started_ns=batch_started_ns,
+                batch_finished_ns=time.monotonic_ns(),
+                proposal_enqueued_ns=proposal_done_ns,
+                state_batch_prepare_ns=batch_prepared_ns - batch_started_ns,
+                input_pack_ns=inputs_ready_ns - batch_prepared_ns,
+                extend_ns=extend_done_ns - inputs_ready_ns,
+                proposal_prepare_ns=proposal_prepared_ns - extend_done_ns,
+                proposal_execute_ns=proposal_done_ns - proposal_prepared_ns,
+                taken_ns=pending[0].taken_ns,
+                oldest_queue_age_ns=pending[0].oldest_queue_age_ns,
+                asynchronous_completion=True,
+                candidate_completion_wait_semantics="deferred_pinned_D2H_event",
+            )
+            self._enqueue_eagle3_materialization_completion(
+                pending, staging_slot, candidates=candidates
+            )
+            return
         candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
         candidate_ready_ns = time.monotonic_ns()
         self._fence_eagle3_feature_staging_reads()
@@ -3851,20 +4074,49 @@ class FlashMTPDraftEngine:
             raise error from exc
 
     def _enqueue_eagle3_materialization_completion(
-        self, pending: list[PendingDraftTask], staging_slot: int
+        self,
+        pending: list[PendingDraftTask],
+        staging_slot: int | None,
+        *,
+        candidates: torch.Tensor | None = None,
+        result_slot: int | None = None,
     ) -> None:
-        """Keep staging and Draft KV owned until async EAGLE3 extend completes."""
+        """Keep persistent KV and slot buffers owned until GPU/D2H completion.
 
-        completion_event = torch.cuda.Event()
-        completion_event.record(torch.cuda.current_stream(self.device))
-        self._pending_eagle3_completions.append(
-            PendingEagle3Completion(
-                pending=pending,
-                staging_slot=staging_slot,
-                completion_event=completion_event,
-                submitted_ns=time.monotonic_ns(),
-            )
+        EAGLE3 retains its feature slot. AR has no feature staging and instead
+        reserves a result slot, using the same completion/release machinery.
+        """
+        host_rows = None
+        if candidates is not None:
+            buffer_slot = staging_slot if staging_slot is not None else result_slot
+            if buffer_slot is None:
+                raise RuntimeError("persistent proposal has no bounded buffer slot")
+            host_rows = self._candidate_result_host_buffers[buffer_slot][:len(pending)]
+        completion = PendingEagle3Completion(
+            pending=pending,
+            staging_slot=staging_slot,
+            completion_event=torch.cuda.Event(),
+            submitted_ns=time.monotonic_ns(),
+            candidates=candidates,
+            candidate_rows_cpu=host_rows,
+            result_slot=result_slot,
         )
+        try:
+            if host_rows is not None:
+                host_rows.copy_(candidates, non_blocking=True)
+            completion.completion_event.record(torch.cuda.current_stream(self.device))
+        except Exception as exc:
+            try:
+                torch.cuda.current_stream(self.device).synchronize()
+            except Exception:
+                self._quarantined_eagle3_completions.append(completion)
+                self._quarantined_feature_draft_handles.update(
+                    item.task.draft_kv_handle for item in pending
+                )
+                self._enter_fatal_gpu_quarantine("unquiesced persistent candidate copy")
+                exc.resources_quiescent = False
+            raise
+        self._pending_eagle3_completions.append(completion)
 
     def _poll_eagle3_completions(self) -> None:
         if self._fatal_gpu_quarantine_active():
@@ -3917,8 +4169,23 @@ class FlashMTPDraftEngine:
             cancelled = [
                 task for task in tasks if task.transfer_id in self._cancelled_ids
             ]
+            candidate_rows_cpu = getattr(completion, "candidate_rows_cpu", None)
+            result_slot = getattr(completion, "result_slot", None)
             if active:
-                self._publish_materialization_successes(active)
+                if candidate_rows_cpu is None:
+                    self._publish_materialization_successes(active)
+                else:
+                    active_ids = {task.transfer_id for task in active}
+                    indices = [
+                        index for index, task in enumerate(tasks)
+                        if task.transfer_id in active_ids
+                    ]
+                    rows = candidate_rows_cpu[indices].contiguous()
+                    self._publish_successes(
+                        active, rows.numpy().tobytes(), result_slot=result_slot
+                    )
+            elif result_slot is not None:
+                self._free_result_slots.append(result_slot)
             for task in cancelled:
                 self._cancelled_ids.discard(task.transfer_id)
                 self._release_persistent_request(task.draft_kv_handle)
@@ -3930,15 +4197,20 @@ class FlashMTPDraftEngine:
                         (
                             task,
                             TimeoutError(
-                                "EAGLE3 materialization completed after its deadline"
+                                "persistent Draft work completed after its deadline"
                             ),
                         )
                         for task in expired
                     ]
                 )
-            if profile_event_enabled("draft_eagle3_materialization_complete"):
+            completion_event_name = (
+                "draft_persistent_proposal_complete"
+                if candidate_rows_cpu is not None
+                else "draft_eagle3_materialization_complete"
+            )
+            if profile_event_enabled(completion_event_name):
                 profile_emit(
-                    "draft_eagle3_materialization_complete",
+                    completion_event_name,
                     draft_instance=self.instance_id,
                     batch_size=len(tasks),
                     transfer_ids=tuple(task.transfer_id for task in tasks),
@@ -3954,7 +4226,8 @@ class FlashMTPDraftEngine:
                     submitted_ns=completion.submitted_ns,
                     gpu_completed_ns=completed_ns,
                 )
-            self._free_feature_staging_slots.append(completion.staging_slot)
+            if completion.staging_slot is not None:
+                self._free_feature_staging_slots.append(completion.staging_slot)
             for handle in {task.draft_kv_handle for task in tasks}:
                 self._drain_deferred_persistent_release(handle)
             capacity_changed = True
@@ -3982,6 +4255,8 @@ class FlashMTPDraftEngine:
                 prior_candidate_copy_pending_count += 1
         launch_started_ns = time.monotonic_ns()
         tasks = [item.task for item in pending]
+        if getattr(self, "continuous_batching", False) and len({bool(task.requires_proposal) for task in tasks}) > 1:
+            raise RuntimeError("DFLASH frozen batch mixed proposal boundaries")
         states = []
         cache_locs = []
         reconcile_prepare_phase_ns = [0] * 6 if profile_enabled() else None
@@ -4061,6 +4336,7 @@ class FlashMTPDraftEngine:
                 )
         if grouped_rows is None:
             packed_cache_locs = torch.cat(cache_locs, dim=0)
+            async_metadata = getattr(self, "continuous_batching", False)
             positions = torch.tensor(
                 [
                     position
@@ -4070,8 +4346,9 @@ class FlashMTPDraftEngine:
                     )
                 ],
                 dtype=torch.int64,
-                device=self.device,
-            )
+                device="cpu" if async_metadata else self.device,
+                pin_memory=async_metadata,
+            ).to(self.device, non_blocking=async_metadata)
         else:
             _grouped_cache_locs, packed_cache_locs, positions = grouped_rows
         tasks_prepared_ns = time.monotonic_ns()
@@ -4397,6 +4674,9 @@ class FlashMTPDraftEngine:
             phase_started_ns = phase_completed_ns
         try:
             cache_locs = list(torch.split(packed_cache_locs, token_counts))
+            # Frozen metadata uploads precede the existing current-stream page-table
+            # write; pinned allocation lifetime is retained by the async copy.
+            async_metadata = getattr(self, "continuous_batching", False)
             row_indices = torch.tensor(
                 [
                     req.req_pool_idx
@@ -4406,8 +4686,9 @@ class FlashMTPDraftEngine:
                     for _ in range(token_count)
                 ],
                 dtype=torch.int64,
-                device=self.device,
-            )
+                device="cpu" if async_metadata else self.device,
+                pin_memory=async_metadata,
+            ).to(self.device, non_blocking=async_metadata)
             positions = torch.tensor(
                 [
                     position
@@ -4417,8 +4698,9 @@ class FlashMTPDraftEngine:
                     )
                 ],
                 dtype=torch.int64,
-                device=self.device,
-            )
+                device="cpu" if async_metadata else self.device,
+                pin_memory=async_metadata,
+            ).to(self.device, non_blocking=async_metadata)
             req_pool.req_to_token[row_indices, positions] = packed_cache_locs.to(
                 req_pool.req_to_token.dtype
             )
@@ -4808,6 +5090,11 @@ class FlashMTPDraftEngine:
             profile_emit(
                 "draft_dflash_batch_complete",
                 draft_instance=self.instance_id,
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                execute_started_ns=completion.launch_started_ns,
+                tasks_prepared_ns=completion.tasks_prepared_ns,
+                metadata_ready_ns=completion.proposal_metadata_ready_ns,
+                materialize_submitted_ns=completion.materialize_submitted_ns,
                 batch_size=len(tasks),
                 active_task_count=len(active_tasks),
                 cancelled_task_count=len(cancelled_tasks),
@@ -4947,6 +5234,7 @@ class FlashMTPDraftEngine:
     def _execute_standalone_batch(self, pending: list[PendingDraftTask]) -> None:
         batch_start_ns = time.monotonic_ns()
         sync_profile = profile_enabled() and cuda_sync_enabled()
+        # _take_batch already fixed Target-major order; all AR steps use it.
         tasks = [item.task for item in pending]
         states: list[PersistentDraftRequest] = []
         prepare_done_ns = batch_start_ns
@@ -4956,7 +5244,10 @@ class FlashMTPDraftEngine:
         extend_graph_replays = 0
         expected_extend_graph_replays = 1
         decode_graph_replays = 0
+        result_slot = None
         try:
+            if getattr(self, "continuous_batching", False):
+                result_slot = self._free_result_slots.popleft()
             states = [self._prepare_persistent_task(task) for task in tasks]
             oversized_bootstrap = (
                 len(tasks) == 1
@@ -5132,11 +5423,17 @@ class FlashMTPDraftEngine:
                     expected_graph_replays=expected_decode_replays,
                 )
 
+            # Root IDs are already host-owned. Do not wait for the preceding
+            # extend/decode work just to upload them before the candidate copy.
+            # Existing result slots bound inflight batches; PyTorch tracks the
+            # pinned source lifetime through the same-stream asynchronous copy.
+            async_roots = getattr(self, "continuous_batching", False)
             roots = torch.tensor(
                 [task.committed_token_ids[-1] for task in tasks],
                 dtype=torch.int64,
-                device=self.device,
-            )
+                device="cpu" if async_roots else self.device,
+                pin_memory=async_roots,
+            ).to(self.device, non_blocking=async_roots)
             candidates = torch.stack([roots, *proposals], dim=1).to(torch.int32)
             if tuple(candidates.shape) != (len(tasks), self.profile.block_size):
                 raise RuntimeError(
@@ -5165,35 +5462,64 @@ class FlashMTPDraftEngine:
                     committed_kv_len=state.valid_committed_len,
                     proposal_tokens=self.profile.draft_k,
                 )
-            candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
+            if getattr(self, "continuous_batching", False):
+                self._enqueue_eagle3_materialization_completion(
+                    pending, None, candidates=candidates, result_slot=result_slot
+                )
+                result_slot = None  # ownership moved to the completion
+            else:
+                candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
         except Exception as exc:
             logger.exception("failed DT STANDALONE batch")
-            for task in tasks:
-                self._release_persistent_request(task.draft_kv_handle)
+            resources_quiescent = bool(getattr(exc, "resources_quiescent", True))
+            if resources_quiescent:
+                try:
+                    torch.cuda.current_stream(self.device).synchronize()
+                except Exception:
+                    resources_quiescent = False
+            if resources_quiescent:
+                for task in tasks:
+                    self._release_persistent_request(task.draft_kv_handle)
+                if result_slot is not None:
+                    self._free_result_slots.append(result_slot)
+            else:
+                self._quarantined_feature_draft_handles.update(
+                    task.draft_kv_handle for task in tasks
+                )
+                self._enter_fatal_gpu_quarantine("unquiesced AR proposal failure")
             self._publish_failures([(task, exc) for task in tasks])
         else:
-            self._publish_successes(tasks, candidate_bytes)
+            if not getattr(self, "continuous_batching", False):
+                self._publish_successes(tasks, candidate_bytes)
         finished_ns = time.monotonic_ns()
         decode_durations_ns = []
         previous_ns = extend_done_ns
         for done_ns in decode_done_ns:
             decode_durations_ns.append(done_ns - previous_ns)
             previous_ns = done_ns
-        profile_emit(
-            "draft_standalone_batch",
-            batch_size=len(tasks),
-            bootstrap_count=sum(task.round_id == 0 for task in tasks),
-            reconcile_count=sum(task.round_id > 0 for task in tasks),
-            extend_cuda_graph=extend_cuda_graph,
-            extend_graph_replays=extend_graph_replays,
-            expected_extend_graph_replays=expected_extend_graph_replays,
-            decode_graph_replays=decode_graph_replays,
-            prepare_ns=prepare_done_ns - batch_start_ns,
-            extend_ns=extend_done_ns - prepare_done_ns,
-            decode_ns=decode_durations_ns,
-            publish_ns=finished_ns - previous_ns,
-            total_ns=finished_ns - batch_start_ns,
-        )
+        if profile_event_enabled("draft_standalone_batch"):
+            profile_emit(
+                "draft_standalone_batch",
+                draft_instance=self.instance_id,
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                execute_started_ns=batch_start_ns,
+                prepare_finished_ns=prepare_done_ns,
+                proposal_enqueued_ns=decode_done_ns[-1] if decode_done_ns else extend_done_ns,
+                finished_ns=finished_ns,
+                asynchronous_completion=getattr(self, "continuous_batching", False),
+                batch_size=len(tasks),
+                bootstrap_count=sum(task.round_id == 0 for task in tasks),
+                reconcile_count=sum(task.round_id > 0 for task in tasks),
+                extend_cuda_graph=extend_cuda_graph,
+                extend_graph_replays=extend_graph_replays,
+                expected_extend_graph_replays=expected_extend_graph_replays,
+                decode_graph_replays=decode_graph_replays,
+                prepare_ns=prepare_done_ns - batch_start_ns,
+                extend_ns=extend_done_ns - prepare_done_ns,
+                decode_ns=decode_durations_ns,
+                publish_ns=finished_ns - previous_ns,
+                total_ns=finished_ns - batch_start_ns,
+            )
         self._publish_capacity()
 
     def _record_graph_measurement(
@@ -5606,7 +5932,7 @@ class FlashMTPDraftEngine:
                 self._migration_cleanup_ids.get(message.migration_id, ""),
             )
             return
-        if self._is_feature_backed and self._has_pending_feature_gpu_completions():
+        if self._has_pending_feature_gpu_completions():
             # Reservation writes the request page table and then reads the
             # allocated GPU indices into its transport descriptor.  On the
             # shared model stream that CPU read would wait for an unrelated
@@ -5733,7 +6059,7 @@ class FlashMTPDraftEngine:
                 self._migration_cleanup_ids.get(message.migration_id, ""),
             )
             return
-        if self._is_feature_backed and self._has_pending_feature_gpu_completions():
+        if self._has_pending_feature_gpu_completions():
             # Export snapshots GPU page-table indices into the CUDA-IPC
             # descriptor.  Guard against every outstanding DFlash batch, not
             # just work for the handle being migrated, so another request's
@@ -6782,7 +7108,9 @@ class FlashMTPDraftEngine:
             indices, start_pos=start
         )
 
-    def _publish_successes(self, tasks: list[object], candidate_bytes: bytes) -> None:
+    def _publish_successes(
+        self, tasks: list[object], candidate_bytes: bytes, *, result_slot: int | None = None
+    ) -> None:
         from dt_protocol import (
             PROTOCOL_VERSION,
             DraftExecutionResultBatch,
@@ -6794,7 +7122,7 @@ class FlashMTPDraftEngine:
         publish_started_ns = time.monotonic_ns() if profile else 0
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
-        slot_id = self._free_result_slots.popleft()
+        slot_id = self._free_result_slots.popleft() if result_slot is None else result_slot
         generation = self._result_store.write(slot_id, candidate_bytes)
         result_written_ns = time.monotonic_ns() if profile else 0
         self._result_sequence += 1
@@ -7293,10 +7621,13 @@ class FlashMTPDraftEngine:
             len(batch.pending) for batch in self._pending_eagle3_completions
         )
         pending_tasks = len(self._pending) + active_feature_tasks
+        self._capacity_sequence += 1
         update = DraftCapacityUpdate(
             protocol_version=PROTOCOL_VERSION,
             draft_instance_id=self.instance_id,
             pending_tasks=pending_tasks,
+            received_tasks=self._received_tasks,
+            capacity_sequence=self._capacity_sequence,
             max_pending_tasks=self.max_pending_tasks,
             free_result_rows=(
                 self._available_dflash_result_slots() * self.max_batch_size
@@ -7478,6 +7809,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-batch-size", type=int, default=64)
     parser.add_argument("--batch-ready-threshold", type=int, default=16)
     parser.add_argument("--batch-wait-ms", type=float, default=0.2)
+    parser.add_argument("--disable-continuous-batching", action="store_true")
     parser.add_argument("--result-slot-count", type=int, default=16)
     parser.add_argument("--data-dir", default="/dev/shm")
     parser.add_argument("--mem-fraction-static", type=float, default=0.85)
@@ -7530,6 +7862,7 @@ def main() -> None:
         feature_buffer_max_tokens=args.feature_buffer_max_tokens,
         feature_buffer_slot_count=args.feature_buffer_slot_count,
         dflash_submit_pipeline=args.dflash_submit_pipeline,
+        continuous_batching=not args.disable_continuous_batching,
     )
 
     def stop(_signum, _frame) -> None:

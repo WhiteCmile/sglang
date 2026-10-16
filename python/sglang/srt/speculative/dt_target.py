@@ -33,6 +33,10 @@ DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
 
 
+class _PendingTaskPayloadMismatch(ValueError):
+    """A queued copy reused a transfer identity with different immutable data."""
+
+
 def _parse_pipeline_lane_weights(
     value: str | None, pipeline_lanes: int
 ) -> tuple[int, ...]:
@@ -231,6 +235,16 @@ class ParkedTargetRound:
 
 
 @dataclass(frozen=True, slots=True)
+class DeferredFeatureRound:
+    request_id: str
+    round_id: int
+    attempt: int
+    draft_kv_handle: str | None
+    committed_len: int | None
+    previous_transfer_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class StagedDFlashTask:
     request_id: str
     transfer_id: str
@@ -320,6 +334,9 @@ class DTTargetController:
         self.whole_batch_task_fifo_ablation = (
             os.environ.get("SGLANG_DT_WHOLE_BATCH_TASK_FIFO_ABLATION", "0") == "1"
         )
+        self.continuous_batching = not getattr(
+            self.server_args, "draft_target_disable_continuous_batching", False
+        )
         self.pipeline_lanes = int(self.server_args.draft_target_pipeline_lanes)
         self.pipeline_lane_weights = _parse_pipeline_lane_weights(
             self.server_args.draft_target_pipeline_lane_weights,
@@ -364,6 +381,13 @@ class DTTargetController:
             )
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
+        self._overlap_fix_observer = None
+        if os.environ.get("DT_OVERLAP_FIX_OBSERVER_DIR"):
+            from overlap_observer import create
+
+            self._overlap_fix_observer = create(
+                self.instance_id, "target", scheduler.ps.tp_rank, scheduler.ps.tp_size
+            )
         # This diagnostic performs per-batch timestamping, so unlike ordinary
         # host trace events it must never inherit the empty-filter-means-all
         # behavior.  Only TP0 owns the emitted control-plane chronology.
@@ -381,6 +405,7 @@ class DTTargetController:
             )
         self._parked: dict[str, ParkedTargetRound] = {}
         self._feature_control_rounds: dict[str, ParkedTargetRound] = {}
+        self._draft_admitted_attempts: dict[str, int] = {}
         # Overlap scheduling can have more than one chunked-prefill forward for
         # the same request in ``result_queue``.  Track the number of launched
         # Target forwards whose results have not been consumed yet.  A request
@@ -575,32 +600,66 @@ class DTTargetController:
                     raise RuntimeError(
                         "deferred DFlash result acquired source capacity twice"
                     )
+                # All ranks reserve a credit even when export staging fails;
+                # the ordered result boundary broadcasts failure and releases it.
+                batch_result.dt_dflash_feature_stage_credit = True
+                self._deferred_dflash_feature_stages += 1
                 if self.is_export_rank:
                     from sglang.srt.managers.utils import _async_d2h
 
-                    candidates = batch_result.dt_dflash_candidate_tokens
-                    draft_input = batch_result.next_draft_input
-                    if candidates is None or not candidates.is_cuda:
-                        raise RuntimeError(
-                            "deferred DFlash staging lost GPU candidate rows"
+                    try:
+                        error = getattr(batch_result, "dt_deferred_feature_error", None)
+                        if error is not None:
+                            raise RuntimeError(error)
+                        candidates = batch_result.dt_dflash_candidate_tokens
+                        draft_input = batch_result.next_draft_input
+                        if candidates is None or not candidates.is_cuda:
+                            raise RuntimeError("deferred staging lost GPU token rows")
+                        if getattr(batch_result, "dt_deferred_eagle3_feature_stage", False):
+                            batch_result.dt_deferred_feature_offsets = tuple(
+                                draft_input.dt_feature_offsets
+                            )
+                            batch_result.dt_deferred_feature_rounds = tuple(
+                                DeferredFeatureRound(
+                                    req.rid,
+                                    self._next_round.get(req.rid, 0),
+                                    self._ensure_lifecycle_attempt(req.rid),
+                                    self._draft_kv_handle_by_request.get(req.rid),
+                                    self._draft_committed_len.get(req.rid),
+                                    self._verify_transfer_by_request.get(req.rid),
+                                )
+                                for req in batch.reqs
+                            )
+                            batch_result.dt_eagle3_committed_tokens_cpu = _async_d2h(
+                                batch_result.dt_eagle3_committed_tokens
+                            )
+                        batch_result.dt_dflash_candidate_tokens_cpu = _async_d2h(candidates)
+                        batch_result.dt_dflash_bonus_tokens_cpu = _async_d2h(
+                            draft_input.bonus_tokens
                         )
-                    batch_result.dt_dflash_candidate_tokens_cpu = _async_d2h(candidates)
-                    batch_result.dt_dflash_bonus_tokens_cpu = _async_d2h(
-                        draft_input.bonus_tokens
-                    )
-                    batch_result.dt_dflash_seq_lens_cpu = _async_d2h(
-                        draft_input.new_seq_lens
-                    )
-                    batch_result.dt_dflash_accept_lens_cpu = _async_d2h(
-                        batch_result.accept_lens
-                    )
-                batch_result.dt_dflash_feature_stage_credit = True
-                self._deferred_dflash_feature_stages += 1
+                        batch_result.dt_dflash_seq_lens_cpu = _async_d2h(
+                            draft_input.new_seq_lens
+                        )
+                        batch_result.dt_dflash_accept_lens_cpu = _async_d2h(
+                            batch_result.accept_lens
+                        )
+                    except Exception as exc:
+                        batch_result.dt_deferred_feature_error = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    # Includes partial D2H submissions on failure. The scheduler
+                    # also records copy_done after its ordinary result copies.
+                    done = self.scheduler.device_module.Event()
+                    done.record()
+                    batch_result.dt_deferred_feature_copy_done = done
                 return
             self._stage_dflash_feature_copy(batch, batch_result)
             return
+        # Token-only AR shares bonus/sequence controls with FlashMTP. Stage
+        # them before the next launch so result handling does not copy them
+        # from the GPU after independent work has already been submitted.
+        self._stage_flashmtp_scalar_copy(batch, batch_result)
         if not self.is_token_only:
-            self._stage_flashmtp_scalar_copy(batch, batch_result)
             self._stage_flashmtp_pivot_copy(batch, batch_result)
 
     def _stage_flashmtp_scalar_copy(self, batch: ScheduleBatch, batch_result) -> None:
@@ -936,6 +995,15 @@ class DTTargetController:
             )
         finally:
             if release_credit:
+                for name in (
+                    "dt_dflash_packed_hidden", "dt_dflash_candidate_tokens",
+                    "dt_dflash_candidate_tokens_cpu", "dt_dflash_bonus_tokens_cpu",
+                    "dt_dflash_seq_lens_cpu", "dt_dflash_accept_lens_cpu",
+                    "dt_eagle3_committed_tokens", "dt_eagle3_committed_tokens_cpu",
+                    "dt_deferred_feature_rounds", "dt_deferred_feature_offsets",
+                    "dt_deferred_feature_copy_done",
+                ):
+                    setattr(batch_result, name, None)
                 batch_result.dt_dflash_feature_stage_credit = False
                 self._deferred_dflash_feature_stages -= 1
                 if self._deferred_dflash_feature_stages < 0:
@@ -955,36 +1023,12 @@ class DTTargetController:
         feature_offsets = draft_input.dt_feature_offsets
         deferred = getattr(batch_result, "dt_deferred_dflash_feature_stage", False)
         phase_started_ns = time.monotonic_ns()
-        if deferred:
-            if not finalize_deferred:
-                return
-            if self.is_export_rank:
-                from sglang.srt.speculative.dflash_worker_v2 import (
-                    split_dflash_committed_rows,
-                )
-
-                packed_hidden = batch_result.dt_dflash_packed_hidden
-                candidate_tokens = getattr(
-                    batch_result, "dt_dflash_candidate_tokens_cpu", None
-                )
-                if packed_hidden is None or candidate_tokens is None:
-                    raise RuntimeError(
-                        "deferred DFlash result lost feature staging tensors"
-                    )
-                if packed_hidden.device.type != "cuda" or candidate_tokens.is_cuda:
-                    raise RuntimeError(
-                        "deferred DFlash tensors crossed the wrong staging boundary"
-                    )
-                feature_chunks, token_chunks = split_dflash_committed_rows(
-                    packed_hidden=packed_hidden,
-                    candidates=candidate_tokens,
-                    commit_lens=batch_result.dt_dflash_accept_lens_cpu,
-                    block_size=self.block_size,
-                )
-                draft_input.dt_feature_chunks = feature_chunks
-                draft_input.dt_feature_token_chunks = token_chunks
-        batch_result.dt_dflash_feature_split_ns = time.monotonic_ns() - phase_started_ns
+        if deferred and not finalize_deferred:
+            return
         if feature_chunks is None and not batch.reqs:
+            done = getattr(batch_result, "dt_deferred_feature_copy_done", None)
+            if done is not None:
+                done.synchronize()
             return
 
         packet = None
@@ -992,6 +1036,43 @@ class DTTargetController:
         descriptors = {}
         if self.is_export_rank:
             try:
+                if deferred:
+                    error = getattr(batch_result, "dt_deferred_feature_error", None)
+                    done = getattr(batch_result, "dt_deferred_feature_copy_done", None)
+                    if done is not None:
+                        done.synchronize()
+                    if error is not None:
+                        raise RuntimeError(error)
+                    from sglang.srt.speculative.dflash_worker_v2 import (
+                        split_dflash_committed_rows,
+                    )
+
+                    packed_hidden = batch_result.dt_dflash_packed_hidden
+                    candidate_tokens = batch_result.dt_dflash_candidate_tokens_cpu
+                    if packed_hidden is None or candidate_tokens is None:
+                        raise RuntimeError("deferred result lost feature staging tensors")
+                    if packed_hidden.device.type != "cuda" or candidate_tokens.is_cuda:
+                        raise RuntimeError("deferred tensors crossed wrong staging boundary")
+                    feature_chunks, token_chunks = split_dflash_committed_rows(
+                        packed_hidden=packed_hidden,
+                        candidates=candidate_tokens,
+                        commit_lens=batch_result.dt_dflash_accept_lens_cpu,
+                        block_size=self.block_size,
+                    )
+                    if self.is_eagle3:
+                        feature_offsets = batch_result.dt_deferred_feature_offsets
+                        committed = batch_result.dt_eagle3_committed_tokens_cpu
+                        if committed.is_cuda or committed.shape != candidate_tokens.shape:
+                            raise RuntimeError("EAGLE3 committed token schema mismatch")
+                        committed_chunks = [
+                            committed[index, : int(hidden.shape[0])]
+                            for index, hidden in enumerate(feature_chunks)
+                        ]
+                    # Keep views local: GPU ownership ends after pool publication,
+                    # rather than leaking cloned payloads into the next Draft input.
+                batch_result.dt_dflash_feature_split_ns = (
+                    time.monotonic_ns() - phase_started_ns
+                )
                 phase_started_ns = time.monotonic_ns()
                 if (
                     feature_chunks is None
@@ -1042,7 +1123,26 @@ class DTTargetController:
                 row_offset = 0
                 for index in active:
                     req = batch.reqs[index]
-                    attempt = self._ensure_lifecycle_attempt(req.rid)
+                    snapshot = None
+                    if deferred and self.is_eagle3:
+                        snapshots = batch_result.dt_deferred_feature_rounds
+                        if len(snapshots) != len(batch.reqs):
+                            raise RuntimeError("deferred feature request count changed")
+                        snapshot = snapshots[index]
+                        current = DeferredFeatureRound(
+                            req.rid,
+                            self._next_round.get(req.rid, 0),
+                            self._lifecycle_attempt_by_request.get(req.rid),
+                            self._draft_kv_handle_by_request.get(req.rid),
+                            self._draft_committed_len.get(req.rid),
+                            self._verify_transfer_by_request.get(req.rid),
+                        )
+                        if current != snapshot:
+                            raise RuntimeError("deferred feature round fencing changed")
+                    attempt = (
+                        snapshot.attempt if snapshot is not None
+                        else self._ensure_lifecycle_attempt(req.rid)
+                    )
                     hidden = feature_chunks[index]
                     tokens = token_chunks[index]
                     committed_tokens = (
@@ -1062,8 +1162,14 @@ class DTTargetController:
                         )
                     offset = int(feature_offsets[index])
                     token_count = int(hidden.shape[0])
-                    round_id = self._next_round.get(req.rid, 0)
-                    previous_committed = self._draft_committed_len.get(req.rid)
+                    round_id = (
+                        snapshot.round_id if snapshot is not None
+                        else self._next_round.get(req.rid, 0)
+                    )
+                    previous_committed = (
+                        snapshot.committed_len if snapshot is not None
+                        else self._draft_committed_len.get(req.rid)
+                    )
                     if round_id == 0:
                         if offset != 0 or previous_committed is not None:
                             raise RuntimeError(
@@ -1073,7 +1179,10 @@ class DTTargetController:
                             attempt
                         )
                     else:
-                        draft_kv_handle = self._draft_kv_handle_by_request.get(req.rid)
+                        draft_kv_handle = (
+                            snapshot.draft_kv_handle if snapshot is not None
+                            else self._draft_kv_handle_by_request.get(req.rid)
+                        )
                         if draft_kv_handle is None or previous_committed != offset:
                             raise RuntimeError(
                                 "DFLASH feature range has a committed-prefix gap"
@@ -1102,11 +1211,16 @@ class DTTargetController:
                             token_count,
                             token_ids,
                             committed_token_ids,
-                            self._verify_transfer_by_request.get(req.rid),
+                            (snapshot.previous_transfer_id if snapshot is not None
+                             else self._verify_transfer_by_request.get(req.rid)),
                             int(bonus_values[index]),
                             int(seq_len_values[index]),
                         )
                     )
+                    if deferred:
+                        # Clones were allocated on forward_stream; publication
+                        # reads them on schedule_stream after result completion.
+                        hidden.record_stream(torch.cuda.current_stream(hidden.device))
                     hidden_rows.append(hidden.contiguous())
                     transfers.append((transfer_id, row_offset, token_count))
                     row_offset += token_count
@@ -1376,12 +1490,6 @@ class DTTargetController:
             tasks=tuple(staged_tasks),
             descriptors_by_transfer=descriptors,
         )
-        if deferred:
-            batch_result.dt_dflash_packed_hidden = None
-            batch_result.dt_dflash_candidate_tokens = None
-            batch_result.dt_dflash_candidate_tokens_cpu = None
-            batch_result.dt_dflash_bonus_tokens_cpu = None
-            batch_result.dt_dflash_seq_lens_cpu = None
         batch_result.dt_dflash_feature_commit_ns = (
             time.monotonic_ns() - phase_started_ns
         )
@@ -1785,15 +1893,19 @@ class DTTargetController:
         )
         if wave_id is None or ready_ns is None or lane_id is None:
             return
-        if lane_id < 0 or lane_id >= self.pipeline_lanes:
-            raise RuntimeError("DT full-wave completion has an invalid lane")
+        if lane_id != -1 or not self.continuous_batching:
+            if lane_id < 0 or lane_id >= self.pipeline_lanes:
+                raise RuntimeError("DT full-wave completion has an invalid lane")
         completed_ns = time.monotonic_ns()
         if self.eagle3_host_span_profile_enabled and batch_result is not None:
             batch_result.dt_eagle3_completed_ns = completed_ns
         previous_completed_ns = self._last_full_wave_completed_ns
-        previous_lane_completed_ns = self._last_lane_full_wave_completed_ns[lane_id]
+        previous_lane_completed_ns = (
+            self._last_lane_full_wave_completed_ns[lane_id] if lane_id >= 0 else 0
+        )
         self._last_full_wave_completed_ns = completed_ns
-        self._last_lane_full_wave_completed_ns[lane_id] = completed_ns
+        if lane_id >= 0:
+            self._last_lane_full_wave_completed_ns[lane_id] = completed_ns
         if self.is_export_rank:
             self._profile_emit(
                 "target_full_wave_complete",
@@ -1837,7 +1949,11 @@ class DTTargetController:
         ]
         if not measurement_reqs:
             return
-        lanes = {self._lane_by_request.get(req.rid) for req in measurement_reqs}
+        lanes = (
+            {getattr(batch, "dt_pipeline_lane_id", -1)}
+            if self.continuous_batching
+            else {self._lane_by_request.get(req.rid) for req in measurement_reqs}
+        )
         if None in lanes or len(lanes) != 1:
             raise RuntimeError(
                 "DT measurement verify batch does not have one assigned lane"
@@ -1858,6 +1974,7 @@ class DTTargetController:
                     "lane_id": lane_id,
                     "pipeline_lanes": self.pipeline_lanes,
                     "pipeline_lane_weights": self.pipeline_lane_weights,
+                    "scheduling": "continuous" if self.continuous_batching else "fixed_lane",
                     "execution": execution,
                     "fallback_reason": (
                         None if execution == "graph" else "target_verify_not_graphed"
@@ -1875,6 +1992,10 @@ class DTTargetController:
 
     def _park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
         if not batch.reqs:
+            if getattr(batch_result, "dt_dflash_feature_stage_credit", False):
+                self._stage_dflash_feature_copy(
+                    batch, batch_result, finalize_deferred=True
+                )
             staged_flash = getattr(batch_result, "dt_staged_flashmtp_pivots", None)
             if isinstance(staged_flash, StagedFlashMTPPivotBatch):
                 self._cancel_staged_flashmtp_pivots(staged_flash, batch_result)
@@ -2269,6 +2390,9 @@ class DTTargetController:
 
     def poll(self, *, overlap_result=None) -> None:
         poll_entered_ns = time.monotonic_ns()
+        observer = getattr(self, "_overlap_fix_observer", None)
+        if observer is not None:
+            observer.checkpoint(poll_entered_ns)
         previous_poll_ns = self._last_poll_ns
         receive_ns = 0
         packet = None
@@ -2324,6 +2448,20 @@ class DTTargetController:
                 parked=len(self._parked),
             )
         for kind, transfer_id, payload in events:
+            # Successful results prove owner materialization; ACK acceptance
+            # alone can also acknowledge a request that ends in FINAL_ERROR.
+            if kind in ("ready", "materialized"):
+                admitted_state = self._parked.get(
+                    transfer_id
+                ) or self._feature_control_rounds.get(transfer_id)
+                if (
+                    admitted_state is not None
+                    and self._lifecycle_attempt_by_request.get(admitted_state.req.rid)
+                    == admitted_state.attempt
+                ):
+                    self._draft_admitted_attempts[admitted_state.req.rid] = (
+                        admitted_state.attempt
+                    )
             state = self._parked.get(transfer_id)
             if state is None and kind == "materialized":
                 self._feature_control_rounds.pop(transfer_id, None)
@@ -2345,18 +2483,26 @@ class DTTargetController:
                         f"local_seq_len={state.seq_len}, "
                         f"export_seq_len={seq_len}"
                     )
+                observe_ready = (
+                    observer is not None and observer.enabled()
+                    and state.candidate_bytes is None
+                )
+                applied_before_ns = time.monotonic_ns() if observe_ready else 0
                 state.candidate_bytes = candidate_bytes
                 state.draft_admitted = True
+                if observe_ready:
+                    observer.ready(state, applied_before_ns, time.monotonic_ns())
             elif kind == "accepted":
                 state.draft_admitted = True
             else:
                 state.failure = payload
 
+        if observer is not None:
+            observer.target_decision(self)
+
     def has_feature_source_capacity(self) -> bool:
         has_capacity = not self.uses_direct_gpu_source or self._feature_source_free_slots > (
             self._deferred_dflash_feature_stages
-            if self.defer_dflash_feature_stage
-            else 0
         )
         if self.is_export_rank and self.uses_direct_gpu_source:
             now_ns = time.monotonic_ns()
@@ -2513,6 +2659,9 @@ class DTTargetController:
         for req in launched_batch.reqs:
             self._target_inflight_counts[req.rid] += 1
             self._target_inflight_reqs[req.rid] = req
+        observer = getattr(self, "_overlap_fix_observer", None)
+        if observer is not None and observer.enabled():
+            observer.submitted(launched_batch)
 
     def detach_overlap_inflight_batch(
         self, *, running_batch: ScheduleBatch, launched_batch: ScheduleBatch
@@ -2714,6 +2863,17 @@ class DTTargetController:
         ``_last_poll_ns`` and ``_overlap_launch_ns`` come from the TP0 poll
         packet, keeping the defer decision identical on every TP rank.
         """
+        if self.continuous_batching:
+            # TP0 broadcasts copy_done readiness in poll(). Keep receiving and
+            # preparing independent work while this result is on the GPU. Once
+            # ready, publish promptly, even if no next batch can be submitted.
+            # There is still at most one old result when no batch is launched;
+            # the ordinary overlap loop bounds the queue to two on submission.
+            return bool(
+                next_batch is None
+                and last_batch is not None
+                and self._overlap_result_ready is False
+            )
         elapsed_ns = max(0, self._last_poll_ns - self._overlap_launch_ns)
         should_defer = bool(
             self.overlap_result_defer_ns > 0
@@ -2726,12 +2886,56 @@ class DTTargetController:
         return should_defer
 
     def build_ready_batch(self) -> ScheduleBatch | None:
+        observer = getattr(self, "_overlap_fix_observer", None)
+        observe_build = observer is not None and observer.enabled()
+        build_entry_ns = time.monotonic_ns() if observe_build else 0
+        build_cpu_start_ns = time.thread_time_ns() if observe_build else 0
         ready = [
             state
             for state in self._parked.values()
             if state.candidate_bytes is not None
         ]
-        if ready:
+        if self.continuous_batching:
+            # Dict insertion order is shared by TP ranks through poll's ordered
+            # control packet. Route affinity remains wire metadata only; it is
+            # never a readiness or membership barrier. Decode allocation and
+            # OOM/retraction remain owned by Scheduler.update_running_batch.
+            ready = [
+                state for state in ready
+                if state.draft_admitted
+                and not state.failure
+                and not state.req.finished()
+                and not state.req.is_retracted
+                and not self._target_inflight_count(state.req.rid)
+            ]
+            if ready:
+                # Reuse the allocator's actual page/reservation estimate;
+                # do not retract independent WAIT_DRAFT owners merely because
+                # every READY row does not fit together. This is host metadata
+                # only, with no GPU tensor construction or Req mutation.
+                budget_batch = ScheduleBatch(
+                    reqs=[state.req for state in ready],
+                    token_to_kv_pool_allocator=self.scheduler.token_to_kv_pool_allocator,
+                    tree_cache=self.scheduler.tree_cache,
+                    spec_algorithm=self.scheduler.spec_algorithm,
+                )
+                budget_batch.check_decode_mem()  # existing evictable-cache policy
+                available = self.scheduler.token_to_kv_pool_allocator.available_size()
+                selected = []
+                for index, state in enumerate(ready):
+                    needed = budget_batch.new_tokens_required_next_decode([index])
+                    if needed <= available:
+                        selected.append(state)
+                        available -= needed
+                        if len(selected) == self.scheduler.max_running_requests:
+                            break
+                if not selected and not self._target_inflight_counts:
+                    # No GPU work can release more capacity. Hand one row to
+                    # the existing synchronized OOM/retraction path for progress;
+                    # it must pass check_decode_mem again before actual submit.
+                    selected = ready[:1]
+                ready = selected
+        elif ready:
             ready = self._select_pipeline_lane_ready(ready)
         if not ready:
             return None
@@ -2749,8 +2953,16 @@ class DTTargetController:
                 self._verify_transfer_by_request[state.req.rid] = state.transfer_id
 
         reqs = [state.req for state in ready]
-        lane_id = ready[0].lane_id
-        if any(state.lane_id != lane_id for state in ready):
+        # Reserve membership/order at removal from _parked. Generic decode
+        # may still filter/retract for OOM; submission freezes its surviving
+        # order. No host control polling intervenes before prepare/submit. The
+        # queued ScheduleBatch snapshot and per-request inflight counts retain
+        # ownership until its result is processed. -1 means unpartitioned; it
+        # is a diagnostic value, never an index into a resource slot array.
+        lane_id = -1 if self.continuous_batching else ready[0].lane_id
+        if not self.continuous_batching and any(
+            state.lane_id != lane_id for state in ready
+        ):
             raise RuntimeError("DT ready verification batch spans pipeline lanes")
         device = self.scheduler.device
         batch = ScheduleBatch.init_new(
@@ -2887,6 +3099,13 @@ class DTTargetController:
         self._next_full_wave_id += 1
         batch.dt_full_wave_id = wave_id
         batch.dt_full_wave_ready_ns = finished_ns
+        if observe_build and observer.enabled(finished_ns):
+            observer.build(
+                ready, wave_id, build_entry_ns, started_ns, finished_ns,
+                time.thread_time_ns() - build_cpu_start_ns,
+                scheduling_mode=("continuous" if self.continuous_batching else "fixed_lane"),
+                batch_lane_id=lane_id,
+            )
         if self.eagle3_host_span_profile_enabled:
             batch.dt_eagle3_ready_build_started_ns = started_ns
             batch.dt_full_wave_transfer_ids = tuple(
@@ -2927,12 +3146,25 @@ class DTTargetController:
             )
         return batch
 
-    def should_defer_prefill(self, *, ready_batch_size: int) -> bool:
+    def should_defer_prefill(
+        self, *, ready_batch_size: int, chunked_req: Req | None
+    ) -> bool:
+        # Bootstrap features may retain slots while Draft owner admission is
+        # full. Keep one slot for existing owners to verify or finish a chunk.
+        # A locally staged KV handle is not evidence of Draft admission.
+        if self.is_feature_backed and (
+            self._feature_source_free_slots - self._deferred_dflash_feature_stages
+            <= 1
+        ):
+            if chunked_req is None or self._draft_admitted_attempts.get(
+                chunked_req.rid
+            ) != self._lifecycle_attempt_by_request.get(chunked_req.rid, -1):
+                return True
         # Once a frozen wave is ready, run it before admitting replacement
         # prefills.  Otherwise get_new_batch_prefill wins scheduler priority,
         # the replacement becomes the next frozen wave by itself, and the
         # already-built large verify batch remains stranded in running_batch.
-        return ready_batch_size > 0
+        return chunked_req is None and ready_batch_size > 0
 
     def pop_failures(self) -> list[ParkedTargetRound]:
         failed = [state for state in self._parked.values() if state.failure]
@@ -3449,6 +3681,33 @@ class DTTargetController:
                     )
         self._pending_send.append(batch)
 
+    def _prune_obsolete_task_retries(self, tasks) -> None:
+        """Retire exact local copies; remote leases and ledger owners stay intact."""
+        if not self._pending_send:
+            return
+        from msgspec.structs import replace
+
+        obsolete = {task.transfer_id: task for task in tasks}
+        if not obsolete:
+            return
+        retained = deque()
+        for batch in self._pending_send:
+            entries = []
+            for task in batch.entries:
+                authoritative = obsolete.get(task.transfer_id)
+                if authoritative is None:
+                    entries.append(task)
+                elif task != authoritative:
+                    raise _PendingTaskPayloadMismatch(
+                        f"queued transfer {task.transfer_id!r} changed its task payload"
+                    )
+            if len(entries) == len(batch.entries):
+                retained.append(batch)
+            elif entries:
+                retained.append(replace(batch, entries=tuple(entries)))
+        # Commit only after every matching copy passed the full equality check.
+        self._pending_send = retained
+
     def _flush_pending_send(self) -> None:
         from dt_protocol import TargetTaskBatch
 
@@ -3622,6 +3881,14 @@ class DTTargetController:
                     continue
                 self._delivery_outbox.ack("task_batch", message.batch_id)
                 retry_tasks = self._ledger.apply_ack(message)
+                self._prune_obsolete_task_retries(
+                    state.task
+                    for transfer_id in (
+                        *message.accepted_transfer_ids,
+                        *message.duplicate_transfer_ids,
+                    )
+                    if (state := self._ledger.get(transfer_id)) is not None
+                )
                 if self.is_persistent:
                     for transfer_id in (
                         *message.accepted_transfer_ids,
@@ -3858,6 +4125,7 @@ class DTTargetController:
             outbox.mark_sent(operation, message_id, now_ns=now_ns)
 
     def _release_draft_request(self, request_id: str) -> None:
+        self._draft_admitted_attempts.pop(request_id, None)
         if not self.is_persistent:
             return
         draft_kv_handle = self._draft_kv_handle_by_request.pop(request_id, None)
@@ -4165,6 +4433,8 @@ class DTTargetController:
     def _consume_result_batch(self, batch) -> list[tuple[str, str, object]]:
         try:
             return self._consume_result_batch_body(batch)
+        except _PendingTaskPayloadMismatch:
+            raise
         except Exception as exc:
             logger.exception(
                 "failed to consume DT result buffer; failing its active transfers"
@@ -4213,6 +4483,13 @@ class DTTargetController:
             sent_ns=time.monotonic_ns(),
         )
         disposition = self._ledger.apply_results(failure_batch)
+        self._prune_obsolete_task_retries(
+            self._ledger.get(transfer_id).task
+            for transfer_id in (
+                *disposition.ready_transfer_ids,
+                *disposition.failed_transfer_ids,
+            )
+        )
         events = []
         for transfer_id in disposition.failed_transfer_ids:
             if self.uses_direct_gpu_source:
@@ -4342,6 +4619,13 @@ class DTTargetController:
                     )
 
         disposition = self._ledger.apply_results(batch)
+        self._prune_obsolete_task_retries(
+            self._ledger.get(transfer_id).task
+            for transfer_id in (
+                *disposition.ready_transfer_ids,
+                *disposition.failed_transfer_ids,
+            )
+        )
         events: list[tuple[str, str, object]] = []
 
         ready_ids = set(disposition.ready_transfer_ids)

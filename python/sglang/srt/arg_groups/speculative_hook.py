@@ -867,11 +867,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 
 def _validate_standalone_draft_target(server_args: ServerArgs) -> None:
-    """Validate the milestone-1 token-only Target role.
+    """Validate the token-only Target with the shared linear-chain verifier.
 
-    The external Draft engine is launched separately, so this SGLang process
-    must not construct a local Draft worker or opt into unsupported overlap or
-    multi-DP ownership.
+    Draft weights and persistent Draft KV belong to the external Draft engine.
+    Target overlap uses the same ordered result ownership as FlashMTP.
     """
     if server_args.draft_target_disaggregation_role != "target":
         raise ValueError(
@@ -881,15 +880,21 @@ def _validate_standalone_draft_target(server_args: ServerArgs) -> None:
         raise ValueError(
             "disaggregated STANDALONE V2 milestone 1 requires dp_size == 1"
         )
-    if not server_args.disable_overlap_schedule:
+    if (
+        not server_args.disable_overlap_schedule
+        and not server_args.draft_target_overlap_schedule
+    ):
         raise ValueError(
-            "disaggregated STANDALONE V2 milestone 1 requires "
-            "--disable-overlap-schedule"
+            "disaggregated STANDALONE Target overlap requires the explicit "
+            "--draft-target-overlap-schedule opt-in"
         )
-    if server_args.draft_target_overlap_schedule:
+    if (
+        server_args.disable_overlap_schedule
+        and server_args.draft_target_overlap_schedule
+    ):
         raise ValueError(
-            "disaggregated STANDALONE V2 milestone 1 does not support Target "
-            "overlap scheduling"
+            "--draft-target-overlap-schedule is incompatible with "
+            "--disable-overlap-schedule"
         )
     missing = [
         flag

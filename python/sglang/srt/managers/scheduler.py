@@ -2982,9 +2982,9 @@ class Scheduler(
         else:
             defer_dt_prefill = (
                 self.dt_target_controller is not None
-                and self.chunked_req is None
                 and self.dt_target_controller.should_defer_prefill(
                     ready_batch_size=dt_ready_batch_size,
+                    chunked_req=self.chunked_req,
                 )
             )
             if defer_dt_prefill:
@@ -3181,8 +3181,18 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # An admitted chunk may use the last source slot, but adding a new
+        # bootstrap to that same batch would consume its progress headroom.
+        defer_new_dt_requests = (
+            self.dt_target_controller is not None
+            and self.dt_target_controller.should_defer_prefill(
+                ready_batch_size=0, chunked_req=None
+            )
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if defer_new_dt_requests:
+                break
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 

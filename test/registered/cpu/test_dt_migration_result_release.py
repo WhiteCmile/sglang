@@ -187,7 +187,8 @@ def test_flashmtp_park_scalars_prefer_staged_cpu_rows_and_preserve_order() -> No
         )
 
 
-def test_flashmtp_scalar_stage_adds_reverse_stream_edge(monkeypatch) -> None:
+@pytest.mark.parametrize("is_token_only", (False, True))
+def test_linear_chain_scalar_stage_adds_reverse_stream_edge(monkeypatch, is_token_only) -> None:
     from sglang.srt.managers import utils as manager_utils
 
     copied = []
@@ -208,6 +209,10 @@ def test_flashmtp_scalar_stage_adds_reverse_stream_edge(monkeypatch) -> None:
     waited = []
     controller = object.__new__(DTTargetController)
     controller._profile_active = False
+    controller.is_feature_backed = False
+    controller.is_token_only = is_token_only
+    pivots = []
+    controller._stage_flashmtp_pivot_copy = lambda *args: pivots.append(args)
     controller.scheduler = SimpleNamespace(
         device_module=SimpleNamespace(Event=lambda: event),
         forward_stream=SimpleNamespace(wait_event=waited.append),
@@ -223,7 +228,8 @@ def test_flashmtp_scalar_stage_adds_reverse_stream_edge(monkeypatch) -> None:
         ]
     )
 
-    controller._stage_flashmtp_scalar_copy(batch, batch_result)
+    controller.stage_overlap_pivot_copy(batch, batch_result)
+    assert len(pivots) == (0 if is_token_only else 1)
 
     assert copied == [draft_input.bonus_tokens, draft_input.new_seq_lens]
     assert torch.equal(
@@ -884,6 +890,9 @@ def test_flashmtp_profiled_completion_emits_async_gpu_timings(monkeypatch) -> No
             "draft_flashmtp_proposal",
             {
                 "draft_instance": "draft-0",
+                "execute_started_ns": 10,
+                "inputs_ready_ns": 20,
+                "proposal_enqueued_ns": 30,
                 "batch_size": 1,
                 "transfer_ids": ("transfer-profiled",),
                 "execution": "graph",
@@ -3851,6 +3860,7 @@ def test_dflash_pipeline_reserves_one_result_slot_per_submitted_batch() -> None:
     def task(transfer_id: str, *, requires_proposal: bool):
         return SimpleNamespace(
             transfer_id=transfer_id,
+            draft_kv_handle=f"kv-{transfer_id}",
             target_instance_id="target-0",
             created_ns=1,
             deadline_ns=2**63 - 1,
