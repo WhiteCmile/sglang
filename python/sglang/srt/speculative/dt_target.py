@@ -521,6 +521,13 @@ class DTTargetController:
         self._freeze_lead_ema_ns: dict[bool, float] = {}
         self._freeze_last_done_ns = 0
         self.hold_next_batch = False
+        # Two-threshold READY batching (design rev 39): launch once READY rows
+        # reach B, the wait reaches T, or nothing is still out at a Draft.
+        self._ready_batch_wait_ns = int(
+            float(os.environ.get("DT_TARGET_BATCH_WAIT_MS", "0")) * 1_000_000
+        )
+        self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "64"))
+        self._ready_hold_started_ns = 0
         self._client = None
         self._ledger = None
         self._feature_source_pool = None
@@ -3446,6 +3453,37 @@ class DTTargetController:
         )
         return should_defer
 
+    def _hold_ready_batch(self, ready_count: int) -> bool:
+        """Return whether to keep a small READY set open for returning rows.
+
+        Verify cost grows slowly with batch size, so idling the GPU briefly
+        until rows just handed to a Draft come back beats running them as a
+        separate small wave.  All inputs are TP-consistent: ``_last_poll_ns``
+        comes from the TP0 poll packet and ``_parked`` from its ordered events.
+        """
+        wait_ns = getattr(self, "_ready_batch_wait_ns", 0)
+        if wait_ns <= 0 or ready_count >= getattr(self, "_ready_batch_min_size", 1):
+            self._ready_hold_started_ns = 0
+            return False
+        outstanding = any(
+            state.candidate_bytes is None
+            and state.candidate_completion is None
+            and not state.failure
+            and not state.req.finished()
+            and not state.req.is_retracted
+            for state in self._parked.values()
+        )
+        if not outstanding:
+            self._ready_hold_started_ns = 0
+            return False
+        now_ns = self._last_poll_ns
+        if not self._ready_hold_started_ns:
+            self._ready_hold_started_ns = now_ns
+        if now_ns - self._ready_hold_started_ns < wait_ns:
+            return True
+        self._ready_hold_started_ns = 0
+        return False
+
     def build_ready_batch(self) -> ScheduleBatch | None:
         observer = getattr(self, "_overlap_fix_observer", None)
         observe_build = observer is not None and observer.enabled()
@@ -3471,6 +3509,8 @@ class DTTargetController:
                 and not state.req.is_retracted
                 and not self._target_inflight_count(state.req.rid)
             ]
+            if ready and self._hold_ready_batch(len(ready)):
+                return None
             if ready:
                 # Reuse the allocator's actual page/reservation estimate;
                 # do not retract independent WAIT_DRAFT owners merely because

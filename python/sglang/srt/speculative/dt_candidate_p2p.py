@@ -14,6 +14,7 @@ and the local slot lifecycle.
 
 from __future__ import annotations
 
+import os
 import secrets
 import time
 import uuid
@@ -42,6 +43,7 @@ ROOT_TOKEN_WORD = 4
 COMPLETION_RETRY_NS = 100_000_000
 COMPLETION_MAX_ATTEMPTS = 100
 COMPLETION_SOCKET_HWM = 4096
+METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
 
 
 class CandidateTransportError(RuntimeError):
@@ -355,8 +357,18 @@ class TargetCandidateArena:
         draft_session_id: str,
         notice_queued_ns: int = 0,
         notice_received_ns: int = 0,
+        valid_length: int = 0,
+        root_token: int = 0,
     ) -> None:
-        """Arm the tiny metadata read after transport reports remote completion."""
+        """Arm the tiny metadata read after transport reports remote completion.
+
+        A successful completion whose notice carries the published metadata is
+        made READY directly: the producer sends the notice only after its push
+        event completed, so the payload is already in this arena and the
+        readback would only re-read words the authenticated notice states.
+        Cancellation tombstones keep the readback, which proves remote
+        quiescence before a slot is reused.
+        """
 
         if not draft_instance_id or not draft_session_id:
             raise ValueError("candidate host completion identity is incomplete")
@@ -402,6 +414,33 @@ class TargetCandidateArena:
             slot.completion_draft_session_id = draft_session_id
             slot.notice_queued_ns = notice_queued_ns
             slot.notice_received_ns = notice_received_ns
+            if (
+                not METADATA_READBACK
+                and valid_length == self.row_width
+                and slot.state is CandidateSlotState.ARMED
+                and not slot.cancel_pending
+            ):
+                observed_ns = time.monotonic_ns()
+                slot.completion = CandidateCompletion(
+                    transfer_id=slot.transfer_id,
+                    slot_id=slot_id,
+                    generation=slot.generation,
+                    authorization_nonce=slot.authorization_nonce,
+                    valid_length=valid_length,
+                    root_token=root_token,
+                    draft_instance_id=draft_instance_id,
+                    draft_session_id=draft_session_id,
+                    observed_ns=observed_ns,
+                    notice_queued_ns=notice_queued_ns,
+                    notice_received_ns=notice_received_ns,
+                    # No readback is issued; record it as instantaneous so
+                    # traces keep one monotonic receive->observe chain.
+                    metadata_submitted_ns=observed_ns,
+                )
+                # Same parked-before-ACK semantics as the readback path: poll()
+                # exposes it only once the assignment identity matches.
+                slot.state = CandidateSlotState.READY
+                return
 
         timing_enabled = bool(getattr(self, "_profile_timing", False))
         event = torch.cuda.Event(enable_timing=timing_enabled)
@@ -492,6 +531,8 @@ class TargetCandidateArena:
             draft_session_id=notice.draft_session_id,
             notice_queued_ns=notice.sent_ns,
             notice_received_ns=received_ns,
+            valid_length=0 if notice.cancelled else notice.valid_length,
+            root_token=notice.root_token,
         )
         self._remember_notice(key)
         return True
@@ -988,6 +1029,8 @@ class DraftCandidatePushTransport:
                 draft_session_id=self.draft_session_id,
                 cancelled=cancelled,
                 sent_ns=now_ns,
+                valid_length=0 if cancelled else int(destination.row_width),
+                root_token=int(task.next_token_id),
             )
             pending = self._pending_notices.get(task.transfer_id)
             if pending is not None:
