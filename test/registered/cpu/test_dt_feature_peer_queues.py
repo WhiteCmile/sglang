@@ -206,6 +206,10 @@ def test_successful_measured_feature_pulls_account_for_proposal_boundaries() -> 
     engine._stop = False
     engine._fatal_gpu_quarantine_reason = None
     engine._pending_feature_batches = deque(pending_batches)
+    engine._input_ready_features = deque()
+    engine._feature_staging_refcounts = {0: 1, 1: 1}
+    engine._feature_staging_compute_busy = set()
+    engine._pending_flashmtp_completions = deque()
     engine._pending_dflash_completions = deque()
     engine._pending_eagle3_completions = deque()
     engine._feature_source_inflight = set()
@@ -219,6 +223,8 @@ def test_successful_measured_feature_pulls_account_for_proposal_boundaries() -> 
     engine._direct_gpu_measurement_epochs = {}
     engine._direct_gpu_measurement_requests = {}
     engine._last_direct_gpu_measurement_ns = 0
+    engine.max_batch_size = 8
+    engine.feature_buffer_max_tokens = 8
 
     source_done = []
     launched = []
@@ -229,6 +235,10 @@ def test_successful_measured_feature_pulls_account_for_proposal_boundaries() -> 
     engine._publish_capacity = lambda: capacity_updates.append("capacity")
 
     engine._poll_feature_batches()
+    assert len(engine._input_ready_features) == 2
+    assert not launched
+    while ready := engine._take_input_ready_batch():
+        engine._execute_input_ready_batch(ready)
 
     assert [task.transfer_id for task in source_done] == [
         materialize.transfer_id,
@@ -269,6 +279,101 @@ def test_successful_measured_feature_pulls_account_for_proposal_boundaries() -> 
             "measurement_requests": 1,
             "measurement_proposal_requests": 1,
         },
+    ]
+
+
+def test_feature_batch_promotes_each_request_to_input_ready_independently() -> None:
+    def make_task(transfer_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            transfer_id=transfer_id,
+            request_id=f"request-{transfer_id}",
+            round_id=1,
+            draft_kv_handle="",
+            source_read_migration_id="",
+            deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            requires_proposal=True,
+            source=SimpleNamespace(
+                nbytes=2,
+                shape=(1, 1),
+                target_instance_id="target-0",
+                source_session_id="target-session",
+                pool_generation="target-pool",
+                transport_session="target-transport",
+            ),
+        )
+
+    def metrics() -> SimpleNamespace:
+        return SimpleNamespace(
+            submitted_ns=1,
+            gpu_completed_ns=2,
+            mapping_ns=0,
+            driver_submit_ns=0,
+            gpu_copy_ns=1,
+            feature_bytes=2,
+            cold_mapping_count=0,
+        )
+
+    fast = make_task("fast")
+    slow = make_task("slow")
+    fast_future = Future()
+    fast_future.set_result(metrics())
+    slow_future = Future()
+    engine = FlashMTPDraftEngine.__new__(FlashMTPDraftEngine)
+    engine.instance_id = "draft-0"
+    engine._persistent = False
+    engine._is_feature_backed = False
+    engine._fatal_gpu_quarantine_reason = None
+    engine._pending_feature_batches = deque(
+        (
+            PendingFeatureBatch(
+                batch_id="mixed-readiness",
+                pending=[PendingDraftTask(fast), PendingDraftTask(slow)],
+                staging_slot=0,
+                row_ranges=((0, 1), (1, 2)),
+                futures=(fast_future, slow_future),
+                submitted_ns=1,
+            ),
+        )
+    )
+    engine._input_ready_features = deque()
+    engine._feature_staging_refcounts = {0: 2}
+    engine._feature_staging_compute_busy = set()
+    engine._pending_flashmtp_completions = deque()
+    engine._pending_dflash_completions = deque()
+    engine._pending_eagle3_completions = deque()
+    engine._feature_source_inflight = set()
+    engine._feature_source_quiescent = set()
+    engine._feature_source_unquiescent = set()
+    engine._deferred_feature_source_tasks = {}
+    engine._quarantined_feature_draft_handles = set()
+    engine._cancelled_ids = set()
+    engine.batch_source_read_done = False
+    engine.max_batch_size = 8
+    engine.feature_buffer_max_tokens = 8
+    source_done = []
+    engine._publish_source_done = source_done.append
+    engine._publish_failures = lambda failures: pytest.fail(str(failures))
+    engine._publish_capacity = lambda: None
+
+    engine._poll_feature_batches()
+
+    assert [entry.pending.task.transfer_id for entry in engine._input_ready_features] == [
+        "fast"
+    ]
+    assert [item.task.transfer_id for item in engine._pending_feature_batches[0].pending] == [
+        "slow"
+    ]
+    selected = engine._take_input_ready_batch()
+    assert [entry.pending.task.transfer_id for entry in selected] == ["fast"]
+    assert source_done == [fast]
+
+    # The unfinished entry is not part of that compute selection and can
+    # independently become READY later in the same staging arena.
+    engine._feature_staging_compute_busy.clear()
+    slow_future.set_result(metrics())
+    engine._poll_feature_batches()
+    assert [entry.pending.task.transfer_id for entry in engine._input_ready_features] == [
+        "slow"
     ]
 
 
@@ -495,6 +600,10 @@ def test_unquiesced_feature_batch_keeps_staging_and_draft_kv_quarantined() -> No
             ),
         )
     )
+    engine._input_ready_features = deque()
+    engine._feature_staging_refcounts = {0: 1, 1: 1}
+    engine._feature_staging_compute_busy = set()
+    engine._pending_flashmtp_completions = deque()
     engine._pending_dflash_completions = deque()
     engine._pending_eagle3_completions = deque()
     engine._quarantined_eagle3_completions = []
@@ -612,6 +721,10 @@ def test_fatal_gpu_quarantine_blocks_deferred_migration_and_resource_reuse(
             ),
         )
     )
+    engine._input_ready_features = deque()
+    engine._feature_staging_refcounts = {7: 1}
+    engine._feature_staging_compute_busy = set()
+    engine._pending_flashmtp_completions = deque()
     engine._pending_dflash_completions = deque()
     engine._pending_eagle3_completions = deque()
     engine._quarantined_eagle3_completions = []
@@ -631,6 +744,8 @@ def test_fatal_gpu_quarantine_blocks_deferred_migration_and_resource_reuse(
     engine._deferred_persistent_releases = {}
     engine._migration_source_handles = {}
     engine._prepared_migrations = {}
+    engine.max_batch_size = 8
+    engine.feature_buffer_max_tokens = 8
 
     control_type = (
         DraftKvMigrationPrepare
@@ -687,6 +802,10 @@ def test_fatal_gpu_quarantine_blocks_deferred_migration_and_resource_reuse(
         engine._launch_dflash_materialization = fail_proposal
 
     FlashMTPDraftEngine._poll_feature_batches(engine)
+    if failure_stage == "proposal":
+        ready = engine._take_input_ready_batch()
+        assert len(ready) == 1
+        engine._execute_input_ready_batch(ready)
 
     assert engine._stop
     assert engine._fatal_gpu_quarantine_active()
@@ -831,6 +950,10 @@ def test_dflash_proposal_recovery_fence_failure_retains_all_gpu_ownership(
             ),
         )
     )
+    engine._input_ready_features = deque()
+    engine._feature_staging_refcounts = {7: 1}
+    engine._feature_staging_compute_busy = set()
+    engine._pending_flashmtp_completions = deque()
     engine._pending_dflash_completions = deque()
     engine._pending_eagle3_completions = deque()
     engine._feature_source_inflight = set()
@@ -840,6 +963,8 @@ def test_dflash_proposal_recovery_fence_failure_retains_all_gpu_ownership(
     engine._quarantined_feature_draft_handles = set()
     engine._free_feature_staging_slots = deque()
     engine._cancelled_ids = set()
+    engine.max_batch_size = 8
+    engine.feature_buffer_max_tokens = 8
 
     persistent_owner = SimpleNamespace(request_id="request-1")
     prepared_owner = SimpleNamespace(transfer_future=None)
@@ -887,6 +1012,9 @@ def test_dflash_proposal_recovery_fence_failure_retains_all_gpu_ownership(
     engine._launch_dflash_materialization = launch_through_real_proposal_handler
 
     FlashMTPDraftEngine._poll_feature_batches(engine)
+    ready = engine._take_input_ready_batch()
+    assert len(ready) == 1
+    engine._execute_input_ready_batch(ready)
 
     assert recovery_stream.synchronize_calls == 1
     assert synchronization_error.resources_quiescent is False
@@ -1443,6 +1571,10 @@ def test_engine_fatal_quarantine_fences_queued_feature_executor_callback(
                 ),
             )
         )
+        engine._input_ready_features = deque()
+        engine._feature_staging_refcounts = {7: 1, 8: 1}
+        engine._feature_staging_compute_busy = set()
+        engine._pending_flashmtp_completions = deque()
         engine._pending_dflash_completions = deque()
         engine._pending_eagle3_completions = deque()
         engine._feature_source_inflight = set()
@@ -1452,6 +1584,8 @@ def test_engine_fatal_quarantine_fences_queued_feature_executor_callback(
         engine._quarantined_feature_draft_handles = set()
         engine._free_feature_staging_slots = deque()
         engine._cancelled_ids = set()
+        engine.max_batch_size = 8
+        engine.feature_buffer_max_tokens = 8
         source_done = []
         failures = []
         capacity_updates = []
@@ -1467,6 +1601,9 @@ def test_engine_fatal_quarantine_fences_queued_feature_executor_callback(
 
         engine._launch_dflash_materialization = fail_proposal
         engine._poll_feature_batches()
+        ready = engine._take_input_ready_batch()
+        assert len(ready) == 1
+        engine._execute_input_ready_batch(ready)
 
         assert engine._stop
         assert (

@@ -27,6 +27,7 @@ from dt_protocol import (
     DraftRequestRelease,
     DraftTaskKind,
     PullDone,
+    ResultBatchAck,
     SourceReadDone,
     SourceReadDoneBatch,
     SourceReadDoneBatchAck,
@@ -55,6 +56,11 @@ from sglang.srt.speculative.dt_feature_p2p import (
     FeatureTransferSlice,
     TargetFeatureSourcePool,
 )
+from sglang.srt.speculative.dt_candidate_p2p import (
+    CandidateSlotState,
+    TargetCandidateArena,
+    _CandidateSlot,
+)
 from sglang.srt.speculative.dt_target import (
     DTTargetController,
     ParkedTargetRound,
@@ -78,6 +84,41 @@ from sglang.srt.speculative.dt_kv_p2p import (
     TransferQuiescenceError,
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+
+def test_direct_cancel_before_assignment_ack_retains_authenticated_generation() -> None:
+    arena = TargetCandidateArena.__new__(TargetCandidateArena)
+    arena._lock = Lock()
+    arena._active = {"transfer": 0}
+    arena._slots = [
+        _CandidateSlot(
+            generation=7,
+            state=CandidateSlotState.ARMED,
+            transfer_id="transfer",
+            authorization_nonce=91,
+        )
+    ]
+
+    assert arena.cancel("transfer", remote_quiescent=False) is False
+    slot = arena._slots[0]
+    assert slot.state is CandidateSlotState.QUARANTINED
+    assert slot.cancel_pending is True
+    assert arena._active == {"transfer": 0}
+
+    arena.authorize(
+        SimpleNamespace(
+            transfer_id="transfer",
+            authorization_nonce=91,
+            draft_instance_id="draft-0",
+            draft_session_id="draft-session",
+        )
+    )
+    assert (slot.draft_instance_id, slot.draft_session_id) == (
+        "draft-0",
+        "draft-session",
+    )
+    assert slot.state is CandidateSlotState.QUARANTINED
+    assert slot.cancel_pending is True
 
 
 @pytest.mark.parametrize(
@@ -719,6 +760,8 @@ def test_flashmtp_candidate_completion_retains_slot_and_filters_rows(
     engine._pending_flashmtp_completions = deque((completion,))
     engine._quarantined_flashmtp_completions = []
     engine._cancelled_ids = {"cancelled"}
+    engine._pending_ids = {task.transfer_id for task in tasks}
+    engine._received_ns_by_transfer = {}
     engine._free_feature_staging_slots = deque()
     successes = []
     failures = []
@@ -2264,6 +2307,31 @@ def test_eagle3_pending_cancel_releases_unsubmitted_feature_source() -> None:
     assert retired == [task.draft_kv_handle]
 
 
+def test_cancelled_transfer_identity_waits_only_for_direct_tombstone_ack() -> None:
+    mmap_task = SimpleNamespace(
+        transfer_id="mmap-cancel",
+        candidate_destination=None,
+    )
+    direct_task = SimpleNamespace(
+        transfer_id="direct-cancel",
+        candidate_destination=object(),
+    )
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine._pending_ids = {mmap_task.transfer_id, direct_task.transfer_id}
+    engine._cancelled_ids = {mmap_task.transfer_id, direct_task.transfer_id}
+    engine._received_ns_by_transfer = {
+        mmap_task.transfer_id: 1,
+        direct_task.transfer_id: 2,
+    }
+
+    engine._retire_cancelled_transfer_identity(mmap_task)
+    engine._retire_cancelled_transfer_identity(direct_task)
+
+    assert engine._pending_ids == {direct_task.transfer_id}
+    assert engine._cancelled_ids == set()
+    assert engine._received_ns_by_transfer == {}
+
+
 def test_eagle3_token_metadata_batches_ragged_streams_without_reordering() -> None:
     token_chunks = [
         torch.tensor([10, 11]),
@@ -3201,6 +3269,29 @@ def test_deferred_dflash_stages_reserve_bounded_source_capacity() -> None:
     assert controller._deferred_dflash_feature_stages == 0
 
 
+def test_dflash_prefill_reserve_keeps_one_slot_for_admitted_owner() -> None:
+    controller = object.__new__(DTTargetController)
+    controller.is_feature_backed = True
+    controller.is_export_rank = False
+    controller._deferred_dflash_feature_stages = 0
+    controller._draft_admitted_attempts = {"admitted": 4}
+    controller._lifecycle_attempt_by_request = {"admitted": 4}
+
+    controller._feature_source_free_slots = 2
+    assert not controller.should_defer_prefill(ready_batch_size=0, chunked_req=None)
+
+    controller._feature_source_free_slots = 1
+    assert controller.has_feature_source_capacity()
+    assert controller.should_defer_prefill(ready_batch_size=0, chunked_req=None)
+    assert not controller.should_defer_prefill(
+        ready_batch_size=0,
+        chunked_req=SimpleNamespace(rid="admitted"),
+    )
+
+    controller._feature_source_free_slots = 0
+    assert not controller.has_feature_source_capacity()
+
+
 def test_terminal_request_retires_late_dflash_control_failure() -> None:
     controller = object.__new__(DTTargetController)
     req = SimpleNamespace(rid="request-0")
@@ -3283,6 +3374,94 @@ def test_oom_cleanup_detaches_failed_parked_alias_before_kv_release() -> None:
     assert not controller._parked
     assert not controller.pop_failures()
     assert controller._lifecycle_attempt_by_request[req.rid] == 1
+
+
+def test_detach_parked_requests_clears_already_empty_batch_full_state() -> None:
+    controller = object.__new__(DTTargetController)
+    batch = SimpleNamespace(reqs=[], batch_is_full=True)
+
+    controller.detach_parked_requests(batch)
+
+    assert batch.batch_is_full is False
+
+
+def test_empty_prefill_arbitration_profile_deduplicates_state() -> None:
+    controller = object.__new__(DTTargetController)
+    controller.is_export_rank = True
+    controller._profile_active = True
+    controller.empty_prefill_arbitration_profile_enabled = True
+    controller._feature_source_free_slots = 2
+    controller._deferred_dflash_feature_stages = 1
+    controller._draft_admitted_attempts = {}
+    controller._lifecycle_attempt_by_request = {}
+    controller._last_empty_prefill_arbitration_profile = None
+    emitted = []
+    controller._profile_emit = lambda event, **fields: emitted.append(
+        (event, fields)
+    )
+
+    kwargs = dict(
+        decision_started_ns=1,
+        prefill_decision="one_slot_headroom",
+        selected="ready",
+        waiting_request_ids=("request-0",),
+        running_batch_is_full=False,
+        empty_full_before_detach=False,
+        fullness_cleared_by_detach=False,
+        batch_size_before_detach=0,
+        batch_size_after_detach=0,
+        selected_wave_id=7,
+        selected_batch_size=4,
+        chunked_req=None,
+    )
+    controller.profile_empty_prefill_arbitration(**kwargs)
+    controller.profile_empty_prefill_arbitration(**kwargs)
+
+    assert len(emitted) == 1
+    assert emitted[0][0] == "target_empty_prefill_arbitration"
+    assert emitted[0][1]["effective_source_slots"] == 1
+    assert emitted[0][1]["waiting_request_ids"] == ("request-0",)
+    assert emitted[0][1]["selected_wave_id"] == 7
+
+    controller.profile_empty_prefill_arbitration(
+        **{**kwargs, "selected": "idle"}
+    )
+    assert len(emitted) == 2
+
+
+@pytest.mark.parametrize("keep_live_request", (False, True))
+def test_detach_parked_request_clears_stale_batch_full_state(
+    keep_live_request: bool,
+) -> None:
+    controller = object.__new__(DTTargetController)
+    parked_req = SimpleNamespace(
+        rid="parked-request",
+        is_retracted=False,
+        finished=lambda: False,
+    )
+    live_req = SimpleNamespace(
+        rid="live-request",
+        is_retracted=False,
+        finished=lambda: False,
+    )
+    controller._parked = {"transfer-0": SimpleNamespace(req=parked_req)}
+    controller._target_inflight_counts = {}
+
+    batch = SimpleNamespace(
+        reqs=[parked_req] + ([live_req] if keep_live_request else []),
+        batch_is_full=True,
+        spec_info=None,
+    )
+
+    def filter_batch(*, keep_indices):
+        batch.reqs = [batch.reqs[index] for index in keep_indices]
+
+    batch.filter_batch = filter_batch
+
+    controller.detach_parked_requests(batch)
+
+    assert batch.reqs == ([live_req] if keep_live_request else [])
+    assert batch.batch_is_full is False
 
 
 def test_remote_failure_retires_one_request_lifecycle_exactly_once() -> None:
@@ -3923,6 +4102,324 @@ def test_flashmtp_pending_completion_reserves_result_slot() -> None:
     engine._pending_dflash_completions = deque()
 
     assert engine._available_dflash_result_slots() == 1
+
+
+def test_direct_candidate_cancel_publishes_quiescent_host_completion() -> None:
+    class ReadyEvent:
+        @staticmethod
+        def query() -> bool:
+            return True
+
+    class CandidateTransport:
+        def __init__(self) -> None:
+            self.tasks = None
+            self.completions = []
+
+        def publish_cancelled(self, tasks):
+            self.tasks = list(tasks)
+            return SimpleNamespace(
+                event=ReadyEvent(),
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                submitted_ns=11,
+                candidate_bytes=0,
+            )
+
+        def publish_completion(self, tasks, *, cancelled):
+            self.completions.append((list(tasks), cancelled))
+
+    task = SimpleNamespace(
+        transfer_id="direct-cancel",
+        request_id="request-0",
+        round_id=3,
+        attempt=1,
+        target_instance_id="target-0",
+        candidate_destination=object(),
+    )
+    sent = []
+    capacity_updates = []
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine.EntryStatus = EntryStatus
+    engine.instance_id = "draft-0"
+    engine.candidate_transport = "cuda-ipc"
+    engine._candidate_push_transport = CandidateTransport()
+    engine._pending_candidate_pushes = deque()
+    # The cancel may land after INPUT_READY selection removed the task from
+    # its queue but before the compute completion owner was linked.
+    engine._pending = deque()
+    engine._direct_tasks_by_transfer = {task.transfer_id: task}
+    engine._pending_feature_batches = deque()
+    engine._input_ready_features = deque()
+    engine._pending_flashmtp_completions = deque()
+    engine._pending_dflash_completions = deque()
+    engine._pending_eagle3_completions = deque()
+    engine._cancelled_ids = {task.transfer_id}
+    engine._pending_ids = {task.transfer_id}
+    engine._received_ns_by_transfer = {task.transfer_id: 1}
+    engine._fatal_gpu_quarantine_reason = None
+    engine._result_sequence = 0
+    engine._free_result_slots = deque((7,))
+    engine._profile_active = False
+    engine._send_result = sent.append
+    engine._publish_capacity = lambda: capacity_updates.append(True)
+
+    engine._publish_candidate_cancellations((task.transfer_id,))
+    assert engine._candidate_push_transport.tasks == [task]
+    assert len(engine._pending_candidate_pushes) == 1
+    assert engine._pending_candidate_pushes[0].cancelled
+    assert engine._pending_candidate_pushes[0].result_slot is None
+
+    engine._poll_candidate_pushes()
+    assert engine._candidate_push_transport.completions == [([task], True)]
+
+    assert not engine._pending_candidate_pushes
+    assert list(engine._free_result_slots) == [7]
+    assert capacity_updates == [True]
+    assert task.transfer_id not in engine._cancelled_ids
+    assert task.transfer_id not in engine._direct_tasks_by_transfer
+    # Direct publication is only the data-plane half of return ownership.
+    # Coordinator ResultBatchAck retires the accepted transfer identity.
+    assert engine._pending_ids == {task.transfer_id}
+    assert len(sent) == 1
+    assert sent[0].entries[0].status == EntryStatus.CANCELLED
+    assert sent[0].entries[0].source_read_quiescent
+    assert sent[0].buffer is None
+
+
+def test_direct_candidate_completion_timestamp_precedes_notice_publish(
+    monkeypatch,
+) -> None:
+    class ReadyEvent:
+        @staticmethod
+        def query() -> bool:
+            return True
+
+    publish_observed = []
+
+    class CandidateTransport:
+        @staticmethod
+        def publish_completion(_tasks, *, cancelled):
+            assert not cancelled
+            publish_observed.append(dt_draft_engine_module.time.monotonic_ns())
+
+    task = SimpleNamespace(
+        transfer_id="direct-profile-order",
+        request_id="request-0",
+        round_id=3,
+        attempt=1,
+        target_instance_id="target-0",
+    )
+    emitted = []
+    sent = []
+    clock = iter((100, 110, 120, 130))
+    monkeypatch.setattr(
+        dt_draft_engine_module.time, "monotonic_ns", lambda: next(clock)
+    )
+    monkeypatch.setattr(
+        dt_draft_engine_module,
+        "profile_emit",
+        lambda event, **fields: emitted.append((event, fields)),
+    )
+
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine.EntryStatus = EntryStatus
+    engine.instance_id = "draft-0"
+    engine._candidate_push_transport = CandidateTransport()
+    engine._pending_candidate_pushes = deque(
+        (
+            SimpleNamespace(
+                push=SimpleNamespace(
+                    event=ReadyEvent(),
+                    start_event=None,
+                    submitted_ns=50,
+                    candidate_bytes=64,
+                ),
+                tasks=[task],
+                result_slot=None,
+                cancelled=False,
+            ),
+        )
+    )
+    engine._pending = deque()
+    engine._pending_feature_batches = deque()
+    engine._input_ready_features = deque()
+    engine._pending_flashmtp_completions = deque()
+    engine._pending_dflash_completions = deque()
+    engine._pending_eagle3_completions = deque()
+    engine._cancelled_ids = set()
+    engine._pending_ids = {task.transfer_id}
+    engine._received_ns_by_transfer = {task.transfer_id: 1}
+    engine._direct_tasks_by_transfer = {task.transfer_id: task}
+    engine._fatal_gpu_quarantine_reason = None
+    engine._result_sequence = 0
+    engine._free_result_slots = deque()
+    engine._profile_active = True
+    engine._send_result = sent.append
+    engine._publish_capacity = lambda: None
+
+    engine._poll_candidate_pushes()
+
+    observed = dict(emitted)["draft_candidate_producer_completion_observed"]
+    completed = dict(emitted)["draft_candidate_push_complete"]
+    assert observed["completion_observed_ns"] == 100
+    assert publish_observed == [110]
+    assert observed["notice_publish_returned_ns"] == 120
+    assert completed["completed_ns"] == 100
+    assert completed["completion_ns"] == 50
+    assert completed["coordinator_result_sent_ns"] == 130
+    assert sent[0].sent_ns == 130
+
+
+def test_target_cuda_observation_emits_one_ordered_wave_without_sync() -> None:
+    class FakeEvent:
+        def __init__(self, *, ready: bool, elapsed_ms: float) -> None:
+            self.ready = ready
+            self.elapsed_ms = elapsed_ms
+            self.query_calls = 0
+
+        def query(self):
+            self.query_calls += 1
+            return self.ready
+
+        def elapsed_time(self, _other):
+            return self.elapsed_ms
+
+    start = FakeEvent(ready=True, elapsed_ms=0.75)
+    end = FakeEvent(ready=True, elapsed_ms=0.0)
+    emitted = []
+    controller = object.__new__(DTTargetController)
+    controller.is_export_rank = True
+    controller._profile_active = True
+    controller._last_target_verify_end_event = None
+    controller._profile_emit = lambda event, **fields: emitted.append(
+        (event, fields)
+    )
+    controller._pending_target_gpu_observations = deque(
+        (
+            dt_target_module._PendingTargetGpuObservation(
+                wave_id=9,
+                transfer_ids=("transfer-a",),
+                ready_ns=10,
+                selection_started_ns=11,
+                selection_finished_ns=12,
+                submission_started_ns=13,
+                submission_returned_ns=14,
+                start_event=start,
+                end_event=end,
+            ),
+        )
+    )
+
+    controller._poll_target_gpu_observations()
+
+    assert not controller._pending_target_gpu_observations
+    assert start.query_calls == 1
+    assert end.query_calls == 1
+    assert [name for name, _ in emitted] == ["target_verify_cuda_observed"]
+    fields = emitted[0][1]
+    assert fields["wave_id"] == 9
+    assert fields["transfer_ids"] == ("transfer-a",)
+    assert fields["cuda_total_ns"] == 750_000
+    assert fields["gpu_start_observed_ns"] <= fields["gpu_end_observed_ns"]
+
+
+def test_direct_tombstone_keeps_cancel_marker_until_feature_pull_retires() -> None:
+    class ReadyEvent:
+        @staticmethod
+        def query() -> bool:
+            return True
+
+    class CandidateTransport:
+        @staticmethod
+        def publish_completion(_tasks, *, cancelled):
+            assert cancelled
+
+    task = SimpleNamespace(
+        transfer_id="cancel-during-feature-pull",
+        request_id="request-0",
+        round_id=0,
+        attempt=1,
+        target_instance_id="target-0",
+        candidate_destination=object(),
+    )
+    item = SimpleNamespace(task=task)
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine.EntryStatus = EntryStatus
+    engine.instance_id = "draft-0"
+    engine._candidate_push_transport = CandidateTransport()
+    engine._pending_candidate_pushes = deque(
+        (
+            SimpleNamespace(
+                push=SimpleNamespace(event=ReadyEvent(), submitted_ns=1),
+                tasks=[task],
+                result_slot=None,
+                cancelled=True,
+            ),
+        )
+    )
+    engine._pending = deque()
+    engine._pending_feature_batches = deque(
+        (SimpleNamespace(pending=[item]),)
+    )
+    engine._input_ready_features = deque()
+    engine._pending_flashmtp_completions = deque()
+    engine._pending_dflash_completions = deque()
+    engine._pending_eagle3_completions = deque()
+    engine._cancelled_ids = {task.transfer_id}
+    engine._pending_ids = {task.transfer_id}
+    engine._received_ns_by_transfer = {task.transfer_id: 1}
+    engine._direct_tasks_by_transfer = {task.transfer_id: task}
+    engine._fatal_gpu_quarantine_reason = None
+    engine._result_sequence = 0
+    engine._free_result_slots = deque()
+    engine._profile_active = False
+    engine._send_result = lambda _message: None
+    engine._publish_capacity = lambda: None
+
+    engine._poll_candidate_pushes()
+    assert task.transfer_id in engine._cancelled_ids
+    assert task.transfer_id in engine._pending_ids
+
+    engine._pending_feature_batches.clear()
+    engine._retire_cancelled_transfer_identity(task)
+    assert task.transfer_id not in engine._cancelled_ids
+    # Direct return responsibility is still retired only by ResultBatchAck.
+    assert task.transfer_id in engine._pending_ids
+
+
+def test_result_ack_retires_held_transfer_identity() -> None:
+    transfer_id = "held-until-result-ack"
+    batch_id = "draft-0:direct-result:9"
+    result = SimpleNamespace(
+        entries=(SimpleNamespace(transfer_id=transfer_id),)
+    )
+    outbox = RetryOutbox(retry_interval_ns=1)
+    outbox.add("result", batch_id, result)
+    capacity_updates = []
+
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine._delivery_outbox = outbox
+    engine._pending_ids = {transfer_id}
+    engine._published_by_batch = {}
+    engine._client = SimpleNamespace(
+        recv_nowait=lambda: (
+            ResultBatchAck(
+                protocol_version=PROTOCOL_VERSION,
+                batch_id=batch_id,
+                accepted_transfer_ids=(transfer_id,),
+            ),
+        )
+    )
+    engine._flush_source_done = lambda: None
+    engine._poll_migration_transfers = lambda: False
+    engine._poll_deferred_migration_gpu_controls = lambda: False
+    engine._drop_cancelled_pending = lambda: None
+    engine._publish_capacity = lambda: capacity_updates.append(True)
+
+    engine._poll_messages()
+
+    assert engine._pending_ids == set()
+    assert outbox.get("result", batch_id) is None
+    assert capacity_updates == [True]
 
 
 def test_failed_enqueued_copy_future_waits_for_gpu_quiescence(monkeypatch) -> None:

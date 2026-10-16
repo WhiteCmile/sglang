@@ -22,7 +22,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
-from threading import Lock
+from threading import Condition, Lock, local
 
 import torch
 
@@ -141,6 +141,12 @@ class FeaturePullMetrics:
     gpu_copy_ns: int
     feature_bytes: int
     cold_mapping_count: int
+    worker_started_ns: int = 0
+    mapping_done_ns: int = 0
+    driver_submit_started_ns: int = 0
+    driver_submit_done_ns: int = 0
+    cuda_pre_copy_ns: int = 0
+    gpu_start_observed_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +160,12 @@ class FeaturePullBatchMetrics:
     cold_mapping_count: int
     segment_count: int
     peer_count: int
+    worker_started_ns: int = 0
+    mapping_done_ns: int = 0
+    driver_submit_started_ns: int = 0
+    driver_submit_done_ns: int = 0
+    cuda_pre_copy_ns: int = 0
+    gpu_start_observed_ns: int = 0
 
 
 @dataclass(slots=True)
@@ -745,9 +757,10 @@ class DraftFeaturePullTransport:
         *,
         device: torch.device,
         max_workers: int = 1,
+        profile_timing: bool = False,
     ) -> None:
-        if max_workers != 1:
-            raise ValueError("feature copy transport requires exactly one worker")
+        if max_workers <= 0:
+            raise ValueError("feature copy transport requires positive workers")
         requested_device = torch.device(device)
         if requested_device.type != "cuda":
             raise ValueError("direct GPU source pulls require a CUDA device")
@@ -757,10 +770,12 @@ class DraftFeaturePullTransport:
             else int(requested_device.index)
         )
         self.device = torch.device("cuda", self.device_index)
+        self._profile_timing = bool(profile_timing)
         torch.cuda.set_device(self.device)
         self._runtime = CudaIpcRuntime()
         self._mapping_cache = CudaIpcMappingCache(self._runtime)
-        self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._stream_local = local()
+        self._copy_streams: list[torch.cuda.Stream] = []
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="dt-feature-p2p",
@@ -768,6 +783,9 @@ class DraftFeaturePullTransport:
         self._fatal_error: FeatureTransportQuiescenceError | None = None
         self._closed = False
         self._lock = Lock()
+        self._admission = Condition(self._lock)
+        self._admitted_pulls = 0
+        self._lifecycle_fence = False
 
     def submit(
         self,
@@ -777,14 +795,30 @@ class DraftFeaturePullTransport:
     ) -> Future[FeaturePullMetrics]:
         """Queue a direct source-to-destination pull and return immediately."""
         self._validate_submission(source, destination)
-        with self._lock:
+        admission = getattr(self, "_admission", None)
+        lock = self._lock if admission is None else admission
+        with lock:
             if self._closed:
                 raise FeatureTransportError("feature pull transport is closed")
             if self._fatal_error is not None:
                 raise FeatureTransportError(
                     "feature pull transport is quarantined after an unquiesced GPU-copy failure"
                 ) from self._fatal_error
-            return self._executor.submit(self._run_pull, source, destination)
+            if admission is None:
+                return self._executor.submit(self._run_pull, source, destination)
+            if self._lifecycle_fence:
+                raise FeatureTransportError(
+                    "feature pull admission is fenced by peer lifecycle work"
+                )
+            self._admitted_pulls += 1
+            try:
+                return self._executor.submit(
+                    self._run_admitted, self._run_pull, source, destination
+                )
+            except Exception:
+                self._admitted_pulls -= 1
+                self._admission.notify_all()
+                raise
 
     def submit_batch(
         self,
@@ -796,14 +830,38 @@ class DraftFeaturePullTransport:
         sources = tuple(sources)
         destinations = tuple(destinations)
         self._validate_batch_submission(sources, destinations)
-        with self._lock:
+        admission = getattr(self, "_admission", None)
+        lock = self._lock if admission is None else admission
+        with lock:
             if self._closed:
                 raise FeatureTransportError("feature pull transport is closed")
             if self._fatal_error is not None:
                 raise FeatureTransportError(
                     "feature pull transport is quarantined after an unquiesced GPU-copy failure"
                 ) from self._fatal_error
-            return self._executor.submit(self._run_batch, sources, destinations)
+            if admission is None:
+                return self._executor.submit(self._run_batch, sources, destinations)
+            if self._lifecycle_fence:
+                raise FeatureTransportError(
+                    "feature pull admission is fenced by peer lifecycle work"
+                )
+            self._admitted_pulls += 1
+            try:
+                return self._executor.submit(
+                    self._run_admitted, self._run_batch, sources, destinations
+                )
+            except Exception:
+                self._admitted_pulls -= 1
+                self._admission.notify_all()
+                raise
+
+    def _run_admitted(self, callback, *args):
+        try:
+            return callback(*args)
+        finally:
+            with self._admission:
+                self._admitted_pulls -= 1
+                self._admission.notify_all()
 
     @staticmethod
     def query(future: Future[FeaturePullMetrics]) -> FeaturePullMetrics | None:
@@ -815,20 +873,35 @@ class DraftFeaturePullTransport:
         return future.result()
 
     def invalidate_peer(self, target_instance_id: str) -> None:
-        with self._lock:
+        admission = getattr(self, "_admission", None)
+        if admission is None:
+            with self._lock:
+                if self._closed:
+                    raise FeatureTransportError("feature pull transport is closed")
+                if self._fatal_error is not None:
+                    raise FeatureTransportError(
+                        "cannot invalidate a peer while feature pulls are quarantined"
+                    ) from self._fatal_error
+                invalidated = self._executor.submit(
+                    self._invalidate_peer_if_healthy, target_instance_id
+                )
+            invalidated.result()
+            return
+        with admission:
             if self._closed:
                 raise FeatureTransportError("feature pull transport is closed")
             if self._fatal_error is not None:
                 raise FeatureTransportError(
                     "cannot invalidate a peer while feature pulls are quarantined"
                 ) from self._fatal_error
-            invalidated = self._executor.submit(
-                self._invalidate_peer_if_healthy, target_instance_id
-            )
-        # Generation changes are rare lifecycle events. Waiting here makes the
-        # unmap a peer-FIFO barrier instead of closing an allocation still used
-        # by an earlier copy from that peer.
-        invalidated.result()
+            self._lifecycle_fence = True
+            try:
+                while self._admitted_pulls:
+                    admission.wait()
+                self._mapping_cache.invalidate(target_instance_id)
+            finally:
+                self._lifecycle_fence = False
+                admission.notify_all()
 
     def _invalidate_peer_if_healthy(self, target_instance_id: str) -> None:
         with self._lock:
@@ -853,10 +926,37 @@ class DraftFeaturePullTransport:
 
     def probe_quiescence(self) -> Future[bool]:
         """Fence all admitted copy work before retrying/releasing state."""
-        with self._lock:
+        admission = getattr(self, "_admission", None)
+        if admission is None:
+            with self._lock:
+                if self._closed:
+                    raise FeatureTransportError("feature pull transport is closed")
+                return self._executor.submit(self._probe_stream_quiescence)
+        with admission:
             if self._closed:
                 raise FeatureTransportError("feature pull transport is closed")
-            return self._executor.submit(self._probe_stream_quiescence)
+            if self._lifecycle_fence:
+                raise FeatureTransportError(
+                    "feature pull lifecycle work is already in progress"
+                )
+            self._lifecycle_fence = True
+            try:
+                return self._executor.submit(self._run_quiescence_probe)
+            except Exception:
+                self._lifecycle_fence = False
+                admission.notify_all()
+                raise
+
+    def _run_quiescence_probe(self) -> bool:
+        try:
+            with self._admission:
+                while self._admitted_pulls:
+                    self._admission.wait()
+            return self._probe_stream_quiescence()
+        finally:
+            with self._admission:
+                self._lifecycle_fence = False
+                self._admission.notify_all()
 
     def close(self) -> None:
         with self._lock:
@@ -872,10 +972,31 @@ class DraftFeaturePullTransport:
     def _probe_stream_quiescence(self) -> bool:
         torch.cuda.set_device(self.device)
         try:
-            self._copy_stream.synchronize()
+            if hasattr(self, "_copy_streams"):
+                with self._lock:
+                    streams = tuple(self._copy_streams)
+            else:
+                streams = (self._copy_stream,)
+            for stream in streams:
+                stream.synchronize()
         except Exception:
             return False
         return True
+
+    def _worker_stream(self):
+        """Return one bounded CUDA stream owned by the current copy worker."""
+
+        stream_local = getattr(self, "_stream_local", None)
+        if stream_local is None:
+            # Compatibility for narrow CPU transport fixtures.
+            return self._copy_stream
+        stream = getattr(stream_local, "copy_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            stream_local.copy_stream = stream
+            with self._lock:
+                self._copy_streams.append(stream)
+        return stream
 
     def _run_pull(
         self,
@@ -891,6 +1012,12 @@ class DraftFeaturePullTransport:
             gpu_copy_ns=batch.gpu_copy_ns,
             feature_bytes=batch.feature_bytes,
             cold_mapping_count=batch.cold_mapping_count,
+            worker_started_ns=batch.worker_started_ns,
+            mapping_done_ns=batch.mapping_done_ns,
+            driver_submit_started_ns=batch.driver_submit_started_ns,
+            driver_submit_done_ns=batch.driver_submit_done_ns,
+            cuda_pre_copy_ns=batch.cuda_pre_copy_ns,
+            gpu_start_observed_ns=batch.gpu_start_observed_ns,
         )
 
     def _run_batch(
@@ -963,29 +1090,40 @@ class DraftFeaturePullTransport:
         peer_count: int,
     ) -> FeaturePullBatchMetrics:
         """Finish a submitted batch only once it cannot touch source memory."""
+        copy_stream = self._worker_stream()
+        gpu_queued = torch.cuda.Event(enable_timing=True)
         gpu_start = torch.cuda.Event(enable_timing=True)
         gpu_done = torch.cuda.Event(enable_timing=True)
         submitted_ns = time.monotonic_ns()
         stream_may_reference_source = False
         try:
-            with torch.cuda.stream(self._copy_stream):
+            with torch.cuda.stream(copy_stream):
                 stream_may_reference_source = True
+                gpu_queued.record(copy_stream)
                 for event in source_ready:
-                    self._copy_stream.wait_event(event)
-                gpu_start.record(self._copy_stream)
+                    copy_stream.wait_event(event)
+                gpu_start.record(copy_stream)
                 driver_submit_started_ns = time.monotonic_ns()
                 self._runtime.copy_batch_async(
-                    segments, self._copy_stream.cuda_stream
+                    segments, copy_stream.cuda_stream
                 )
                 driver_submit_done_ns = time.monotonic_ns()
-                gpu_done.record(self._copy_stream)
+                gpu_done.record(copy_stream)
             # This synchronization happens only in the bounded copy worker;
             # Target and Draft scheduler loops poll the returned Future.
+            gpu_start_observed_ns = 0
+            if getattr(self, "_profile_timing", False):
+                # This is a host observation of the CUDA start event, not a
+                # conversion of the device clock to monotonic wall time.  The
+                # worker already blocks for gpu_done below, so observing the
+                # earlier boundary does not serialize either scheduler loop.
+                gpu_start.synchronize()
+                gpu_start_observed_ns = time.monotonic_ns()
             gpu_done.synchronize()
         except Exception:
             if stream_may_reference_source:
                 try:
-                    self._copy_stream.synchronize()
+                    copy_stream.synchronize()
                 except Exception as fence_exc:
                     fatal = FeatureTransportQuiescenceError(
                         "failed feature pull may still access source or destination VRAM"
@@ -1004,6 +1142,12 @@ class DraftFeaturePullTransport:
             cold_mapping_count=cold_mapping_count,
             segment_count=len(segments),
             peer_count=peer_count,
+            worker_started_ns=mapping_started_ns,
+            mapping_done_ns=mapping_done_ns,
+            driver_submit_started_ns=driver_submit_started_ns,
+            driver_submit_done_ns=driver_submit_done_ns,
+            cuda_pre_copy_ns=int(gpu_queued.elapsed_time(gpu_start) * 1_000_000),
+            gpu_start_observed_ns=gpu_start_observed_ns,
         )
 
     def _validate_batch_submission(

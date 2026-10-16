@@ -17,8 +17,9 @@ from threading import Lock
 
 CUDA_IPC_HANDLE_BYTES = 64
 CUDA_IPC_LAZY_ENABLE_PEER_ACCESS = 1
-CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM = 1
-CUDA_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE = 1
+CUDA_MEMCPY_DEFAULT = 4
+CU_STREAM_WAIT_VALUE_EQ = 0x1
+CU_STREAM_WAIT_VALUE_FLUSH = 1 << 30
 
 
 class CudaIpcError(RuntimeError):
@@ -27,19 +28,6 @@ class CudaIpcError(RuntimeError):
 
 class _CudaIpcMemHandle(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_byte * CUDA_IPC_HANDLE_BYTES)]
-
-
-class _CudaMemLocation(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
-
-
-class _CudaMemcpyAttributes(ctypes.Structure):
-    _fields_ = [
-        ("srcAccessOrder", ctypes.c_int),
-        ("srcLocHint", _CudaMemLocation),
-        ("dstLocHint", _CudaMemLocation),
-        ("flags", ctypes.c_uint),
-    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +82,41 @@ class CudaIpcRuntime:
         ]
         get_range.restype = ctypes.c_int
 
+        self._driver.cuGetErrorString.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self._driver.cuGetErrorString.restype = ctypes.c_int
+
+        # Stream memory operations are Driver APIs. PyTorch's cudaStream_t is
+        # ABI-compatible with CUstream in the same CUDA context.
+        self._stream_wait_value32 = getattr(
+            self._driver,
+            "cuStreamWaitValue32_v2",
+            getattr(self._driver, "cuStreamWaitValue32", None),
+        )
+        self._stream_write_value32 = getattr(
+            self._driver,
+            "cuStreamWriteValue32_v2",
+            getattr(self._driver, "cuStreamWriteValue32", None),
+        )
+        if self._stream_wait_value32 is not None:
+            self._stream_wait_value32.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.c_uint,
+            ]
+            self._stream_wait_value32.restype = ctypes.c_int
+        if self._stream_write_value32 is not None:
+            self._stream_write_value32.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.c_uint,
+            ]
+            self._stream_write_value32.restype = ctypes.c_int
+
         self._runtime.cudaGetErrorString.argtypes = [ctypes.c_int]
         self._runtime.cudaGetErrorString.restype = ctypes.c_char_p
         self._runtime.cudaRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
@@ -104,11 +127,6 @@ class CudaIpcRuntime:
             "cudaRuntimeGetVersion",
         )
         self.runtime_version = runtime_version.value
-        if self.runtime_version < 12080:
-            raise CudaIpcError(
-                "DT P2P migration requires cudaMemcpyBatchAsync from CUDA 12.8 "
-                f"or newer; found runtime {self.runtime_version}"
-            )
         self._runtime.cudaIpcGetMemHandle.argtypes = [
             ctypes.POINTER(_CudaIpcMemHandle),
             ctypes.c_void_p,
@@ -123,33 +141,32 @@ class CudaIpcRuntime:
         self._runtime.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
         self._runtime.cudaIpcCloseMemHandle.restype = ctypes.c_int
 
-        self._batch_copy = getattr(self._runtime, "cudaMemcpyBatchAsync", None)
-        if self._batch_copy is None:
-            raise CudaIpcError(
-                "cudaMemcpyBatchAsync is unavailable; DT P2P migration requires "
-                "CUDA 12.8 or newer"
-            )
-        batch_copy_argtypes = [
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_size_t),
+        self._runtime.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
             ctypes.c_size_t,
-            ctypes.POINTER(_CudaMemcpyAttributes),
-            ctypes.POINTER(ctypes.c_size_t),
-            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
         ]
-        if self.runtime_version < 13000:
-            # CUDA 12.8 additionally reports the first failed copy index.
-            batch_copy_argtypes.append(ctypes.POINTER(ctypes.c_size_t))
-        batch_copy_argtypes.append(ctypes.c_void_p)
-        self._batch_copy.argtypes = batch_copy_argtypes
-        self._batch_copy.restype = ctypes.c_int
+        self._runtime.cudaMemcpyAsync.restype = ctypes.c_int
 
     def _check_runtime(self, code: int, operation: str) -> None:
         if code == 0:
             return
         detail = self._runtime.cudaGetErrorString(code)
         message = detail.decode(errors="replace") if detail else f"error {code}"
+        raise CudaIpcError(f"{operation} failed: {message}")
+
+    def _check_driver(self, code: int, operation: str) -> None:
+        if code == 0:
+            return
+        detail = ctypes.c_char_p()
+        decoded = self._driver.cuGetErrorString(code, ctypes.byref(detail))
+        message = (
+            detail.value.decode(errors="replace")
+            if decoded == 0 and detail.value
+            else f"CUresult {code}"
+        )
         raise CudaIpcError(f"{operation} failed: {message}")
 
     def register_allocation(
@@ -199,47 +216,57 @@ class CudaIpcRuntime:
         )
 
     def copy_batch_async(self, segments: Sequence[CopySegment], stream: int) -> None:
-        if not segments:
-            return
-        if stream == 0:
-            raise ValueError("DT P2P copy must use a non-default CUDA stream")
-        count = len(segments)
-        destinations = (ctypes.c_void_p * count)(
-            *(segment.destination_address for segment in segments)
-        )
-        sources = (ctypes.c_void_p * count)(
-            *(segment.source_address for segment in segments)
-        )
-        lengths = (ctypes.c_size_t * count)(*(segment.length for segment in segments))
-        attrs = _CudaMemcpyAttributes(
-            srcAccessOrder=CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM,
-            srcLocHint=_CudaMemLocation(0, 0),
-            dstLocHint=_CudaMemLocation(0, 0),
-            flags=CUDA_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE,
-        )
-        attrs_index = ctypes.c_size_t(0)
-        arguments = [
-            destinations,
-            sources,
-            lengths,
-            count,
-            ctypes.byref(attrs),
-            ctypes.byref(attrs_index),
-            1,
-        ]
-        failed_index = ctypes.c_size_t(count)
-        if self.runtime_version < 13000:
-            arguments.append(ctypes.byref(failed_index))
-        arguments.append(ctypes.c_void_p(stream))
-        code = self._batch_copy(*arguments)
-        if code != 0 and self.runtime_version < 13000 and failed_index.value < count:
-            raise CudaIpcError(
-                "cudaMemcpyBatchAsync failed at segment "
-                f"{failed_index.value} of {count}"
+        # CUDA 13's batched copy rejected peer IPC mappings on the validated
+        # H800 forward-compat stack.  Enqueue the bounded segments on the same
+        # dedicated stream instead.  The following publication/event remains
+        # ordered after every copy, so transport and lifecycle semantics do not
+        # change and this also works with the CUDA 12.4 prototype runtime.
+        for segment in segments:
+            self._check_runtime(
+                self._runtime.cudaMemcpyAsync(
+                    ctypes.c_void_p(segment.destination_address),
+                    ctypes.c_void_p(segment.source_address),
+                    ctypes.c_size_t(segment.length),
+                    ctypes.c_int(CUDA_MEMCPY_DEFAULT),
+                    ctypes.c_void_p(stream),
+                ),
+                "cudaMemcpyAsync",
             )
-        self._check_runtime(
-            code,
-            "cudaMemcpyBatchAsync",
+
+    def stream_wait_value32(self, *, address: int, value: int, stream: int) -> None:
+        """Queue an acquire-style equality wait without blocking the CPU."""
+
+        if self._stream_wait_value32 is None:
+            raise CudaIpcError("cuStreamWaitValue32 is unavailable")
+        if address <= 0 or stream == 0 or not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("stream wait requires a valid address, stream, and uint32")
+        self._check_driver(
+            self._stream_wait_value32(
+                ctypes.c_void_p(stream),
+                ctypes.c_uint64(address),
+                ctypes.c_uint32(value),
+                ctypes.c_uint(
+                    CU_STREAM_WAIT_VALUE_EQ | CU_STREAM_WAIT_VALUE_FLUSH
+                ),
+            ),
+            "cuStreamWaitValue32",
+        )
+
+    def stream_write_value32(self, *, address: int, value: int, stream: int) -> None:
+        """Queue one device-memory publication word on an existing CUDA stream."""
+
+        if self._stream_write_value32 is None:
+            raise CudaIpcError("cuStreamWriteValue32 is unavailable")
+        if address <= 0 or not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("stream write requires a valid address and uint32")
+        self._check_driver(
+            self._stream_write_value32(
+                ctypes.c_void_p(stream),
+                ctypes.c_uint64(address),
+                ctypes.c_uint32(value),
+                ctypes.c_uint(0),
+            ),
+            "cuStreamWriteValue32",
         )
 
     @staticmethod

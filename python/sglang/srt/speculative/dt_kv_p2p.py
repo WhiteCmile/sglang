@@ -319,8 +319,8 @@ class DraftKvP2pTransport:
                 self._copy_stream.wait_event(source_ready)
                 gpu_start.record(self._copy_stream)
                 driver_submit_started_ns = time.monotonic_ns()
-                # CUDA 12.8 may enqueue a prefix of cudaMemcpyBatchAsync before
-                # returning an error. From this point onward every failure
+                # The runtime may enqueue a prefix of the bounded segments
+                # before returning an error. From this point onward every failure
                 # must fence the stream before its Future becomes done.
                 self._runtime.copy_batch_async(segments, self._copy_stream.cuda_stream)
                 driver_submit_done_ns = time.monotonic_ns()

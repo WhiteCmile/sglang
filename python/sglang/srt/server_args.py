@@ -2078,6 +2078,18 @@ class ServerArgs:
         "Directory for single-node Draft-Target mmap slot files.",
         NS("spec"),
     ] = "/dev/shm"
+    draft_target_candidate_transport: A[
+        Literal["mmap", "cuda-ipc"],
+        "Candidate return transport. 'mmap' is the accepted V2 A/B path; "
+        "'cuda-ipc' writes into a bounded Target-owned GPU arena.",
+        NS("spec"),
+    ] = "mmap"
+    draft_target_candidate_slots: A[
+        int,
+        "Target-owned direct candidate arena rows. Zero derives a bounded "
+        "capacity from max_running_requests.",
+        NS("spec"),
+    ] = 0
     draft_target_round_timeout_ms: A[
         int,
         "Deadline in milliseconds for one remote Draft round.",

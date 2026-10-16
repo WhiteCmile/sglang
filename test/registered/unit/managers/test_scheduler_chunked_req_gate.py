@@ -12,9 +12,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.speculative.dt_target import DTTargetController
 from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -81,6 +82,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.dllm_manager = None
     s.enable_hisparse = False
     s.enable_fpm = False
+    s.dt_target_controller = None
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
@@ -104,6 +106,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
+    s.waiting_queue = []
     s._pending_chunked_abort_req = None
     return s
 
@@ -175,6 +178,156 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestDTPrefillArbitration(CustomTestCase):
+    def _build(self):
+        pool = _make_req_to_token_pool(num_slots=2, max_context=8)
+        scheduler = _scheduler_for_get_next_batch(
+            tree_cache=_make_chunk_cache(pool), chunked_req=None
+        )
+        controller = MagicMock()
+        controller.pop_failures.return_value = []
+        controller.has_feature_source_capacity.return_value = True
+        controller.should_defer_prefill.return_value = False
+        controller.empty_prefill_arbitration_profile_enabled = True
+        controller.eagle3_host_span_profile_enabled = False
+        scheduler.dt_target_controller = controller
+        return scheduler, controller
+
+    def test_admissible_prefill_runs_before_unsubmitted_ready_wave(self):
+        scheduler, controller = self._build()
+        prefill = MagicMock(name="prefill")
+        scheduler.get_new_batch_prefill.return_value = NextBatchPlan(
+            batch_to_run=prefill, running_batch=scheduler.running_batch
+        )
+
+        plan = Scheduler.get_next_batch_to_run(
+            scheduler,
+            running_batch=scheduler.running_batch,
+            last_batch=None,
+        )
+
+        self.assertIs(plan.batch_to_run, prefill)
+        controller.build_ready_batch.assert_not_called()
+        controller.profile_empty_prefill_arbitration.assert_called_once()
+        profile = controller.profile_empty_prefill_arbitration.call_args.kwargs
+        self.assertEqual(profile["prefill_decision"], "prefill_selected")
+        self.assertEqual(profile["selected"], "prefill")
+
+    def test_stale_empty_full_alias_is_normalized_before_prefill_choice(self):
+        scheduler, controller = self._build()
+        scheduler.running_batch.batch_is_full = True
+        controller.detach_parked_requests.side_effect = (
+            lambda batch: DTTargetController.detach_parked_requests(
+                controller, batch
+            )
+        )
+        prefill = MagicMock(name="prefill")
+
+        def choose_prefill(running_batch):
+            self.assertFalse(running_batch.batch_is_full)
+            return NextBatchPlan(
+                batch_to_run=prefill,
+                running_batch=running_batch,
+            )
+
+        scheduler.get_new_batch_prefill.side_effect = choose_prefill
+
+        plan = Scheduler.get_next_batch_to_run(
+            scheduler,
+            running_batch=scheduler.running_batch,
+            last_batch=None,
+        )
+
+        self.assertIs(plan.batch_to_run, prefill)
+        controller.build_ready_batch.assert_not_called()
+        profile = controller.profile_empty_prefill_arbitration.call_args.kwargs
+        self.assertTrue(profile["empty_full_before_detach"])
+        self.assertTrue(profile["fullness_cleared_by_detach"])
+
+    def test_ready_wave_runs_when_no_prefill_is_admissible(self):
+        scheduler, controller = self._build()
+        ready = MagicMock(name="ready")
+        ready.is_empty.return_value = False
+        ready.is_prefill_only = False
+        scheduler.get_new_batch_prefill.return_value = NextBatchPlan(
+            batch_to_run=None, running_batch=scheduler.running_batch
+        )
+        controller.build_ready_batch.return_value = ready
+
+        plan = Scheduler.get_next_batch_to_run(
+            scheduler,
+            running_batch=scheduler.running_batch,
+            last_batch=None,
+        )
+
+        self.assertIs(plan.batch_to_run, ready)
+        controller.build_ready_batch.assert_called_once_with()
+        profile = controller.profile_empty_prefill_arbitration.call_args.kwargs
+        self.assertEqual(profile["prefill_decision"], "no_waiting")
+        self.assertEqual(profile["selected"], "ready")
+
+    def test_reserved_source_headroom_blocks_prefill_before_ready_choice(self):
+        scheduler, controller = self._build()
+        ready = MagicMock(name="ready")
+        ready.is_empty.return_value = False
+        ready.is_prefill_only = False
+        controller.should_defer_prefill.return_value = True
+        controller.build_ready_batch.return_value = ready
+
+        plan = Scheduler.get_next_batch_to_run(
+            scheduler,
+            running_batch=scheduler.running_batch,
+            last_batch=None,
+        )
+
+        self.assertIs(plan.batch_to_run, ready)
+        scheduler.get_new_batch_prefill.assert_not_called()
+        profile = controller.profile_empty_prefill_arbitration.call_args.kwargs
+        self.assertEqual(profile["prefill_decision"], "one_slot_headroom")
+        self.assertEqual(profile["selected"], "ready")
+
+    def test_previous_prefill_result_is_reconciled_before_ready_choice(self):
+        scheduler, controller = self._build()
+        previous_prefill = MagicMock(name="previous_prefill")
+        previous_prefill.forward_mode.is_extend.return_value = True
+        previous_prefill.chunked_req = None
+        previous_prefill.reqs = []
+        previous_prefill.batch_size.return_value = 1
+        previous_prefill.is_empty.return_value = False
+        previous_prefill.is_prefill_only = False
+        scheduler.get_new_batch_prefill.side_effect = lambda running: NextBatchPlan(
+            batch_to_run=None, running_batch=running
+        )
+
+        plan = Scheduler.get_next_batch_to_run(
+            scheduler,
+            running_batch=scheduler.running_batch,
+            last_batch=previous_prefill,
+        )
+
+        self.assertIs(plan.batch_to_run, previous_prefill)
+        controller.build_ready_batch.assert_not_called()
+        profile = controller.profile_empty_prefill_arbitration.call_args.kwargs
+        self.assertEqual(profile["prefill_decision"], "not_empty_running")
+        self.assertEqual(profile["selected"], "running")
+
+
+def test_overlap_snapshot_preserves_dt_full_wave_profile_identity():
+    batch = ScheduleBatch(reqs=[])
+    batch.dt_full_wave_id = 17
+    batch.dt_full_wave_transfer_ids = ("transfer-a", "transfer-b")
+    batch.dt_full_wave_ready_ns = 123456
+
+    copied = batch.copy()
+
+    self_identity = (
+        copied.dt_full_wave_id,
+        copied.dt_full_wave_transfer_ids,
+        copied.dt_full_wave_ready_ns,
+    )
+    assert self_identity == (17, ("transfer-a", "transfer-b"), 123456)
 
 
 if __name__ == "__main__":

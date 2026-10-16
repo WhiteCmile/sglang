@@ -225,6 +225,7 @@ class ParkedTargetRound:
     seq_len: int
     lane_id: int = 0
     candidate_bytes: bytes | None = None
+    candidate_completion: object | None = None
     failure: str | None = None
     draft_admitted: bool = False
     # Profiling-only provenance. Only the export rank consumes coordinator
@@ -279,7 +280,27 @@ class StagedFlashMTPPivotBatch:
     descriptors_by_transfer: dict[str, object]
 
 
+@dataclass(slots=True)
+class _PendingTargetGpuObservation:
+    wave_id: int
+    transfer_ids: tuple[str, ...]
+    ready_ns: int
+    selection_started_ns: int
+    selection_finished_ns: int
+    submission_started_ns: int
+    submission_returned_ns: int
+    start_event: object
+    end_event: object
+    start_observed_ns: int = 0
+
+
 class DTTargetController:
+    # Object-level construction in existing CPU diagnostics bypasses
+    # ``__init__``.  Their established behavior is the mmap A/B baseline.
+    candidate_transport = "mmap"
+    _candidate_arena = None
+    target_phase_profile_enabled = False
+
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
 
     def __init__(self, scheduler) -> None:
@@ -313,6 +334,11 @@ class DTTargetController:
         self.is_eagle3 = scheduler.spec_algorithm.is_eagle3()
         self.is_feature_backed = self.is_dflash or self.is_eagle3
         self.is_persistent = self.is_token_only or self.is_feature_backed
+        self.candidate_transport = str(
+            self.server_args.draft_target_candidate_transport
+        )
+        if self.candidate_transport not in {"mmap", "cuda-ipc"}:
+            raise ValueError("candidate transport must be mmap or cuda-ipc")
         self.defer_dflash_feature_stage = bool(
             self.server_args.draft_target_defer_dflash_feature_stage
         )
@@ -381,6 +407,12 @@ class DTTargetController:
             )
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
+        self.target_phase_profile_enabled = bool(
+            self.is_export_rank and self._profile_active
+        )
+        self.empty_prefill_arbitration_profile_enabled = bool(
+            self.is_export_rank and self._profile_active
+        )
         self._overlap_fix_observer = None
         if os.environ.get("DT_OVERLAP_FIX_OBSERVER_DIR"):
             from overlap_observer import create
@@ -414,6 +446,7 @@ class DTTargetController:
         # transfer from an older result.
         self._target_inflight_counts: Counter[str] = Counter()
         self._target_inflight_reqs: dict[str, Req] = {}
+        self._target_compute_batches_inflight = 0
         self._next_round: dict[str, int] = {}
         # V2 token-only lifecycle.  The Draft owns the physical KV handle; the
         # Target records the authoritative full committed sequence boundary and
@@ -466,12 +499,17 @@ class DTTargetController:
         self._next_full_wave_id = 0
         self._last_full_wave_completed_ns = 0
         self._last_lane_full_wave_completed_ns = [0] * self.pipeline_lanes
+        self._pending_target_gpu_observations: deque[
+            _PendingTargetGpuObservation
+        ] = deque()
+        self._last_target_verify_end_event = None
         self._measurement_lane_counts: dict[tuple[int, str], int] = {}
         self._overlap_launch_ns = 0
         self._overlap_result_ready: bool | None = None
         self._client = None
         self._ledger = None
         self._feature_source_pool = None
+        self._candidate_arena = None
         # A failed direct-GPU-source shutdown is not an ordinary close.  Until
         # every remote read is acknowledged, the pool remains the owner of its
         # exported allocation, producer events, and active leases.  Latch the
@@ -481,6 +519,7 @@ class DTTargetController:
         self._feature_source_free_slots = 0
         self._deferred_dflash_feature_stages = 0
         self._feature_source_stall_started_ns = 0
+        self._last_empty_prefill_arbitration_profile = None
         if self.is_export_rank:
             try:
                 self._client = TargetCoordinatorClient(
@@ -519,6 +558,29 @@ class DTTargetController:
                     self._feature_source_free_slots = (
                         self._feature_source_pool.free_slot_count
                     )
+                if self.candidate_transport == "cuda-ipc":
+                    from sglang.srt.speculative.dt_candidate_p2p import (
+                        TargetCandidateArena,
+                    )
+
+                    configured_slots = int(
+                        self.server_args.draft_target_candidate_slots
+                    )
+                    self._candidate_arena = TargetCandidateArena(
+                        target_instance_id=self.instance_id,
+                        target_session_id=self._client.instance_session_id,
+                        device=scheduler.device,
+                        slot_count=(
+                            configured_slots
+                            if configured_slots > 0
+                            else max(2, int(scheduler.max_running_requests) * 2)
+                        ),
+                        row_width=self.block_size,
+                        profile_timing=self._profile_active,
+                    )
+                    self._client.candidate_arena = (
+                        self._candidate_arena.registration()
+                    )
                 self._client.register_target(
                     timeout_s=self.server_args.draft_target_registration_timeout_s
                 )
@@ -530,6 +592,9 @@ class DTTargetController:
                 if self._feature_source_pool is not None:
                     self._feature_source_pool.close()
                     self._feature_source_pool = None
+                if self._candidate_arena is not None:
+                    self._candidate_arena.close()
+                    self._candidate_arena = None
                 raise
 
     @property
@@ -1816,7 +1881,7 @@ class DTTargetController:
         events = getattr(batch_result, "dt_target_verify_gpu_events", None)
         if events is None:
             return
-        if len(events) != 4:
+        if events is None or len(events) != 4:
             raise RuntimeError("DFlash Target verify GPU profile is incomplete")
         model_start, model_done, accept_done, finish_done = events
         self._profile_emit(
@@ -2390,6 +2455,7 @@ class DTTargetController:
 
     def poll(self, *, overlap_result=None) -> None:
         poll_entered_ns = time.monotonic_ns()
+        self._poll_target_gpu_observations()
         observer = getattr(self, "_overlap_fix_observer", None)
         if observer is not None:
             observer.checkpoint(poll_entered_ns)
@@ -2432,8 +2498,12 @@ class DTTargetController:
         self._overlap_result_ready = result_ready
         self._feature_source_free_slots = feature_source_free_slots
         if self.is_export_rank and events:
+            poll_finished_ns = time.monotonic_ns()
             self._profile_emit(
                 "target_result_poll",
+                started_ns=poll_entered_ns,
+                finished_ns=poll_finished_ns,
+                total_ns=poll_finished_ns - poll_entered_ns,
                 poll_gap_ns=(
                     poll_entered_ns - previous_poll_ns if previous_poll_ns else 0
                 ),
@@ -2441,6 +2511,9 @@ class DTTargetController:
                 broadcast_ns=broadcast_ns,
                 event_count=len(events),
                 ready_count=sum(kind == "ready" for kind, _transfer_id, _ in events),
+                direct_ready_count=sum(
+                    kind == "ready_direct" for kind, _transfer_id, _ in events
+                ),
                 accepted_count=sum(
                     kind == "accepted" for kind, _transfer_id, _ in events
                 ),
@@ -2450,7 +2523,7 @@ class DTTargetController:
         for kind, transfer_id, payload in events:
             # Successful results prove owner materialization; ACK acceptance
             # alone can also acknowledge a request that ends in FINAL_ERROR.
-            if kind in ("ready", "materialized"):
+            if kind in ("ready", "ready_direct", "materialized"):
                 admitted_state = self._parked.get(
                     transfer_id
                 ) or self._feature_control_rounds.get(transfer_id)
@@ -2472,8 +2545,8 @@ class DTTargetController:
                     self._parked[transfer_id] = state
             if state is None:
                 continue
-            if kind == "ready":
-                candidate_bytes, bonus_token, seq_len = payload
+            if kind in ("ready", "ready_direct"):
+                candidate_payload, bonus_token, seq_len = payload
                 if state.bonus_token != bonus_token or state.seq_len != seq_len:
                     raise RuntimeError(
                         "DT Target TP metadata diverged before Draft result: "
@@ -2486,9 +2559,26 @@ class DTTargetController:
                 observe_ready = (
                     observer is not None and observer.enabled()
                     and state.candidate_bytes is None
+                    and state.candidate_completion is None
                 )
                 applied_before_ns = time.monotonic_ns() if observe_ready else 0
-                state.candidate_bytes = candidate_bytes
+                if kind == "ready_direct":
+                    state.candidate_completion = candidate_payload
+                    if self.is_export_rank and self._profile_active:
+                        self._profile_emit(
+                            "target_direct_tp_apply",
+                            transfer_id=transfer_id,
+                            request_id=state.req.rid,
+                            round_id=state.round_id,
+                            completion_observed_ns=candidate_payload.observed_ns,
+                            tp_apply_ns=time.monotonic_ns(),
+                            broadcast_ns=broadcast_ns,
+                            target_compute_batches_inflight=(
+                                self._target_compute_batches_inflight
+                            ),
+                        )
+                else:
+                    state.candidate_bytes = candidate_payload
                 state.draft_admitted = True
                 if observe_ready:
                     observer.ready(state, applied_before_ns, time.monotonic_ns())
@@ -2499,6 +2589,163 @@ class DTTargetController:
 
         if observer is not None:
             observer.target_decision(self)
+
+    def record_target_batch_submission(
+        self,
+        batch,
+        batch_result,
+        *,
+        selection_started_ns: int,
+        selection_finished_ns: int,
+        submission_started_ns: int,
+        submission_returned_ns: int,
+        result_queue_depth_before: int,
+        iteration_started_ns: int,
+        receive_started_ns: int,
+        receive_finished_ns: int,
+        poll_started_ns: int,
+        poll_finished_ns: int,
+    ) -> None:
+        """Record host submission and retain CUDA events for bounded queries."""
+
+        if not getattr(self, "is_export_rank", False) or not getattr(
+            self, "_profile_active", False
+        ):
+            return
+        wave_id = getattr(batch, "dt_full_wave_id", None)
+        if wave_id is None:
+            return
+        transfer_ids = tuple(getattr(batch, "dt_full_wave_transfer_ids", ()))
+        events = getattr(batch_result, "dt_target_verify_gpu_events", None)
+        if events is None or len(events) != 4:
+            self._profile_emit(
+                "target_verify_cuda_observation_error",
+                wave_id=wave_id,
+                transfer_ids=transfer_ids,
+                reason="missing_events",
+            )
+        else:
+            self._pending_target_gpu_observations.append(
+                _PendingTargetGpuObservation(
+                    wave_id=wave_id,
+                    transfer_ids=transfer_ids,
+                    ready_ns=getattr(batch, "dt_full_wave_ready_ns", 0),
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=submission_started_ns,
+                    submission_returned_ns=submission_returned_ns,
+                    start_event=events[0],
+                    end_event=events[-1],
+                )
+            )
+        self._profile_emit(
+            "target_batch_submit",
+            wave_id=wave_id,
+            transfer_ids=transfer_ids,
+            batch_size=len(batch.reqs),
+            ready_ns=getattr(batch, "dt_full_wave_ready_ns", 0),
+            selection_started_ns=selection_started_ns,
+            selection_finished_ns=selection_finished_ns,
+            submission_started_ns=submission_started_ns,
+            submission_returned_ns=submission_returned_ns,
+            submission_wall_ns=submission_returned_ns - submission_started_ns,
+            result_queue_depth_before=result_queue_depth_before,
+            target_compute_batches_inflight=self._target_compute_batches_inflight,
+            iteration_started_ns=iteration_started_ns,
+            receive_started_ns=receive_started_ns,
+            receive_finished_ns=receive_finished_ns,
+            poll_started_ns=poll_started_ns,
+            poll_finished_ns=poll_finished_ns,
+        )
+
+    def _poll_target_gpu_observations(self) -> None:
+        """Capture host observations of CUDA boundaries without synchronizing."""
+
+        pending = getattr(self, "_pending_target_gpu_observations", None)
+        if (
+            not pending
+            or not getattr(self, "is_export_rank", False)
+            or not getattr(self, "_profile_active", False)
+        ):
+            return
+        retained = deque()
+        while pending:
+            observation = pending.popleft()
+            try:
+                if (
+                    not observation.start_observed_ns
+                    and observation.start_event.query()
+                ):
+                    observation.start_observed_ns = time.monotonic_ns()
+                end_ready = bool(observation.end_event.query())
+            except Exception as exc:
+                self._profile_emit(
+                    "target_verify_cuda_observation_error",
+                    wave_id=observation.wave_id,
+                    transfer_ids=observation.transfer_ids,
+                    reason=type(exc).__name__,
+                )
+                continue
+            if not end_ready:
+                retained.append(observation)
+                continue
+            end_observed_ns = time.monotonic_ns()
+            if not observation.start_observed_ns:
+                observation.start_observed_ns = end_observed_ns
+            previous_end_event = getattr(
+                self, "_last_target_verify_end_event", None
+            )
+            previous_verify_end_to_start_ns = (
+                int(previous_end_event.elapsed_time(observation.start_event) * 1_000_000)
+                if previous_end_event is not None
+                else None
+            )
+            self._profile_emit(
+                "target_verify_cuda_observed",
+                wave_id=observation.wave_id,
+                transfer_ids=observation.transfer_ids,
+                ready_ns=observation.ready_ns,
+                selection_started_ns=observation.selection_started_ns,
+                selection_finished_ns=observation.selection_finished_ns,
+                submission_started_ns=observation.submission_started_ns,
+                submission_returned_ns=observation.submission_returned_ns,
+                gpu_start_observed_ns=observation.start_observed_ns,
+                gpu_end_observed_ns=end_observed_ns,
+                cuda_total_ns=int(
+                    observation.start_event.elapsed_time(observation.end_event)
+                    * 1_000_000
+                ),
+                cuda_previous_verify_end_to_start_ns=(
+                    previous_verify_end_to_start_ns
+                ),
+            )
+            self._last_target_verify_end_event = observation.end_event
+        self._pending_target_gpu_observations = retained
+
+    def record_target_old_result_processing(
+        self,
+        batch,
+        *,
+        started_ns: int,
+        finished_ns: int,
+        result_queue_depth_before: int,
+    ) -> None:
+        if not getattr(self, "is_export_rank", False) or not getattr(
+            self, "_profile_active", False
+        ):
+            return
+        self._profile_emit(
+            "target_old_result_process",
+            wave_id=getattr(batch, "dt_full_wave_id", None),
+            transfer_ids=tuple(
+                getattr(batch, "dt_full_wave_transfer_ids", ())
+            ),
+            request_ids=tuple(req.rid for req in batch.reqs),
+            started_ns=started_ns,
+            finished_ns=finished_ns,
+            total_ns=finished_ns - started_ns,
+            result_queue_depth_before=result_queue_depth_before,
+        )
 
     def has_feature_source_capacity(self) -> bool:
         has_capacity = not self.uses_direct_gpu_source or self._feature_source_free_slots > (
@@ -2532,6 +2779,77 @@ class DTTargetController:
                     parked=len(self._parked),
                 )
         return has_capacity
+
+    def profile_empty_prefill_arbitration(
+        self,
+        *,
+        decision_started_ns: int,
+        prefill_decision: str,
+        selected: str,
+        waiting_request_ids: tuple[str, ...],
+        running_batch_is_full: bool,
+        empty_full_before_detach: bool,
+        fullness_cleared_by_detach: bool,
+        batch_size_before_detach: int,
+        batch_size_after_detach: int,
+        selected_wave_id: int | None,
+        selected_batch_size: int,
+        chunked_req,
+    ) -> None:
+        """Emit deduplicated host-only evidence for empty-running DT choices."""
+        if not self.empty_prefill_arbitration_profile_enabled:
+            return
+        chunked_request_id = getattr(chunked_req, "rid", None)
+        chunked_owner_admitted = bool(
+            chunked_request_id is not None
+            and self._draft_admitted_attempts.get(chunked_request_id)
+            == self._lifecycle_attempt_by_request.get(chunked_request_id, -1)
+        )
+        effective_source_slots = (
+            self._feature_source_free_slots - self._deferred_dflash_feature_stages
+        )
+        signature = (
+            prefill_decision,
+            selected,
+            waiting_request_ids,
+            running_batch_is_full,
+            empty_full_before_detach,
+            fullness_cleared_by_detach,
+            batch_size_before_detach,
+            batch_size_after_detach,
+            selected_wave_id,
+            selected_batch_size,
+            effective_source_slots,
+            self._deferred_dflash_feature_stages,
+            chunked_request_id,
+            chunked_owner_admitted,
+        )
+        if signature == self._last_empty_prefill_arbitration_profile:
+            return
+        self._last_empty_prefill_arbitration_profile = signature
+        observed_ns = time.monotonic_ns()
+        self._profile_emit(
+            "target_empty_prefill_arbitration",
+            decision_started_ns=decision_started_ns,
+            observed_ns=observed_ns,
+            decision_wall_ns=max(0, observed_ns - decision_started_ns),
+            prefill_decision=prefill_decision,
+            selected=selected,
+            waiting_count=len(waiting_request_ids),
+            waiting_request_ids=waiting_request_ids,
+            running_batch_is_full=running_batch_is_full,
+            empty_full_before_detach=empty_full_before_detach,
+            fullness_cleared_by_detach=fullness_cleared_by_detach,
+            batch_size_before_detach=batch_size_before_detach,
+            batch_size_after_detach=batch_size_after_detach,
+            selected_wave_id=selected_wave_id,
+            selected_batch_size=selected_batch_size,
+            feature_source_free_slots=self._feature_source_free_slots,
+            deferred_feature_stages=self._deferred_dflash_feature_stages,
+            effective_source_slots=effective_source_slots,
+            chunked_request_id=chunked_request_id,
+            chunked_owner_admitted=chunked_owner_admitted,
+        )
 
     @staticmethod
     def _query_overlap_result_ready(overlap_result) -> bool | None:
@@ -2612,7 +2930,12 @@ class DTTargetController:
         are injected.  WAIT_DRAFT and READY_VERIFY inputs cannot share a forward.
         """
         if not batch.reqs:
+            # PrefillAdder may leave an empty running alias marked full after
+            # returning a separate prefill batch. Fullness is a snapshot of
+            # the old membership, so an empty alias must never retain it.
+            batch.batch_is_full = False
             return
+        initial_batch_size = len(batch.reqs)
         parked_req_ids = {id(state.req) for state in self._parked.values()}
         target_inflight_rids = set(self._target_inflight_counts)
         keep_indices = [
@@ -2642,6 +2965,12 @@ class DTTargetController:
                 # requests. They may still exist only in this stale alias and
                 # must not be merged into a READY_VERIFY batch.
                 batch.filter_batch(keep_indices=[])
+        if len(batch.reqs) < initial_batch_size:
+            # ``batch_is_full`` describes the allocation decision for the old
+            # membership. Once parked/inflight owners are detached, retaining
+            # it makes get_new_batch_prefill() reject an otherwise empty batch
+            # before it examines the waiting queue.
+            batch.batch_is_full = False
 
     def register_overlap_inflight_batch(self, launched_batch: ScheduleBatch) -> None:
         """Register Target ownership immediately after an overlap launch.
@@ -2654,6 +2983,13 @@ class DTTargetController:
         Keep registration next to ``result_queue.append`` so every launched
         forward is visible before any older result can be processed.
         """
+        inflight_batches = getattr(self, "_target_compute_batches_inflight", 0)
+        if inflight_batches >= 2:
+            raise RuntimeError(
+                "Target compute invariant violated: more than one executing plus "
+                "one submitted batch"
+            )
+        self._target_compute_batches_inflight = inflight_batches + 1
         if self.is_export_rank:
             self._overlap_launch_ns = time.monotonic_ns()
         for req in launched_batch.reqs:
@@ -2716,8 +3052,8 @@ class DTTargetController:
         A request may occur in multiple queued prefill chunks, hence the
         reference count. Missing entries are expected for non-overlap mode.
         """
-        if not self._target_inflight_counts:
-            return
+        if getattr(self, "_target_compute_batches_inflight", 0):
+            self._target_compute_batches_inflight -= 1
         for req in batch.reqs:
             count = self._target_inflight_counts.get(req.rid, 0)
             if count <= 0:
@@ -2727,6 +3063,13 @@ class DTTargetController:
                 self._target_inflight_reqs.pop(req.rid, None)
             else:
                 self._target_inflight_counts[req.rid] = count - 1
+
+    def assert_overlap_compute_admission(self) -> None:
+        if getattr(self, "_target_compute_batches_inflight", 0) >= 2:
+            raise RuntimeError(
+                "Target compute admission exceeded the one-executing plus "
+                "one-submitted bound"
+            )
 
     def has_target_inflight(self) -> bool:
         return bool(self._target_inflight_counts)
@@ -2888,12 +3231,14 @@ class DTTargetController:
     def build_ready_batch(self) -> ScheduleBatch | None:
         observer = getattr(self, "_overlap_fix_observer", None)
         observe_build = observer is not None and observer.enabled()
-        build_entry_ns = time.monotonic_ns() if observe_build else 0
+        trace_build = bool(self.is_export_rank and self._profile_active)
+        build_entry_ns = time.monotonic_ns() if (observe_build or trace_build) else 0
         build_cpu_start_ns = time.thread_time_ns() if observe_build else 0
         ready = [
             state
             for state in self._parked.values()
             if state.candidate_bytes is not None
+            or state.candidate_completion is not None
         ]
         if self.continuous_batching:
             # Dict insertion order is shared by TP ranks through poll's ordered
@@ -3021,24 +3366,57 @@ class DTTargetController:
             time.monotonic_ns() if breakdown_active else seq_lens_derived_ns
         )
 
-        candidate_blob = b"".join(state.candidate_bytes for state in ready)
-        expected_bytes = len(ready) * self.block_size * 4
-        if len(candidate_blob) != expected_bytes:
-            raise ValueError("DT candidate payload width does not match block size")
-        draft_tokens_cpu = _ready_candidate_host_tensor(
-            candidate_blob,
-            batch_size=len(ready),
-            block_size=self.block_size,
-            pin_memory=pin_ready_inputs,
+        direct_candidates = any(
+            state.candidate_completion is not None for state in ready
         )
-        candidate_cpu_ns = (
-            time.monotonic_ns() if breakdown_active else bonus_tokens_ns
-        )
-        draft_tokens = _ready_batch_h2d(draft_tokens_cpu, device=device)
-        # req_pool_indices_cpu and seq_lens_cpu already live on ScheduleBatch.
-        # Retain the two otherwise-local pinned sources until this batch has
-        # launched, rather than depending on host-allocator reuse fencing.
-        batch.dt_ready_h2d_sources = (bonus_tokens_cpu, draft_tokens_cpu)
+        if direct_candidates and any(
+            state.candidate_completion is None for state in ready
+        ):
+            raise RuntimeError("one Target batch cannot mix candidate transports")
+        if direct_candidates:
+            completions = [state.candidate_completion for state in ready]
+            if self.is_export_rank:
+                if self._candidate_arena is None:
+                    raise RuntimeError("direct candidate arena is unavailable")
+                wire_tokens = self._candidate_arena.begin_read(completions)
+            else:
+                wire_tokens = torch.empty(
+                    (len(ready), self.block_size),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            candidate_cpu_ns = (
+                time.monotonic_ns() if breakdown_active else bonus_tokens_ns
+            )
+            if self.scheduler.ps.tp_size > 1:
+                self.scheduler.tp_group.broadcast(wire_tokens, src=0)
+            draft_tokens = wire_tokens.to(dtype=torch.int64)
+            if self.is_export_rank:
+                self._candidate_arena.finish_read(completions)
+                if not self.is_persistent:
+                    for state in ready:
+                        if self._ledger.get(state.transfer_id) is not None:
+                            self._ledger.finish(state.transfer_id)
+            batch.dt_ready_h2d_sources = (bonus_tokens_cpu,)
+        else:
+            candidate_blob = b"".join(state.candidate_bytes for state in ready)
+            expected_bytes = len(ready) * self.block_size * 4
+            if len(candidate_blob) != expected_bytes:
+                raise ValueError("DT candidate payload width does not match block size")
+            draft_tokens_cpu = _ready_candidate_host_tensor(
+                candidate_blob,
+                batch_size=len(ready),
+                block_size=self.block_size,
+                pin_memory=pin_ready_inputs,
+            )
+            candidate_cpu_ns = (
+                time.monotonic_ns() if breakdown_active else bonus_tokens_ns
+            )
+            draft_tokens = _ready_batch_h2d(draft_tokens_cpu, device=device)
+            # req_pool_indices_cpu and seq_lens_cpu already live on ScheduleBatch.
+            # Retain the two otherwise-local pinned sources until this batch has
+            # launched, rather than depending on host-allocator reuse fencing.
+            batch.dt_ready_h2d_sources = (bonus_tokens_cpu, draft_tokens_cpu)
         candidate_device_ns = (
             time.monotonic_ns() if breakdown_active else candidate_cpu_ns
         )
@@ -3099,6 +3477,10 @@ class DTTargetController:
         self._next_full_wave_id += 1
         batch.dt_full_wave_id = wave_id
         batch.dt_full_wave_ready_ns = finished_ns
+        if trace_build:
+            batch.dt_full_wave_transfer_ids = tuple(
+                state.transfer_id for state in ready
+            )
         if observe_build and observer.enabled(finished_ns):
             observer.build(
                 ready, wave_id, build_entry_ns, started_ns, finished_ns,
@@ -3118,6 +3500,10 @@ class DTTargetController:
                 lane_id=lane_id,
                 batch_size=len(ready),
                 transfer_ids=tuple(state.transfer_id for state in ready),
+                selection_started_ns=build_entry_ns,
+                selection_finished_ns=started_ns,
+                build_started_ns=started_ns,
+                build_finished_ns=finished_ns,
                 result_batch_ids=result_batch_ids,
                 oldest_result_age_ns=(
                     finished_ns - min(result_received_ns)
@@ -3231,6 +3617,7 @@ class DTTargetController:
             self._cancelled_transfers.update(transfer_ids)
             self._drop_cancelled_unsent()
             for transfer_id in tuple(transfer_ids):
+                self._release_candidate_destination(transfer_id)
                 if (
                     transfer_id not in self._source_slot_by_transfer
                     and self._ledger.get(transfer_id) is not None
@@ -3338,6 +3725,17 @@ class DTTargetController:
                         f"active_leases={active_leases}, "
                         f"quarantined_slots={quarantined_slots}"
                     )
+            if self._candidate_arena is not None:
+                active_candidates, quarantined_candidates = (
+                    self._candidate_arena.close()
+                )
+                if active_candidates or quarantined_candidates:
+                    raise RuntimeError(
+                        "DT Target shutdown found unresolved direct candidate "
+                        "ownership: "
+                        f"active={active_candidates}, "
+                        f"quarantined={quarantined_candidates}"
+                    )
             shutdown_drained = True
         except BaseException as exc:
             if source_pool is not None and self.uses_direct_gpu_source:
@@ -3366,6 +3764,8 @@ class DTTargetController:
                 if not source_pool_fenced:
                     self._feature_source_pool.close()
                 self._feature_source_pool = None
+            if shutdown_drained:
+                self._candidate_arena = None
 
     def _drain_token_only_shutdown(self) -> None:
         from dt_protocol import (
@@ -3683,7 +4083,7 @@ class DTTargetController:
 
     def _prune_obsolete_task_retries(self, tasks) -> None:
         """Retire exact local copies; remote leases and ledger owners stay intact."""
-        if not self._pending_send:
+        if not getattr(self, "_pending_send", None):
             return
         from msgspec.structs import replace
 
@@ -3710,12 +4110,18 @@ class DTTargetController:
 
     def _flush_pending_send(self) -> None:
         from dt_protocol import TargetTaskBatch
+        from msgspec.structs import replace
 
         self._flush_reliable_outbox()
         while self._pending_send:
             dispatchable = []
             selected_by_request = {}
             blocked = None
+            candidate_budget = None
+            if self.candidate_transport == "cuda-ipc":
+                if not self.is_export_rank or self._candidate_arena is None:
+                    raise RuntimeError("direct candidate arena is unavailable")
+                candidate_budget = self._candidate_arena.free_slot_count
             pending_batches = (
                 (self._pending_send[0],)
                 if self.whole_batch_task_fifo_ablation
@@ -3741,6 +4147,14 @@ class DTTargetController:
                             dispatchable.clear()
                             break
                         continue
+                    if (
+                        candidate_budget is not None
+                        and task.requires_proposal
+                        and task.candidate_destination is None
+                    ):
+                        if candidate_budget <= 0:
+                            continue
+                        candidate_budget -= 1
                     dispatchable.append(task)
                     selected_by_request[task.request_id] = task
                 if blocked is not None and self.whole_batch_task_fifo_ablation:
@@ -3791,6 +4205,30 @@ class DTTargetController:
             if not dispatchable:
                 break
 
+            reserved = []
+            if candidate_budget is not None:
+                with_destinations = []
+                try:
+                    for task in dispatchable:
+                        if (
+                            not task.requires_proposal
+                            or task.candidate_destination is not None
+                        ):
+                            with_destinations.append(task)
+                            continue
+                        destination = self._candidate_arena.reserve(task.transfer_id)
+                        reserved.append(task.transfer_id)
+                        with_destinations.append(
+                            replace(task, candidate_destination=destination)
+                        )
+                except Exception:
+                    for transfer_id in reserved:
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    raise
+                dispatchable = with_destinations
+
             self._batch_sequence += 1
             dispatch_batch = TargetTaskBatch(
                 protocol_version=self._pending_send[0].protocol_version,
@@ -3799,7 +4237,19 @@ class DTTargetController:
                 entries=tuple(dispatchable),
                 sent_ns=time.monotonic_ns(),
             )
-            if not self._client.submit(dispatch_batch):
+            try:
+                submitted = self._client.submit(dispatch_batch)
+            except Exception:
+                for transfer_id in reserved:
+                    self._candidate_arena.cancel(
+                        transfer_id, remote_quiescent=True
+                    )
+                raise
+            if not submitted:
+                for transfer_id in reserved:
+                    self._candidate_arena.cancel(
+                        transfer_id, remote_quiescent=True
+                    )
                 break
             submitted_ns = time.monotonic_ns()
             if self._profile_active:
@@ -3875,12 +4325,21 @@ class DTTargetController:
         self._flush_pending_send()
 
         events: list[tuple[str, str, object]] = []
+        if self._candidate_arena is not None:
+            # Direct Draft completion is intentionally observed before the
+            # independent Coordinator retirement channel.
+            self._candidate_arena.poll_completion_notices()
         for message in self._client.recv_nowait():
             if isinstance(message, TaskBatchAck):
                 if not self._ledger.has_submitted_batch(message.batch_id):
                     continue
                 self._delivery_outbox.ack("task_batch", message.batch_id)
                 retry_tasks = self._ledger.apply_ack(message)
+                if self.candidate_transport == "cuda-ipc":
+                    if self._candidate_arena is None:
+                        raise RuntimeError("direct candidate arena is unavailable")
+                    for assignment in message.assignments:
+                        self._candidate_arena.authorize(assignment)
                 self._prune_obsolete_task_retries(
                     state.task
                     for transfer_id in (
@@ -3902,6 +4361,9 @@ class DTTargetController:
                     if task.transfer_id in self._cancelled_transfers:
                         self._ledger.finish(task.transfer_id)
                         self._release_source_slot(task.transfer_id)
+                        self._release_candidate_destination(
+                            task.transfer_id, remote_quiescent=True
+                        )
                         self._cancelled_transfers.discard(task.transfer_id)
                     else:
                         active_retries.append(task)
@@ -3982,6 +4444,51 @@ class DTTargetController:
                 raise TypeError(
                     f"unexpected Target Coordinator message {type(message).__name__}"
                 )
+        if self._candidate_arena is not None:
+            self._candidate_arena.poll_releases()
+            self._candidate_arena.poll_cancelled()
+            for completion in self._candidate_arena.poll():
+                state = self._ledger.get(completion.transfer_id)
+                if state is None:
+                    continue
+                parked = self._parked.get(completion.transfer_id)
+                if parked is None:
+                    continue
+                if parked.candidate_completion is not None:
+                    continue
+                if completion.root_token != parked.bonus_token:
+                    raise ValueError(
+                        "direct candidate root does not match Target bonus token"
+                    )
+                self._ledger.mark_direct_ready(
+                    completion.transfer_id,
+                    draft_instance_id=completion.draft_instance_id,
+                )
+                parked.result_received_ns = completion.observed_ns
+                if self._profile_active:
+                    export_ledger_ready_ns = time.monotonic_ns()
+                    self._profile_emit(
+                        "target_direct_completion",
+                        transfer_id=completion.transfer_id,
+                        request_id=parked.req.rid,
+                        round_id=parked.round_id,
+                        slot_id=completion.slot_id,
+                        generation=completion.generation,
+                        notice_queued_ns=completion.notice_queued_ns,
+                        notice_received_ns=completion.notice_received_ns,
+                        metadata_submitted_ns=completion.metadata_submitted_ns,
+                        metadata_gpu_ns=completion.metadata_gpu_ns,
+                        completion_observed_ns=completion.observed_ns,
+                        export_ledger_ready_ns=export_ledger_ready_ns,
+                        target_compute_batches_inflight=self._target_compute_batches_inflight,
+                    )
+                events.append(
+                    (
+                        "ready_direct",
+                        completion.transfer_id,
+                        (completion, parked.bonus_token, parked.seq_len),
+                    )
+                )
         events.extend(self._expire_local_rounds())
         self._expire_source_leases(now_ns=time.monotonic_ns())
         self._maybe_emit_lifecycle_status()
@@ -3999,6 +4506,7 @@ class DTTargetController:
             "parked_rounds": len(self._parked),
             "feature_control_rounds": len(self._feature_control_rounds),
             "target_inflight_forwards": sum(self._target_inflight_counts.values()),
+            "target_compute_batches_inflight": self._target_compute_batches_inflight,
             "target_inflight_requests": len(self._target_inflight_reqs),
             "pending_send_batches": len(self._pending_send),
             "pending_send_tasks": sum(
@@ -4243,6 +4751,7 @@ class DTTargetController:
             transfer_id = state.task.transfer_id
             if self.uses_direct_gpu_source:
                 self._quarantine_source_slot(transfer_id)
+            self._release_candidate_destination(transfer_id)
             self._ledger.finish(transfer_id)
             if (
                 self._lifecycle_attempt_by_request.get(state.task.request_id)
@@ -4552,6 +5061,7 @@ class DTTargetController:
                 and entry.attempt == state.task.attempt
                 and entry.target_instance_id == state.task.target_instance_id
                 and state.task.requires_proposal
+                and state.task.candidate_destination is None
             )
         }
         payload = None
@@ -4668,6 +5178,23 @@ class DTTargetController:
                 events.append(
                     ("failed", transfer_id, entry.error_message or entry.status.value)
                 )
+                direct_candidate = (
+                    self._ledger.get(transfer_id) is not None
+                    and self._ledger.get(transfer_id).task.candidate_destination
+                    is not None
+                )
+                self._release_candidate_destination(
+                    transfer_id,
+                    # Source-read completion proves only that Draft stopped
+                    # reading the Target-owned feature source.  It cannot
+                    # prove that an attempted direct candidate write stopped.
+                    # Direct failures therefore retain/quarantine the row
+                    # unless the direct completion endpoint supplies the
+                    # authenticated tombstone used by normal cancellation.
+                    remote_quiescent=(
+                        entry.source_read_quiescent and not direct_candidate
+                    ),
+                )
                 self._ledger.finish(transfer_id)
         return events
 
@@ -4688,6 +5215,9 @@ class DTTargetController:
             }
             for transfer_id in removed:
                 self._release_source_slot(transfer_id)
+                self._release_candidate_destination(
+                    transfer_id, remote_quiescent=True
+                )
                 self._cancelled_transfers.discard(transfer_id)
             if entries:
                 retained.append(
@@ -4700,6 +5230,15 @@ class DTTargetController:
                     )
                 )
         self._pending_send = retained
+
+    def _release_candidate_destination(
+        self, transfer_id: str, *, remote_quiescent: bool = False
+    ) -> None:
+        if self._candidate_arena is None:
+            return
+        self._candidate_arena.cancel(
+            transfer_id, remote_quiescent=remote_quiescent
+        )
 
     def _release_source_slot(self, transfer_id: str) -> None:
         staged_leases = getattr(self, "_staged_flashmtp_source_leases", None)

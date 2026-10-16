@@ -1681,30 +1681,81 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
+        target_phase_profile_enabled = bool(
+            self.dt_target_controller is not None
+            and getattr(
+                self.dt_target_controller,
+                "target_phase_profile_enabled",
+                False,
+            )
+        )
 
         def pop_and_process():
             # Process the results of the last batch
+            result_queue_depth_before = (
+                len(self.result_queue) if target_phase_profile_enabled else 0
+            )
             tmp_batch, tmp_result = self.result_queue.popleft()
+            result_process_started_ns = (
+                time.monotonic_ns()
+                if target_phase_profile_enabled
+                else 0
+            )
             self.process_batch_result(tmp_batch, tmp_result)
+            if target_phase_profile_enabled:
+                result_process_finished_ns = time.monotonic_ns()
+                self.dt_target_controller.record_target_old_result_processing(
+                    tmp_batch,
+                    started_ns=result_process_started_ns,
+                    finished_ns=result_process_finished_ns,
+                    result_queue_depth_before=result_queue_depth_before,
+                )
 
         while True:
             if self.gracefully_exit:
                 break
 
             # Receive requests
+            iteration_started_ns = (
+                time.monotonic_ns()
+                if target_phase_profile_enabled
+                else 0
+            )
+            receive_started_ns = iteration_started_ns
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            receive_finished_ns = (
+                time.monotonic_ns()
+                if target_phase_profile_enabled
+                else 0
+            )
+            poll_started_ns = receive_finished_ns
             if self.dt_target_controller is not None:
                 pending_result = (
                     self.result_queue[0][1] if self.result_queue else None
                 )
                 self.dt_target_controller.poll(overlap_result=pending_result)
+            poll_finished_ns = (
+                time.monotonic_ns()
+                if target_phase_profile_enabled
+                else 0
+            )
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            selection_started_ns = (
+                time.monotonic_ns()
+                if target_phase_profile_enabled
+                else 0
+            )
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            selection_finished_ns = (
+                time.monotonic_ns()
+                if target_phase_profile_enabled
+                else 0
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -1735,10 +1786,41 @@ class Scheduler(
                         pass
             # Launch the current batch
             if batch:
+                if self.dt_target_controller is not None:
+                    self.dt_target_controller.assert_overlap_compute_admission()
+                result_queue_depth_before = (
+                    len(self.result_queue) if target_phase_profile_enabled else 0
+                )
+                submission_started_ns = (
+                    time.monotonic_ns()
+                    if target_phase_profile_enabled
+                    else 0
+                )
                 batch_result = self.run_batch(batch)
+                if target_phase_profile_enabled:
+                    submission_returned_ns = time.monotonic_ns()
+                    self.dt_target_controller.record_target_batch_submission(
+                        batch,
+                        batch_result,
+                        selection_started_ns=selection_started_ns,
+                        selection_finished_ns=selection_finished_ns,
+                        submission_started_ns=submission_started_ns,
+                        submission_returned_ns=submission_returned_ns,
+                        result_queue_depth_before=result_queue_depth_before,
+                        iteration_started_ns=iteration_started_ns,
+                        receive_started_ns=receive_started_ns,
+                        receive_finished_ns=receive_finished_ns,
+                        poll_started_ns=poll_started_ns,
+                        poll_finished_ns=poll_finished_ns,
+                    )
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if len(self.result_queue) > 2:
+                    raise RuntimeError(
+                        "overlap result queue exceeded one executing plus one "
+                        "submitted compute batch"
+                    )
                 if self.dt_target_controller is not None:
                     # A previous chunk result can be processed below before
                     # this batch reaches the post-sample detach point. Publish
@@ -2860,8 +2942,31 @@ class Scheduler(
         self.process_pending_chunked_abort()
 
         dt_ready_batch_size = 0
+        dt_empty_full_before_detach = False
+        dt_fullness_cleared_by_detach = False
+        dt_batch_size_before_detach = 0
+        dt_batch_size_after_detach = 0
+        dt_arbitration_profile_requested = bool(
+            self.dt_target_controller is not None
+            and getattr(
+                self.dt_target_controller,
+                "empty_prefill_arbitration_profile_enabled",
+                False,
+            )
+        )
         if self.dt_target_controller is not None:
+            if dt_arbitration_profile_requested:
+                dt_empty_full_before_detach = bool(
+                    running_batch.is_empty() and running_batch.batch_is_full
+                )
+                dt_batch_size_before_detach = running_batch.batch_size()
+                dt_full_before_detach = bool(running_batch.batch_is_full)
             self.dt_target_controller.detach_parked_requests(running_batch)
+            if dt_arbitration_profile_requested:
+                dt_batch_size_after_detach = running_batch.batch_size()
+                dt_fullness_cleared_by_detach = bool(
+                    dt_full_before_detach and not running_batch.batch_is_full
+                )
             for failed in self.dt_target_controller.pop_failures():
                 prepare_abort(failed.req, f"Remote Draft failed: {failed.failure}")
                 # A remote control-round failure can race a local retraction
@@ -2957,6 +3062,38 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        dt_arbitration_profile_enabled = bool(
+            dt_arbitration_profile_requested and running_batch.is_empty()
+        )
+        dt_arbitration_decision_started_ns = (
+            time.monotonic_ns() if dt_arbitration_profile_requested else 0
+        )
+        dt_empty_waiting_request_ids = (
+            tuple(req.rid for req in self.waiting_queue)
+            if dt_arbitration_profile_enabled
+            else ()
+        )
+        if dt_arbitration_profile_requested and not dt_arbitration_profile_enabled:
+            # Close any prior empty-running state. Without this explicit edge,
+            # a deduplicated headroom state could appear to extend across a
+            # later nonempty running batch in interval analysis.
+            self.dt_target_controller.profile_empty_prefill_arbitration(
+                decision_started_ns=dt_arbitration_decision_started_ns,
+                prefill_decision="not_empty_running",
+                selected="running",
+                waiting_request_ids=(),
+                running_batch_is_full=running_batch.batch_is_full,
+                empty_full_before_detach=dt_empty_full_before_detach,
+                fullness_cleared_by_detach=dt_fullness_cleared_by_detach,
+                batch_size_before_detach=dt_batch_size_before_detach,
+                batch_size_after_detach=dt_batch_size_after_detach,
+                selected_wave_id=getattr(
+                    running_batch, "dt_full_wave_id", None
+                ),
+                selected_batch_size=running_batch.batch_size(),
+                chunked_req=self.chunked_req,
+            )
+
         if (
             self.dt_target_controller is not None
             and not self.dt_target_controller.has_feature_source_capacity()
@@ -2965,9 +3102,61 @@ class Scheduler(
             # feature rows. Keep the selected work in running_batch until TP0
             # observes a reusable registered source slot; this is ordinary
             # scheduler backpressure, not a per-round allocation fallback.
+            if dt_arbitration_profile_enabled:
+                self.dt_target_controller.profile_empty_prefill_arbitration(
+                    decision_started_ns=dt_arbitration_decision_started_ns,
+                    prefill_decision="hard_capacity",
+                    selected="idle",
+                    waiting_request_ids=dt_empty_waiting_request_ids,
+                    running_batch_is_full=running_batch.batch_is_full,
+                    empty_full_before_detach=dt_empty_full_before_detach,
+                    fullness_cleared_by_detach=dt_fullness_cleared_by_detach,
+                    batch_size_before_detach=dt_batch_size_before_detach,
+                    batch_size_after_detach=dt_batch_size_after_detach,
+                    selected_wave_id=None,
+                    selected_batch_size=0,
+                    chunked_req=self.chunked_req,
+                )
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
-        if self.dt_target_controller is not None and running_batch.is_empty():
+        # Preserve ordinary prefill admission before freezing a DT verify wave.
+        # A ready wave is still unsubmitted work at this point.  Building it
+        # first makes should_defer_prefill() choose it on every busy turn and
+        # can starve newly arrived prefills once direct completions are
+        # continuous.  Trying prefill while running_batch is empty also avoids
+        # merging an extend result into an already-frozen pipeline lane.
+        dt_empty_prefill_plan = None
+        dt_empty_prefill_decision = None
+        dt_empty_had_waiting = bool(self.waiting_queue)
+        if (
+            self.dt_target_controller is not None
+            and self.dllm_config is None
+            and running_batch.is_empty()
+        ):
+            if self.dt_target_controller.should_defer_prefill(
+                ready_batch_size=0,
+                chunked_req=self.chunked_req,
+            ):
+                dt_empty_prefill_decision = "one_slot_headroom"
+            else:
+                dt_empty_prefill_plan = self.get_new_batch_prefill(running_batch)
+                running_batch = dt_empty_prefill_plan.running_batch
+                if dt_empty_prefill_plan.batch_to_run is not None:
+                    dt_empty_prefill_decision = "prefill_selected"
+                elif dt_empty_had_waiting:
+                    dt_empty_prefill_decision = "no_prefill_admitted"
+                else:
+                    dt_empty_prefill_decision = "no_waiting"
+
+        ready_batch = None
+        if (
+            self.dt_target_controller is not None
+            and running_batch.is_empty()
+            and (
+                dt_empty_prefill_plan is None
+                or dt_empty_prefill_plan.batch_to_run is None
+            )
+        ):
             # Reconcile the previous prefill result above before admitting a
             # completed Draft lane.  Injecting the lane earlier lets the
             # previous prefill batch merge into it, producing a mixed verify
@@ -2977,8 +3166,45 @@ class Scheduler(
                 dt_ready_batch_size = ready_batch.batch_size()
                 running_batch = ready_batch
 
+        if dt_empty_prefill_decision is not None and dt_arbitration_profile_enabled:
+            selected_batch = (
+                dt_empty_prefill_plan.batch_to_run
+                if dt_empty_prefill_plan is not None
+                and dt_empty_prefill_plan.batch_to_run is not None
+                else ready_batch
+            )
+            self.dt_target_controller.profile_empty_prefill_arbitration(
+                decision_started_ns=dt_arbitration_decision_started_ns,
+                prefill_decision=dt_empty_prefill_decision,
+                selected=(
+                    "prefill"
+                    if dt_empty_prefill_plan is not None
+                    and dt_empty_prefill_plan.batch_to_run is not None
+                    else "ready"
+                    if dt_ready_batch_size
+                    else "idle"
+                ),
+                waiting_request_ids=dt_empty_waiting_request_ids,
+                running_batch_is_full=running_batch.batch_is_full,
+                empty_full_before_detach=dt_empty_full_before_detach,
+                fullness_cleared_by_detach=dt_fullness_cleared_by_detach,
+                batch_size_before_detach=dt_batch_size_before_detach,
+                batch_size_after_detach=dt_batch_size_after_detach,
+                selected_wave_id=getattr(
+                    selected_batch, "dt_full_wave_id", None
+                ),
+                selected_batch_size=(
+                    selected_batch.batch_size()
+                    if selected_batch is not None
+                    else 0
+                ),
+                chunked_req=self.chunked_req,
+            )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif dt_empty_prefill_plan is not None:
+            new_batch = dt_empty_prefill_plan.batch_to_run
         else:
             defer_dt_prefill = (
                 self.dt_target_controller is not None

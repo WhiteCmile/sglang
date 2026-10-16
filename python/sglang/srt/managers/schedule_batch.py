@@ -3064,7 +3064,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # merge_batch historically mutated the list in place; they now rebind
         # new lists, but the slice stays so this snapshot never aliases the
         # original.
-        return ScheduleBatch(
+        copied = ScheduleBatch(
             reqs=self.reqs[:],
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
@@ -3102,6 +3102,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # intermediate chunk from the final prompt chunk.
             chunked_req=self.chunked_req,
         )
+        # Full-wave identity is consumed after overlap scheduling snapshots the
+        # batch.  Preserve these immutable stamps without copying any live DT
+        # controller ownership.
+        for name in (
+            "dt_full_wave_id",
+            "dt_full_wave_transfer_ids",
+            "dt_full_wave_ready_ns",
+        ):
+            if hasattr(self, name):
+                setattr(copied, name, getattr(self, name))
+        return copied
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
