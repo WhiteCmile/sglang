@@ -883,6 +883,7 @@ class FlashMTPDraftEngine:
         self._result_row_width = self.profile.block_size
         self._pending: deque[object] = deque()
         self._pending_ids: set[str] = set()
+        self._ring_pending_ids: set[str] = set()
         self._received_ns_by_transfer: dict[str, int] = {}
         self._cancelled_ids: set[str] = set()
         self._persistent_requests: dict[str, PersistentDraftRequest] = {}
@@ -1028,6 +1029,9 @@ class FlashMTPDraftEngine:
         self._unconfirmed_direct: dict[str, int] = {}
         self._held_direct_results: dict[str, object] = {}
         self._held_direct_source_done: dict[str, list] = {}
+        # Held results released by confirmations, sent as one batch per turn.
+        self._confirmed_held_results: list = []
+        self._confirmed_held_sequence = 0
         # Bounded window of accepted transfer ids: a direct copy that arrives
         # after its Coordinator copy (even after retirement) must not re-run.
         self._seen_transfers: set[str] = set()
@@ -2042,6 +2046,7 @@ class FlashMTPDraftEngine:
                 break
             if self._ring_worker is not None:
                 self._poll_direct_rings()
+            self._flush_confirmed_results()
             if self._uses_direct_gpu_source:
                 self._poll_feature_batches()
                 if self._stop:
@@ -2363,6 +2368,7 @@ class FlashMTPDraftEngine:
         if len(self._seen_transfer_order) > 65536:
             self._seen_transfers.discard(self._seen_transfer_order.popleft())
         self._pending_ids.add(transfer_id)
+        self._ring_pending_ids.add(transfer_id)
         self._received_ns_by_transfer[transfer_id] = received_ns
         if entry.has_pull:
             slot = self._landing_slot_base + entry.landing_index
@@ -2798,6 +2804,7 @@ class FlashMTPDraftEngine:
             if self._uses_direct_gpu_source and not task.source_read_migration_id:
                 self._publish_source_done(task)
             self._pending_ids.discard(task.transfer_id)
+            getattr(self, "_ring_pending_ids", set()).discard(task.transfer_id)
             self._received_ns_by_transfer.pop(task.transfer_id, None)
         self._pending.clear()
         for batch in self._pending_feature_batches:
@@ -2956,6 +2963,7 @@ class FlashMTPDraftEngine:
                 if not task.source_read_migration_id:
                     self._publish_source_done(task)
                 self._pending_ids.discard(task.transfer_id)
+                getattr(self, "_ring_pending_ids", set()).discard(task.transfer_id)
                 self._received_ns_by_transfer.pop(task.transfer_id, None)
             self._pending.clear()
             self._flush_source_done()
@@ -3173,6 +3181,7 @@ class FlashMTPDraftEngine:
                 if pending_result is not None:
                     for entry in pending_result.entries:
                         self._pending_ids.discard(entry.transfer_id)
+                        getattr(self, "_ring_pending_ids", set()).discard(entry.transfer_id)
                     capacity_changed = True
                 published = self._published_by_batch.get(message.batch_id)
                 if published is not None:
@@ -3234,7 +3243,39 @@ class FlashMTPDraftEngine:
             self._queue_source_done(message)
         held = self._held_direct_results.pop(task.transfer_id, None)
         if held is not None:
-            self._send_result(held)
+            self._confirmed_held_results.append(held)
+
+    def _flush_confirmed_results(self) -> None:
+        """Send the results released by Coordinator confirmations as one batch.
+
+        A ring round usually completes before its Coordinator copy arrives, so
+        its result is held per entry.  Sending each one on confirmation
+        multiplied result, ACK and Target routing traffic by the batch size and
+        saturated the Coordinator under load.
+        """
+        held = getattr(self, "_confirmed_held_results", None)
+        if not held:
+            return
+        self._confirmed_held_results = []
+        from msgspec.structs import replace
+
+        groups: dict[tuple[str, str], list] = {}
+        for message in held:
+            key = (message.instance_session_id, message.coordinator_session_id)
+            groups.setdefault(key, []).append(message)
+        for (instance_session_id, _), messages in groups.items():
+            self._confirmed_held_sequence += 1
+            self._send_result(
+                replace(
+                    messages[0],
+                    batch_id=(
+                        f"{self.instance_id}:held:{instance_session_id}:"
+                        f"{self._confirmed_held_sequence}"
+                    ),
+                    entries=tuple(entry for m in messages for entry in m.entries),
+                    sent_ns=min(m.sent_ns for m in messages),
+                )
+            )
 
     def _expire_unconfirmed_direct(self) -> None:
         """Drop never-confirmed direct work after its deadline (bounded leak)."""
@@ -3251,6 +3292,7 @@ class FlashMTPDraftEngine:
             self._held_direct_results.pop(transfer_id)
             self._held_direct_source_done.pop(transfer_id, None)
             self._pending_ids.discard(transfer_id)
+            getattr(self, "_ring_pending_ids", set()).discard(transfer_id)
             self._direct_tasks_by_transfer.pop(transfer_id, None)
             if hasattr(self, "_ring_retired"):
                 self._remember_ring_retired(transfer_id, failed=True)
@@ -7655,6 +7697,7 @@ class FlashMTPDraftEngine:
             if pending_task.transfer_id == task.transfer_id:
                 removed = True
                 self._pending_ids.discard(task.transfer_id)
+                getattr(self, "_ring_pending_ids", set()).discard(task.transfer_id)
                 self._received_ns_by_transfer.pop(task.transfer_id, None)
                 self._cancelled_ids.discard(task.transfer_id)
             else:
@@ -8884,6 +8927,7 @@ class FlashMTPDraftEngine:
 
         if getattr(task, "candidate_destination", None) is None:
             self._pending_ids.discard(task.transfer_id)
+            getattr(self, "_ring_pending_ids", set()).discard(task.transfer_id)
         self._cancelled_ids.discard(task.transfer_id)
         self._received_ns_by_transfer.pop(task.transfer_id, None)
 
@@ -9054,6 +9098,7 @@ class FlashMTPDraftEngine:
             pending_work=pending_tasks + active_transfers,
             queue_delay_ns=self._last_queue_delay_ns,
             last_batch_size=self._last_batch_size,
+            ring_pending_tasks=(lambda rpi: len(rpi) - sum(t in rpi for t in unconfirmed))(getattr(self, "_ring_pending_ids", set())),
         )
         if not self._client.update_capacity(update):
             logger.warning("Draft capacity update was locally backpressured")
@@ -9092,6 +9137,11 @@ class FlashMTPDraftEngine:
             SourceReadDoneBatch,
         )
 
+        if getattr(self, "_stop", False):
+            # Shutdown drains flush only the outbox; carry confirmed results.
+            # While serving, the loop flushes them once per turn so that one
+            # turn's confirmations share a batch.
+            self._flush_confirmed_results()
         now_ns = time.monotonic_ns()
         for operation, message_id, message in self._delivery_outbox.due(now_ns=now_ns):
             if operation == "result":
