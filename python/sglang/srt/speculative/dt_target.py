@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 
 import torch
@@ -22,6 +22,11 @@ from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
+
+# Coordinator failure codes meaning the assigned Draft session is gone.
+RING_OWNER_LOSS_CODES = frozenset(
+    {"draft_session_replaced", "draft_result_pool_retired", "draft_owner_session_lost"}
+)
 # Initial control delivery is immediate.  A one-second retry cadence still
 # provides multiple attempts inside the round lease while preventing a busy
 # scheduler from turning transient ACK latency into a duplicate-message storm.
@@ -292,6 +297,9 @@ class _PendingTargetGpuObservation:
     start_event: object
     end_event: object
     start_observed_ns: int = 0
+    # DT_GPU_CLOCK: absolute GPU time of the verify end (dt_gpu_clock).
+    clock_slot: int = -1
+    clock_done: object = None
 
 
 class DTTargetController:
@@ -528,16 +536,29 @@ class DTTargetController:
         )
         self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "64"))
         self._ready_hold_started_ns = 0
-        # Direct Target->owner-Draft descriptors (design rev 41). Off by
-        # default: a direct copy the Coordinator never accepts (overload
-        # backpressure until the round deadline, or shutdown) has no
-        # retirement path for its source lease yet.
-        self._direct_dispatch = os.environ.get("DT_DIRECT_DISPATCH", "0") == "1"
-        self._draft_binding: dict[str, tuple[str, str]] = {}
+        # Same-host Target -> owner-Draft descriptor rings (dt_direct_ring).
+        # They replace the former ZMQ direct dispatch (DT_DIRECT_DISPATCH).
+        self._direct_ring = os.environ.get("DT_DIRECT_RING", "1") == "1"
+        self._ring_writers: dict[str, object] = {}
+        self._ring_outstanding: dict[str, deque] = {}
+        self._ring_missing_until_ns: dict[str, int] = {}
+        self._ring_encoder = None
+        # Ring rounds are authorized by the request's owner lease and their
+        # source leases retire only on the ring read proof or a lease
+        # revocation (Draft session lost or process gone).  A Coordinator
+        # failure result never speaks for a ring copy's source read.
+        self._ring_lease = self._direct_ring
+        self._ring_unproven: dict[str, str] = {}
+        # Bounded record of ring rounds whose read the proof retired; their
+        # relayed SourceReadDone is an idempotent repeat.
+        self._ring_proven: OrderedDict[str, None] = OrderedDict()
+        self._lease_marks: list[tuple[str, str]] = []
+        self._ring_revoked_sessions: set[str] = set()
+        # Owner lease per request from Coordinator assignments:
+        # request_id -> (draft_instance_id, draft_session_id, owner_epoch).
+        self._draft_binding: dict[str, tuple[str, str, int]] = {}
+        # Ring rounds written but not yet accepted by the Coordinator.
         self._direct_sent: set[str] = set()
-        self._direct_orphans: set[str] = set()
-        self._direct_sequence = 0
-        self._direct_encoder = None
         self._client = None
         self._ledger = None
         self._feature_source_pool = None
@@ -2201,6 +2222,11 @@ class DTTargetController:
 
     def _park_completed_batch(self, batch: ScheduleBatch, *, batch_result=None) -> None:
         if not batch.reqs:
+            # Every launched forward was registered; its result still retires
+            # that ownership even when all its requests left the batch.
+            self._release_target_inflight_batch(batch)
+            if not getattr(batch_result, "dt_dflash_feature_stage_credit", False):
+                self._release_inplace_hidden(batch_result)
             if getattr(batch_result, "dt_dflash_feature_stage_credit", False):
                 self._stage_dflash_feature_copy(
                     batch, batch_result, finalize_deferred=True
@@ -2775,8 +2801,14 @@ class DTTargetController:
                 reason="missing_events",
             )
         else:
+            clock_slot, clock_done = -1, None
+            clock = self._verify_gpu_clock()
+            if clock is not None:
+                clock_slot, clock_done = clock.stamp_after(events[-1])
             self._pending_target_gpu_observations.append(
                 _PendingTargetGpuObservation(
+                    clock_slot=clock_slot,
+                    clock_done=clock_done,
                     wave_id=wave_id,
                     transfer_ids=transfer_ids,
                     ready_ns=getattr(batch, "dt_full_wave_ready_ns", 0),
@@ -2808,6 +2840,14 @@ class DTTargetController:
             poll_finished_ns=poll_finished_ns,
         )
 
+    def _verify_gpu_clock(self):
+        clock = getattr(self, "_gpu_clock", None)
+        if clock is None and os.environ.get("DT_GPU_CLOCK", "0") == "1":
+            from sglang.srt.speculative.dt_gpu_clock import GpuClock
+
+            clock = self._gpu_clock = GpuClock(torch.device("cuda", torch.cuda.current_device()))
+        return clock
+
     def _poll_target_gpu_observations(self) -> None:
         """Capture host observations of CUDA boundaries without synchronizing."""
 
@@ -2836,7 +2876,9 @@ class DTTargetController:
                     reason=type(exc).__name__,
                 )
                 continue
-            if not end_ready:
+            if not end_ready or (
+                observation.clock_done is not None and not observation.clock_done.query()
+            ):
                 retained.append(observation)
                 continue
             end_observed_ns = time.monotonic_ns()
@@ -2867,6 +2909,11 @@ class DTTargetController:
                 ),
                 cuda_previous_verify_end_to_start_ns=(
                     previous_verify_end_to_start_ns
+                ),
+                gpu_end_clock_ns=(
+                    self._gpu_clock.read(observation.clock_slot)
+                    if observation.clock_slot >= 0
+                    else 0
                 ),
             )
             self._last_target_verify_end_event = observation.end_event
@@ -3993,6 +4040,7 @@ class DTTargetController:
                         f"active_leases={active_leases}, "
                         f"quarantined_slots={quarantined_slots}"
                     )
+            self._close_direct_rings()
             if self._candidate_arena is not None:
                 active_candidates, quarantined_candidates = (
                     self._candidate_arena.close()
@@ -4496,6 +4544,9 @@ class DTTargetController:
                         )
                     raise
                 dispatchable = with_destinations
+            ring_plan = ()
+            if getattr(self, "_direct_ring", False):
+                dispatchable, ring_plan = self._plan_direct_ring(dispatchable)
 
             self._batch_sequence += 1
             dispatch_batch = TargetTaskBatch(
@@ -4520,7 +4571,8 @@ class DTTargetController:
                     )
                 break
             submitted_ns = time.monotonic_ns()
-            self._send_direct_dispatch(dispatch_batch.entries)
+            if ring_plan:
+                self._write_direct_ring(ring_plan)
             if self._profile_active:
                 self._profile_emit(
                     "target_task_submit",
@@ -4555,6 +4607,19 @@ class DTTargetController:
                     ),
                 )
             self._ledger.begin(dispatch_batch)
+            lease_marks = getattr(self, "_lease_marks", None)
+            if lease_marks:
+                # A ring copy written before a submit that did not go out is
+                # marked once its (re)submitted round is registered.
+                retained_marks = []
+                for transfer_id, instance_id in lease_marks:
+                    if self._ledger.get(transfer_id) is None:
+                        retained_marks.append((transfer_id, instance_id))
+                    else:
+                        self._ledger.mark_lease_dispatched(
+                            transfer_id, draft_instance_id=instance_id
+                        )
+                self._lease_marks = retained_marks
             outbox = self._delivery_outbox
             outbox.add("task_batch", dispatch_batch.batch_id, dispatch_batch)
             outbox.mark_sent("task_batch", dispatch_batch.batch_id, now_ns=submitted_ns)
@@ -4598,6 +4663,10 @@ class DTTargetController:
             # Direct Draft completion is intentionally observed before the
             # independent Coordinator retirement channel.
             self._candidate_arena.poll_completion_notices()
+            if self._ring_outstanding:
+                self._poll_direct_ring_reads()
+                if self._ring_lease:
+                    self._fence_dead_ring_owners()
         for message in self._client.recv_nowait():
             if isinstance(message, TaskBatchAck):
                 if not self._ledger.has_submitted_batch(message.batch_id):
@@ -4607,8 +4676,26 @@ class DTTargetController:
                 if self.candidate_transport == "cuda-ipc":
                     if self._candidate_arena is None:
                         raise RuntimeError("direct candidate arena is unavailable")
+                    from sglang.srt.speculative.dt_candidate_p2p import (
+                        CandidateTransportError,
+                    )
+
                     for assignment in message.assignments:
-                        self._candidate_arena.authorize(assignment)
+                        try:
+                            self._candidate_arena.authorize(assignment)
+                        except CandidateTransportError:
+                            if assignment.transfer_id not in self._ring_unproven and (
+                                assignment.transfer_id not in self._direct_sent
+                            ):
+                                raise
+                            # The Coordinator named another producer than the
+                            # owner lease used for this ring round: the slot is
+                            # quarantined (no READY), the round times out.
+                            logger.error(
+                                "Coordinator assignment for ring round %s differs "
+                                "from the owner lease",
+                                assignment.transfer_id,
+                            )
                         self._remember_draft_binding(assignment)
                     direct_sent = getattr(self, "_direct_sent", None)
                     if direct_sent:
@@ -4718,8 +4805,6 @@ class DTTargetController:
         if self._candidate_arena is not None:
             self._candidate_arena.poll_releases()
             self._candidate_arena.poll_cancelled()
-            if getattr(self, "_direct_orphans", None):
-                self._poll_direct_orphans()
             for completion in self._candidate_arena.poll():
                 state = self._ledger.get(completion.transfer_id)
                 if state is None:
@@ -4752,6 +4837,7 @@ class DTTargetController:
                         metadata_submitted_ns=completion.metadata_submitted_ns,
                         metadata_gpu_ns=completion.metadata_gpu_ns,
                         completion_observed_ns=completion.observed_ns,
+                        ready_source=getattr(completion, "ready_source", "notice"),
                         export_ledger_ready_ns=export_ledger_ready_ns,
                         target_compute_batches_inflight=self._target_compute_batches_inflight,
                     )
@@ -4912,6 +4998,8 @@ class DTTargetController:
         draft_kv_handle = self._draft_kv_handle_by_request.pop(request_id, None)
         self._draft_committed_len.pop(request_id, None)
         self._draft_dispatched_len.pop(request_id, None)
+        # The owner lease ends with the request (a reused id starts fresh).
+        getattr(self, "_draft_binding", {}).pop(request_id, None)
         if draft_kv_handle is None:
             return
         if not self.is_export_rank:
@@ -5073,6 +5161,13 @@ class DTTargetController:
         message_id = source_read_done_id(message)
         if message_id in self._source_done_applied_ids:
             return message_id
+        if (
+            message.transfer_id in getattr(self, "_ring_proven", ())
+            and message.transfer_id not in self._source_slot_by_transfer
+        ):
+            # The ring read proof already retired this lease; the pool's
+            # bounded history may no longer remember it.
+            return message_id
         source_ref = self._source_slot_by_transfer.get(message.transfer_id)
         if source_ref is not None and source_ref != (
             message.source_slot_id,
@@ -5112,7 +5207,13 @@ class DTTargetController:
             if flush:
                 self._flush_reliable_outbox()
             return
-        if self.uses_direct_gpu_source:
+        ring_retired = (
+            message.transfer_id in getattr(self, "_ring_proven", ())
+            and message.transfer_id not in self._source_slot_by_transfer
+        )
+        if ring_retired:
+            pass
+        elif self.uses_direct_gpu_source:
             assert self._feature_source_pool is not None
             self._feature_source_pool.read_done(
                 transfer_id=message.transfer_id,
@@ -5313,9 +5414,30 @@ class DTTargetController:
         # result was delivered but before its ordered SourceReadDone reached the
         # Target.  Quarantine first so ledger idempotence cannot hide that late
         # loss of GPU-read quiescence.
+        ring_unproven = getattr(self, "_ring_unproven", None) or {}
+        if getattr(self, "_ring_lease", False) and getattr(self, "_ring_writers", None):
+            batch_session = getattr(batch, "draft_session_id", "")
+            lost: dict[str, bool] = {}
+            for entry in batch.entries:
+                if entry.error_code not in RING_OWNER_LOSS_CODES:
+                    continue
+                # Coordinator orphan batches may not name a session; the code
+                # then refers to the session that holds this ring round.
+                session = ring_unproven.get(entry.transfer_id) or batch_session
+                if not session or (
+                    batch_session and session != batch_session
+                ) or session not in self._ring_writers:
+                    continue
+                lost[session] = lost.get(session, True) and entry.source_read_quiescent
+            for draft_session_id, quiescent in lost.items():
+                self._revoke_ring_owner(draft_session_id, quiescent=quiescent)
         if self.uses_direct_gpu_source:
             for entry in batch.entries:
                 if entry.status == EntryStatus.OK:
+                    continue
+                if getattr(self, "_ring_lease", False) and entry.transfer_id in ring_unproven:
+                    # The Coordinator speaks only for its own copy; the ring
+                    # copy's read retires the lease (proof or revocation).
                     continue
                 if entry.source_read_quiescent:
                     self._release_source_slot(entry.transfer_id)
@@ -5510,82 +5632,303 @@ class DTTargetController:
         """
         direct_sent = getattr(self, "_direct_sent", None)
         if direct_sent and transfer_id in direct_sent:
+            # A ring copy exists: its candidate slot waits for the Draft's
+            # completion or tombstone, its source for the ring read proof or
+            # an owner revocation.
             direct_sent.discard(transfer_id)
             self._release_candidate_destination(transfer_id, remote_quiescent=False)
-            self._direct_orphans.add(transfer_id)
             return
         self._release_source_slot(transfer_id)
         self._release_candidate_destination(transfer_id, remote_quiescent=True)
-
-    def _poll_direct_orphans(self) -> None:
-        arena = self._candidate_arena
-        for transfer_id in tuple(self._direct_orphans):
-            if arena is None or not arena.has_active(transfer_id):
-                # The candidate push follows the hidden pull, so its proof
-                # also proves the source read finished.
-                self._direct_orphans.discard(transfer_id)
-                self._release_source_slot(transfer_id)
 
     def _remember_draft_binding(self, assignment) -> None:
         bindings = getattr(self, "_draft_binding", None)
         state = self._ledger.get(assignment.transfer_id)
         if bindings is None or state is None:
             return
+        previous = bindings.get(state.task.request_id)
+        epoch = int(getattr(assignment, "owner_epoch", 0))
+        if previous is not None and epoch and epoch < previous[2]:
+            return  # stale assignment from an older owner epoch
+        if assignment.draft_session_id in getattr(self, "_ring_revoked_sessions", ()):
+            bindings.pop(state.task.request_id, None)
+            return
         bindings[state.task.request_id] = (
             assignment.draft_instance_id,
             assignment.draft_session_id,
+            epoch,
         )
         if len(bindings) > 65536:
-            # Dropping a binding only disables direct dispatch for that request.
+            # Dropping a binding only disables the direct ring for that request.
             for request_id in tuple(bindings)[:16384]:
                 del bindings[request_id]
 
-    def _send_direct_dispatch(self, tasks) -> None:
-        """Send owner-known persistent rounds straight to their Draft."""
-        if (
-            not getattr(self, "_direct_dispatch", False)
-            or not self.is_persistent
-            or self.candidate_transport != "cuda-ipc"
-            or self._candidate_arena is None
-        ):
-            return
-        from dt_protocol import (
-            PROTOCOL_VERSION,
-            DraftDispatchBatch,
-            DraftTaskKind,
+    def _direct_ring_writer(self, draft_session_id: str):
+        """Return the serving ring to one owner Draft session, or None."""
+
+        from sglang.srt.speculative.dt_direct_ring import (
+            STATE_CREATED,
+            STATE_SERVING,
+            TargetRingWriter,
+            ring_path,
         )
 
-        by_draft: dict[tuple[str, str], list] = {}
-        for task in tasks:
-            if task.kind != DraftTaskKind.RECONCILE or task.candidate_destination is None:
-                continue
-            binding = getattr(self, "_draft_binding", {}).get(task.request_id)
-            if binding is not None:
-                by_draft.setdefault(binding, []).append(task)
-        if not by_draft:
-            return
-        if self._direct_encoder is None:
+        writer = self._ring_writers.get(draft_session_id)
+        if writer is None:
+            if draft_session_id in self._ring_revoked_sessions:
+                return None
+            now_ns = time.monotonic_ns()
+            if self._ring_missing_until_ns.get(draft_session_id, 0) > now_ns:
+                return None
+            path = ring_path(draft_session_id, self._client.instance_session_id)
+            try:
+                writer = TargetRingWriter(path)
+            except FileNotFoundError:
+                # Not on this host or not created yet: Coordinator path only.
+                self._ring_missing_until_ns[draft_session_id] = now_ns + 1_000_000_000
+                return None
+            self._ring_writers[draft_session_id] = writer
+            self._ring_outstanding[draft_session_id] = deque()
+        if writer.state == STATE_CREATED:
+            pool = self._feature_source_pool
+            if pool is not None:
+                allocation = pool._allocations[pool._buffer.allocation_index]
+                writer.register_source(
+                    ipc_handle=allocation.ipc_handle,
+                    allocation_length=allocation.length,
+                    pool_generation=pool.pool_generation,
+                    source_session_id=pool.source_session_id,
+                )
+                writer.source_ipc_handle = allocation.ipc_handle
+            else:
+                writer.register_source(
+                    ipc_handle=bytes(64),
+                    allocation_length=0,
+                    pool_generation="",
+                    source_session_id="",
+                )
+                writer.source_ipc_handle = b""
+        return writer if writer.state == STATE_SERVING else None
+
+    def _plan_direct_ring(self, tasks):
+        """Choose owner-known rounds for the ring and stamp their ring seq."""
+
+        from dt_protocol import DraftTaskKind
+        from msgspec.structs import replace
+
+        from dt_protocol import DraftAssignment
+
+        from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
+        from sglang.srt.speculative.dt_direct_ring import MAX_PAYLOAD_BYTES, next_seq
+
+        if not self.is_persistent or self.candidate_transport != "cuda-ipc":
+            return tasks, ()
+        if self._ring_encoder is None:
             import msgspec
 
-            self._direct_encoder = msgspec.msgpack.Encoder()
-        now_ns = time.monotonic_ns()
-        for (draft_instance_id, draft_session_id), entries in by_draft.items():
-            self._direct_sequence += 1
-            message = DraftDispatchBatch(
-                protocol_version=PROTOCOL_VERSION,
-                batch_id=f"{self.instance_id}:direct:{self._direct_sequence}",
-                draft_instance_id=draft_instance_id,
-                entries=tuple(entries),
-                sent_ns=now_ns,
-            )
-            # Mark first: a delivered frame may reach the Draft immediately.
-            self._direct_sent.update(task.transfer_id for task in entries)
-            if not self._candidate_arena.send_direct_dispatch(
-                draft_session_id, self._direct_encoder.encode(message)
+            self._ring_encoder = msgspec.msgpack.Encoder()
+        planned_next: dict[str, int] = {}
+        planned_count: dict[str, int] = {}
+        plan = []
+        stamped = []
+        for task in tasks:
+            binding = self._draft_binding.get(task.request_id)
+            writer = None
+            if (
+                task.kind == DraftTaskKind.RECONCILE
+                and task.candidate_destination is not None
+                and not task.direct_ring_seq
+                and not task.source_read_migration_id
+                and binding is not None
             ):
-                self._direct_sent.difference_update(
-                    task.transfer_id for task in entries
+                writer = self._direct_ring_writer(binding[1])
+            source = task.source
+            if writer is not None and source is not None and (
+                source.ipc_handle != writer.source_ipc_handle
+                or source.nbytes > writer.max_entry_bytes
+                or len(source.producer_event_handle) != 64
+            ):
+                writer = None
+            if writer is not None:
+                count = planned_count.get(binding[1], 0)
+                if writer.free_entries() - count <= 0:
+                    writer = None
+            if writer is None:
+                stamped.append(task)
+                continue
+            seq = planned_next.get(binding[1], writer.next_seq)
+            ring_task = replace(task, direct_ring_seq=seq)
+            payload = self._ring_encoder.encode(ring_task)
+            if len(payload) > MAX_PAYLOAD_BYTES:
+                stamped.append(task)
+                continue
+            instance_id, session_id, epoch = binding
+            try:
+                # Lease authorization: READY needs no per-round Coordinator
+                # assignment; a later assignment must name this producer.
+                self._candidate_arena.authorize(
+                    DraftAssignment(
+                        transfer_id=task.transfer_id,
+                        draft_instance_id=instance_id,
+                        draft_session_id=session_id,
+                        authorization_nonce=task.candidate_destination.authorization_nonce,
+                        owner_epoch=epoch,
+                    )
                 )
+            except CandidateTransportError:
+                logger.warning(
+                    "owner lease cannot authorize %s; using the Coordinator path",
+                    task.transfer_id,
+                )
+                stamped.append(task)
+                continue
+            planned_next[binding[1]] = next_seq(seq)
+            planned_count[binding[1]] = count + 1
+            plan.append((binding[1], writer, ring_task, payload))
+            stamped.append(ring_task)
+        return stamped, tuple(plan)
+
+    def _write_direct_ring(self, plan) -> None:
+        """Publish planned ring entries after the Coordinator submit succeeded."""
+
+        for draft_session_id, writer, task, payload in plan:
+            # Stamped before the seq store: the Draft may take it immediately.
+            written_ns = time.monotonic_ns()
+            source = task.source
+            if source is None:
+                seq = writer.write(payload=payload, has_pull=False)
+                pull = None
+            else:
+                seq = writer.write(
+                    payload=payload,
+                    has_pull=True,
+                    source_offset=source.allocation_offset + source.byte_offset,
+                    nbytes=source.nbytes,
+                    source_slot_id=source.source_slot_id,
+                    slot_generation=source.slot_generation,
+                    event_handle=source.producer_event_handle,
+                )
+                pull = (source.source_slot_id, source.slot_generation)
+            if seq != task.direct_ring_seq:
+                raise RuntimeError("direct ring sequence diverged from its plan")
+            self._ring_unproven[task.transfer_id] = draft_session_id
+            # Applied after ledger.begin() registers the round.
+            self._lease_marks.append(
+                (task.transfer_id, self._draft_binding[task.request_id][0])
+            )
+            self._direct_sent.add(task.transfer_id)
+            self._ring_outstanding[draft_session_id].append(
+                (seq, task.transfer_id, pull)
+            )
+            if self._profile_active:
+                self._profile_emit(
+                    "target_ring_write",
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    ring_seq=seq,
+                    written_ns=written_ns,
+                )
+
+    def _poll_direct_ring_reads(self) -> None:
+        """Retire source leases on the Draft worker's GPU-written read proof.
+
+        The worker writes an entry's INPUT_READY word on its copy stream after
+        the hidden copy, so a matching word proves the source range was read;
+        no Coordinator relay is needed.  The later relayed SourceReadDone is
+        an idempotent repeat.
+        """
+
+        pool = self._feature_source_pool
+        for draft_session_id, outstanding in self._ring_outstanding.items():
+            writer = self._ring_writers[draft_session_id]
+            while outstanding:
+                seq, transfer_id, pull = outstanding[0]
+                if not writer.read_proven(seq):
+                    break
+                outstanding.popleft()
+                self._ring_unproven.pop(transfer_id, None)
+                if pull is None or pool is None:
+                    continue
+                proven = self._ring_proven
+                proven[transfer_id] = None
+                if len(proven) > 65536:
+                    proven.popitem(last=False)
+                if self._source_slot_by_transfer.get(transfer_id) != pull:
+                    continue
+                pool.read_done(
+                    transfer_id=transfer_id,
+                    source_slot_id=pull[0],
+                    slot_generation=pull[1],
+                    source_session_id=pool.source_session_id,
+                    pool_generation=pool.pool_generation,
+                )
+                self._source_slot_by_transfer.pop(transfer_id, None)
+                self._source_deadline_by_transfer.pop(transfer_id, None)
+                self._staged_flashmtp_source_leases.discard(transfer_id)
+
+    def _fence_dead_ring_owners(self) -> None:
+        """Revoke a ring owner whose process is gone or whose ring is closed.
+
+        Same-host fence: a Draft that exited cannot read Target memory any
+        more, so its unproven ring rounds can retire without the Coordinator,
+        which never knew of ring copies it did not accept.
+        """
+
+        from sglang.srt.speculative.dt_direct_ring import STATE_CLOSED
+
+        now_ns = time.monotonic_ns()
+        if now_ns < getattr(self, "_ring_fence_next_ns", 0):
+            return
+        self._ring_fence_next_ns = now_ns + 200_000_000
+        for draft_session_id, outstanding in tuple(self._ring_outstanding.items()):
+            if not outstanding:
+                continue
+            writer = self._ring_writers[draft_session_id]
+            gone = writer.state == STATE_CLOSED
+            if not gone and writer.owner_pid:
+                try:
+                    os.kill(writer.owner_pid, 0)
+                except ProcessLookupError:
+                    gone = True
+                except PermissionError:
+                    pass
+            if gone:
+                self._revoke_ring_owner(draft_session_id, quiescent=True)
+
+    def _revoke_ring_owner(self, draft_session_id: str, *, quiescent: bool) -> None:
+        """Revoke one Draft session's ring lease and retire its ring rounds."""
+
+        self._ring_revoked_sessions.add(draft_session_id)
+        writer = self._ring_writers.pop(draft_session_id, None)
+        outstanding = self._ring_outstanding.pop(draft_session_id, deque())
+        for _seq, transfer_id, pull in outstanding:
+            self._ring_unproven.pop(transfer_id, None)
+            if pull is None:
+                continue
+            if quiescent:
+                self._release_source_slot(transfer_id)
+            else:
+                self._quarantine_source_slot(transfer_id)
+        if self._candidate_arena is not None:
+            self._candidate_arena.revoke_producer(draft_session_id, quiescent=quiescent)
+        for request_id, binding in tuple(self._draft_binding.items()):
+            if binding[1] == draft_session_id:
+                del self._draft_binding[request_id]
+        if writer is not None:
+            writer.close(unlink=quiescent)
+        logger.warning(
+            "revoked direct ring owner session %s (quiescent=%s, ring rounds=%d)",
+            draft_session_id,
+            quiescent,
+            len(outstanding),
+        )
+
+    def _close_direct_rings(self) -> None:
+        for writer in self._ring_writers.values():
+            writer.close()
+        self._ring_writers.clear()
+        self._ring_outstanding.clear()
 
     def _release_candidate_destination(
         self, transfer_id: str, *, remote_quiescent: bool = False

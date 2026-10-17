@@ -252,7 +252,9 @@ class TargetFeatureSourcePool:
         # Bounded history makes duplicate read-done idempotent without allowing
         # a stale acknowledgement to free a reissued slot generation.
         self._completed: OrderedDict[str, tuple[int, int]] = OrderedDict()
-        self._completed_limit = max(64, self.slot_count * 16)
+        # Ring read proofs retire a lease before its relayed SourceReadDone;
+        # keep enough history for that repeat to stay idempotent.
+        self._completed_limit = max(4096, self.slot_count * 16)
         self._lock = Lock()
         self._closed = False
 
@@ -815,7 +817,10 @@ class TargetFeatureSourcePool:
         self.poll_cancelled_producers()
         with self._lock:
             return (
-                len(self._active),
+                # An unpublished in-place reservation may still be written by
+                # its verify; it blocks detaching the pool like a lease.
+                len(self._active)
+                + sum(slot.state is FeatureSlotState.RESERVED for slot in self._slots),
                 sum(
                     slot.state is FeatureSlotState.QUARANTINED
                     for slot in self._slots

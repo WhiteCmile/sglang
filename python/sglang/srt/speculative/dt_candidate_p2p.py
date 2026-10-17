@@ -7,6 +7,12 @@ and publishes the slot generation last. After the Draft transport reports its
 stream completion, the Target enqueues one tiny metadata D2H and observes a
 CUDA event without blocking the scheduler thread.
 
+With DT_GPU_READY_RECORD=1 the Target also shares a same-host /dev/shm file
+of per-slot READY records.  The Draft queues the candidate copy, metadata words
+and then the record (generation last) on its push stream, so the Target CPU
+observes READY from host memory without waiting for a Draft-side completion
+poll or the direct notice.  The notice stays as the retirement/fallback path.
+
 Request, assignment, timeout, and retirement policy remain in the existing DT
 controller/router.  This module owns only allocation-relative CUDA transport
 and the local slot lifecycle.
@@ -14,16 +20,20 @@ and the local slot lifecycle.
 
 from __future__ import annotations
 
+import logging
+import mmap
 import os
 import secrets
 import time
 import uuid
+import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
 
 import msgspec
+import numpy as np
 import torch
 import zmq
 
@@ -44,8 +54,63 @@ COMPLETION_RETRY_NS = 100_000_000
 COMPLETION_MAX_ATTEMPTS = 100
 COMPLETION_SOCKET_HWM = 4096
 RETIRED_TRANSFER_LIMIT = 65536
-DIRECT_DISPATCH_FRAME = b"dispatch"
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
+GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
+# One 32-byte host READY record per slot: the metadata words plus the
+# producer tag.  The generation word is written last.
+READY_RECORD_WORDS = 8
+READY_RECORD_BYTES = READY_RECORD_WORDS * 4
+PRODUCER_TAG_WORD = 5
+
+logger = logging.getLogger(__name__)
+
+
+def producer_tag(draft_session_id: str) -> int:
+    """Nonzero 31-bit tag binding a host READY record to its Draft session."""
+
+    return (zlib.crc32(draft_session_id.encode()) & 0x7FFFFFFF) or 1
+
+
+class _ReadyRecordFile:
+    """A /dev/shm mapping of per-slot READY records shared by Target and Draft."""
+
+    def __init__(self, path: str, *, slot_count: int = 0, create: bool) -> None:
+        if create and slot_count <= 0:
+            raise ValueError("READY record file needs a positive slot count")
+        page = mmap.PAGESIZE
+        flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            if create:
+                nbytes = -(-slot_count * READY_RECORD_BYTES // page) * page
+                os.ftruncate(fd, nbytes)
+            else:
+                nbytes = os.fstat(fd).st_size
+            if nbytes <= 0 or nbytes % READY_RECORD_BYTES:
+                raise CandidateTransportError("READY record file has an invalid size")
+            self._mm = mmap.mmap(fd, nbytes)
+        finally:
+            os.close(fd)
+        self.path = path
+        self.nbytes = nbytes
+        self.slot_capacity = nbytes // READY_RECORD_BYTES
+        self.words = np.frombuffer(self._mm, dtype=np.uint32).reshape(
+            self.slot_capacity, READY_RECORD_WORDS
+        )
+        self.host_address = int(self.words.ctypes.data)
+
+    def close(self, *, unlink: bool) -> None:
+        self.words = None
+        try:
+            self._mm.close()
+        except BufferError:
+            # A caller still holds a view; the mapping dies with the process.
+            pass
+        if unlink:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
 
 
 class CandidateTransportError(RuntimeError):
@@ -76,6 +141,7 @@ class CandidateCompletion:
     notice_received_ns: int = 0
     metadata_submitted_ns: int = 0
     metadata_gpu_ns: int = 0
+    ready_source: str = "notice"
 
 
 @dataclass(slots=True)
@@ -191,6 +257,19 @@ class TargetCandidateArena:
         self._recent_notice_keys: deque[tuple[object, ...]] = deque()
         self._recent_notice_set: set[tuple[object, ...]] = set()
         self._recent_notice_limit = max(16, self.slot_count * 4)
+        self._ready_records: _ReadyRecordFile | None = None
+        self.ready_record_path = ""
+        if GPU_READY_RECORD:
+            self._ready_records = _ReadyRecordFile(
+                f"/dev/shm/dt-ready-{self.transport_session}",
+                slot_count=self.slot_count,
+                create=True,
+            )
+            self.ready_record_path = self._ready_records.path
+            # Generation/tag a slot's record must carry to become READY; 0 means
+            # the slot is not waiting for a record (unassigned, done, cancelled).
+            self._record_generation = np.zeros(self.slot_count, dtype=np.uint32)
+            self._record_tag = np.zeros(self.slot_count, dtype=np.uint32)
 
     @property
     def free_slot_count(self) -> int:
@@ -232,6 +311,7 @@ class TargetCandidateArena:
             metadata_allocation_length=metadata_allocation.length,
             metadata_ipc_handle=metadata_allocation.ipc_handle,
             completion_endpoint=self.completion_endpoint,
+            ready_record_path=self.ready_record_path,
         )
 
     def reserve(self, transfer_id: str):
@@ -282,6 +362,8 @@ class TargetCandidateArena:
             slot.notice_received_ns = 0
             slot.metadata_submitted_ns = 0
             self._active[transfer_id] = slot_id
+            if getattr(self, "_ready_records", None) is not None:
+                self._record_generation[slot_id] = 0
 
         data_allocation = self._allocations[self._data_buffer.allocation_index]
         metadata_allocation = self._allocations[
@@ -325,6 +407,15 @@ class TargetCandidateArena:
                     return
                 raise CandidateTransportError("assignment names no active destination")
             slot = self._slots[slot_id]
+            if slot.draft_instance_id and (
+                slot.draft_instance_id,
+                slot.draft_session_id,
+            ) == (assignment.draft_instance_id, assignment.draft_session_id):
+                if assignment.authorization_nonce != slot.authorization_nonce:
+                    raise CandidateTransportError("candidate assignment nonce mismatch")
+                # Already authorized for this producer (owner lease at ring
+                # write); the slot may have moved on to READING or cancel.
+                return
             assignable_cancel = (
                 slot.state is CandidateSlotState.QUARANTINED
                 and slot.cancel_pending
@@ -353,6 +444,16 @@ class TargetCandidateArena:
                 )
             slot.draft_instance_id = assignment.draft_instance_id
             slot.draft_session_id = assignment.draft_session_id
+            if (
+                getattr(self, "_ready_records", None) is not None
+                and slot.state is CandidateSlotState.ARMED
+                and not slot.cancel_pending
+                and not slot.completion_draft_instance_id
+            ):
+                # A record is accepted only from the assigned producer, so the
+                # READY identity is the assignment's, as on the notice path.
+                self._record_tag[slot_id] = producer_tag(assignment.draft_session_id)
+                self._record_generation[slot_id] = slot.generation
 
     def notify_host_completion(
         self,
@@ -519,7 +620,12 @@ class TargetCandidateArena:
             return False
         with self._lock:
             slot_id = self._active.get(notice.transfer_id)
-            if slot_id is None or slot_id != notice.slot_id:
+            if slot_id is None:
+                # A notice for a transfer this arena already retired (READY
+                # from its host record, read, and freed) is a late duplicate;
+                # ACK it so the producer stops retrying.
+                return notice.transfer_id in self._retired_transfers
+            if slot_id != notice.slot_id:
                 return False
             slot = self._slots[slot_id]
             if (
@@ -542,20 +648,36 @@ class TargetCandidateArena:
         self._remember_notice(key)
         return True
 
-    def send_direct_dispatch(self, draft_session_id: str, payload: bytes) -> bool:
-        """Send an encoded DraftDispatchBatch to a connected Draft producer.
+    def revoke_producer(self, draft_session_id: str, *, quiescent: bool) -> int:
+        """Retire unfinished slots authorized to a revoked Draft session.
 
-        Uses the completion ROUTER the Draft already connected to; an unknown
-        peer drops the frame, and the Coordinator copy remains authoritative.
+        ``quiescent`` means the producer process is proven gone (it can no
+        longer write this arena), so its ARMED or cancel-pending slots free
+        now; otherwise they stay quarantined.  READY/READING slots already hold
+        a complete payload and follow the normal read lifecycle.
         """
-        try:
-            self._completion_socket.send_multipart(
-                (draft_session_id.encode(), DIRECT_DISPATCH_FRAME, payload),
-                flags=zmq.NOBLOCK,
-            )
-        except zmq.Again:
-            return False
-        return True
+
+        retired = 0
+        with self._lock:
+            if quiescent:
+                # The producer can no longer write: later cancels of slots it
+                # was (or is) assigned need no tombstone.
+                revoked = getattr(self, "_revoked_producers", None)
+                if revoked is None:
+                    revoked = self._revoked_producers = set()
+                revoked.add(draft_session_id)
+            for slot_id, slot in enumerate(self._slots):
+                if slot.draft_session_id != draft_session_id or slot.state not in {
+                    CandidateSlotState.ARMED,
+                    CandidateSlotState.QUARANTINED,
+                }:
+                    continue
+                if quiescent:
+                    self._free_locked(slot_id)
+                else:
+                    slot.state = CandidateSlotState.QUARANTINED
+                retired += 1
+        return retired
 
     def has_active(self, transfer_id: str) -> bool:
         with self._lock:
@@ -617,6 +739,7 @@ class TargetCandidateArena:
 
         if max_queries <= 0:
             raise ValueError("max_queries must be positive")
+        self.poll_ready_records()
         completed: list[CandidateCompletion] = []
         queries = min(max_queries, self.slot_count)
         for offset in range(queries):
@@ -713,6 +836,84 @@ class TargetCandidateArena:
                     completed.append(slot.completion)
         return tuple(completed)
 
+    def poll_ready_records(self) -> int:
+        """Mark assigned ARMED slots READY from GPU-written host records.
+
+        The Draft push stream writes payload, metadata, and record words in
+        order, generation last, so a matching generation proves the payload is
+        in this arena.  The identity is the assignment's; the producer tag and
+        nonce reject records from any other writer.
+        """
+
+        records = getattr(self, "_ready_records", None)
+        if records is None:
+            return 0
+        expected = self._record_generation
+        hits = np.flatnonzero((expected != 0) & (records.words[: self.slot_count, 0] == expected))
+        if hits.size == 0:
+            return 0
+        observed_ns = time.monotonic_ns()
+        accepted = 0
+        for slot_id in hits.tolist():
+            values = [int(value) for value in records.words[slot_id]]
+            with self._lock:
+                generation = int(expected[slot_id])
+                expected[slot_id] = 0
+                slot = self._slots[slot_id]
+                if (
+                    slot.generation != generation
+                    or slot.state is not CandidateSlotState.ARMED
+                    or slot.cancel_pending
+                    or slot.completion_draft_instance_id
+                    or not slot.draft_instance_id
+                ):
+                    continue
+                nonce = values[NONCE_LOW_WORD] | (values[NONCE_HIGH_WORD] << 32)
+                if (
+                    nonce != slot.authorization_nonce
+                    or values[PRODUCER_TAG_WORD] != int(self._record_tag[slot_id])
+                    or values[VALID_LENGTH_WORD] != self.row_width
+                ):
+                    slot.state = CandidateSlotState.QUARANTINED
+                    raise CandidateTransportError(
+                        "candidate READY record failed generation/authentication"
+                    )
+                root = values[ROOT_TOKEN_WORD]
+                if root & 0x80000000:
+                    root -= 1 << 32
+                slot.completion_draft_instance_id = slot.draft_instance_id
+                slot.completion_draft_session_id = slot.draft_session_id
+                slot.completion = CandidateCompletion(
+                    transfer_id=slot.transfer_id,
+                    slot_id=slot_id,
+                    generation=slot.generation,
+                    authorization_nonce=slot.authorization_nonce,
+                    valid_length=values[VALID_LENGTH_WORD],
+                    root_token=root,
+                    draft_instance_id=slot.draft_instance_id,
+                    draft_session_id=slot.draft_session_id,
+                    observed_ns=observed_ns,
+                    # No notice or readback precedes a record; keep one
+                    # monotonic chain for traces.
+                    notice_queued_ns=observed_ns,
+                    notice_received_ns=observed_ns,
+                    metadata_submitted_ns=observed_ns,
+                    ready_source="gpu_record",
+                )
+                slot.state = CandidateSlotState.READY
+                key = (
+                    slot.transfer_id,
+                    slot_id,
+                    slot.generation,
+                    slot.authorization_nonce,
+                    slot.draft_instance_id,
+                    slot.draft_session_id,
+                )
+            # The direct notice still follows; ACK it as a duplicate.
+            self._remember_notice(key)
+            accepted += 1
+        return accepted
+
     def begin_read(self, completions: list[CandidateCompletion]) -> torch.Tensor:
         """Gather selected rows, fence their last read, and return device tokens."""
 
@@ -799,6 +1000,12 @@ class TargetCandidateArena:
                 return True
             if slot.state is CandidateSlotState.READING:
                 return False
+            if slot.draft_session_id and slot.draft_session_id in getattr(
+                self, "_revoked_producers", ()
+            ) and slot.state in {CandidateSlotState.ARMED, CandidateSlotState.QUARANTINED}:
+                # Its producer was revoked as gone: nothing can still write it.
+                self._free_locked(slot_id)
+                return True
             if slot.state is CandidateSlotState.QUARANTINED:
                 return False
             if not remote_quiescent:
@@ -875,6 +1082,10 @@ class TargetCandidateArena:
         self.poll_releases()
         self.poll_cancelled()
         self._completion_socket.close(linger=0)
+        if getattr(self, "_ready_records", None) is not None:
+            # Draft mappings keep the inode alive; only the name goes away.
+            self._ready_records.close(unlink=True)
+            self._ready_records = None
         return self.active_count, self.quarantined_slot_count
 
     def _free_locked(self, slot_id: int) -> None:
@@ -889,6 +1100,8 @@ class TargetCandidateArena:
                 retired.popitem(last=False)
         generation = slot.generation
         self._slots[slot_id] = _CandidateSlot(generation=generation)
+        if getattr(self, "_ready_records", None) is not None:
+            self._record_generation[slot_id] = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -937,7 +1150,9 @@ class DraftCandidatePushTransport:
         )
         self._zmq_context = zmq.Context.instance()
         self._notice_encoder = msgspec.msgpack.Encoder()
-        self._direct_dispatches: list[bytes] = []
+        # Target READY record mappings: key -> (file, device base address).
+        self._ready_records: dict[tuple[str, str, str, str], tuple[_ReadyRecordFile, int]] = {}
+        self._producer_tag = producer_tag(draft_session_id)
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
@@ -1009,6 +1224,38 @@ class DraftCandidatePushTransport:
         if previous is not None and previous != mapped:
             raise CandidateTransportError("candidate arena registration changed")
         self._registered[key] = mapped
+        if (
+            GPU_READY_RECORD
+            and getattr(registration, "ready_record_path", "")
+            and key not in getattr(self, "_ready_records", {})
+        ):
+            try:
+                records = _ReadyRecordFile(registration.ready_record_path, create=False)
+            except (OSError, CandidateTransportError):
+                # Not the same host or the file is gone: notice-only completion.
+                logger.warning(
+                    "Target READY record file unavailable, using notices: %s",
+                    registration.ready_record_path,
+                    exc_info=True,
+                )
+            else:
+                try:
+                    device_base = self._runtime.host_register(
+                        records.host_address, records.nbytes
+                    )
+                except Exception:
+                    records.close(unlink=False)
+                    raise
+                self._ready_records[key] = (records, device_base)
+
+    def has_ready_records(self, tasks: list[object]) -> bool:
+        """Whether every task's Target arena accepts GPU-written READY records."""
+
+        records = getattr(self, "_ready_records", None)
+        return bool(tasks and records) and all(
+            self._registration_key(task.candidate_destination) in records
+            for task in tasks
+        )
 
     def _mapping(self, destination):
         mapped = self._registered.get(self._registration_key(destination))
@@ -1106,9 +1353,6 @@ class DraftCandidatePushTransport:
                 except zmq.Again:
                     break
                 budget -= 1
-                if len(parts) == 2 and parts[0] == DIRECT_DISPATCH_FRAME:
-                    self._direct_dispatches.append(parts[1])
-                    continue
                 payload = parts[-1]
                 try:
                     ack = msgspec.msgpack.decode(payload, type=CandidateCompletionAck)
@@ -1155,11 +1399,6 @@ class DraftCandidatePushTransport:
             pending.attempts += 1
             pending.next_retry_ns = now_ns + COMPLETION_RETRY_NS
         return acknowledged
-
-    def pop_direct_dispatches(self) -> list[bytes]:
-        dispatches = self._direct_dispatches
-        self._direct_dispatches = []
-        return dispatches
 
     def pop_acknowledgements(self) -> tuple[dict[str, int | str], ...]:
         queue = getattr(self, "_acknowledgements", None)
@@ -1229,6 +1468,26 @@ class DraftCandidatePushTransport:
                     value=value,
                     stream=stream.cuda_stream,
                 )
+            record = getattr(self, "_ready_records", {}).get(
+                self._registration_key(destination)
+            )
+            if record is not None:
+                records, device_base = record
+                if destination.slot_id >= records.slot_capacity:
+                    raise CandidateTransportError("READY record slot is out of range")
+                record_address = device_base + destination.slot_id * READY_RECORD_BYTES
+                # Default stream memops order after the copy and metadata
+                # above; the Target CPU treats a matching generation as READY.
+                for word, value in (
+                    *words[:-1],
+                    (PRODUCER_TAG_WORD, self._producer_tag),
+                    words[-1],
+                ):
+                    self._runtime.stream_write_value32(
+                        address=record_address + word * 4,
+                        value=value,
+                        stream=stream.cuda_stream,
+                    )
         event = torch.cuda.Event(enable_timing=start_event is not None)
         event.record(stream)
         return CandidatePush(
@@ -1289,6 +1548,13 @@ class DraftCandidatePushTransport:
             return
         self._closed = True
         torch.cuda.current_stream(self.device).synchronize()
+        records_by_key = getattr(self, "_ready_records", {})
+        # Pushes run on push_stream; their sources and mappings must outlive them.
+        self.push_stream.synchronize()
+        for records, _device_base in records_by_key.values():
+            self._runtime.host_unregister(records.host_address)
+            records.close(unlink=False)
+        records_by_key.clear()
         self._mapping_cache.close()
         self._registered.clear()
         for socket in self._completion_sockets.values():

@@ -11,7 +11,7 @@ import signal
 import time
 import uuid
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
@@ -132,6 +132,11 @@ def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tens
     index = index_cpu.to(rows.device, non_blocking=True)
     return rows.index_select(0, index)
 COALESCING_POLL_S = 0.0001
+# Queue candidate pushes behind the proposal at launch and let the Target
+# observe READY from GPU-written host records (dt_candidate_p2p).
+GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
+DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
+RING_RETIRED_LIMIT = 65536
 # Initial control delivery is immediate.  Retrying every scheduler tick-scale
 # interval amplifies delayed ACKs under full-wave load; keep retries reliable
 # but slow enough that the Coordinator can drain the original transaction.
@@ -433,6 +438,8 @@ class PendingCandidatePush:
     result_slot: int | None
     candidates: torch.Tensor | None
     cancelled: bool = False
+    # False for a dropped ring copy whose round was already reported.
+    coordinator_result: bool = True
 
 
 STANDALONE_DRAFT_DECODE_GRAPH_BATCH_SIZES = (
@@ -976,6 +983,28 @@ class FlashMTPDraftEngine:
         # arrive in any of those gaps and must still publish an authenticated
         # tombstone for the Target-owned generation.
         self._direct_tasks_by_transfer: dict[str, object] = {}
+        # Transfers whose candidate push was queued at launch, behind the
+        # proposal on the push stream (DT_GPU_READY_RECORD).  Their completion
+        # handler must not push, expire, or tombstone them again.
+        self._early_pushed_ids: set[str] = set()
+        # Same-host Target -> Draft descriptor rings (DT_DIRECT_RING); created
+        # on the first candidate arena registration.
+        self._ring_worker = None
+        self._ring_endpoints: dict[str, object] = {}
+        self._ring_targets: dict[int, str] = {}
+        self._ring_admission: deque[tuple[object, int, tuple[int, int]]] = deque()
+        self._ring_waiting: dict[str, object] = {}
+        self._ring_task_decoder = None
+        self._landing_slot_base = -1
+        self._landing_taken: list[int] = []
+        # Landing frees waiting for the GPU work that last read the buffer.
+        self._landing_free_pending: deque[tuple[int, torch.cuda.Event]] = deque()
+        # Ring copies that must never execute: cancelled/released before the
+        # copy arrived, or abandoned after its Coordinator copy timed out.
+        self._ring_abandoned: set[str] = set()
+        # Bounded record of dropped/expired ring rounds; their late
+        # Coordinator copies get no second result.
+        self._ring_retired: OrderedDict[str, bool] = OrderedDict()
 
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id)
         self._result_store = None
@@ -999,7 +1028,6 @@ class FlashMTPDraftEngine:
         self._unconfirmed_direct: dict[str, int] = {}
         self._held_direct_results: dict[str, object] = {}
         self._held_direct_source_done: dict[str, list] = {}
-        self._direct_dispatch_decoder = None
         # Bounded window of accepted transfer ids: a direct copy that arrives
         # after its Coordinator copy (even after retirement) must not re-run.
         self._seen_transfers: set[str] = set()
@@ -2001,8 +2029,6 @@ class FlashMTPDraftEngine:
             self._poll_messages()
             if self._candidate_push_transport is not None:
                 self._candidate_push_transport.progress_completions()
-                for payload in self._candidate_push_transport.pop_direct_dispatches():
-                    self._accept_direct_dispatch(payload)
                 if self._profile_active:
                     for acknowledgement in (
                         self._candidate_push_transport.pop_acknowledgements()
@@ -2014,6 +2040,8 @@ class FlashMTPDraftEngine:
                         )
             if self._stop:
                 break
+            if self._ring_worker is not None:
+                self._poll_direct_rings()
             if self._uses_direct_gpu_source:
                 self._poll_feature_batches()
                 if self._stop:
@@ -2047,6 +2075,7 @@ class FlashMTPDraftEngine:
                 not self._pending
                 and not self._input_ready_features
                 and not self._pending_feature_batches
+                and not self._ring_admission
             ):
                 sleep_s = self._idle_sleep_s()
                 if sleep_s > 0:
@@ -2078,6 +2107,450 @@ class FlashMTPDraftEngine:
             while not event.query() and time.monotonic_ns() < deadline_ns:
                 pass
             self._poll_candidate_pushes()
+
+    def _queue_early_candidate_push(
+        self, tasks, candidates: torch.Tensor | None, ready_event
+    ) -> None:
+        """Queue the candidate push behind the proposal at launch time.
+
+        The push stream waits on ``ready_event`` on the GPU, then copies the
+        rows into the Target arena and writes metadata and the host READY
+        record.  The Target sees READY without this loop reaching the
+        completion poll; that poll and the push poll still do the Coordinator
+        result, notice, KV and staging retirement.
+        """
+
+        if not GPU_READY_RECORD or candidates is None:
+            return
+        transport = getattr(self, "_candidate_push_transport", None)
+        if self.candidate_transport != "cuda-ipc" or transport is None:
+            return
+        tasks = list(tasks)
+        indices = [
+            index
+            for index, task in enumerate(tasks)
+            if task.candidate_destination is not None
+            and task.transfer_id not in self._cancelled_ids
+        ]
+        selected = [tasks[index] for index in indices]
+        if not selected or not transport.has_ready_records(selected):
+            return
+        stream = transport.push_stream
+        stream.wait_event(ready_event)
+        candidates.record_stream(stream)
+        try:
+            with torch.cuda.stream(stream):
+                rows = candidates[: len(tasks)]
+                if len(indices) != len(tasks):
+                    rows = _select_candidate_rows(rows, indices)
+                rows = rows.contiguous()
+                push = transport.submit(tasks=selected, candidates=rows)
+        except Exception:
+            # Some READY records may already be queued (the Target can act on
+            # them) while others are not; no failure result may follow those.
+            # Fence and fail stop: Draft exit revokes the owner lease.
+            logger.critical(
+                "launch-time candidate push failed; entering fatal GPU quarantine",
+                exc_info=True,
+            )
+            try:
+                stream.synchronize()
+            except Exception:
+                pass
+            self._early_pushed_ids.update(task.transfer_id for task in selected)
+            self._enter_fatal_gpu_quarantine("launch-time candidate push failure")
+            return
+        self._pending_candidate_pushes.append(
+            PendingCandidatePush(
+                push=push, tasks=selected, result_slot=None, candidates=rows
+            )
+        )
+        self._early_pushed_ids.update(task.transfer_id for task in selected)
+        if self._profile_active:
+            profile_emit(
+                "draft_candidate_push_submit",
+                draft_instance=self.instance_id,
+                transfer_ids=tuple(task.transfer_id for task in selected),
+                entries=len(selected),
+                candidate_bytes=push.candidate_bytes,
+                cold_mapping_count=push.cold_mapping_count,
+                submitted_ns=push.submitted_ns,
+                queued_at_launch=True,
+            )
+
+    def _open_direct_ring(self, registration) -> None:
+        """Create this Draft's ring for one Target session (same host only)."""
+
+        from sglang.srt.speculative.dt_direct_ring import (
+            RING_CAPACITY,
+            DraftRingEndpoint,
+            DraftRingWorker,
+            ring_path,
+        )
+
+        if (
+            not self._persistent
+            or self.candidate_transport != "cuda-ipc"
+            or self._candidate_push_transport is None
+            or registration.target_session_id in self._ring_endpoints
+        ):
+            return
+        if self._ring_worker is None:
+            if self._is_feature_backed:
+                count = int(os.environ.get("DT_DIRECT_RING_LANDING", "4"))
+                landing = torch.empty(
+                    (count, self.feature_buffer_max_tokens, self._pivot_width),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                base = len(self._feature_staging_buffers)
+                self._landing_slot_base = base
+                self._feature_staging_buffers.extend(landing[index] for index in range(count))
+                # Every per-staging-slot scratch list (proposal metadata, pinned
+                # candidate rows, ...) gets entries for the landing slots too.
+                for name, value in list(vars(self).items()):
+                    if (
+                        name == "_feature_staging_buffers"
+                        or not name.endswith("_buffers")
+                        or not isinstance(value, list)
+                        or len(value) != base
+                        or not all(isinstance(item, torch.Tensor) for item in value)
+                    ):
+                        continue
+                    template = value[0]
+                    value.extend(
+                        torch.empty(
+                            template.shape,
+                            dtype=template.dtype,
+                            device=template.device,
+                            pin_memory=template.device.type == "cpu"
+                            and template.is_pinned(),
+                        )
+                        for _ in range(count)
+                    )
+                row_bytes = self._pivot_width * landing.element_size()
+            else:
+                # Token-only rounds carry no hidden; the worker still needs a
+                # (never used) landing buffer.
+                count = 1
+                landing = torch.empty((1, 1, 1), dtype=torch.bfloat16, device=self.device)
+                row_bytes = landing.element_size()
+            self._landing_taken = [0] * count
+            self._ring_worker = DraftRingWorker(
+                device=self.gpu_id,
+                cpu=int(os.environ.get("DT_DIRECT_RING_CPU", "-1")),
+                landing=landing,
+                row_bytes=row_bytes,
+            )
+        ring_id = len(self._ring_targets) + 1
+        endpoint = DraftRingEndpoint(
+            path=ring_path(
+                self._candidate_push_transport.draft_session_id,
+                registration.target_session_id,
+            ),
+            ring_id=ring_id,
+            target_session_id=registration.target_session_id,
+            capacity=RING_CAPACITY,
+            max_entry_bytes=(
+                self._ring_worker.landing_bytes if self._is_feature_backed else 0
+            ),
+            runtime=self._candidate_push_transport._runtime,
+        )
+        self._ring_endpoints[registration.target_session_id] = endpoint
+        self._ring_targets[ring_id] = registration.target_instance_id
+
+    def _poll_direct_rings(self) -> None:
+        """Attach registered rings, take worker-completed entries, admit them."""
+
+        from dt_protocol import DraftTask, DraftTaskKind
+
+        worker = self._ring_worker
+        worker.check()
+        decoder = self._ring_task_decoder
+        if decoder is None:
+            decoder = self._ring_task_decoder = msgspec.msgpack.Decoder(DraftTask)
+        for endpoint in self._ring_endpoints.values():
+            if not endpoint.attached:
+                registration = endpoint.registration()
+                if registration is None:
+                    continue
+                handle, length, pool_generation, source_session_id = registration
+                source_base = 0
+                if self._is_feature_backed:
+                    if not length:
+                        raise RuntimeError("direct ring Target registered no source")
+                    source_base, _warm = self._feature_pull_transport._mapping_cache.map(
+                        peer_instance_id=self._ring_targets[endpoint.ring_id],
+                        peer_session_id=source_session_id,
+                        pool_generation=pool_generation,
+                        ipc_handle=handle,
+                    )
+                worker.attach(endpoint, source_base=source_base, source_length=length)
+                endpoint.mark_serving(
+                    pool_generation=pool_generation,
+                    source_session_id=source_session_id,
+                )
+                continue
+            for _ in range(256):
+                entry = endpoint.take_ready()
+                if entry is None:
+                    break
+                task = decoder.decode(entry.payload)
+                self._accept_ring_task(endpoint, entry, task, DraftTaskKind)
+        self._admit_ring_tasks()
+        if self._ring_waiting:
+            now_ns = time.monotonic_ns()
+            for transfer_id, task in tuple(self._ring_waiting.items()):
+                if now_ns >= task.deadline_ns + UNCONFIRMED_DIRECT_GRACE_NS:
+                    # The worker may still be stalled on landing capacity: the
+                    # ring copy can still read the source and push, so this
+                    # result proves nothing; drop that copy when it arrives.
+                    del self._ring_waiting[transfer_id]
+                    self._received_tasks += 1  # Coordinator copy retires here
+                    self._ring_abandoned.add(transfer_id)
+                    error = TimeoutError("direct ring copy did not arrive in time")
+                    error.resources_quiescent = False
+                    self._publish_failures([(task, error)])
+        pending_frees = self._landing_free_pending
+        while pending_frees and pending_frees[0][1].query():
+            index, _event = pending_frees.popleft()
+            taken = self._landing_taken[index]
+            if taken and worker.try_free(index, taken) == 1:
+                self._landing_taken[index] = 0
+        for index, taken in enumerate(self._landing_taken):
+            if taken and self._feature_staging_refcounts.get(
+                self._landing_slot_base + index, 0
+            ) == 0 and not any(item[0] == index for item in pending_frees):
+                self._free_landing(index)
+
+    def _accept_ring_task(self, endpoint, entry, task, task_kinds) -> None:
+        if (
+            task.direct_ring_seq != entry.seq
+            or task.target_instance_id != self._ring_targets[endpoint.ring_id]
+            or task.kind != task_kinds.RECONCILE
+            or task.candidate_destination is None
+            or task.candidate_destination.target_session_id != endpoint.target_session_id
+        ):
+            raise ValueError("direct ring entry does not match its task")
+        if entry.has_pull:
+            source = task.source
+            if (
+                source is None
+                or source.source_slot_id != entry.source_slot_id
+                or source.slot_generation != entry.slot_generation
+                or source.nbytes != entry.nbytes
+                or source.allocation_offset + source.byte_offset != entry.source_offset
+                or source.source_session_id != endpoint.source_session_id
+                or source.pool_generation != endpoint.pool_generation
+                or entry.landing_index < 0
+            ):
+                raise ValueError("direct ring pull does not match its task source")
+        elif task.source is not None:
+            raise ValueError("direct ring task source was not pulled")
+        transfer_id = task.transfer_id
+        if transfer_id in self._pending_ids:
+            raise ValueError("direct ring task is already known")
+        self._validate_task(task)
+        abandoned = transfer_id in self._ring_abandoned
+        if abandoned or transfer_id in self._cancelled_ids:
+            self._drop_ring_task(task, entry, report=not abandoned)
+            return
+        received_ns = time.monotonic_ns()
+        self._direct_tasks_by_transfer[transfer_id] = task
+        self._unconfirmed_direct[transfer_id] = task.deadline_ns
+        self._seen_transfers.add(transfer_id)
+        self._seen_transfer_order.append(transfer_id)
+        if len(self._seen_transfer_order) > 65536:
+            self._seen_transfers.discard(self._seen_transfer_order.popleft())
+        self._pending_ids.add(transfer_id)
+        self._received_ns_by_transfer[transfer_id] = received_ns
+        if entry.has_pull:
+            slot = self._landing_slot_base + entry.landing_index
+            row_bytes = self._ring_worker.row_bytes
+            first = entry.landing_offset // row_bytes
+            rows = (first, first + entry.nbytes // row_bytes)
+            if rows[1] - rows[0] != int(task.feature_token_count):
+                raise ValueError("direct ring pull row count mismatch")
+            refcounts = self._feature_staging_refcounts
+            refcounts[slot] = refcounts.get(slot, 0) + 1
+            self._landing_taken[entry.landing_index] += 1
+            # The worker's INPUT_READY write followed the copy on its stream.
+            self._publish_source_done(task)
+            self._ring_admission.append((task, slot, rows))
+        else:
+            self._pending.append(task)
+        profile_emit(
+            "draft_ring_take",
+            draft_instance=self.instance_id,
+            transfer_id=transfer_id,
+            request_id=task.request_id,
+            round_id=task.round_id,
+            ring_seq=entry.seq,
+            has_pull=entry.has_pull,
+            taken_ns=received_ns,
+        )
+        waiting = self._ring_waiting.pop(transfer_id, None)
+        if waiting is not None:
+            self._confirm_direct_task(waiting)
+
+    def _drop_ring_task(self, task, entry, *, report: bool) -> None:
+        """Consume a ring copy that must not run (cancelled/released/abandoned).
+
+        The worker already read its source.  Publish the authenticated
+        candidate tombstone so the Target can reuse the slot; ``report`` also
+        sends the Coordinator its CANCELLED result (an abandoned round already
+        got its failure).
+        """
+
+        transfer_id = task.transfer_id
+        self._ring_abandoned.discard(transfer_id)
+        waiting = self._ring_waiting.pop(transfer_id, None)
+        if waiting is not None:
+            self._received_tasks += 1  # its Coordinator copy retires here
+        if entry.has_pull:
+            self._publish_source_done(waiting or task)
+        transport = self._candidate_push_transport
+        if transport is not None and task.candidate_destination is not None:
+            push = transport.publish_cancelled([task])
+            self._pending_candidate_pushes.append(
+                PendingCandidatePush(
+                    push=push,
+                    tasks=[task],
+                    result_slot=None,
+                    candidates=None,
+                    cancelled=True,
+                    coordinator_result=report,
+                )
+            )
+        self._cancelled_ids.discard(transfer_id)
+        self._received_ns_by_transfer.pop(transfer_id, None)
+        if waiting is None:
+            # A later Coordinator copy is answered by this drop.
+            self._remember_ring_retired(transfer_id, failed=False)
+        self._drain_deferred_persistent_release(task.draft_kv_handle)
+        profile_emit(
+            "draft_ring_drop",
+            draft_instance=self.instance_id,
+            transfer_id=transfer_id,
+            ring_seq=entry.seq,
+            reported=report,
+        )
+
+    def _remember_ring_retired(self, transfer_id: str, *, failed: bool) -> None:
+        retired = self._ring_retired
+        retired[transfer_id] = failed
+        while len(retired) > RING_RETIRED_LIMIT:
+            retired.popitem(last=False)
+
+    def _admit_ring_tasks(self) -> None:
+        """Move pulled ring tasks into INPUT_READY under persistent admission."""
+
+        queue = self._ring_admission
+        if not queue:
+            return
+        available_rows = self._draft_model_runner.req_to_token_pool.available_size()
+        available_kv = self._draft_model_runner.token_to_kv_pool_allocator.available_size()
+        for owner in self._pending_feature_batches:
+            for item in owner.pending:
+                rows, tokens = self._persistent_task_allocation(item.task)
+                available_rows -= rows
+                available_kv -= max(tokens, 0)
+        for entry in self._input_ready_features:
+            rows, tokens = self._persistent_task_allocation(entry.pending.task)
+            available_rows -= rows
+            available_kv -= max(tokens, 0)
+        now_ns = time.monotonic_ns()
+        while queue:
+            task, slot, rows = queue[0]
+            if task.transfer_id in self._cancelled_ids or now_ns >= task.deadline_ns:
+                queue.popleft()
+                cancelled = task.transfer_id in self._cancelled_ids
+                if cancelled:
+                    self._retire_cancelled_transfer_identity(task)
+                    self._drain_deferred_persistent_release(task.draft_kv_handle)
+                else:
+                    self._release_persistent_request(task.draft_kv_handle)
+                    self._publish_failures(
+                        [(task, TimeoutError("direct ring task deadline expired"))]
+                    )
+                self._release_feature_staging_entries(slot, 1)
+                continue
+            row_cost, kv_cost = self._persistent_task_allocation(task)
+            if row_cost > available_rows or kv_cost > available_kv:
+                break
+            if task.requires_proposal and self._available_dflash_result_slots() <= 0:
+                break
+            queue.popleft()
+            available_rows -= row_cost
+            available_kv -= max(kv_cost, 0)
+            self._received_ns_by_transfer.pop(task.transfer_id, None)
+            self._input_ready_features.append(
+                InputReadyFeature(
+                    batch_id=f"ring:{task.transfer_id}",
+                    pending=PendingDraftTask(task=task, taken_ns=now_ns),
+                    staging_slot=slot,
+                    row_range=rows,
+                    ready_ns=now_ns,
+                )
+            )
+
+    def _free_landing(self, index: int) -> None:
+        taken = self._landing_taken[index]
+        worker = self._ring_worker
+        if worker is None:
+            # Shutdown: the worker is gone and its stream drained.
+            self._landing_taken[index] = 0
+            return
+        if not taken:
+            return
+        # The last consumer may have been launched just now (synchronous
+        # EAGLE3 publish): return the buffer only after that GPU read.
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self._landing_free_pending.append((index, event))
+
+    def _close_direct_rings(self) -> None:
+        """Stop the ring worker (drains its copies) and retire unadmitted work.
+
+        Endpoints stay SERVING; ``_close_direct_ring_endpoints`` marks them
+        CLOSED only after every candidate push has drained, because the
+        Target treats CLOSED as proof that no further push can land.
+        """
+
+        worker = getattr(self, "_ring_worker", None)
+        if worker is None:
+            return
+        self._ring_worker = None
+        rc = worker.destroy()
+        if rc:
+            raise RuntimeError(f"direct ring worker stream drain failed: {rc}")
+        self._landing_free_pending.clear()
+        queue = self._ring_admission
+        while queue:
+            task, slot, _rows = queue.popleft()
+            self._cancelled_ids.add(task.transfer_id)
+            self._release_persistent_request(task.draft_kv_handle)
+            refcounts = self._feature_staging_refcounts
+            remaining = refcounts.get(slot, 0) - 1
+            if remaining > 0:
+                refcounts[slot] = remaining
+            else:
+                refcounts.pop(slot, None)
+
+    def _close_direct_ring_endpoints(self) -> None:
+        for endpoint in getattr(self, "_ring_endpoints", {}).values():
+            endpoint.close()
+        self._ring_endpoints.clear()
+
+    def _take_early_pushed(self, tasks) -> set[str]:
+        """Remove and return the transfers whose push was queued at launch."""
+
+        early = getattr(self, "_early_pushed_ids", None)
+        if not early:
+            return set()
+        taken = {task.transfer_id for task in tasks if task.transfer_id in early}
+        early.difference_update(taken)
+        return taken
 
     def _draft_compute_batches_inflight(self) -> int:
         count = (
@@ -2343,6 +2816,7 @@ class FlashMTPDraftEngine:
             self._cancelled_ids.update(
                 item.task.transfer_id for item in completion.pending
             )
+        self._close_direct_rings()
         if self._feature_pull_transport is not None:
             self._feature_pull_transport.close()
         input_ready = getattr(self, "_input_ready_features", deque())
@@ -2545,6 +3019,7 @@ class FlashMTPDraftEngine:
     def close(self) -> None:
         if self._uses_direct_gpu_source or getattr(self, "continuous_batching", False):
             self._quiesce_direct_gpu_source_shutdown()
+        self._close_direct_rings()
         # Direct-source shutdown checks this immediately after its control-only
         # capacity publication.  Keep the same fail-closed guarantee for any
         # future/non-feature path that enters the common fatal state: neither
@@ -2556,6 +3031,8 @@ class FlashMTPDraftEngine:
             self._p2p_transport.close()
         if self._candidate_push_transport is not None:
             self._candidate_push_transport.close()
+        # Push stream drained above: CLOSED now means no further pushes.
+        self._close_direct_ring_endpoints()
         for draft_kv_handle in tuple(self._persistent_requests):
             self._release_persistent_request(draft_kv_handle)
         self._client.close()
@@ -2660,6 +3137,17 @@ class FlashMTPDraftEngine:
                     if item.task.draft_kv_handle == message.draft_kv_handle
                     and item.task.request_id == message.request_id
                 )
+                # Ring rounds: admitted copies hold the handle; waiting
+                # Coordinator copies make their ring copy drop on arrival.
+                self._cancelled_ids.update(
+                    queued_task.transfer_id
+                    for queued_task in (
+                        *(item[0] for item in getattr(self, "_ring_admission", ())),
+                        *getattr(self, "_ring_waiting", {}).values(),
+                    )
+                    if queued_task.draft_kv_handle == message.draft_kv_handle
+                    and queued_task.request_id == message.request_id
+                )
                 self._release_persistent_request(
                     message.draft_kv_handle, request_id=message.request_id
                 )
@@ -2735,20 +3223,6 @@ class FlashMTPDraftEngine:
             self._drop_cancelled_pending()
             self._publish_capacity()
 
-    def _accept_direct_dispatch(self, payload: bytes) -> None:
-        """Start a Target's direct descriptor before the Coordinator confirms it."""
-        from dt_protocol import DraftDispatchBatch
-
-        decoder = self._direct_dispatch_decoder
-        if decoder is None:
-            decoder = self._direct_dispatch_decoder = msgspec.msgpack.Decoder(
-                DraftDispatchBatch
-            )
-        message = decoder.decode(payload)
-        if message.draft_instance_id != self.instance_id or message.candidate_registrations:
-            raise ValueError("invalid direct Draft dispatch")
-        self._accept_dispatch(message, direct=True)
-
     def _confirm_direct_task(self, task) -> None:
         """The Coordinator accepted a directly received task: release its holds."""
         direct = self._direct_tasks_by_transfer.get(task.transfer_id)
@@ -2778,12 +3252,14 @@ class FlashMTPDraftEngine:
             self._held_direct_source_done.pop(transfer_id, None)
             self._pending_ids.discard(transfer_id)
             self._direct_tasks_by_transfer.pop(transfer_id, None)
+            if hasattr(self, "_ring_retired"):
+                self._remember_ring_retired(transfer_id, failed=True)
             logger.warning(
                 "dropping direct Draft task never confirmed by Coordinator: %s",
                 transfer_id,
             )
 
-    def _accept_dispatch(self, message, *, direct: bool = False) -> bool:
+    def _accept_dispatch(self, message) -> bool:
         received_ns = time.monotonic_ns()
         accepted = False
         candidate_registrations = getattr(message, "candidate_registrations", ())
@@ -2796,17 +3272,44 @@ class FlashMTPDraftEngine:
                 raise RuntimeError("direct candidate push transport is unavailable")
             for registration in candidate_registrations:
                 self._candidate_push_transport.register(registration)
+                if DIRECT_RING:
+                    self._open_direct_ring(registration)
         unconfirmed = getattr(self, "_unconfirmed_direct", None)
         if unconfirmed is None:
             unconfirmed = self._unconfirmed_direct = {}
         seen = getattr(self, "_seen_transfers", None)
         for task in message.entries:
             if task.transfer_id in self._pending_ids:
-                if not direct and task.transfer_id in unconfirmed:
+                if task.transfer_id in unconfirmed:
                     self._confirm_direct_task(task)
                     accepted = True
                 continue
-            if direct and seen is not None and task.transfer_id in seen:
+            if getattr(task, "direct_ring_seq", 0):
+                # The ring copy (and its hidden pull) is authoritative for
+                # execution; wait for it and confirm then.  Never pull again:
+                # the Target may already have retired the source on the ring
+                # worker's completion proof.
+                retired = getattr(self, "_ring_retired", {}).pop(task.transfer_id, None)
+                if retired is not None:
+                    # Received and retired at once: the Coordinator dispatched it.
+                    self._received_tasks += 1
+                    if retired:
+                        # Its ring copy ran and was retired unconfirmed.
+                        self._publish_failures(
+                            [(task, TimeoutError("ring task retired before confirmation"))]
+                        )
+                    # Otherwise the drop already reported this transfer.
+                    accepted = True
+                    continue
+                if seen is not None and task.transfer_id in seen:
+                    # Duplicate delivery of a copy already confirmed.
+                    accepted = True
+                    continue
+                waiting = self._ring_waiting
+                if task.transfer_id in waiting and waiting[task.transfer_id] != task:
+                    raise ValueError("Coordinator ring task changed while waiting")
+                waiting[task.transfer_id] = task
+                accepted = True
                 continue
             active_feature_tasks = sum(
                 len(batch.pending) for batch in self._pending_feature_batches
@@ -2818,13 +3321,14 @@ class FlashMTPDraftEngine:
             ) + sum(
                 len(batch.pending) for batch in self._pending_eagle3_completions
             )
-            # A direct copy is a round of a request this Draft already owns
-            # (at most one active round each), so it is bounded by owned KV
-            # rather than the Coordinator queue. Never drop one: its Target
-            # retires an unaccepted direct round only on this Draft's proof.
+            # Unconfirmed ring rounds are bounded by owned KV, not by the
+            # Coordinator queue this check protects; Coordinator copies
+            # waiting for their ring copy are Coordinator-charged.
+            active_feature_tasks += len(getattr(self, "_ring_admission", ())) + len(
+                getattr(self, "_ring_waiting", ())
+            )
             if (
-                not direct
-                and len(self._pending) + active_feature_tasks - len(unconfirmed)
+                len(self._pending) + active_feature_tasks - len(unconfirmed)
                 >= self.max_pending_tasks
             ):
                 raise RuntimeError(
@@ -2843,10 +3347,7 @@ class FlashMTPDraftEngine:
             self._pending.append(task)
             if task.candidate_destination is not None:
                 self._direct_tasks_by_transfer[task.transfer_id] = task
-            if direct:
-                unconfirmed[task.transfer_id] = task.deadline_ns
-            else:
-                self._received_tasks += 1
+            self._received_tasks += 1
             if seen is not None:
                 seen.add(task.transfer_id)
                 self._seen_transfer_order.append(task.transfer_id)
@@ -3474,6 +3975,10 @@ class FlashMTPDraftEngine:
                 ),
             )
         )
+        if self.candidate_transport == "cuda-ipc":
+            self._queue_early_candidate_push(
+                [item.task for item in pending], candidates, completion_event
+            )
 
     def _poll_flashmtp_completions(self) -> None:
         """Publish same-stream candidate copies only after their event retires."""
@@ -3512,10 +4017,13 @@ class FlashMTPDraftEngine:
             self._pending_flashmtp_completions.popleft()
             tasks = [item.task for item in completion.pending]
             completed_ns = time.monotonic_ns()
+            # A push queued at launch already published these candidates.
+            early = self._take_early_pushed(tasks)
             expired = [
                 task
                 for task in tasks
                 if task.transfer_id not in self._cancelled_ids
+                and task.transfer_id not in early
                 and completed_ns >= task.deadline_ns
             ]
             expired_ids = {task.transfer_id for task in expired}
@@ -3524,6 +4032,7 @@ class FlashMTPDraftEngine:
                 for index, task in enumerate(tasks)
                 if task.transfer_id not in self._cancelled_ids
                 and task.transfer_id not in expired_ids
+                and task.transfer_id not in early
             ]
             cancelled = [
                 task for task in tasks if task.transfer_id in self._cancelled_ids
@@ -3774,6 +4283,10 @@ class FlashMTPDraftEngine:
         if staging_slot in self._feature_staging_compute_busy:
             raise RuntimeError("feature staging released while compute still owns it")
         del self._feature_staging_refcounts[staging_slot]
+        if 0 <= getattr(self, "_landing_slot_base", -1) <= staging_slot:
+            # Ring landing buffers return to the ring worker, not the pull pool.
+            self._free_landing(staging_slot - self._landing_slot_base)
+            return
         self._free_feature_staging_slots.append(staging_slot)
 
     def _complete_feature_compute(self, staging_slot: int, count: int) -> None:
@@ -4136,6 +4649,10 @@ class FlashMTPDraftEngine:
         if staging_slot in self._feature_staging_compute_busy:
             raise RuntimeError("feature staging slot already has submitted compute")
         self._feature_staging_compute_busy.add(staging_slot)
+        if 0 <= getattr(self, "_landing_slot_base", -1) <= staging_slot:
+            # New ring arrivals land in another buffer instead of waiting
+            # behind this batch's compute ownership.
+            self._ring_worker.seal(staging_slot - self._landing_slot_base)
         pending = [entry.pending for entry in ready]
         row_ranges = tuple(entry.row_range for entry in ready)
         try:
@@ -4665,6 +5182,12 @@ class FlashMTPDraftEngine:
                 exc.resources_quiescent = False
             raise
         self._pending_eagle3_completions.append(completion)
+        if candidates is not None and self.candidate_transport == "cuda-ipc":
+            self._queue_early_candidate_push(
+                [item.task for item in pending],
+                candidates,
+                completion.completion_event,
+            )
 
     def _poll_eagle3_completions(self) -> None:
         if self._fatal_gpu_quarantine_active():
@@ -4701,10 +5224,13 @@ class FlashMTPDraftEngine:
             self._pending_eagle3_completions.popleft()
             tasks = [item.task for item in completion.pending]
             completed_ns = time.monotonic_ns()
+            # A push queued at launch already published these candidates.
+            early = self._take_early_pushed(tasks)
             expired = [
                 task
                 for task in tasks
                 if task.transfer_id not in self._cancelled_ids
+                and task.transfer_id not in early
                 and completed_ns >= task.deadline_ns
             ]
             expired_ids = {task.transfer_id for task in expired}
@@ -4719,11 +5245,15 @@ class FlashMTPDraftEngine:
             ]
             candidate_rows_cpu = getattr(completion, "candidate_rows_cpu", None)
             result_slot = getattr(completion, "result_slot", None)
-            if active:
+            push_active = [task for task in active if task.transfer_id not in early]
+            if active and not push_active and completion.candidates is not None:
+                if result_slot is not None:
+                    self._free_result_slots.append(result_slot)
+            elif active:
                 if completion.candidates is None:
                     self._publish_materialization_successes(active)
                 else:
-                    active_ids = {task.transfer_id for task in active}
+                    active_ids = {task.transfer_id for task in push_active}
                     indices = [
                         index for index, task in enumerate(tasks)
                         if task.transfer_id in active_ids
@@ -4740,7 +5270,7 @@ class FlashMTPDraftEngine:
                     ):
                         rows = _select_candidate_rows(source_rows, indices)
                         self._publish_successes(
-                            active,
+                            push_active,
                             (
                                 rows
                                 if self.candidate_transport == "cuda-ipc"
@@ -5062,6 +5592,10 @@ class FlashMTPDraftEngine:
             completion=completion,
             copy_stream=copy_stream,
         )
+        if copy_stream is None and proposal_tasks:
+            self._queue_early_candidate_push(
+                proposal_tasks, candidates, completion.completion_event
+            )
 
     def _register_dflash_completion(
         self,
@@ -5624,10 +6158,13 @@ class FlashMTPDraftEngine:
             self._pending_dflash_completions.popleft()
             tasks = [item.task for item in completion.pending]
             completed_ns = time.monotonic_ns()
+            # A push queued at launch already published these candidates.
+            early = self._take_early_pushed(tasks)
             expired_tasks = [
                 task
                 for task in tasks
                 if task.transfer_id not in self._cancelled_ids
+                and task.transfer_id not in early
                 and completed_ns >= task.deadline_ns
             ]
             expired_ids = {task.transfer_id for task in expired_tasks}
@@ -5648,6 +6185,7 @@ class FlashMTPDraftEngine:
                 for index, task in enumerate(completion.proposal_tasks)
                 if task.transfer_id not in self._cancelled_ids
                 and task.transfer_id not in expired_ids
+                and task.transfer_id not in early
             ]
             gpu_materialization_ns = int(
                 completion.materialize_start_event.elapsed_time(
@@ -7656,6 +8194,11 @@ class FlashMTPDraftEngine:
             for entry in getattr(self, "_input_ready_features", ())
         ):
             return True
+        if any(
+            item[0].draft_kv_handle == draft_kv_handle
+            for item in getattr(self, "_ring_admission", ())
+        ):
+            return True
         return any(
             item.task.draft_kv_handle == draft_kv_handle
             for completion in self._pending_dflash_completions
@@ -7927,6 +8470,7 @@ class FlashMTPDraftEngine:
                 )
             self._result_sequence += 1
             result_sent_ns = time.monotonic_ns()
+            report = getattr(pending, "coordinator_result", True)
             message = DraftExecutionResultBatch(
                 protocol_version=PROTOCOL_VERSION,
                 batch_id=f"{self.instance_id}:direct-result:{self._result_sequence}",
@@ -7949,12 +8493,17 @@ class FlashMTPDraftEngine:
                 ),
                 sent_ns=result_sent_ns,
             )
-            self._send_result(message)
+            if report:
+                self._send_result(message)
             if pending.result_slot is not None:
                 self._free_result_slots.append(pending.result_slot)
+            early = getattr(self, "_early_pushed_ids", ())
             for task in pending.tasks:
-                if not pending.cancelled or not self._has_local_execution_owner(
-                    task.transfer_id
+                # A push queued at launch can retire before its completion
+                # handler runs; that handler still needs the cancel mark.
+                if task.transfer_id not in early and (
+                    not pending.cancelled
+                    or not self._has_local_execution_owner(task.transfer_id)
                 ):
                     self._cancelled_ids.discard(task.transfer_id)
                 self._direct_tasks_by_transfer.pop(task.transfer_id, None)
@@ -7992,6 +8541,8 @@ class FlashMTPDraftEngine:
         """Return whether cancelled work still has a local queue/GPU owner."""
 
         if any(task.transfer_id == transfer_id for task in self._pending):
+            return True
+        if any(item[0].transfer_id == transfer_id for item in getattr(self, "_ring_admission", ())):
             return True
         for owner in (
             *self._pending_feature_batches,
@@ -8104,7 +8655,7 @@ class FlashMTPDraftEngine:
             task.transfer_id
             for pending in self._pending_candidate_pushes
             for task in pending.tasks
-        }
+        } | getattr(self, "_early_pushed_ids", set())
         tasks_by_id = {
             transfer_id: task
             for transfer_id, task in self._direct_tasks_by_transfer.items()
@@ -8475,6 +9026,8 @@ class FlashMTPDraftEngine:
         # INPUT_READY, compute, and pending return; its publication path
         # retires this identity exactly once.
         unconfirmed = getattr(self, "_unconfirmed_direct", None) or {}
+        # Coordinator copies waiting for their ring copy are not yet
+        # received: the Coordinator already counts them as in flight.
         pending_tasks = len(self._pending_ids) - sum(
             transfer_id in self._pending_ids for transfer_id in unconfirmed
         )

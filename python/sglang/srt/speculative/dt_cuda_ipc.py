@@ -20,6 +20,8 @@ CUDA_IPC_LAZY_ENABLE_PEER_ACCESS = 1
 CUDA_MEMCPY_DEFAULT = 4
 CU_STREAM_WAIT_VALUE_EQ = 0x1
 CU_STREAM_WAIT_VALUE_FLUSH = 1 << 30
+CU_MEMHOSTREGISTER_PORTABLE = 0x01
+CU_MEMHOSTREGISTER_DEVICEMAP = 0x02
 
 
 class CudaIpcError(RuntimeError):
@@ -221,17 +223,34 @@ class CudaIpcRuntime:
         # dedicated stream instead.  The following publication/event remains
         # ordered after every copy, so transport and lifecycle semantics do not
         # change and this also works with the CUDA 12.4 prototype runtime.
-        for segment in segments:
-            self._check_runtime(
-                self._runtime.cudaMemcpyAsync(
-                    ctypes.c_void_p(segment.destination_address),
-                    ctypes.c_void_p(segment.source_address),
-                    ctypes.c_size_t(segment.length),
-                    ctypes.c_int(CUDA_MEMCPY_DEFAULT),
-                    ctypes.c_void_p(stream),
-                ),
-                "cudaMemcpyAsync",
+        if not segments:
+            return
+        if stream == 0:
+            raise ValueError("DT P2P copy must use a non-default CUDA stream")
+        for index, segment in enumerate(segments):
+            code = self._runtime.cudaMemcpyAsync(
+                ctypes.c_void_p(segment.destination_address),
+                ctypes.c_void_p(segment.source_address),
+                ctypes.c_size_t(segment.length),
+                ctypes.c_int(CUDA_MEMCPY_DEFAULT),
+                ctypes.c_void_p(stream),
             )
+            if code == 0:
+                continue
+            # Earlier segments are already queued: drain them so callers may
+            # treat the failure as "no copy references these buffers".
+            fenced = index == 0 or self._stream_synchronize(stream) == 0
+            try:
+                self._check_runtime(code, "cudaMemcpyAsync")
+            except CudaIpcError as exc:
+                exc.resources_quiescent = fenced
+                raise
+
+    def _stream_synchronize(self, stream: int) -> int:
+        synchronize = self._runtime.cudaStreamSynchronize
+        synchronize.argtypes = [ctypes.c_void_p]
+        synchronize.restype = ctypes.c_int
+        return int(synchronize(ctypes.c_void_p(stream)))
 
     def stream_wait_value32(self, *, address: int, value: int, stream: int) -> None:
         """Queue an acquire-style equality wait without blocking the CPU."""
@@ -268,6 +287,46 @@ class CudaIpcRuntime:
             ),
             "cuStreamWriteValue32",
         )
+
+    def host_register(self, address: int, length: int) -> int:
+        """Page-lock a host mapping for every context; return its device address."""
+
+        if address <= 0 or length <= 0:
+            raise ValueError("host registration requires a valid address and length")
+        register = self._driver.cuMemHostRegister_v2
+        register.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        register.restype = ctypes.c_int
+        self._check_driver(
+            register(
+                ctypes.c_void_p(address),
+                ctypes.c_size_t(length),
+                ctypes.c_uint(CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP),
+            ),
+            "cuMemHostRegister",
+        )
+        device_pointer = ctypes.c_uint64()
+        get_pointer = self._driver.cuMemHostGetDevicePointer_v2
+        get_pointer.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        get_pointer.restype = ctypes.c_int
+        try:
+            self._check_driver(
+                get_pointer(ctypes.byref(device_pointer), ctypes.c_void_p(address), 0),
+                "cuMemHostGetDevicePointer",
+            )
+        except Exception:
+            self.host_unregister(address)
+            raise
+        return int(device_pointer.value)
+
+    def host_unregister(self, address: int) -> None:
+        unregister = self._driver.cuMemHostUnregister
+        unregister.argtypes = [ctypes.c_void_p]
+        unregister.restype = ctypes.c_int
+        self._check_driver(unregister(ctypes.c_void_p(address)), "cuMemHostUnregister")
 
     @staticmethod
     def _decode_handle(value: bytes) -> _CudaIpcMemHandle:
