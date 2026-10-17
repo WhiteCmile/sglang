@@ -538,7 +538,7 @@ class DTTargetController:
         self._ready_hold_started_ns = 0
         # Same-host Target -> owner-Draft descriptor rings (dt_direct_ring).
         # They replace the former ZMQ direct dispatch (DT_DIRECT_DISPATCH).
-        self._direct_ring = os.environ.get("DT_DIRECT_RING", "1") == "1"
+        self._direct_ring = os.environ.get("DT_DIRECT_RING", "0") == "1"
         self._ring_writers: dict[str, object] = {}
         self._ring_outstanding: dict[str, deque] = {}
         self._ring_missing_until_ns: dict[str, int] = {}

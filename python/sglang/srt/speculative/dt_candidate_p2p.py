@@ -55,7 +55,7 @@ COMPLETION_MAX_ATTEMPTS = 100
 COMPLETION_SOCKET_HWM = 4096
 RETIRED_TRANSFER_LIMIT = 65536
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
-GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
+GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "0") == "1"
 # One 32-byte host READY record per slot: the metadata words plus the
 # producer tag.  The generation word is written last.
 READY_RECORD_WORDS = 8

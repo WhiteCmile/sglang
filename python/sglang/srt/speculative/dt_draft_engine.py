@@ -134,8 +134,8 @@ def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tens
 COALESCING_POLL_S = 0.0001
 # Queue candidate pushes behind the proposal at launch and let the Target
 # observe READY from GPU-written host records (dt_candidate_p2p).
-GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
-DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
+GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "0") == "1"
+DIRECT_RING = os.environ.get("DT_DIRECT_RING", "0") == "1"
 RING_RETIRED_LIMIT = 65536
 # Initial control delivery is immediate.  Retrying every scheduler tick-scale
 # interval amplifies delayed ACKs under full-wave load; keep retries reliable
