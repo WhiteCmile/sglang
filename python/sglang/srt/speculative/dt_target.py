@@ -528,6 +528,16 @@ class DTTargetController:
         )
         self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "64"))
         self._ready_hold_started_ns = 0
+        # Direct Target->owner-Draft descriptors (design rev 41). Off by
+        # default: a direct copy the Coordinator never accepts (overload
+        # backpressure until the round deadline, or shutdown) has no
+        # retirement path for its source lease yet.
+        self._direct_dispatch = os.environ.get("DT_DIRECT_DISPATCH", "0") == "1"
+        self._draft_binding: dict[str, tuple[str, str]] = {}
+        self._direct_sent: set[str] = set()
+        self._direct_orphans: set[str] = set()
+        self._direct_sequence = 0
+        self._direct_encoder = None
         self._client = None
         self._ledger = None
         self._feature_source_pool = None
@@ -4510,6 +4520,7 @@ class DTTargetController:
                     )
                 break
             submitted_ns = time.monotonic_ns()
+            self._send_direct_dispatch(dispatch_batch.entries)
             if self._profile_active:
                 self._profile_emit(
                     "target_task_submit",
@@ -4598,6 +4609,11 @@ class DTTargetController:
                         raise RuntimeError("direct candidate arena is unavailable")
                     for assignment in message.assignments:
                         self._candidate_arena.authorize(assignment)
+                        self._remember_draft_binding(assignment)
+                    direct_sent = getattr(self, "_direct_sent", None)
+                    if direct_sent:
+                        direct_sent.difference_update(message.accepted_transfer_ids)
+                        direct_sent.difference_update(message.duplicate_transfer_ids)
                 self._prune_obsolete_task_retries(
                     state.task
                     for transfer_id in (
@@ -4618,10 +4634,7 @@ class DTTargetController:
                 for task in retry_tasks:
                     if task.transfer_id in self._cancelled_transfers:
                         self._ledger.finish(task.transfer_id)
-                        self._release_source_slot(task.transfer_id)
-                        self._release_candidate_destination(
-                            task.transfer_id, remote_quiescent=True
-                        )
+                        self._retire_unaccepted_transfer(task.transfer_id)
                         self._cancelled_transfers.discard(task.transfer_id)
                     else:
                         active_retries.append(task)
@@ -4705,6 +4718,8 @@ class DTTargetController:
         if self._candidate_arena is not None:
             self._candidate_arena.poll_releases()
             self._candidate_arena.poll_cancelled()
+            if getattr(self, "_direct_orphans", None):
+                self._poll_direct_orphans()
             for completion in self._candidate_arena.poll():
                 state = self._ledger.get(completion.transfer_id)
                 if state is None:
@@ -5472,10 +5487,7 @@ class DTTargetController:
                 if task.transfer_id in self._cancelled_transfers
             }
             for transfer_id in removed:
-                self._release_source_slot(transfer_id)
-                self._release_candidate_destination(
-                    transfer_id, remote_quiescent=True
-                )
+                self._retire_unaccepted_transfer(transfer_id)
                 self._cancelled_transfers.discard(transfer_id)
             if entries:
                 retained.append(
@@ -5488,6 +5500,92 @@ class DTTargetController:
                     )
                 )
         self._pending_send = retained
+
+    def _retire_unaccepted_transfer(self, transfer_id: str) -> None:
+        """Release a transfer the Coordinator never accepted.
+
+        Without a direct copy no Draft can hold it.  A direct copy may already
+        be pulling or pushing, so keep both rows until the Draft's
+        authenticated completion or tombstone retires the candidate slot.
+        """
+        direct_sent = getattr(self, "_direct_sent", None)
+        if direct_sent and transfer_id in direct_sent:
+            direct_sent.discard(transfer_id)
+            self._release_candidate_destination(transfer_id, remote_quiescent=False)
+            self._direct_orphans.add(transfer_id)
+            return
+        self._release_source_slot(transfer_id)
+        self._release_candidate_destination(transfer_id, remote_quiescent=True)
+
+    def _poll_direct_orphans(self) -> None:
+        arena = self._candidate_arena
+        for transfer_id in tuple(self._direct_orphans):
+            if arena is None or not arena.has_active(transfer_id):
+                # The candidate push follows the hidden pull, so its proof
+                # also proves the source read finished.
+                self._direct_orphans.discard(transfer_id)
+                self._release_source_slot(transfer_id)
+
+    def _remember_draft_binding(self, assignment) -> None:
+        bindings = getattr(self, "_draft_binding", None)
+        state = self._ledger.get(assignment.transfer_id)
+        if bindings is None or state is None:
+            return
+        bindings[state.task.request_id] = (
+            assignment.draft_instance_id,
+            assignment.draft_session_id,
+        )
+        if len(bindings) > 65536:
+            # Dropping a binding only disables direct dispatch for that request.
+            for request_id in tuple(bindings)[:16384]:
+                del bindings[request_id]
+
+    def _send_direct_dispatch(self, tasks) -> None:
+        """Send owner-known persistent rounds straight to their Draft."""
+        if (
+            not getattr(self, "_direct_dispatch", False)
+            or not self.is_persistent
+            or self.candidate_transport != "cuda-ipc"
+            or self._candidate_arena is None
+        ):
+            return
+        from dt_protocol import (
+            PROTOCOL_VERSION,
+            DraftDispatchBatch,
+            DraftTaskKind,
+        )
+
+        by_draft: dict[tuple[str, str], list] = {}
+        for task in tasks:
+            if task.kind != DraftTaskKind.RECONCILE or task.candidate_destination is None:
+                continue
+            binding = getattr(self, "_draft_binding", {}).get(task.request_id)
+            if binding is not None:
+                by_draft.setdefault(binding, []).append(task)
+        if not by_draft:
+            return
+        if self._direct_encoder is None:
+            import msgspec
+
+            self._direct_encoder = msgspec.msgpack.Encoder()
+        now_ns = time.monotonic_ns()
+        for (draft_instance_id, draft_session_id), entries in by_draft.items():
+            self._direct_sequence += 1
+            message = DraftDispatchBatch(
+                protocol_version=PROTOCOL_VERSION,
+                batch_id=f"{self.instance_id}:direct:{self._direct_sequence}",
+                draft_instance_id=draft_instance_id,
+                entries=tuple(entries),
+                sent_ns=now_ns,
+            )
+            # Mark first: a delivered frame may reach the Draft immediately.
+            self._direct_sent.update(task.transfer_id for task in entries)
+            if not self._candidate_arena.send_direct_dispatch(
+                draft_session_id, self._direct_encoder.encode(message)
+            ):
+                self._direct_sent.difference_update(
+                    task.transfer_id for task in entries
+                )
 
     def _release_candidate_destination(
         self, transfer_id: str, *, remote_quiescent: bool = False

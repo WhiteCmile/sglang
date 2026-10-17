@@ -18,7 +18,7 @@ import os
 import secrets
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
@@ -43,6 +43,8 @@ ROOT_TOKEN_WORD = 4
 COMPLETION_RETRY_NS = 100_000_000
 COMPLETION_MAX_ATTEMPTS = 100
 COMPLETION_SOCKET_HWM = 4096
+RETIRED_TRANSFER_LIMIT = 65536
+DIRECT_DISPATCH_FRAME = b"dispatch"
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
 
 
@@ -171,6 +173,7 @@ class TargetCandidateArena:
         self._slots = [_CandidateSlot() for _ in range(self.slot_count)]
         self._active: dict[str, int] = {}
         self._poll_cursor = 0
+        self._retired_transfers: OrderedDict[str, None] = OrderedDict()
         self._lock = Lock()
         self._closed = False
         self.device_uuid = str(torch.cuda.get_device_properties(self.device).uuid)
@@ -318,6 +321,8 @@ class TargetCandidateArena:
         with self._lock:
             slot_id = self._active.get(assignment.transfer_id)
             if slot_id is None:
+                if assignment.transfer_id in getattr(self, "_retired_transfers", ()):
+                    return
                 raise CandidateTransportError("assignment names no active destination")
             slot = self._slots[slot_id]
             assignable_cancel = (
@@ -536,6 +541,25 @@ class TargetCandidateArena:
         )
         self._remember_notice(key)
         return True
+
+    def send_direct_dispatch(self, draft_session_id: str, payload: bytes) -> bool:
+        """Send an encoded DraftDispatchBatch to a connected Draft producer.
+
+        Uses the completion ROUTER the Draft already connected to; an unknown
+        peer drops the frame, and the Coordinator copy remains authoritative.
+        """
+        try:
+            self._completion_socket.send_multipart(
+                (draft_session_id.encode(), DIRECT_DISPATCH_FRAME, payload),
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            return False
+        return True
+
+    def has_active(self, transfer_id: str) -> bool:
+        with self._lock:
+            return transfer_id in self._active
 
     def poll_completion_notices(self, *, max_messages: int = 64) -> int:
         """Drain bounded payload-free Draft completions from the direct endpoint."""
@@ -856,6 +880,13 @@ class TargetCandidateArena:
     def _free_locked(self, slot_id: int) -> None:
         slot = self._slots[slot_id]
         self._active.pop(slot.transfer_id, None)
+        if slot.transfer_id:
+            # A freed slot had a proven completion or a proven-quiescent
+            # cancellation; a later assignment for it is stale, not an error.
+            retired = self._retired_transfers
+            retired[slot.transfer_id] = None
+            if len(retired) > RETIRED_TRANSFER_LIMIT:
+                retired.popitem(last=False)
         generation = slot.generation
         self._slots[slot_id] = _CandidateSlot(generation=generation)
 
@@ -906,6 +937,7 @@ class DraftCandidatePushTransport:
         )
         self._zmq_context = zmq.Context.instance()
         self._notice_encoder = msgspec.msgpack.Encoder()
+        self._direct_dispatches: list[bytes] = []
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
@@ -1070,10 +1102,14 @@ class DraftCandidatePushTransport:
         for socket in self._completion_sockets.values():
             while budget:
                 try:
-                    payload = socket.recv(flags=zmq.NOBLOCK)
+                    parts = socket.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:
                     break
                 budget -= 1
+                if len(parts) == 2 and parts[0] == DIRECT_DISPATCH_FRAME:
+                    self._direct_dispatches.append(parts[1])
+                    continue
+                payload = parts[-1]
                 try:
                     ack = msgspec.msgpack.decode(payload, type=CandidateCompletionAck)
                 except (msgspec.DecodeError, msgspec.ValidationError):
@@ -1119,6 +1155,11 @@ class DraftCandidatePushTransport:
             pending.attempts += 1
             pending.next_retry_ns = now_ns + COMPLETION_RETRY_NS
         return acknowledged
+
+    def pop_direct_dispatches(self) -> list[bytes]:
+        dispatches = self._direct_dispatches
+        self._direct_dispatches = []
+        return dispatches
 
     def pop_acknowledgements(self) -> tuple[dict[str, int | str], ...]:
         queue = getattr(self, "_acknowledgements", None)

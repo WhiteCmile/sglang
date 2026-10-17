@@ -18,6 +18,7 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from dt_client import RetryOutbox
@@ -51,6 +52,68 @@ logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.0005
 DIRECT_PUSH_SPIN_NS = 200_000
+# Token-count buckets for the CUDA-graphed DFlash KV materializer.
+DFLASH_MATERIALIZE_GRAPH_BUCKETS = (8, 16, 32, 64, 96, 128, 192, 256, 384, 512)
+
+
+class _GraphedDFlashMaterializer:
+    """CUDA-graph replay of the DFlash target-hidden -> draft-KV writer.
+
+    The eager writer launches the projection, fused norm/RoPE and one KV write
+    per layer from Python on every Draft batch.  Each token-count bucket is
+    captured once; padded rows write KV slot 0, which the allocator reserves for
+    padded tokens.  Inputs are copied into static buffers on the same stream,
+    so a later batch never overwrites them before an earlier replay ran.
+    Larger batches (prefill chunks) use the eager writer unchanged.
+    """
+
+    def __init__(self, materializer, *, width: int, dtype, device, buckets) -> None:
+        self._materializer = materializer
+        self._buckets = tuple(sorted(buckets))
+        top = self._buckets[-1]
+        self._hidden = torch.zeros((top, width), dtype=dtype, device=device)
+        self._cache_loc = torch.zeros((top,), dtype=torch.int64, device=device)
+        self._positions = torch.zeros((top,), dtype=torch.int64, device=device)
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+
+    def capture(self) -> None:
+        pool = torch.cuda.graph_pool_handle()
+        # Largest first, so the writer's growable workspace reaches its final
+        # size before any capture records its address.
+        for bucket in reversed(self._buckets):
+            self._eager(bucket)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                self._eager(bucket)
+            self._graphs[bucket] = graph
+        torch.cuda.synchronize()
+
+    def _eager(self, rows: int) -> None:
+        self._materializer.append(
+            target_hidden=self._hidden[:rows],
+            cache_loc=self._cache_loc[:rows],
+            positions=self._positions[:rows],
+        )
+
+    def append(self, *, target_hidden, cache_loc, positions) -> None:
+        rows = int(target_hidden.shape[0])
+        bucket = next((size for size in self._buckets if size >= rows), None)
+        if bucket is None or bucket not in self._graphs or rows == 0:
+            self._materializer.append(
+                target_hidden=target_hidden, cache_loc=cache_loc, positions=positions
+            )
+            return
+        self._hidden[:rows].copy_(target_hidden)
+        self._cache_loc[:rows].copy_(cache_loc)
+        self._positions[:rows].copy_(positions)
+        if rows < bucket:
+            self._cache_loc[rows:bucket].zero_()
+            self._positions[rows:bucket].zero_()
+        self._graphs[bucket].replay()
+# A direct dispatch never confirmed by the Coordinator is dropped from local
+# accounting this long after its task deadline, once its result is held.
+UNCONFIRMED_DIRECT_GRACE_NS = 1_000_000_000
 
 
 def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tensor:
@@ -930,6 +993,17 @@ class FlashMTPDraftEngine:
                 slot_bytes=max_batch_size * self._result_row_width * 4,
             )
         self._received_tasks = 0
+        # Tasks received directly from their Target before the Coordinator's
+        # confirming copy: transfer_id -> deadline_ns.  Their Coordinator-bound
+        # retirement and source-read messages are held until confirmation.
+        self._unconfirmed_direct: dict[str, int] = {}
+        self._held_direct_results: dict[str, object] = {}
+        self._held_direct_source_done: dict[str, list] = {}
+        self._direct_dispatch_decoder = None
+        # Bounded window of accepted transfer ids: a direct copy that arrives
+        # after its Coordinator copy (even after retirement) must not re-run.
+        self._seen_transfers: set[str] = set()
+        self._seen_transfer_order: deque[str] = deque()
         self._capacity_sequence = 0
         self._client = None
         try:
@@ -1927,6 +2001,8 @@ class FlashMTPDraftEngine:
             self._poll_messages()
             if self._candidate_push_transport is not None:
                 self._candidate_push_transport.progress_completions()
+                for payload in self._candidate_push_transport.pop_direct_dispatches():
+                    self._accept_direct_dispatch(payload)
                 if self._profile_active:
                     for acknowledgement in (
                         self._candidate_push_transport.pop_acknowledgements()
@@ -2505,6 +2581,8 @@ class FlashMTPDraftEngine:
 
         capacity_changed = False
         self._flush_source_done()
+        if getattr(self, "_unconfirmed_direct", None):
+            self._expire_unconfirmed_direct()
         capacity_changed = self._poll_migration_transfers() or capacity_changed
         for message in self._client.recv_nowait():
             if isinstance(message, DraftDispatchBatch):
@@ -2657,7 +2735,55 @@ class FlashMTPDraftEngine:
             self._drop_cancelled_pending()
             self._publish_capacity()
 
-    def _accept_dispatch(self, message) -> bool:
+    def _accept_direct_dispatch(self, payload: bytes) -> None:
+        """Start a Target's direct descriptor before the Coordinator confirms it."""
+        from dt_protocol import DraftDispatchBatch
+
+        decoder = self._direct_dispatch_decoder
+        if decoder is None:
+            decoder = self._direct_dispatch_decoder = msgspec.msgpack.Decoder(
+                DraftDispatchBatch
+            )
+        message = decoder.decode(payload)
+        if message.draft_instance_id != self.instance_id or message.candidate_registrations:
+            raise ValueError("invalid direct Draft dispatch")
+        self._accept_dispatch(message, direct=True)
+
+    def _confirm_direct_task(self, task) -> None:
+        """The Coordinator accepted a directly received task: release its holds."""
+        direct = self._direct_tasks_by_transfer.get(task.transfer_id)
+        if direct is not None and direct != task:
+            raise ValueError("Coordinator task differs from its direct dispatch")
+        self._unconfirmed_direct.pop(task.transfer_id, None)
+        self._received_tasks += 1
+        for message in self._held_direct_source_done.pop(task.transfer_id, ()):
+            self._queue_source_done(message)
+        held = self._held_direct_results.pop(task.transfer_id, None)
+        if held is not None:
+            self._send_result(held)
+
+    def _expire_unconfirmed_direct(self) -> None:
+        """Drop never-confirmed direct work after its deadline (bounded leak)."""
+        if not self._unconfirmed_direct:
+            return
+        now_ns = time.monotonic_ns()
+        for transfer_id, deadline_ns in tuple(self._unconfirmed_direct.items()):
+            if (
+                now_ns < deadline_ns + UNCONFIRMED_DIRECT_GRACE_NS
+                or transfer_id not in self._held_direct_results
+            ):
+                continue
+            self._unconfirmed_direct.pop(transfer_id)
+            self._held_direct_results.pop(transfer_id)
+            self._held_direct_source_done.pop(transfer_id, None)
+            self._pending_ids.discard(transfer_id)
+            self._direct_tasks_by_transfer.pop(transfer_id, None)
+            logger.warning(
+                "dropping direct Draft task never confirmed by Coordinator: %s",
+                transfer_id,
+            )
+
+    def _accept_dispatch(self, message, *, direct: bool = False) -> bool:
         received_ns = time.monotonic_ns()
         accepted = False
         candidate_registrations = getattr(message, "candidate_registrations", ())
@@ -2670,8 +2796,17 @@ class FlashMTPDraftEngine:
                 raise RuntimeError("direct candidate push transport is unavailable")
             for registration in candidate_registrations:
                 self._candidate_push_transport.register(registration)
+        unconfirmed = getattr(self, "_unconfirmed_direct", None)
+        if unconfirmed is None:
+            unconfirmed = self._unconfirmed_direct = {}
+        seen = getattr(self, "_seen_transfers", None)
         for task in message.entries:
             if task.transfer_id in self._pending_ids:
+                if not direct and task.transfer_id in unconfirmed:
+                    self._confirm_direct_task(task)
+                    accepted = True
+                continue
+            if direct and seen is not None and task.transfer_id in seen:
                 continue
             active_feature_tasks = sum(
                 len(batch.pending) for batch in self._pending_feature_batches
@@ -2683,7 +2818,15 @@ class FlashMTPDraftEngine:
             ) + sum(
                 len(batch.pending) for batch in self._pending_eagle3_completions
             )
-            if len(self._pending) + active_feature_tasks >= self.max_pending_tasks:
+            # A direct copy is a round of a request this Draft already owns
+            # (at most one active round each), so it is bounded by owned KV
+            # rather than the Coordinator queue. Never drop one: its Target
+            # retires an unaccepted direct round only on this Draft's proof.
+            if (
+                not direct
+                and len(self._pending) + active_feature_tasks - len(unconfirmed)
+                >= self.max_pending_tasks
+            ):
                 raise RuntimeError(
                     "Coordinator exceeded advertised Draft queue capacity"
                 )
@@ -2700,7 +2843,15 @@ class FlashMTPDraftEngine:
             self._pending.append(task)
             if task.candidate_destination is not None:
                 self._direct_tasks_by_transfer[task.transfer_id] = task
-            self._received_tasks += 1
+            if direct:
+                unconfirmed[task.transfer_id] = task.deadline_ns
+            else:
+                self._received_tasks += 1
+            if seen is not None:
+                seen.add(task.transfer_id)
+                self._seen_transfer_order.append(task.transfer_id)
+                if len(self._seen_transfer_order) > 65536:
+                    seen.discard(self._seen_transfer_order.popleft())
             self._pending_ids.add(task.transfer_id)
             self._received_ns_by_transfer[task.transfer_id] = received_ns
             accepted = True
@@ -8323,7 +8474,10 @@ class FlashMTPDraftEngine:
         # the held request-round count.  Keep an accepted task held across
         # INPUT_READY, compute, and pending return; its publication path
         # retires this identity exactly once.
-        pending_tasks = len(self._pending_ids)
+        unconfirmed = getattr(self, "_unconfirmed_direct", None) or {}
+        pending_tasks = len(self._pending_ids) - sum(
+            transfer_id in self._pending_ids for transfer_id in unconfirmed
+        )
         self._capacity_sequence += 1
         update = DraftCapacityUpdate(
             protocol_version=PROTOCOL_VERSION,
@@ -8352,6 +8506,27 @@ class FlashMTPDraftEngine:
             logger.warning("Draft capacity update was locally backpressured")
 
     def _send_result(self, message) -> None:
+        unconfirmed = getattr(self, "_unconfirmed_direct", None)
+        if unconfirmed and any(
+            entry.transfer_id in unconfirmed for entry in message.entries
+        ):
+            from msgspec.structs import replace
+
+            if getattr(message, "buffer", None) is not None:
+                raise RuntimeError("direct Draft dispatch requires bufferless results")
+            confirmed = tuple(
+                entry for entry in message.entries if entry.transfer_id not in unconfirmed
+            )
+            for entry in message.entries:
+                if entry.transfer_id in unconfirmed:
+                    self._held_direct_results[entry.transfer_id] = replace(
+                        message,
+                        batch_id=f"{message.batch_id}:held:{entry.transfer_id}",
+                        entries=(entry,),
+                    )
+            if not confirmed:
+                return
+            message = replace(message, entries=confirmed)
         self._delivery_outbox.add("result", message.batch_id, message)
         self._flush_reliable_outbox()
 
@@ -8421,6 +8596,15 @@ class FlashMTPDraftEngine:
             instance_session_id=self._client.instance_session_id,
             coordinator_session_id=self._client.coordinator_session_id,
         )
+        unconfirmed = getattr(self, "_unconfirmed_direct", None)
+        if unconfirmed and task.transfer_id in unconfirmed:
+            self._held_direct_source_done.setdefault(task.transfer_id, []).append(
+                message
+            )
+            return
+        self._queue_source_done(message)
+
+    def _queue_source_done(self, message) -> None:
         if self.batch_source_read_done:
             self._source_done_pending.append(message)
         else:
