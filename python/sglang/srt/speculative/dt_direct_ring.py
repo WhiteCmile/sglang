@@ -40,7 +40,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DIRECT_RING = os.environ.get("DT_DIRECT_RING", "0") == "1"
+DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
 RING_CAPACITY = int(os.environ.get("DT_DIRECT_RING_CAPACITY", "256"))
 if RING_CAPACITY <= 0 or RING_CAPACITY & (RING_CAPACITY - 1):
     # Indices are derived from the 32-bit wire seq in the native worker; a
