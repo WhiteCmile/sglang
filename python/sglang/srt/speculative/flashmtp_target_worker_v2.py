@@ -68,6 +68,16 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
                 and not server_args.disable_overlap_schedule
             )
         )
+        # Bootstrap prefill reuses the verify wave's deferred staging so the
+        # launch only enqueues preservation copies; metadata conversion,
+        # publication, broadcast, and commit move to the in-order result
+        # boundary.  The eager launch-path staging stays the default until
+        # the deferred path passes its correctness and capacity gates;
+        # DT_DEFER_PREFILL_FEATURE_STAGE=1 opts into the deferred path.
+        self._defer_prefill_feature_stage = (
+            self._defer_dflash_feature_stage
+            and os.environ.get("DT_DEFER_PREFILL_FEATURE_STAGE", "0") == "1"
+        )
         self.block_size = int(server_args.speculative_num_draft_tokens)
         self.speculative_num_draft_tokens = self.block_size
         self.num_proposed_tokens = self.block_size - 1
@@ -344,8 +354,47 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
                 )
             if input_ids is None or int(input_ids.numel()) != total_tokens:
                 raise RuntimeError("DFLASH prefill input ids do not match feature rows")
-            feature_chunks = list(torch.split(packed_hidden, batch.extend_lens, dim=0))
-            feature_token_chunks = list(torch.split(input_ids, batch.extend_lens, dim=0))
+            if self._defer_prefill_feature_stage:
+                # Target prefill graphs reuse their input/output buffers.
+                # Preserve this prompt's hidden rows and token ids on the
+                # forward stream, exactly like a deferred verify wave, so the
+                # overlap scheduler stages only async D2H metadata copies and
+                # finalizes publication at the ordered result boundary.
+                deferred_feature_hidden = None
+                deferred_feature_tokens = None
+                if self.ps.tp_rank == 0:
+                    try:
+                        reserve = getattr(
+                            self, "dt_deferred_hidden_destination", None
+                        )
+                        deferred_feature_hidden = (
+                            reserve(packed_hidden) if reserve is not None else None
+                        )
+                        if deferred_feature_hidden is None:
+                            deferred_feature_hidden = packed_hidden.clone()
+                        deferred_feature_tokens = input_ids.clone()
+                    except torch.cuda.OutOfMemoryError as exc:
+                        # Join peers at the existing ordered result-side
+                        # failure broadcast; retain any submitted clone.
+                        batch_output.dt_deferred_feature_error = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                batch_output.dt_deferred_dflash_feature_stage = True
+                batch_output.dt_deferred_prefill_feature_stage = True
+                batch_output.dt_deferred_prefill_extend_lens = tuple(
+                    int(value) for value in batch.extend_lens
+                )
+                batch_output.dt_dflash_packed_hidden = deferred_feature_hidden
+                batch_output.dt_dflash_candidate_tokens = deferred_feature_tokens
+                feature_chunks = None
+                feature_token_chunks = None
+            else:
+                feature_chunks = list(
+                    torch.split(packed_hidden, batch.extend_lens, dim=0)
+                )
+                feature_token_chunks = list(
+                    torch.split(input_ids, batch.extend_lens, dim=0)
+                )
             pivot_hidden = torch.empty(
                 (len(batch.reqs), 0), dtype=torch.bfloat16, device=self.device
             )

@@ -767,9 +767,14 @@ class DTTargetController:
                         batch_result.dt_dflash_seq_lens_cpu = _async_d2h(
                             draft_input.new_seq_lens
                         )
-                        batch_result.dt_dflash_accept_lens_cpu = _async_d2h(
-                            batch_result.accept_lens
-                        )
+                        if not getattr(
+                            batch_result, "dt_deferred_prefill_feature_stage", False
+                        ):
+                            # Bootstrap prefill commits every prompt row, so it
+                            # has no per-request accept lengths to stage.
+                            batch_result.dt_dflash_accept_lens_cpu = _async_d2h(
+                                batch_result.accept_lens
+                            )
                     except Exception as exc:
                         batch_result.dt_deferred_feature_error = (
                             f"{type(exc).__name__}: {exc}"
@@ -1174,6 +1179,8 @@ class DTTargetController:
                     "dt_eagle3_committed_tokens", "dt_eagle3_committed_tokens_cpu",
                     "dt_deferred_feature_rounds", "dt_deferred_feature_offsets",
                     "dt_deferred_feature_copy_done",
+                    "dt_deferred_prefill_feature_stage",
+                    "dt_deferred_prefill_extend_lens",
                 ):
                     setattr(batch_result, name, None)
                 batch_result.dt_dflash_feature_stage_credit = False
@@ -1225,12 +1232,38 @@ class DTTargetController:
                         raise RuntimeError("deferred result lost feature staging tensors")
                     if packed_hidden.device.type != "cuda" or candidate_tokens.is_cuda:
                         raise RuntimeError("deferred tensors crossed wrong staging boundary")
-                    feature_chunks, token_chunks = split_dflash_committed_rows(
-                        packed_hidden=packed_hidden,
-                        candidates=candidate_tokens,
-                        commit_lens=batch_result.dt_dflash_accept_lens_cpu,
-                        block_size=self.block_size,
-                    )
+                    if getattr(
+                        batch_result, "dt_deferred_prefill_feature_stage", False
+                    ):
+                        # Bootstrap prefill commits every prompt row; split the
+                        # preserved prompt by its launch-time extend layout
+                        # instead of the verify block/accept-lens layout.
+                        extend_lens = getattr(
+                            batch_result, "dt_deferred_prefill_extend_lens", None
+                        )
+                        if (
+                            extend_lens is None
+                            or len(extend_lens) != len(batch.reqs)
+                            or int(sum(extend_lens)) != int(packed_hidden.shape[0])
+                            or int(candidate_tokens.numel())
+                            != int(packed_hidden.shape[0])
+                        ):
+                            raise RuntimeError(
+                                "deferred bootstrap result lost its extend layout"
+                            )
+                        feature_chunks = list(
+                            torch.split(packed_hidden, extend_lens, dim=0)
+                        )
+                        token_chunks = list(
+                            torch.split(candidate_tokens, extend_lens, dim=0)
+                        )
+                    else:
+                        feature_chunks, token_chunks = split_dflash_committed_rows(
+                            packed_hidden=packed_hidden,
+                            candidates=candidate_tokens,
+                            commit_lens=batch_result.dt_dflash_accept_lens_cpu,
+                            block_size=self.block_size,
+                        )
                     if self.is_eagle3:
                         feature_offsets = batch_result.dt_deferred_feature_offsets
                         committed = batch_result.dt_eagle3_committed_tokens_cpu
