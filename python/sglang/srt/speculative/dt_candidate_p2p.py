@@ -52,8 +52,21 @@ VALID_LENGTH_WORD = 3
 ROOT_TOKEN_WORD = 4
 COMPLETION_RETRY_NS = 100_000_000
 COMPLETION_MAX_ATTEMPTS = 100
-COMPLETION_SOCKET_HWM = 4096
+# Queue bursts instead of silently dropping them: at the measured standalone
+# rate (~3k notices/s per Target with retries) a multi-second Target prefill
+# stall alone overflows a 4096-deep ROUTER queue.
+COMPLETION_SOCKET_HWM = 65536
+# One poll call must be able to empty a full queue; the time cap keeps a
+# pathological flood from taxing the scheduler thread beyond a few ms.
+COMPLETION_POLL_MAX_MESSAGES = COMPLETION_SOCKET_HWM
+COMPLETION_POLL_MAX_NS = 4_000_000
+# Stop burn-retrying into a full pipe after this many consecutive EAGAINs
+# per Target socket; the next progress call tries again.
+COMPLETION_RETRY_EAGAIN_LIMIT = 16
+# Bounded, deduplicated deferred-ACK queue (one queued ACK per transfer).
+COMPLETION_PENDING_ACK_LIMIT = 4096
 RETIRED_TRANSFER_LIMIT = 65536
+RING_DEBUG = os.environ.get("DT_RING_DEBUG", "0") == "1"
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
 # One 32-byte host READY record per slot: the metadata words plus the
@@ -117,6 +130,45 @@ class CandidateTransportError(RuntimeError):
     pass
 
 
+class _RingDebugLog:
+    """Rate-limited DT_RING_DEBUG=1 counters for the completion channel."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.total: dict[str, int] = {}
+        self.window: dict[str, int] = {}
+        self.last_emit_ns = time.monotonic_ns()
+        self.last_call_ns = 0
+        self.max_gap_ns = 0
+
+    def note_call(self, now_ns: int) -> None:
+        if self.last_call_ns:
+            gap = now_ns - self.last_call_ns
+            if gap > self.max_gap_ns:
+                self.max_gap_ns = gap
+        self.last_call_ns = now_ns
+
+    def bump(self, key: str, count: int = 1) -> None:
+        self.total[key] = self.total.get(key, 0) + count
+        self.window[key] = self.window.get(key, 0) + count
+
+    def maybe_emit(self, now_ns: int, *, force: bool = False, extra: str = "") -> None:
+        if not force and now_ns - self.last_emit_ns < 1_000_000_000:
+            return
+        self.last_emit_ns = now_ns
+        gap_ms = self.max_gap_ns / 1e6
+        self.max_gap_ns = 0
+        window, self.window = self.window, {}
+        logger.info(
+            "DT_RING_DEBUG %s: window=%s total=%s max_call_gap_ms=%.1f%s",
+            self.label,
+            dict(sorted(window.items())),
+            dict(sorted(self.total.items())),
+            gap_ms,
+            extra,
+        )
+
+
 class CandidateSlotState(StrEnum):
     FREE = "free"
     ARMED = "armed"
@@ -173,6 +225,9 @@ class _PendingCompletionNotice:
     encoded: bytes
     attempts: int = 0
     next_retry_ns: int = 0
+    # Sends that failed with EAGAIN (peer queue full).  Tracked separately so
+    # the retry budget measures Target silence, not local pipe pressure.
+    send_failures: int = 0
 
 
 class TargetCandidateArena:
@@ -248,6 +303,12 @@ class TargetCandidateArena:
         self._completion_socket.setsockopt(zmq.LINGER, 0)
         self._completion_socket.setsockopt(zmq.RCVHWM, COMPLETION_SOCKET_HWM)
         self._completion_socket.setsockopt(zmq.SNDHWM, COMPLETION_SOCKET_HWM)
+        # Without ROUTER_MANDATORY a ROUTER send to a backlogged or departed
+        # peer silently succeeds while dropping the message, which hides ACK
+        # loss from every counter.  Mandatory turns the two failure modes
+        # into explicit errors: EAGAIN for a full peer queue (retryable),
+        # EHOSTUNREACH for a departed peer (droppable).
+        self._completion_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         self._completion_socket.bind("tcp://127.0.0.1:*")
         self.completion_endpoint = self._completion_socket.getsockopt_string(
             zmq.LAST_ENDPOINT
@@ -257,6 +318,17 @@ class TargetCandidateArena:
         self._recent_notice_keys: deque[tuple[object, ...]] = deque()
         self._recent_notice_set: set[tuple[object, ...]] = set()
         self._recent_notice_limit = max(16, self.slot_count * 4)
+        # ACKs whose send failed are retried on later polls instead of being
+        # dropped: a backlogged Draft must not force notice retries.  The
+        # queue is bounded and holds at most one ACK per transfer; a revoked
+        # producer's entries are purged in revoke_producer.
+        self._pending_acks: deque[tuple[bytes, str, bytes]] = deque()
+        self._pending_ack_keys: set[tuple[bytes, str]] = set()
+        self._ring_debug: _RingDebugLog | None = (
+            _RingDebugLog(f"target-arena:{target_instance_id}")
+            if RING_DEBUG
+            else None
+        )
         self._ready_records: _ReadyRecordFile | None = None
         self.ready_record_path = ""
         if GPU_READY_RECORD:
@@ -604,8 +676,11 @@ class TargetCandidateArena:
 
         from dt_protocol import PROTOCOL_VERSION
 
+        dbg = self._ring_debug
         key = self._notice_key(notice)
         if key in self._recent_notice_set:
+            if dbg is not None:
+                dbg.bump("accept_duplicate")
             return True
         if (
             notice.protocol_version != PROTOCOL_VERSION
@@ -617,6 +692,16 @@ class TargetCandidateArena:
             or not notice.draft_session_id
             or routing_id != notice.draft_session_id.encode()
         ):
+            if dbg is not None:
+                dbg.bump("reject_identity")
+                if routing_id != notice.draft_session_id.encode():
+                    dbg.bump("reject_identity_routing")
+                elif notice.target_session_id != self.target_session_id:
+                    dbg.bump("reject_identity_session")
+                elif notice.transport_session != self.transport_session:
+                    dbg.bump("reject_identity_transport")
+                elif notice.pool_generation != self.pool_generation:
+                    dbg.bump("reject_identity_pool_generation")
             return False
         with self._lock:
             slot_id = self._active.get(notice.transfer_id)
@@ -624,8 +709,29 @@ class TargetCandidateArena:
                 # A notice for a transfer this arena already retired (READY
                 # from its host record, read, and freed) is a late duplicate;
                 # ACK it so the producer stops retrying.
-                return notice.transfer_id in self._retired_transfers
+                retired = notice.transfer_id in self._retired_transfers
+                if dbg is not None:
+                    dbg.bump(
+                        "accept_retired" if retired else "reject_unknown_transfer"
+                    )
+                    if not retired:
+                        dbg.maybe_emit(
+                            time.monotonic_ns(),
+                            force=True,
+                            extra=f" unknown_transfer={notice.transfer_id}",
+                        )
+                return retired
             if slot_id != notice.slot_id:
+                if dbg is not None:
+                    dbg.bump("reject_slot_mismatch")
+                    dbg.maybe_emit(
+                        time.monotonic_ns(),
+                        force=True,
+                        extra=(
+                            f" slot_mismatch transfer={notice.transfer_id}"
+                            f" active_slot={slot_id} notice_slot={notice.slot_id}"
+                        ),
+                    )
                 return False
             slot = self._slots[slot_id]
             if (
@@ -646,6 +752,8 @@ class TargetCandidateArena:
             root_token=notice.root_token,
         )
         self._remember_notice(key)
+        if dbg is not None:
+            dbg.bump("accept_new")
         return True
 
     def revoke_producer(self, draft_session_id: str, *, quiescent: bool) -> int:
@@ -677,14 +785,93 @@ class TargetCandidateArena:
                 else:
                     slot.state = CandidateSlotState.QUARANTINED
                 retired += 1
+        self._drop_peer_pending_acks(draft_session_id.encode())
         return retired
 
     def has_active(self, transfer_id: str) -> bool:
         with self._lock:
             return transfer_id in self._active
 
-    def poll_completion_notices(self, *, max_messages: int = 64) -> int:
-        """Drain bounded payload-free Draft completions from the direct endpoint."""
+    def _drop_peer_pending_acks(self, routing_id: bytes) -> None:
+        """Forget deferred ACKs for a peer that can no longer receive them."""
+
+        if not self._pending_acks:
+            return
+        self._pending_acks = deque(
+            entry for entry in self._pending_acks if entry[0] != routing_id
+        )
+        self._pending_ack_keys = {
+            key for key in self._pending_ack_keys if key[0] != routing_id
+        }
+
+    def _defer_ack(self, routing_id: bytes, transfer_id: str, encoded: bytes) -> None:
+        """Queue one ACK for a later resend, bounded and deduplicated.
+
+        A full queue drops the newest ACK: the Draft's idempotent notice
+        retry regenerates one within COMPLETION_RETRY_NS, so no ACK loss is
+        permanent while the producer lives.
+        """
+
+        key = (routing_id, transfer_id)
+        if key in self._pending_ack_keys:
+            return
+        if len(self._pending_acks) >= COMPLETION_PENDING_ACK_LIMIT:
+            if self._ring_debug is not None:
+                self._ring_debug.bump("ack_defer_queue_full")
+            return
+        self._pending_acks.append((routing_id, transfer_id, encoded))
+        self._pending_ack_keys.add(key)
+        if self._ring_debug is not None:
+            self._ring_debug.bump("ack_deferred_eagain")
+
+    def _flush_pending_acks(self, deadline_ns: int) -> None:
+        """Best-effort resend of deferred ACKs within the poll's deadline."""
+
+        dbg = self._ring_debug
+        flushed = 0
+        while self._pending_acks:
+            if flushed and time.monotonic_ns() >= deadline_ns:
+                if dbg is not None:
+                    dbg.bump("ack_flush_deadline")
+                break
+            routing_id, transfer_id, encoded = self._pending_acks[0]
+            try:
+                self._completion_socket.send_multipart(
+                    (routing_id, encoded), flags=zmq.NOBLOCK
+                )
+            except zmq.Again:
+                # Peer queue still full; keep the entry for the next poll.
+                break
+            except zmq.ZMQError as exc:
+                if exc.errno != zmq.EHOSTUNREACH:
+                    raise
+                # Peer is gone: drop its whole queue, the producer revoke
+                # path retires its slots separately.
+                if dbg is not None:
+                    dbg.bump("ack_dropped_peer_gone")
+                self._drop_peer_pending_acks(routing_id)
+                continue
+            self._pending_acks.popleft()
+            self._pending_ack_keys.discard((routing_id, transfer_id))
+            flushed += 1
+            if dbg is not None:
+                dbg.bump("ack_sent")
+        if dbg is not None and flushed:
+            dbg.bump("ack_resent", flushed)
+
+    def poll_completion_notices(
+        self,
+        *,
+        max_messages: int = COMPLETION_POLL_MAX_MESSAGES,
+        max_ns: int = COMPLETION_POLL_MAX_NS,
+    ) -> int:
+        """Drain bounded payload-free Draft completions from the direct endpoint.
+
+        The count cap lets one call empty a full socket queue; the time cap
+        bounds how long a flood can hold the scheduler thread.  Both caps only
+        engage while a backlog exists — steady-state drains return on the
+        first empty read.
+        """
 
         from dt_protocol import (
             PROTOCOL_VERSION,
@@ -694,18 +881,39 @@ class TargetCandidateArena:
 
         if max_messages <= 0:
             raise ValueError("max_messages must be positive")
+        if max_ns <= 0:
+            raise ValueError("max_ns must be positive")
+        dbg = self._ring_debug
+        started_ns = time.monotonic_ns()
+        if dbg is not None:
+            dbg.note_call(started_ns)
+        self._flush_pending_acks(started_ns + max_ns)
         accepted = 0
+        drained = 0
+        timed_out = False
         for _ in range(max_messages):
+            if (
+                drained % 64 == 0
+                and drained > 0
+                and time.monotonic_ns() - started_ns >= max_ns
+            ):
+                timed_out = True
+                break
             try:
                 parts = self._completion_socket.recv_multipart(flags=zmq.NOBLOCK)
             except zmq.Again:
                 break
+            drained += 1
             if len(parts) != 2:
+                if dbg is not None:
+                    dbg.bump("malformed_parts")
                 continue
             routing_id, payload = parts
             try:
                 notice = msgspec.msgpack.decode(payload, type=CandidateCompletionNotice)
             except (msgspec.DecodeError, msgspec.ValidationError):
+                if dbg is not None:
+                    dbg.bump("malformed_decode")
                 continue
             received_ns = time.monotonic_ns()
             if not self._accept_completion_notice(
@@ -724,14 +932,38 @@ class TargetCandidateArena:
                 draft_session_id=notice.draft_session_id,
                 accepted_ns=time.monotonic_ns(),
             )
+            encoded = self._ack_encoder.encode(ack)
             try:
                 self._completion_socket.send_multipart(
-                    (routing_id, self._ack_encoder.encode(ack)), flags=zmq.NOBLOCK
+                    (routing_id, encoded), flags=zmq.NOBLOCK
                 )
+                if dbg is not None:
+                    dbg.bump("ack_sent")
             except zmq.Again:
-                # Draft retries the idempotent notice.  Do not block Target.
-                pass
+                # Do not block Target; resend on a later poll instead of
+                # dropping the ACK and depending on the Draft's notice retry.
+                self._defer_ack(routing_id, notice.transfer_id, encoded)
+            except zmq.ZMQError as exc:
+                if exc.errno != zmq.EHOSTUNREACH:
+                    raise
+                # The Draft is gone; its producer revoke retires its slots.
+                if dbg is not None:
+                    dbg.bump("ack_dropped_peer_gone")
             accepted += 1
+        if dbg is not None:
+            if drained:
+                dbg.bump("notices_drained", drained)
+            if drained == max_messages or timed_out:
+                dbg.bump("drain_cap_reached")
+                dbg.maybe_emit(
+                    time.monotonic_ns(),
+                    force=True,
+                    extra=(
+                        f" drain cap reached drained={drained}"
+                        f" timed_out={timed_out}"
+                    ),
+                )
+            dbg.maybe_emit(time.monotonic_ns())
         return accepted
 
     def poll(self, *, max_queries: int = 64) -> tuple[CandidateCompletion, ...]:
@@ -1157,6 +1389,9 @@ class DraftCandidatePushTransport:
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
         self._closed = False
+        self._ring_debug: _RingDebugLog | None = (
+            _RingDebugLog(f"draft-push:{draft_instance_id}") if RING_DEBUG else None
+        )
 
     @staticmethod
     def _registration_key(value) -> tuple[str, str, str, str]:
@@ -1326,6 +1561,10 @@ class DraftCandidatePushTransport:
                 encoded=self._notice_encoder.encode(notice),
                 next_retry_ns=now_ns,
             )
+            if self._ring_debug is not None:
+                self._ring_debug.bump(
+                    f"notice_queued:{destination.target_instance_id}"
+                )
         self.progress_completions(now_ns=now_ns)
 
     @property
@@ -1344,22 +1583,33 @@ class DraftCandidatePushTransport:
         if max_messages <= 0:
             raise ValueError("max_messages must be positive")
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
+        dbg = self._ring_debug
+        if dbg is not None:
+            dbg.note_call(now_ns)
         acknowledged = 0
-        budget = max_messages
-        for socket in self._completion_sockets.values():
+        # Each Target socket gets its own budget: a busy peer must not starve
+        # the ACK stream of the others.
+        for key, socket in self._completion_sockets.items():
+            budget = max_messages
+            socket_received = 0
             while budget:
                 try:
                     parts = socket.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:
                     break
                 budget -= 1
+                socket_received += 1
                 payload = parts[-1]
                 try:
                     ack = msgspec.msgpack.decode(payload, type=CandidateCompletionAck)
                 except (msgspec.DecodeError, msgspec.ValidationError):
+                    if dbg is not None:
+                        dbg.bump("ack_malformed")
                     continue
                 pending = self._pending_notices.get(ack.transfer_id)
                 if pending is None:
+                    if dbg is not None:
+                        dbg.bump("ack_unknown_transfer")
                     continue
                 notice = pending.notice
                 if (
@@ -1384,20 +1634,70 @@ class DraftCandidatePushTransport:
                         )
                     del self._pending_notices[ack.transfer_id]
                     acknowledged += 1
+                elif dbg is not None:
+                    dbg.bump("ack_rejected")
+            if dbg is not None and socket_received:
+                dbg.bump(f"ack_recv:{key[0]}", socket_received)
+            if dbg is not None and not budget:
+                dbg.bump("ack_budget_exhausted")
+        if dbg is not None:
+            if acknowledged:
+                dbg.bump("ack_accepted", acknowledged)
+            dbg.bump("pending_max", 0)  # ensure key exists
+            pending_now = len(self._pending_notices)
+            if pending_now > dbg.total.get("pending_max", 0):
+                dbg.total["pending_max"] = pending_now
+        # Backpressure is per Target socket: a full pipe to one Target must
+        # not suppress retries owed to healthy Targets in the same call.
+        eagain_streaks: dict[int, int] = {}
         for transfer_id, pending in tuple(self._pending_notices.items()):
             if pending.next_retry_ns > now_ns:
                 continue
-            if pending.attempts >= COMPLETION_MAX_ATTEMPTS:
+            if (
+                pending.attempts >= COMPLETION_MAX_ATTEMPTS
+                or pending.send_failures >= COMPLETION_MAX_ATTEMPTS
+            ):
+                if dbg is not None:
+                    dbg.maybe_emit(
+                        now_ns,
+                        force=True,
+                        extra=(
+                            f" EXHAUSTED transfer={transfer_id}"
+                            f" attempts={pending.attempts}"
+                            f" send_failures={pending.send_failures}"
+                            f" age_ms={(now_ns - pending.notice.sent_ns) / 1e6:.0f}"
+                            f" pending={len(self._pending_notices)}"
+                        ),
+                    )
                 raise CandidateTransportError(
                     "direct candidate completion retry budget exhausted for "
                     f"{transfer_id}"
                 )
+            socket_key = id(pending.socket)
+            if eagain_streaks.get(socket_key, 0) >= COMPLETION_RETRY_EAGAIN_LIMIT:
+                # This Target's pipe is full; further sends to it this call
+                # are futile and burn CPU that the ACK drain above needs.
+                if dbg is not None:
+                    dbg.bump("retry_deferred_pipe_full")
+                continue
             try:
                 pending.socket.send(pending.encoded, flags=zmq.NOBLOCK)
             except zmq.Again:
-                pass
+                eagain_streaks[socket_key] = eagain_streaks.get(socket_key, 0) + 1
+                pending.send_failures += 1
+                # No attempt is burned: the notice never left this process, so
+                # the budget keeps measuring Target silence, not pipe pressure.
+                pending.next_retry_ns = now_ns + COMPLETION_RETRY_NS
+                if dbg is not None:
+                    dbg.bump("retry_send_eagain")
+                continue
+            eagain_streaks[socket_key] = 0
+            if dbg is not None:
+                dbg.bump("retry_sent")
             pending.attempts += 1
             pending.next_retry_ns = now_ns + COMPLETION_RETRY_NS
+        if dbg is not None:
+            dbg.maybe_emit(now_ns)
         return acknowledged
 
     def pop_acknowledgements(self) -> tuple[dict[str, int | str], ...]:
