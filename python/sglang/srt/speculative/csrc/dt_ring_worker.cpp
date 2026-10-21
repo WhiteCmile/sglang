@@ -148,6 +148,8 @@ struct Ring {
   uint64_t pool_tag = 0;  // registered pool-generation tag for v2 records
   uint64_t next_seq = 1;
   bool detached = false;
+  // Per-ring copy stream: entries from different Targets must not serialize.
+  CUstream stream = nullptr;
   // Consumed-credit state: the worker snapshots every entry it serves into
   // the mailbox before releasing its ring slot back to the Target.
   uint32_t* header = nullptr;      // ring header words (H_CONSUMED lives at 5)
@@ -179,6 +181,7 @@ struct Worker {
   int cpu = -1;
   CUcontext ctx = nullptr;
   CUstream stream = nullptr;
+  int stream_priority = 0;  // highest priority reported by the device
   // Landing buffers (all equal size), shared by every ring.
   CUdeviceptr landing_base = 0;
   uint64_t landing_bytes = 0;
@@ -295,7 +298,7 @@ bool mailbox_resolve_rids(Ring* r, const uint8_t* reqs, uint32_t request_count,
 // so the Target may reuse the ring entry from this point on.
 bool finish_entry(Worker* w, Ring* r) {
   CUresult rc = w->api.cuStreamWriteValue32(
-      w->stream, r->ready_words + 4ull * (r->next_seq % r->capacity),
+      r->stream, r->ready_words + 4ull * (r->next_seq % r->capacity),
       (uint32_t)r->next_seq, 0);
   if (rc != 0) {
     fail(w, rc, r->id);
@@ -324,11 +327,11 @@ bool enqueue_pull(Worker* w, Ring* r, uint32_t index, uint64_t source_offset,
   memcpy(&event_handle, event_handle_bytes, sizeof(event_handle));
   CUevent producer = nullptr;
   CUresult rc = w->api.cuIpcOpenEventHandle(&producer, event_handle);
-  if (rc == 0) rc = w->api.cuStreamWaitEvent(w->stream, producer, 0);
+  if (rc == 0) rc = w->api.cuStreamWaitEvent(r->stream, producer, 0);
   if (producer) w->api.cuEventDestroy(producer);
   if (rc == 0)
     rc = w->api.cuMemcpyAsync(w->landing_base + (uint64_t)k * w->landing_bytes + offset,
-                              r->source_base + source_offset, nbytes, w->stream);
+                              r->source_base + source_offset, nbytes, r->stream);
   if (rc != 0) {
     fail(w, rc, r->id);
     return false;
@@ -695,6 +698,7 @@ void* dt_ring_worker_create(int device, int cpu, uint64_t landing_base, uint64_t
   int least = 0, greatest = 0;
   w->api.cuCtxSetCurrent(w->ctx);
   w->api.cuCtxGetStreamPriorityRange(&least, &greatest);
+  w->stream_priority = greatest;
   // CU_STREAM_NON_BLOCKING: never serialize with the legacy default stream.
   if (w->api.cuStreamCreateWithPriority(&w->stream, 0x1, greatest) != 0) {
     w->api.cuDevicePrimaryCtxRelease(dev);
@@ -741,6 +745,12 @@ int dt_ring_worker_attach(void* handle, int ring_id, uint64_t entries_host, uint
   r->mailbox_stride = mailbox_stride;
   r->mail_ack = reinterpret_cast<const uint64_t*>(mail_ack_host);
   r->ledger = ledger;
+  w->api.cuCtxSetCurrent(w->ctx);
+  // CU_STREAM_NON_BLOCKING: never serialize with the legacy default stream.
+  if (w->api.cuStreamCreateWithPriority(&r->stream, 0x1, w->stream_priority) != 0) {
+    delete r;
+    return -1;
+  }
   std::lock_guard<std::mutex> guard(w->lock);
   w->rings.push_back(r);
   return 0;
@@ -806,10 +816,19 @@ uint64_t dt_ring_worker_landing_stalls(void* handle) {
 int dt_ring_worker_sync(void* handle) {
   Worker* w = static_cast<Worker*>(handle);
   w->api.cuCtxSetCurrent(w->ctx);
-  return w->api.cuStreamSynchronize(w->stream);
+  int rc = w->api.cuStreamSynchronize(w->stream);
+  std::vector<CUstream> ring_streams;
+  {
+    std::lock_guard<std::mutex> guard(w->lock);
+    ring_streams.reserve(w->rings.size());
+    for (Ring* r : w->rings) ring_streams.push_back(r->stream);
+  }
+  for (CUstream s : ring_streams)
+    if (int rrc = w->api.cuStreamSynchronize(s); rrc != 0 && rc == 0) rc = rrc;
+  return rc;
 }
 
-// Stop the thread, drain its stream, release everything it owns.
+// Stop the thread, drain every stream, release everything it owns.
 int dt_ring_worker_destroy(void* handle) {
   Worker* w = static_cast<Worker*>(handle);
   if (!w) return 0;
@@ -817,9 +836,18 @@ int dt_ring_worker_destroy(void* handle) {
   if (w->thread.joinable()) w->thread.join();
   w->api.cuCtxSetCurrent(w->ctx);
   int rc = w->api.cuStreamSynchronize(w->stream);
+  for (Ring* r : w->rings) {
+    // cuStreamDestroy returns immediately when the stream has pending work and
+    // releases it lazily; drain first so no copy or ready write can still touch
+    // buffers the caller is about to release after we return.
+    if (r->stream) {
+      if (int rrc = w->api.cuStreamSynchronize(r->stream); rrc != 0 && rc == 0) rc = rrc;
+      w->api.cuStreamDestroy(r->stream);
+    }
+    delete r;
+  }
   w->api.cuStreamDestroy(w->stream);
   w->api.cuDevicePrimaryCtxRelease(w->device);
-  for (Ring* r : w->rings) delete r;
   delete w;
   return rc;
 }
