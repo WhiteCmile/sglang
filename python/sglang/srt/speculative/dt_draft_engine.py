@@ -2076,6 +2076,8 @@ class FlashMTPDraftEngine:
                 preparation = self._take_batch()
                 if preparation:
                     self._execute_batch(preparation)
+                if self._ring_worker is not None:
+                    self._poll_direct_rings()
                 ready = self._take_input_ready_batch()
                 if ready:
                     self._execute_input_ready_batch(ready)
@@ -2095,6 +2097,8 @@ class FlashMTPDraftEngine:
                     self._poll_dflash_completions()
             if self._pending_candidate_pushes:
                 self._poll_candidate_pushes()
+            if self._ring_worker is not None:
+                self._poll_direct_rings()
 
             if (
                 not self._pending
