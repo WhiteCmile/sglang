@@ -270,6 +270,44 @@ class StagedDFlashTask:
 class StagedDFlashFeatureBatch:
     tasks: tuple[StagedDFlashTask, ...]
     descriptors_by_transfer: dict[str, object]
+    # Kernel-published (§7.1) waves stage without descriptors or token-id
+    # tuples; their Coordinator confirmation tasks are built by the deferred
+    # cleanup in _ring_publish_cleanup.
+    ring_publish: bool = False
+
+
+class RingPublishCommittedError(RuntimeError):
+    """The ring record went out; the wave may not be re-published.
+
+    Raised only after the publish kernel was launched.  The caller fails the
+    wave closed instead of falling back to the Python publication path,
+    which would double-publish the same round to the owning Draft.
+    """
+
+
+@dataclass(slots=True)
+class RingPublishWave:
+    """A kernel-published verify wave awaiting its deferred confirmation.
+
+    The ring record is authoritative for the Draft; the cleanup rebuilds the
+    Coordinator-bound copies from the record itself (no GPU sync) and keeps
+    the pool/ledger bookkeeping consistent with the Python publication path.
+    """
+
+    session_id: str
+    wave_seq: int
+    slot_id: int
+    generation: int
+    row_count: int
+    ready_event: object
+    # 12-field StagedDFlashTask values with empty token-id tuples, in the
+    # record's request-table order; aligned with active_slots.
+    specs: tuple
+    reqs: dict  # rid -> req object at stage time
+    active_slots: tuple
+    # Filled by _park_dflash_completed_batch: transfer_id ->
+    # (requires_proposal, previous_transfer_id).
+    proposals: dict
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +597,24 @@ class DTTargetController:
         self._draft_binding: dict[str, tuple[str, str, int]] = {}
         # Ring rounds written but not yet accepted by the Coordinator.
         self._direct_sent: set[str] = set()
+        # §7.1 GPU ring publish (DT_RING_PUBLISH=1): eligible verify waves go
+        # out as kernel-written ring records; the Coordinator confirmation
+        # tasks are built by a deferred cleanup off the park critical path.
+        self._ring_publish = os.environ.get("DT_RING_PUBLISH", "0") == "1"
+        self._ring_publishers: dict[str, object] = {}  # session -> RingGpuPublisher
+        self._ring_publish_pending: deque = deque()
+        self._ring_publish_transfers: set[str] = set()
+        # Producer events of waves that failed after publication; the records
+        # on the ring still reference them, so ownership cannot be dropped.
+        self._ring_publish_orphaned_events: deque = deque(maxlen=1024)
+        # Sticky publication failure, broadcast to other ranks via poll().
+        self._ring_publish_fatal: str | None = None
+        # Producer events are per-slot, not per-wave: a slot is never
+        # re-leased before its previous read completes, so re-recording the
+        # slot's event cannot alias an unconsumed wait.  IPC handles are
+        # exported once per slot.
+        self._slot_ready_events: dict[int, object] = {}
+        self._slot_event_handles: dict[int, bytes] = {}
         self._client = None
         self._ledger = None
         self._feature_source_pool = None
@@ -1129,7 +1185,17 @@ class DTTargetController:
         slot_id, generation, rows = reservation
         try:
             rows.copy_(packed_hidden)
-            ready_event = torch.cuda.Event(interprocess=True)
+            if getattr(self, "_ring_publish", False):
+                events = getattr(self, "_slot_ready_events", None)
+                if events is None:
+                    events = self._slot_ready_events = {}
+                ready_event = events.get(slot_id)
+                if ready_event is None:
+                    ready_event = events[slot_id] = torch.cuda.Event(
+                        interprocess=True
+                    )
+            else:
+                ready_event = torch.cuda.Event(interprocess=True)
             ready_event.record()
         except Exception:
             pool.quarantine_reserved(slot_id, generation)
@@ -1213,7 +1279,150 @@ class DTTargetController:
         packet = None
         published = None
         descriptors = {}
-        if self.is_export_rank:
+        deferred_prefill = deferred and getattr(
+            batch_result, "dt_deferred_prefill_feature_stage", False
+        )
+        # With DT_RING_PUBLISH on, deferred verify waves carry no per-wave
+        # broadcast: every rank derives identical commit specs from its own
+        # batch state and ledger dicts; only the export rank publishes.
+        # Every other wave class keeps the broadcast.  The no-broadcast path
+        # is restricted to same-host direct-ring operation, the configuration
+        # it was designed and validated for.
+        local_verify = (
+            deferred
+            and not deferred_prefill
+            and not self.is_eagle3
+            and getattr(self, "_ring_publish", False)
+            and self.is_persistent
+            and self.candidate_transport == "cuda-ipc"
+            and self._direct_ring
+            and getattr(batch_result, "accept_lens", None) is not None
+            and getattr(draft_input, "bonus_tokens", None) is not None
+            and draft_input.bonus_tokens.is_cuda
+            and getattr(draft_input, "new_seq_lens", None) is not None
+            and draft_input.new_seq_lens.is_cuda
+        )
+        if (
+            deferred
+            and not deferred_prefill
+            and not local_verify
+            and not getattr(self, "_ring_publish_blocked_logged", False)
+        ):
+            self._ring_publish_blocked_logged = True
+            logger.warning(
+                "ring publish local_verify blocked: eagle3=%s flag=%s "
+                "accept_lens=%s bonus=%s seq_lens=%s",
+                self.is_eagle3,
+                getattr(self, "_ring_publish", False),
+                getattr(getattr(batch_result, "accept_lens", None), "device", None),
+                getattr(getattr(draft_input, "bonus_tokens", None), "device", None),
+                getattr(getattr(draft_input, "new_seq_lens", None), "device", None),
+            )
+        export_block = self.is_export_rank
+        if local_verify:
+            derive_started_ns = time.monotonic_ns()
+            try:
+                accept_values, bonus_values, seq_len_values = (
+                    self._dflash_wave_scalars(batch_result, draft_input, deferred=True)
+                )
+                counts = accept_values
+                _active, staged_meta, specs_local = self._dflash_staged_meta_and_specs(
+                    batch, feature_offsets, counts, accept_values, bonus_values,
+                    seq_len_values,
+                )
+            except Exception as exc:
+                # The per-wave broadcast is gone, so a derivation failure
+                # must publish its own fatality: the other ranks raise it at
+                # the next poll instead of committing a poisoned wave.
+                if self.is_export_rank:
+                    self._ring_publish_fatal = (
+                        f"DFLASH deferred staging failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                raise
+            batch_result.dt_dflash_feature_metadata_ns = (
+                time.monotonic_ns() - derive_started_ns
+            )
+            if self.is_export_rank:
+                try:
+                    ring_ok = self._stage_dflash_ring_publish(
+                        batch,
+                        batch_result,
+                        draft_input,
+                        feature_chunks,
+                        token_chunks,
+                        deferred=deferred,
+                        staged_meta=staged_meta,
+                        accept_values=accept_values,
+                        bonus_values=bonus_values,
+                        seq_len_values=seq_len_values,
+                        commit_specs=specs_local,
+                    )
+                except RingPublishCommittedError as exc:
+                    # The record is already on the ring; a Python retry would
+                    # double-publish the wave.  Fail the wave closed instead.
+                    ring_ok = None
+                    packet = (None, f"RingPublishCommittedError: {exc}", False)
+                except Exception:
+                    logger.exception(
+                        "DT ring publish failed; using the Python publication path"
+                    )
+                    ring_ok = None
+                if ring_ok:
+                    packet = (specs_local, None, True)
+                    export_block = False
+            else:
+                packet = (specs_local, None, False)
+                export_block = False
+        elif (            self.is_export_rank
+            and getattr(self, "_ring_publish", False)
+            and not deferred
+            and not self.is_eagle3
+            and feature_chunks is not None
+            and getattr(batch_result, "accept_lens", None) is not None
+            and batch_result.accept_lens.is_cuda
+            and getattr(draft_input, "bonus_tokens", None) is not None
+            and draft_input.bonus_tokens.is_cuda
+            and getattr(draft_input, "new_seq_lens", None) is not None
+            and draft_input.new_seq_lens.is_cuda
+        ):
+            # Non-deferred configs still stage through the broadcast path.
+            accept_values, bonus_values, seq_len_values = self._dflash_wave_scalars(
+                batch_result, draft_input, deferred=False
+            )
+            counts = accept_values
+            _active, staged_meta = self._dflash_staged_meta(
+                batch, feature_offsets, counts
+            )
+            specs_local = self._dflash_commit_specs(
+                staged_meta, accept_values, bonus_values, seq_len_values
+            )
+            try:
+                ring_ok = self._stage_dflash_ring_publish(
+                    batch,
+                    batch_result,
+                    draft_input,
+                    feature_chunks,
+                    token_chunks,
+                    deferred=deferred,
+                    staged_meta=staged_meta,
+                    accept_values=accept_values,
+                    bonus_values=bonus_values,
+                    seq_len_values=seq_len_values,
+                    commit_specs=specs_local,
+                )
+            except RingPublishCommittedError as exc:
+                ring_ok = None
+                packet = (None, f"RingPublishCommittedError: {exc}", False)
+            except Exception:
+                logger.exception(
+                    "DT ring publish failed; using the Python publication path"
+                )
+                ring_ok = None
+            if ring_ok:
+                packet = (specs_local, None, True)
+                export_block = False
+        if export_block and packet is None and self.is_export_rank:
             try:
                 if deferred:
                     error = getattr(batch_result, "dt_deferred_feature_error", None)
@@ -1680,7 +1889,7 @@ class DTTargetController:
                     batch_result.dt_dflash_feature_profile_ns = (
                         time.monotonic_ns() - phase_started_ns
                     )
-                packet = (specs, None)
+                packet = (specs, None, False)
             except Exception as exc:
                 if published is not None:
                     first_descriptor = published.descriptors[0]
@@ -1693,11 +1902,16 @@ class DTTargetController:
                     for descriptor in published.descriptors:
                         self._source_slot_by_transfer.pop(descriptor.transfer_id, None)
                     published = None
-                packet = (None, f"{type(exc).__name__}: {exc}")
+                packet = (
+                    None,
+                    f"{type(exc).__name__}: {exc}"
+                    + self._feature_source_pool_diagnostics(),
+                    False,
+                )
                 descriptors = {}
         phase_started_ns = time.monotonic_ns()
         try:
-            if self.scheduler.ps.tp_size > 1:
+            if self.scheduler.ps.tp_size > 1 and not local_verify:
                 packet = broadcast_pyobj(
                     packet,
                     self.scheduler.tp_group.rank,
@@ -1720,8 +1934,12 @@ class DTTargetController:
             time.monotonic_ns() - phase_started_ns
         )
         assert packet is not None
-        specs, error = packet
+        specs, error, ring_publish = packet
         if error is not None:
+            if self.is_export_rank:
+                self._ring_publish_fatal = (
+                    f"DFLASH feature publication failed: {error}"
+                )
             raise RuntimeError(f"DFLASH feature publication failed: {error}")
 
         phase_started_ns = time.monotonic_ns()
@@ -1741,7 +1959,9 @@ class DTTargetController:
                 )
             elif current_attempt != staged.attempt:
                 raise RuntimeError("DFLASH lifecycle attempt changed during staging")
-            if self.is_export_rank:
+            if self.is_export_rank and not ring_publish:
+                # Ring-published waves register their lease in the deferred
+                # cleanup, once the descriptors exist.
                 descriptor = descriptors[staged.transfer_id]
                 if self._source_slot_by_transfer.get(staged.transfer_id) != (
                     descriptor.source_slot_id,
@@ -1752,6 +1972,7 @@ class DTTargetController:
         batch_result.dt_staged_dflash_features = StagedDFlashFeatureBatch(
             tasks=tuple(staged_tasks),
             descriptors_by_transfer=descriptors,
+            ring_publish=ring_publish,
         )
         batch_result.dt_dflash_feature_commit_ns = (
             time.monotonic_ns() - phase_started_ns
@@ -1800,6 +2021,9 @@ class DTTargetController:
                     ),
                     feature_publish_ns=getattr(
                         batch_result, "dt_dflash_feature_publish_ns", 0
+                    ),
+                    ring_publish_breakdown=getattr(
+                        batch_result, "dt_ring_publish_breakdown", None
                     ),
                     feature_publish_strategy=getattr(
                         batch_result,
@@ -2570,14 +2794,20 @@ class DTTargetController:
                 raise RuntimeError("DFLASH staged request is absent from result batch")
             if req.finished() or req.is_retracted:
                 if self.is_export_rank:
-                    descriptor = staged.descriptors_by_transfer[spec.transfer_id]
-                    self._feature_source_pool.cancel(
-                        transfer_id=spec.transfer_id,
-                        source_slot_id=descriptor.source_slot_id,
-                        slot_generation=descriptor.slot_generation,
-                        source_session_id=descriptor.source_session_id,
-                        pool_generation=descriptor.pool_generation,
-                    )
+                    if staged.ring_publish:
+                        # The wave's descriptors do not exist yet; the
+                        # deferred cleanup cancels this transfer's lease
+                        # share right after publishing them.
+                        self._cancelled_transfers.add(spec.transfer_id)
+                    else:
+                        descriptor = staged.descriptors_by_transfer[spec.transfer_id]
+                        self._feature_source_pool.cancel(
+                            transfer_id=spec.transfer_id,
+                            source_slot_id=descriptor.source_slot_id,
+                            slot_generation=descriptor.slot_generation,
+                            source_session_id=descriptor.source_session_id,
+                            pool_generation=descriptor.pool_generation,
+                        )
                     self._source_slot_by_transfer.pop(spec.transfer_id, None)
                 continue
             requires_proposal = bool(
@@ -2615,22 +2845,35 @@ class DTTargetController:
                     lane_id=self._lane_for_request(req),
                 )
             if self.is_export_rank:
-                descriptor = staged.descriptors_by_transfer[spec.transfer_id]
-                tasks.append(
-                    self._make_task(
-                        transfer_id=spec.transfer_id,
-                        req=req,
-                        round_id=spec.round_id,
-                        attempt=spec.attempt,
-                        bonus_token=spec.bonus_token,
-                        previous_transfer_id=previous_transfer_id,
-                        feature_descriptor=descriptor,
-                        feature_token_ids=spec.feature_token_ids,
-                        committed_token_ids=spec.committed_token_ids,
-                        feature_token_offset=spec.feature_token_offset,
-                        requires_proposal=requires_proposal,
+                if staged.ring_publish:
+                    wave = getattr(batch_result, "dt_ring_publish_wave", None)
+                    if wave is None:
+                        raise RuntimeError("ring-published wave lost its staging state")
+                    if not requires_proposal:
+                        raise RuntimeError(
+                            "ring-published wave changed its proposal boundary"
+                        )
+                    wave.proposals[spec.transfer_id] = (
+                        requires_proposal,
+                        previous_transfer_id,
                     )
-                )
+                else:
+                    descriptor = staged.descriptors_by_transfer[spec.transfer_id]
+                    tasks.append(
+                        self._make_task(
+                            transfer_id=spec.transfer_id,
+                            req=req,
+                            round_id=spec.round_id,
+                            attempt=spec.attempt,
+                            bonus_token=spec.bonus_token,
+                            previous_transfer_id=previous_transfer_id,
+                            feature_descriptor=descriptor,
+                            feature_token_ids=spec.feature_token_ids,
+                            committed_token_ids=spec.committed_token_ids,
+                            feature_token_offset=spec.feature_token_offset,
+                            requires_proposal=requires_proposal,
+                        )
+                    )
                 if previous_transfer_id is not None:
                     self._ledger.finish(previous_transfer_id)
         batch_result.dt_dflash_task_build_ns = time.monotonic_ns() - phase_started_ns
@@ -2674,12 +2917,19 @@ class DTTargetController:
                 (
                     # A reserved slot belongs to a deferred stage that already
                     # holds a source credit; count it once, as before.
+                    # Kernel-published waves pending their flush-time cleanup
+                    # hold reservations that belong to no deferred credit, so
+                    # they must not count as available capacity; otherwise a
+                    # Python-path park can be admitted with zero free slots
+                    # and its pool.publish raises.
                     self._feature_source_pool.free_slot_count
                     + self._feature_source_pool.reserved_slot_count
+                    - len(getattr(self, "_ring_publish_pending", ()))
                     if self._feature_source_pool is not None
                     else 0
                 ),
                 self._overlap_launch_ns,
+                getattr(self, "_ring_publish_fatal", None),
             )
             packet = (*packet, self._late_freeze_hold(overlap_result, packet[2]))
             receive_ns = time.monotonic_ns() - receive_start_ns
@@ -2699,6 +2949,7 @@ class DTTargetController:
             result_ready,
             feature_source_free_slots,
             overlap_launch_ns,
+            ring_publish_fatal,
             hold_next_batch,
         ) = packet
         self._last_poll_ns = poll_now_ns
@@ -2706,6 +2957,10 @@ class DTTargetController:
         self._overlap_result_ready = result_ready
         self.hold_next_batch = bool(hold_next_batch)
         self._feature_source_free_slots = feature_source_free_slots
+        if ring_publish_fatal:
+            # A publication failure is fatal on the export rank; the other
+            # ranks learn it here rather than through a per-wave broadcast.
+            raise RuntimeError(ring_publish_fatal)
         if self.is_export_rank and events:
             poll_finished_ns = time.monotonic_ns()
             self._profile_emit(
@@ -4689,6 +4944,10 @@ class DTTargetController:
             TaskBatchAck,
         )
 
+        if getattr(self, "_ring_publish_pending", None):
+            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
+            # kernel-published waves, off the park critical path.
+            self._ring_publish_cleanup()
         self._flush_pending_send()
 
         events: list[tuple[str, str, object]] = []
@@ -5696,6 +5955,692 @@ class DTTargetController:
             for request_id in tuple(bindings)[:16384]:
                 del bindings[request_id]
 
+    def _dflash_wave_scalars(self, batch_result, draft_input, *, deferred: bool):
+        """Per-request accept/bonus/seq-len ints for the commit specs.
+
+        The export rank reuses the deferred stage's pinned copies; other
+        ranks (and the non-deferred path) take one small async D2H batch of
+        their own.  Either way the wait lands on work enqueued before the
+        forward completed, so it does not gate the park critical path.
+        """
+
+        staged = (
+            deferred
+            and getattr(batch_result, "dt_dflash_accept_lens_cpu", None) is not None
+        )
+        if staged:
+            error = getattr(batch_result, "dt_deferred_feature_error", None)
+            done = getattr(batch_result, "dt_deferred_feature_copy_done", None)
+            if done is not None:
+                done.synchronize()
+            if error is not None:
+                raise RuntimeError(error)
+            accept_cpu = batch_result.dt_dflash_accept_lens_cpu
+            bonus_cpu = getattr(batch_result, "dt_dflash_bonus_tokens_cpu", None)
+            seq_lens_cpu = getattr(batch_result, "dt_dflash_seq_lens_cpu", None)
+            if bonus_cpu is None or seq_lens_cpu is None:
+                raise RuntimeError("deferred result lost scalar staging tensors")
+        else:
+            if deferred:
+                error = getattr(batch_result, "dt_deferred_feature_error", None)
+                if error is not None:
+                    raise RuntimeError(error)
+            from sglang.srt.managers.utils import _async_d2h
+
+            accept_lens = getattr(batch_result, "accept_lens", None)
+            bonus_tokens = getattr(draft_input, "bonus_tokens", None)
+            new_seq_lens = getattr(draft_input, "new_seq_lens", None)
+            if (
+                accept_lens is None
+                or bonus_tokens is None
+                or not bonus_tokens.is_cuda
+                or new_seq_lens is None
+                or not new_seq_lens.is_cuda
+            ):
+                raise RuntimeError("verify wave lost its GPU scalar tensors")
+            if accept_lens.is_cuda:
+                accept_cpu = _async_d2h(accept_lens)
+            else:
+                # Result processing may already have moved the commit counts
+                # to host memory; no copy is needed then.
+                accept_cpu = accept_lens
+            bonus_cpu = _async_d2h(bonus_tokens)
+            seq_lens_cpu = _async_d2h(new_seq_lens)
+            done = self.scheduler.device_module.Event()
+            done.record()
+            done.synchronize()
+        # Zero-copy numpy views: callers index individual values with int()
+        # and stage the counts with one memcpy; building Python lists here
+        # costs ~10 µs per array on every park.
+        return (
+            accept_cpu.numpy(),
+            bonus_cpu.numpy(),
+            seq_lens_cpu.numpy(),
+        )
+
+    def _dflash_staged_meta_and_specs(
+        self, batch, feature_offsets, counts, accept_values, bonus_values, seq_len_values
+    ):
+        """One batch pass producing staged_meta and commit specs together.
+
+        Content-identical to `_dflash_staged_meta` + `_dflash_commit_specs`
+        run back to back; the verify park is the only hot caller.
+        """
+
+        active = []
+        staged_meta = []
+        specs = []
+        next_round = self._next_round
+        committed = self._draft_committed_len
+        kv_handles = self._draft_kv_handle_by_request
+        verify_transfers = self._verify_transfer_by_request
+        for index, req in enumerate(batch.reqs):
+            count = int(counts[index])
+            if req.finished() or req.is_retracted or count <= 0:
+                continue
+            offset = int(feature_offsets[index])
+            round_id = next_round.get(req.rid, 0)
+            previous_committed = committed.get(req.rid)
+            attempt = self._ensure_lifecycle_attempt(req.rid)
+            if round_id == 0:
+                if offset != 0 or previous_committed is not None:
+                    raise RuntimeError("DFLASH bootstrap must begin at offset zero")
+                draft_kv_handle = f"{self.instance_id}:{req.rid}:" + str(attempt)
+            else:
+                draft_kv_handle = kv_handles.get(req.rid)
+                if draft_kv_handle is None or previous_committed != offset:
+                    raise RuntimeError(
+                        "DFLASH feature range has a committed-prefix gap"
+                    )
+            active.append(index)
+            staged_meta.append((index, req, offset, round_id, attempt, draft_kv_handle))
+            specs.append(
+                (
+                    req.rid,
+                    f"{self.instance_id}:{req.rid}:{round_id}:{attempt}",
+                    round_id,
+                    attempt,
+                    draft_kv_handle,
+                    offset,
+                    count,
+                    (),
+                    (),
+                    verify_transfers.get(req.rid),
+                    int(bonus_values[index]),
+                    int(seq_len_values[index]),
+                )
+            )
+        return active, staged_meta, specs
+
+    def _dflash_staged_meta(self, batch, feature_offsets, counts):
+        """Active indices and per-request staging scalars, with the Python
+        publication path's round/offset fences, derived identically on every
+        rank from local batch state and ledger dicts."""
+
+        active = [
+            index
+            for index, req in enumerate(batch.reqs)
+            if not req.finished() and not req.is_retracted and counts[index] > 0
+        ]
+        staged_meta = []
+        for index in active:
+            req = batch.reqs[index]
+            offset = int(feature_offsets[index])
+            round_id = self._next_round.get(req.rid, 0)
+            previous_committed = self._draft_committed_len.get(req.rid)
+            attempt = self._ensure_lifecycle_attempt(req.rid)
+            if round_id == 0:
+                if offset != 0 or previous_committed is not None:
+                    raise RuntimeError("DFLASH bootstrap must begin at offset zero")
+                draft_kv_handle = f"{self.instance_id}:{req.rid}:" + str(attempt)
+            else:
+                draft_kv_handle = self._draft_kv_handle_by_request.get(req.rid)
+                if draft_kv_handle is None or previous_committed != offset:
+                    raise RuntimeError(
+                        "DFLASH feature range has a committed-prefix gap"
+                    )
+            staged_meta.append((index, req, offset, round_id, attempt, draft_kv_handle))
+        return active, staged_meta
+
+    def _dflash_commit_specs(
+        self, staged_meta, accept_values, bonus_values, seq_len_values
+    ) -> list:
+        """The 12-field commit specs (empty token-id tuples on all ranks)."""
+
+        return [
+            (
+                req.rid,
+                f"{self.instance_id}:{req.rid}:{round_id}:{attempt}",
+                round_id,
+                attempt,
+                draft_kv_handle,
+                offset,
+                int(accept_values[index]),
+                (),
+                (),
+                self._verify_transfer_by_request.get(req.rid),
+                int(bonus_values[index]),
+                int(seq_len_values[index]),
+            )
+            for index, req, offset, round_id, attempt, draft_kv_handle in staged_meta
+        ]
+
+    def _ring_publish_publisher(self, draft_session_id: str):
+        """Return the GPU publish channel for one serving owner ring, or None."""
+
+        if not getattr(self, "_ring_publish", False):
+            return None
+        publisher = getattr(self, "_ring_publishers", {}).get(draft_session_id)
+        if publisher is not None:
+            return publisher
+        writer = self._direct_ring_writer(draft_session_id)
+        pool = self._feature_source_pool
+        if writer is None or pool is None:
+            return None
+        from sglang.srt.speculative.dt_direct_ring import RingGpuPublisher
+
+        publisher = RingGpuPublisher(
+            writer,
+            runtime=pool._runtime,
+            device=pool._storage.get_device(),
+            max_batch_slots=int(self.scheduler.max_running_requests),
+            block_size=self.block_size,
+            row_bytes=self.pivot_width * 2,
+        )
+        writers = getattr(self, "_ring_publishers", None)
+        if writers is None:
+            writers = self._ring_publishers = {}
+        writers[draft_session_id] = publisher
+        return publisher
+
+    def _stage_dflash_ring_publish(
+        self,
+        batch: ScheduleBatch,
+        batch_result,
+        draft_input: DFlashDraftInputV2,
+        feature_chunks,
+        token_chunks,
+        *,
+        deferred: bool,
+        staged_meta,
+        accept_values,
+        bonus_values,
+        seq_len_values,
+        commit_specs,
+    ):
+        """Publish one verify wave as a kernel-written ring record (§7.1).
+
+        Returns True when the wave went out on the ring, or None when the
+        wave is ineligible and the caller must fall back to the Python
+        publication path.  Scalars and fences are precomputed by the caller's
+        shared derivation (identical on every rank).  The heavy bookkeeping
+        (descriptors, Coordinator confirmation tasks, ledger updates) is
+        deferred to _ring_publish_cleanup, which rebuilds the per-request
+        token data from the ring record itself without a GPU sync.
+        """
+
+        from sglang.srt.speculative.dt_direct_ring import V2_MAX_REQ, V2_MAX_TOK
+
+        pool = self._feature_source_pool
+        if (
+            pool is None
+            or self._ledger is None
+            or not self.is_persistent
+            or self.candidate_transport != "cuda-ipc"
+            or not self._direct_ring
+            or not getattr(self, "_ring_publish", False)
+            or not staged_meta
+            or len(staged_meta) > V2_MAX_REQ
+        ):
+            return None
+        active = [index for index, *_ in staged_meta]
+        counts = accept_values
+        publish_started_ns = time.monotonic_ns()
+        _marks = []
+        _mark_last = publish_started_ns
+
+        def _mark(name):
+            nonlocal _mark_last
+            now_ns = time.monotonic_ns()
+            _marks.append((name, now_ns - _mark_last))
+            _mark_last = now_ns
+
+        packed = None
+        candidates_gpu = None
+        if deferred:
+            candidates_gpu = getattr(batch_result, "dt_dflash_candidate_tokens", None)
+            packed = getattr(batch_result, "dt_dflash_packed_hidden", None)
+            if (
+                candidates_gpu is None
+                or not candidates_gpu.is_cuda
+                or not candidates_gpu.is_contiguous()
+                or packed is None
+                or not packed.is_cuda
+                or int(packed.shape[0]) != len(batch.reqs) * self.block_size
+            ):
+                return None
+        elif feature_chunks is None:
+            return None
+        # Eligibility is evaluated at park time: the in-flight/binding state
+        # it reads only settles once the previous wave's park has run, so it
+        # cannot be precomputed at the deferred stage.  Eligibility and the
+        # staging entries are built in ONE batch pass; ineligible waves
+        # discard the half-built entries.
+        entries = []
+        session_id = None
+        publisher = None
+        chunked_req = getattr(batch, "chunked_req", None)
+        candidates_base = (
+            int(candidates_gpu.data_ptr()) if deferred else 0
+        )
+        for index, req, _offset, round_id, attempt, _handle in staged_meta:
+            binding = self._draft_binding.get(req.rid)
+            if binding is None:
+                # Round-0/bootstrap rounds have no owner lease yet; Python path.
+                return None
+            if session_id is None:
+                session_id = binding[1]
+                publisher = self._ring_publish_publisher(session_id)
+                if publisher is None:
+                    return None
+            elif binding[1] != session_id:
+                # One ring record describes one wave to one owner Draft session.
+                return None
+            if (
+                req is chunked_req
+                or getattr(req, "inflight_middle_chunks", 0) > 0
+                or self._target_inflight_count(req.rid) != 0
+            ):
+                # Only proposal-boundary waves are reconstructible Draft-side:
+                # the record carries no requires_proposal bit.
+                return None
+            if not deferred and (
+                int(token_chunks[index].numel()) != counts[index]
+                or int(feature_chunks[index].shape[0]) != counts[index]
+            ):
+                raise RuntimeError("DFLASH Target feature/token chunk shape mismatch")
+            if deferred:
+                token_src = candidates_base + (
+                    index * self.block_size * candidates_gpu.element_size()
+                )
+            else:
+                token_src = int(token_chunks[index].data_ptr())
+            entries.append(
+                (
+                    publisher.rid_hash_for(req.rid),
+                    round_id,
+                    attempt,
+                    binding[2],
+                    token_src,
+                )
+            )
+
+        row_count = int(counts[active].sum())
+        token_total = row_count
+        if row_count > V2_MAX_TOK or publisher.free_entries() <= 0:
+            return None
+        if (
+            deferred
+            and packed.data_ptr() in self._inplace_hidden
+            and int(packed.shape[0]) * self.pivot_width * 2
+            > publisher.writer.max_entry_bytes
+        ):
+            # The whole packed wave exceeds the Draft landing buffer.
+            return None
+        # Resolve the slot layout and make the wave's rows visible: either an
+        # in-place reservation from the forward (rows already in the slot,
+        # block-strided feature offsets) or a fresh reserve plus one pack
+        # copy (compacted layout).
+        _mark("eligibility")
+        offset_stride = 0
+        ready_event = None
+        if deferred:
+            reservation = self._inplace_hidden.pop(packed.data_ptr(), None)
+        else:
+            reservation = None
+        if reservation is not None:
+            slot_id, generation, ready_event = reservation
+            offset_stride = self.block_size
+            row_count = int(packed.shape[0])
+        else:
+            fresh = pool.reserve(row_count)
+            if fresh is None:
+                return None
+            slot_id, generation, rows = fresh
+            try:
+                if deferred:
+                    block = self.block_size
+                    torch.cat(
+                        [
+                            packed[index * block : index * block + counts[index]]
+                            for index in active
+                        ],
+                        dim=0,
+                        out=rows,
+                    )
+                else:
+                    torch.cat(
+                        [feature_chunks[index] for index in active], dim=0, out=rows
+                    )
+                events = getattr(self, "_slot_ready_events", None)
+                if events is None:
+                    events = self._slot_ready_events = {}
+                ready_event = events.get(slot_id)
+                if ready_event is None:
+                    ready_event = events[slot_id] = torch.cuda.Event(interprocess=True)
+                ready_event.record()
+            except Exception:
+                pool.release_reserved(slot_id, generation)
+                raise
+        _mark("reserve_pack")
+        published_wave = False
+        try:
+            event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
+            if event_handle is None:
+                event_handle = ready_event.ipc_handle()
+                self._slot_event_handles[slot_id] = event_handle
+            # Same WAR edge as the Python publication: a later graph replay on
+            # the forward stream may not overwrite the rows before the pull.
+            self.scheduler.forward_stream.wait_event(ready_event)
+            _mark("handle_war")
+            publisher.stage_requests(entries)
+            _mark("entries")
+            source_byte_offset = (
+                pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
+            )
+            # The kernel reads the per-slot accept counts straight from the
+            # verify's GPU tensor (same int32 layout as the staged copy); the
+            # CPU-staged counts buffer is only a fallback for CPU-side
+            # accept_lens, and the kernel_done edge below covers the read.
+            accept_lens_gpu = getattr(batch_result, "accept_lens", None)
+            if accept_lens_gpu is not None and accept_lens_gpu.is_cuda:
+                accept_dev = int(accept_lens_gpu.data_ptr())
+            else:
+                publisher.stage_counts(counts)
+                accept_dev = publisher.counts_dev
+            stream_ptr = getattr(self, "_ring_publish_stream_ptr", None)
+            if stream_ptr is None:
+                stream_ptr = self._ring_publish_stream_ptr = (
+                    torch.cuda.current_stream().cuda_stream
+                )
+            wave_seq = publisher.publish(
+                stream=stream_ptr,
+                active_slots=[index for index, *_ in staged_meta],
+                slot_id=slot_id,
+                generation=generation,
+                source_byte_offset=source_byte_offset,
+                nbytes=row_count * self.pivot_width * 2,
+                row_count=row_count,
+                event_handle=event_handle,
+                accept_dev=accept_dev,
+                bonus_dev=int(draft_input.bonus_tokens.data_ptr()),
+                seq_lens_dev=int(draft_input.new_seq_lens.data_ptr()),
+                offset_stride=offset_stride,
+                token_total=token_total,
+            )
+            published_wave = True
+            # The kernel also reads the verify's GPU scalars and candidate
+            # tokens; hold the next graph replay off those buffers until it
+            # has run (the ready_event edge above only covers the pack).  One
+            # event per controller: each park's record tightens the edge the
+            # next replay waits on, so reuse cannot weaken the ordering.
+            kernel_done = getattr(self, "_ring_publish_done_event", None)
+            if kernel_done is None:
+                kernel_done = self._ring_publish_done_event = torch.cuda.Event()
+            kernel_done.record()
+            self.scheduler.forward_stream.wait_event(kernel_done)
+            _mark("stage_launch")
+        except Exception as exc:
+            if published_wave:
+                # The record may already be on the ring: the slot must never
+                # recycle, the producer event must stay alive for the Draft's
+                # wait, and the wave must fail closed rather than re-publish.
+                pool.quarantine_reserved(slot_id, generation)
+                orphaned = getattr(self, "_ring_publish_orphaned_events", None)
+                if orphaned is None:
+                    orphaned = self._ring_publish_orphaned_events = deque(maxlen=1024)
+                orphaned.append(ready_event)
+                raise RingPublishCommittedError(str(exc)) from exc
+            pool.release_reserved(slot_id, generation)
+            raise
+
+        specs = tuple(commit_specs)
+        wave = RingPublishWave(
+            session_id=session_id,
+            wave_seq=wave_seq,
+            slot_id=slot_id,
+            generation=generation,
+            row_count=row_count,
+            ready_event=ready_event,
+            specs=specs,
+            reqs={req.rid: req for req in batch.reqs},
+            active_slots=tuple(index for index, *_ in staged_meta),
+            proposals={},
+        )
+        self._ring_publish_pending.append(wave)
+        _mark("wave_build")
+        batch_result.dt_ring_publish_wave = wave
+        batch_result.dt_ring_publish_breakdown = tuple(_marks)
+        batch_result.dt_dflash_feature_publish_ns = (
+            time.monotonic_ns() - publish_started_ns
+        )
+        batch_result.dt_dflash_feature_publish_strategy = "ring-publish"
+        batch_result.dt_dflash_feature_publish_chunks = 0
+        batch_result.dt_dflash_published_descriptor_count = len(specs)
+        batch_result.dt_dflash_published_feature_rows = row_count
+        batch_result.dt_dflash_published_feature_bytes = (
+            row_count * self.pivot_width * 2
+        )
+        return True
+
+    def _ring_publish_cleanup(self) -> None:
+        """Build Coordinator confirmation tasks for kernel-published waves.
+
+        Runs from _poll_export_rank, off the park critical path.  A wave is
+        processed once its record's seq word is visible in the Target's own
+        ring mapping (the kernel has landed), so no GPU sync is needed; the
+        per-request token ids are read back from the record itself.
+        """
+
+        import struct as _struct
+
+        from msgspec.structs import replace
+
+        from sglang.srt.speculative.dt_direct_ring import (
+            ENTRY_BYTES,
+            V2_HEADER_BYTES,
+            V2_MAX_TOK,
+            V2_REQ_ENTRY_BYTES,
+            V2_TOKEN_OFFSET,
+        )
+        from sglang.srt.speculative.dt_feature_p2p import FeatureTransferSlice
+
+        pool = self._feature_source_pool
+        retained = deque()
+        for wave in self._ring_publish_pending:
+            writer = self._ring_writers.get(wave.session_id)
+            if writer is None:
+                # The owner lease was revoked; the fence machinery retires the
+                # wave's rounds and the slot via the quarantine path.
+                self._feature_source_pool.quarantine_reserved(
+                    wave.slot_id, wave.generation
+                )
+                continue
+            base = (
+                writer._ring.entries_offset
+                + (wave.wave_seq % writer.capacity) * ENTRY_BYTES
+            )
+            raw = writer._ring.raw
+            if _struct.unpack_from("<Q", raw, base)[0] != wave.wave_seq:
+                retained.append(wave)  # kernel has not landed yet; next poll
+                continue
+            row_count = _struct.unpack_from("<I", raw, base + 48)[0]
+            request_count = _struct.unpack_from("<I", raw, base + 56)[0]
+            record_reqs = [
+                _struct.unpack_from(
+                    "<Q6I", raw, base + V2_HEADER_BYTES + i * V2_REQ_ENTRY_BYTES
+                )
+                for i in range(request_count)
+            ]
+            record_counts = [rec[4] for rec in record_reqs]
+            token_total = sum(record_counts)
+            # Feature row offsets come from the record (block-strided for
+            # in-place waves); token ids sit at compacted prefix positions.
+            row_offsets = [rec[3] for rec in record_reqs]
+            tokens = _struct.unpack_from(
+                f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
+            )
+            hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+            specs = wave.specs
+            if (
+                request_count != len(specs)
+                or row_count != wave.row_count
+                or token_total > V2_MAX_TOK
+            ):
+                raise RuntimeError("ring publish record geometry diverged")
+            # Reserve each live request's arena destination now and publish
+            # it in the ring: the owning Draft's candidate push reads it from
+            # the destination region instead of waiting for this cleanup's
+            # Coordinator copy to arrive.
+            live_positions = [
+                position
+                for position, spec in enumerate(specs)
+                if spec[1] not in self._cancelled_transfers
+            ]
+            live_set = set(live_positions)
+            destinations = {}
+            if self._candidate_arena is not None and live_positions:
+                try:
+                    for position in live_positions:
+                        transfer_id = specs[position][1]
+                        destinations[transfer_id] = self._candidate_arena.reserve(
+                            transfer_id
+                        )
+                except Exception:
+                    for transfer_id in destinations:
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    raise
+                writer.write_destinations(
+                    wave.wave_seq,
+                    [
+                        (
+                            (
+                                destinations[spec[1]].slot_id,
+                                destinations[spec[1]].generation,
+                                destinations[spec[1]].authorization_nonce,
+                            )
+                            if position in live_set
+                            else (0, 0, 0)
+                        )
+                        for position, spec in enumerate(specs)
+                    ],
+                    data_buffer_offset=(
+                        self._candidate_arena._data_buffer.allocation_offset
+                    ),
+                    metadata_buffer_offset=(
+                        self._candidate_arena._metadata_buffer.allocation_offset
+                    ),
+                )
+            published = pool.publish_reserved(
+                slot_id=wave.slot_id,
+                generation=wave.generation,
+                token_count=wave.row_count,
+                feature_schema_id=self.feature_schema_id,
+                transfers=tuple(
+                    FeatureTransferSlice(
+                        transfer_id=spec[1],
+                        row_offset=row_offset,
+                        row_count=spec[6],
+                    )
+                    for spec, row_offset in zip(specs, row_offsets, strict=True)
+                ),
+                producer_event=wave.ready_event,
+                hidden_produced_ns=hidden_produced_ns,
+            )
+            descriptors_by_transfer = {
+                descriptor.transfer_id: descriptor
+                for descriptor in published.descriptors
+            }
+            for spec in specs:
+                self._source_slot_by_transfer[spec[1]] = (
+                    wave.slot_id,
+                    wave.generation,
+                )
+            tasks = []
+            token_cursor = 0
+            for index, spec in enumerate(specs):
+                transfer_id = spec[1]
+                count = spec[6]
+                token_ids = tuple(tokens[token_cursor : token_cursor + count])
+                token_cursor += count
+                if int(record_counts[index]) != count:
+                    raise RuntimeError("ring publish record token counts diverged")
+                if transfer_id in self._cancelled_transfers:
+                    pool.cancel(
+                        transfer_id=transfer_id,
+                        source_slot_id=wave.slot_id,
+                        slot_generation=wave.generation,
+                        source_session_id=pool.source_session_id,
+                        pool_generation=pool.pool_generation,
+                    )
+                    self._source_slot_by_transfer.pop(transfer_id, None)
+                    destination = destinations.get(transfer_id)
+                    if destination is not None:
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    continue
+                requires_proposal, previous_transfer_id = wave.proposals.get(
+                    transfer_id, (True, spec[9])
+                )
+                task = self._make_task(
+                    transfer_id=transfer_id,
+                    req=wave.reqs[spec[0]],
+                    round_id=spec[2],
+                    attempt=spec[3],
+                    bonus_token=spec[10],
+                    previous_transfer_id=previous_transfer_id,
+                    feature_descriptor=descriptors_by_transfer[transfer_id],
+                    feature_token_ids=token_ids,
+                    committed_token_ids=token_ids,
+                    feature_token_offset=spec[5],
+                    requires_proposal=requires_proposal,
+                )
+                # Pre-stamped: the record is already on the ring, so the
+                # planner only authorizes the owner lease (no second write).
+                tasks.append(
+                    replace(
+                        task,
+                        direct_ring_seq=wave.wave_seq,
+                        candidate_destination=destinations.get(transfer_id),
+                    )
+                )
+                self._ring_publish_transfers.add(transfer_id)
+                self._ring_unproven[transfer_id] = wave.session_id
+                binding = self._draft_binding.get(spec[0])
+                if binding is not None:
+                    self._lease_marks.append((transfer_id, binding[0]))
+                self._direct_sent.add(transfer_id)
+                self._ring_outstanding[wave.session_id].append(
+                    (wave.wave_seq, transfer_id, (wave.slot_id, wave.generation))
+                )
+            if tasks:
+                self._queue_task_batch(tuple(tasks))
+                self._flush_pending_send()
+            if self._profile_active:
+                self._profile_emit(
+                    "target_ring_publish",
+                    ring_seq=wave.wave_seq,
+                    draft_session_id=wave.session_id,
+                    publication_strategy="ring-publish",
+                    publication_rows=wave.row_count,
+                    publication_requests=len(specs),
+                    publication_bytes=wave.row_count * self.pivot_width * 2,
+                )
+        self._ring_publish_pending = retained
+
     def _direct_ring_writer(self, draft_session_id: str):
         """Return the serving ring to one owner Draft session, or None."""
 
@@ -5731,6 +6676,9 @@ class DTTargetController:
                     allocation_length=allocation.length,
                     pool_generation=pool.pool_generation,
                     source_session_id=pool.source_session_id,
+                    slot_nbytes=pool._slot_nbytes,
+                    slot_count=pool.slot_count,
+                    allocation_offset=pool._buffer.allocation_offset,
                 )
                 writer.source_ipc_handle = allocation.ipc_handle
             else:
@@ -5765,6 +6713,35 @@ class DTTargetController:
         plan = []
         stamped = []
         for task in tasks:
+            if task.direct_ring_seq and task.transfer_id in getattr(
+                self, "_ring_publish_transfers", ()
+            ):
+                # Kernel-published wave: the record is already on the ring,
+                # so this Coordinator copy is confirmation-only and must not
+                # be planned for a second ring write.  The owner lease still
+                # needs its push authorization.
+                self._ring_publish_transfers.discard(task.transfer_id)
+                rp_binding = self._draft_binding.get(task.request_id)
+                if rp_binding is not None and task.candidate_destination is not None:
+                    try:
+                        self._candidate_arena.authorize(
+                            DraftAssignment(
+                                transfer_id=task.transfer_id,
+                                draft_instance_id=rp_binding[0],
+                                draft_session_id=rp_binding[1],
+                                authorization_nonce=(
+                                    task.candidate_destination.authorization_nonce
+                                ),
+                                owner_epoch=rp_binding[2],
+                            )
+                        )
+                    except CandidateTransportError:
+                        logger.warning(
+                            "owner lease cannot authorize %s; confirmation only",
+                            task.transfer_id,
+                        )
+                stamped.append(task)
+                continue
             binding = self._draft_binding.get(task.request_id)
             writer = None
             if (
@@ -5863,6 +6840,31 @@ class DTTargetController:
                     written_ns=written_ns,
                 )
 
+    def _feature_source_pool_diagnostics(self) -> str:
+        """Per-slot lease snapshot appended to park publication failures."""
+
+        pool = self._feature_source_pool
+        if pool is None:
+            return ""
+        try:
+            parts = []
+            for slot_id, slot in enumerate(pool._slots):
+                if str(slot.state) == "FeatureSlotState.FREE":
+                    continue
+                active = sorted(getattr(slot, "active_transfers", None) or ())
+                parts.append(
+                    f"slot={slot_id} state={slot.state} gen={slot.generation}"
+                    f" active={len(active)} {active[:4]}"
+                )
+            outstanding = {
+                session: [seq for seq, _tid, _pull in deque_][:4]
+                for session, deque_ in self._ring_outstanding.items()
+                if deque_
+            }
+            return f" | pool[{'; '.join(parts)}] ring_heads={outstanding}"
+        except Exception:
+            return " | pool diagnostics unavailable"
+
     def _poll_direct_ring_reads(self) -> None:
         """Retire source leases on the Draft worker's GPU-written read proof.
 
@@ -5873,12 +6875,33 @@ class DTTargetController:
         """
 
         pool = self._feature_source_pool
+        blocked_since = getattr(self, "_ring_read_blocked_since", None)
+        if blocked_since is None:
+            blocked_since = self._ring_read_blocked_since = {}
+        now_ns = time.monotonic_ns()
         for draft_session_id, outstanding in self._ring_outstanding.items():
             writer = self._ring_writers[draft_session_id]
             while outstanding:
                 seq, transfer_id, pull = outstanding[0]
                 if not writer.read_proven(seq):
+                    blocked_since.setdefault(draft_session_id, now_ns)
+                    if now_ns - blocked_since[draft_session_id] > 1_000_000_000:
+                        if now_ns - getattr(
+                            self, "_ring_read_stall_emit_ns", 0
+                        ) > 5_000_000_000:
+                            self._ring_read_stall_emit_ns = now_ns
+                            self._profile_emit(
+                                "target_ring_read_stall",
+                                draft_session_id=draft_session_id,
+                                head_seq=seq,
+                                writer_next_seq=writer.next_seq,
+                                ready_word=int(writer._ring.ready[seq % writer.capacity]),
+                                outstanding=len(outstanding),
+                                blocked_ms=(now_ns - blocked_since[draft_session_id])
+                                // 1_000_000,
+                            )
                     break
+                blocked_since.pop(draft_session_id, None)
                 outstanding.popleft()
                 self._ring_unproven.pop(transfer_id, None)
                 if pull is None or pool is None:
@@ -5899,6 +6922,8 @@ class DTTargetController:
                 self._source_slot_by_transfer.pop(transfer_id, None)
                 self._source_deadline_by_transfer.pop(transfer_id, None)
                 self._staged_flashmtp_source_leases.discard(transfer_id)
+            if not outstanding:
+                blocked_since.pop(draft_session_id, None)
 
     def _fence_dead_ring_owners(self) -> None:
         """Revoke a ring owner whose process is gone or whose ring is closed.
@@ -5948,6 +6973,9 @@ class DTTargetController:
         for request_id, binding in tuple(self._draft_binding.items()):
             if binding[1] == draft_session_id:
                 del self._draft_binding[request_id]
+        publisher = getattr(self, "_ring_publishers", {}).pop(draft_session_id, None)
+        if publisher is not None:
+            publisher.close()
         if writer is not None:
             writer.close(unlink=quiescent)
         logger.warning(
@@ -5958,6 +6986,9 @@ class DTTargetController:
         )
 
     def _close_direct_rings(self) -> None:
+        for publisher in getattr(self, "_ring_publishers", {}).values():
+            publisher.close()
+        self._ring_publishers = {}
         for writer in self._ring_writers.values():
             writer.close()
         self._ring_writers.clear()
