@@ -1103,7 +1103,8 @@ def test_dflash_candidate_copy_fence_failure_retains_registered_completion(
     }
     completion = PendingDFlashCompletion(
         pending=[],
-        staging_slot=7,
+        staging_slots=(7,),
+        staging_slot_counts=(0,),
         completion_event=proposal_done,
         materialize_start_event=materialize_start,
         materialize_done_event=materialize_done,
@@ -1275,7 +1276,8 @@ def test_fatal_gpu_quarantine_precedes_fallible_failure_publication(
         )
         completion = PendingEagle3Completion(
             pending=[PendingDraftTask(task=task)],
-            staging_slot=7,
+            staging_slots=(7,),
+            staging_slot_counts=(1,),
             completion_event=completion_event,
             submitted_ns=1,
         )
@@ -1333,7 +1335,8 @@ def test_dflash_completion_query_failure_permanently_quarantines_gpu_work() -> N
     )
     completion = PendingDFlashCompletion(
         pending=[PendingDraftTask(task=task)],
-        staging_slot=9,
+        staging_slots=(9,),
+        staging_slot_counts=(1,),
         completion_event=completion_event,
         materialize_start_event=object(),
         materialize_done_event=object(),

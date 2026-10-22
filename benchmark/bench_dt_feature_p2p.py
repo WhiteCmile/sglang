@@ -465,7 +465,7 @@ def _dflash_launch_liveness_gate(device: torch.device, delay_cycles: int) -> dic
     FlashMTPDraftEngine._launch_dflash_materialization(
         engine,
         pending=[PendingDraftTask(task=task, pivot_bytes=None)],
-        staging_slot=0,
+        staging_slots=(0,),
         row_ranges=((0, rows),),
     )
     launch_return_ns = _now_ns()
@@ -734,7 +734,7 @@ def _dflash_two_batch_liveness_gate(
             FlashMTPDraftEngine._launch_dflash_materialization(
                 engine,
                 pending=[PendingDraftTask(task=tasks[1], pivot_bytes=None)],
-                staging_slot=1,
+                staging_slots=(1,),
                 row_ranges=((0, rows),),
             )
         except RuntimeError as exc:
@@ -1115,7 +1115,7 @@ def _dflash_migration_control_liveness_gate(
         FlashMTPDraftEngine._launch_dflash_materialization(
             engine,
             pending=[PendingDraftTask(task=task, pivot_bytes=None)],
-            staging_slot=0,
+            staging_slots=(0,),
             row_ranges=((0, feature_rows),),
         )
         return engine._pending_dflash_completions[0]

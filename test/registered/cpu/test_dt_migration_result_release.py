@@ -2266,7 +2266,9 @@ def test_eagle3_materialization_event_owns_kv_and_staging_until_complete(
     )
     pending = [SimpleNamespace(task=task)]
 
-    engine._enqueue_eagle3_materialization_completion(pending, 2)
+    engine._enqueue_eagle3_materialization_completion(
+        pending, (2,), staging_slot_counts=(1,)
+    )
     engine._poll_eagle3_completions()
 
     assert events == ["record"]

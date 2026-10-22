@@ -377,7 +377,8 @@ class InputReadyFeature:
 @dataclass(slots=True)
 class PendingDFlashCompletion:
     pending: list[PendingDraftTask]
-    staging_slot: int
+    staging_slots: tuple[int, ...]
+    staging_slot_counts: tuple[int, ...]
     completion_event: torch.cuda.Event
     materialize_start_event: torch.cuda.Event
     materialize_done_event: torch.cuda.Event
@@ -402,7 +403,8 @@ class PendingEagle3Completion:
     """Existing persistent completion owner, shared by EAGLE3 and AR."""
 
     pending: list[PendingDraftTask]
-    staging_slot: int | None
+    staging_slots: tuple[int, ...]
+    staging_slot_counts: tuple[int, ...]
     completion_event: torch.cuda.Event
     submitted_ns: int
     candidates: torch.Tensor | None = None
@@ -4515,7 +4517,7 @@ class FlashMTPDraftEngine:
                 )
 
             self._complete_feature_compute(
-                completion.staging_slot, len(completion.pending)
+                (completion.staging_slot,), (len(completion.pending),)
             )
             capacity_changed = True
 
@@ -4649,15 +4651,22 @@ class FlashMTPDraftEngine:
             return
         self._free_feature_staging_slots.append(staging_slot)
 
-    def _complete_feature_compute(self, staging_slot: int, count: int) -> None:
+    def _complete_feature_compute(
+        self,
+        staging_slots: tuple[int, ...],
+        staging_slot_counts: tuple[int, ...],
+    ) -> None:
         busy = getattr(self, "_feature_staging_compute_busy", None)
-        if busy is None:
+        for staging_slot, count in zip(
+            staging_slots, staging_slot_counts, strict=True
+        ):
+            if busy is not None:
+                if staging_slot not in busy:
+                    raise RuntimeError(
+                        "feature compute completion has no submitted owner"
+                    )
+                busy.remove(staging_slot)
             self._release_feature_staging_entries(staging_slot, count)
-            return
-        if staging_slot not in busy:
-            raise RuntimeError("feature compute completion has no submitted owner")
-        busy.remove(staging_slot)
-        self._release_feature_staging_entries(staging_slot, count)
 
     def _poll_feature_batches(self) -> None:
         """Promote each completed pull independently into INPUT_READY."""
@@ -4881,40 +4890,33 @@ class FlashMTPDraftEngine:
             )
             for item in owner.pending
         }
-        selected_slot = next(
-            (
-                entry.staging_slot
-                for entry in self._input_ready_features
-                if entry.staging_slot not in self._feature_staging_compute_busy
-                and (
-                    not self._persistent
-                    or entry.pending.task.draft_kv_handle not in busy_handles
-                )
-            ),
-            None,
-        )
-        if selected_slot is None:
-            self._profile_input_ready_state(
-                observed_ns=selection_started_ns,
-                waiting_transfer_ids=waiting_before,
-                reason="slot_or_owner_busy",
-                inflight=inflight_before,
-            )
-            return []
         selected = []
         retained = deque()
         proposal_mode = None
         token_count = 0
+        # Persistent compute (DFlash/EAGLE3) merges every non-busy slot into
+        # one batch; FlashMTP keeps the single-slot staging read, so its
+        # selection stays pinned to the first eligible slot.
+        single_slot = None
         now_ns = time.monotonic_ns()
         while self._input_ready_features:
             entry = self._input_ready_features.popleft()
             task = entry.pending.task
-            if entry.staging_slot != selected_slot or len(selected) >= self.max_batch_size:
+            if (
+                entry.staging_slot in self._feature_staging_compute_busy
+                or len(selected) >= self.max_batch_size
+            ):
                 retained.append(entry)
                 continue
             if self._persistent and task.draft_kv_handle in busy_handles:
                 retained.append(entry)
                 continue
+            if not self._persistent:
+                if single_slot is None:
+                    single_slot = entry.staging_slot
+                elif entry.staging_slot != single_slot:
+                    retained.append(entry)
+                    continue
             if task.transfer_id in self._cancelled_ids or now_ns >= task.deadline_ns:
                 cancelled = task.transfer_id in self._cancelled_ids
                 if cancelled:
@@ -4942,7 +4944,17 @@ class FlashMTPDraftEngine:
                 busy_handles.add(task.draft_kv_handle)
         self._input_ready_features = retained
         selection_finished_ns = time.monotonic_ns() if profile_active else 0
-        if profile_active and selected:
+        if not selected:
+            self._profile_input_ready_state(
+                observed_ns=selection_finished_ns,
+                waiting_transfer_ids=tuple(
+                    entry.pending.task.transfer_id for entry in retained
+                ),
+                reason="slot_or_owner_busy",
+                inflight=inflight_before,
+            )
+            return []
+        if profile_active:
             profile_emit(
                 "draft_input_ready_select",
                 draft_instance=self.instance_id,
@@ -4951,7 +4963,9 @@ class FlashMTPDraftEngine:
                 inflight_before=inflight_before,
                 waiting_before=len(waiting_before),
                 waiting_after=len(retained),
-                staging_slot=selected_slot,
+                staging_slots=tuple(
+                    dict.fromkeys(entry.staging_slot for entry in selected)
+                ),
                 rows=tuple(
                     dict(
                         transfer_id=entry.pending.task.transfer_id,
@@ -5003,20 +5017,31 @@ class FlashMTPDraftEngine:
         profile_active = getattr(self, "_profile_active", False)
         submit_started_ns = time.monotonic_ns() if profile_active else 0
         inflight_before = self._draft_compute_batches_inflight()
-        staging_slot = ready[0].staging_slot
-        if any(entry.staging_slot != staging_slot for entry in ready):
-            raise RuntimeError("one compute batch cannot span feature staging slots")
-        if staging_slot in self._feature_staging_compute_busy:
+        entry_slots = tuple(entry.staging_slot for entry in ready)
+        staging_slots = tuple(dict.fromkeys(entry_slots))
+        staging_slot_counts = tuple(
+            entry_slots.count(slot) for slot in staging_slots
+        )
+        if any(
+            slot in self._feature_staging_compute_busy for slot in staging_slots
+        ):
             raise RuntimeError("feature staging slot already has submitted compute")
-        self._feature_staging_compute_busy.add(staging_slot)
-        if 0 <= getattr(self, "_landing_slot_base", -1) <= staging_slot:
-            # New ring arrivals land in another buffer instead of waiting
-            # behind this batch's compute ownership.
-            self._ring_worker.seal(staging_slot - self._landing_slot_base)
+        self._feature_staging_compute_busy.update(staging_slots)
+        landing_slot_base = getattr(self, "_landing_slot_base", -1)
+        for slot in staging_slots:
+            if 0 <= landing_slot_base <= slot:
+                # New ring arrivals land in another buffer instead of waiting
+                # behind this batch's compute ownership.
+                self._ring_worker.seal(slot - landing_slot_base)
         pending = [entry.pending for entry in ready]
         row_ranges = tuple(entry.row_range for entry in ready)
         try:
             if not self._persistent:
+                if len(staging_slots) != 1:
+                    raise RuntimeError(
+                        "one FlashMTP compute batch cannot span feature staging slots"
+                    )
+                staging_slot = staging_slots[0]
                 staging = self._feature_staging_buffers[staging_slot]
                 rows = [staging[start:end] for start, end in row_ranges]
                 if any(int(row.shape[0]) != 1 for row in rows):
@@ -5030,13 +5055,13 @@ class FlashMTPDraftEngine:
             elif self._is_eagle3:
                 self._execute_eagle3_feature_batch(
                     pending=pending,
-                    staging_slot=staging_slot,
+                    staging_slots=entry_slots,
                     row_ranges=row_ranges,
                 )
             else:
                 self._launch_dflash_materialization(
                     pending=pending,
-                    staging_slot=staging_slot,
+                    staging_slots=entry_slots,
                     row_ranges=row_ranges,
                 )
             if profile_active:
@@ -5053,7 +5078,7 @@ class FlashMTPDraftEngine:
                     round_ids=tuple(
                         entry.pending.task.round_id for entry in ready
                     ),
-                    staging_slot=staging_slot,
+                    staging_slots=staging_slots,
                     submitted_started_ns=submit_started_ns,
                     submitted_returned_ns=submit_returned_ns,
                     submit_wall_ns=submit_returned_ns - submit_started_ns,
@@ -5070,8 +5095,11 @@ class FlashMTPDraftEngine:
                     resources_quiescent = False
             tasks = [item.task for item in pending]
             if resources_quiescent:
-                self._feature_staging_compute_busy.discard(staging_slot)
-                self._release_feature_staging_entries(staging_slot, len(pending))
+                for slot, count in zip(
+                    staging_slots, staging_slot_counts, strict=True
+                ):
+                    self._feature_staging_compute_busy.discard(slot)
+                    self._release_feature_staging_entries(slot, count)
                 if self._persistent:
                     for handle in {task.draft_kv_handle for task in tasks}:
                         self._release_persistent_request(handle)
@@ -5089,7 +5117,7 @@ class FlashMTPDraftEngine:
         self,
         *,
         pending: list[PendingDraftTask],
-        staging_slot: int,
+        staging_slots: tuple[int, ...],
         row_ranges: tuple[tuple[int, int], ...],
     ) -> None:
         """Reconcile authoritative Target features, then run remote EAGLE3."""
@@ -5101,6 +5129,10 @@ class FlashMTPDraftEngine:
             raise ValueError("EAGLE3 feature batch must not be empty")
         if len({bool(task.requires_proposal) for task in tasks}) != 1:
             raise RuntimeError("EAGLE3 feature batch mixed proposal boundaries")
+        distinct_slots = tuple(dict.fromkeys(staging_slots))
+        staging_slot_counts = tuple(
+            staging_slots.count(slot) for slot in distinct_slots
+        )
 
         batch_started_ns = time.monotonic_ns()
         states, grouped_reconcile = self._prepare_eagle3_persistent_tasks(tasks)
@@ -5155,16 +5187,26 @@ class FlashMTPDraftEngine:
         # consumer here; do not upload it or let deferred resolution replace
         # the feature-aligned inputs.
         batch.prefill_input_ids_cpu = None
-        staging = self._feature_staging_buffers[staging_slot]
-        staging_view_bounds = _eagle3_feature_staging_view_bounds(
-            requires_proposal=bool(tasks[0].requires_proposal),
-            row_ranges=row_ranges,
-        )
+        staging_view_bounds = None
+        if len(distinct_slots) == 1:
+            # The direct staging view only exists within one slot's buffer;
+            # cross-slot entries always materialize through the concatenation.
+            staging_view_bounds = _eagle3_feature_staging_view_bounds(
+                requires_proposal=bool(tasks[0].requires_proposal),
+                row_ranges=row_ranges,
+            )
         if staging_view_bounds is None:
             target_hidden = torch.cat(
-                [staging[start:end] for start, end in row_ranges], dim=0
+                [
+                    self._feature_staging_buffers[slot][start:end]
+                    for slot, (start, end) in zip(
+                        staging_slots, row_ranges, strict=True
+                    )
+                ],
+                dim=0,
             )
         else:
+            staging = self._feature_staging_buffers[distinct_slots[0]]
             target_hidden = staging[
                 staging_view_bounds[0] : staging_view_bounds[1]
             ]
@@ -5289,7 +5331,9 @@ class FlashMTPDraftEngine:
                     total_ns=batch_finished_ns - batch_started_ns,
                 )
             self._enqueue_eagle3_materialization_completion(
-                pending, staging_slot
+                pending,
+                distinct_slots,
+                staging_slot_counts=staging_slot_counts,
             )
             return
 
@@ -5396,12 +5440,15 @@ class FlashMTPDraftEngine:
                 ),
             )
             self._enqueue_eagle3_materialization_completion(
-                pending, staging_slot, candidates=candidates
+                pending,
+                distinct_slots,
+                staging_slot_counts=staging_slot_counts,
+                candidates=candidates,
             )
             return
         if self.candidate_transport == "cuda-ipc":
             self._publish_successes(tasks, candidates.contiguous())
-            self._complete_feature_compute(staging_slot, len(pending))
+            self._complete_feature_compute(distinct_slots, staging_slot_counts)
             return
         candidate_bytes = candidates.cpu().contiguous().numpy().tobytes()
         candidate_ready_ns = time.monotonic_ns()
@@ -5484,7 +5531,7 @@ class FlashMTPDraftEngine:
                 )
         else:
             self._publish_successes(tasks, candidate_bytes)
-        self._complete_feature_compute(staging_slot, len(pending))
+        self._complete_feature_compute(distinct_slots, staging_slot_counts)
 
     def _fence_eagle3_feature_staging_reads(self) -> None:
         """Fence every consumer before the independent pull stream can overwrite."""
@@ -5501,25 +5548,27 @@ class FlashMTPDraftEngine:
     def _enqueue_eagle3_materialization_completion(
         self,
         pending: list[PendingDraftTask],
-        staging_slot: int | None,
+        staging_slots: tuple[int, ...] | None,
         *,
+        staging_slot_counts: tuple[int, ...] = (),
         candidates: torch.Tensor | None = None,
         result_slot: int | None = None,
     ) -> None:
         """Keep persistent KV and slot buffers owned until GPU/D2H completion.
 
-        EAGLE3 retains its feature slot. AR has no feature staging and instead
+        EAGLE3 retains its feature slots. AR has no feature staging and instead
         reserves a result slot, using the same completion/release machinery.
         """
         host_rows = None
         if candidates is not None and self.candidate_transport == "mmap":
-            buffer_slot = staging_slot if staging_slot is not None else result_slot
+            buffer_slot = staging_slots[0] if staging_slots else result_slot
             if buffer_slot is None:
                 raise RuntimeError("persistent proposal has no bounded buffer slot")
             host_rows = self._candidate_result_host_buffers[buffer_slot][:len(pending)]
         completion = PendingEagle3Completion(
             pending=pending,
-            staging_slot=staging_slot,
+            staging_slots=tuple(staging_slots or ()),
+            staging_slot_counts=staging_slot_counts,
             completion_event=torch.cuda.Event(),
             submitted_ns=time.monotonic_ns(),
             candidates=candidates,
@@ -5680,9 +5729,9 @@ class FlashMTPDraftEngine:
                     submitted_ns=completion.submitted_ns,
                     gpu_completed_ns=completed_ns,
                 )
-            if completion.staging_slot is not None:
+            if completion.staging_slots:
                 self._complete_feature_compute(
-                    completion.staging_slot, len(completion.pending)
+                    completion.staging_slots, completion.staging_slot_counts
                 )
             for handle in {task.draft_kv_handle for task in tasks}:
                 self._drain_deferred_persistent_release(handle)
@@ -5694,7 +5743,7 @@ class FlashMTPDraftEngine:
         self,
         *,
         pending: list[PendingDraftTask],
-        staging_slot: int,
+        staging_slots: tuple[int, ...],
         row_ranges: tuple[tuple[int, int], ...],
     ) -> None:
         if self._pending_dflash_completions and not self.dflash_submit_pipeline:
@@ -5702,6 +5751,14 @@ class FlashMTPDraftEngine:
                 "DFLASH materialization submission must wait for the prior "
                 "completion event"
             )
+        # staging_slots is per entry, parallel to row_ranges.  Temporary H2D
+        # staging (proposal metadata, candidate rows) is indexed by slot; any
+        # slot this batch owns is valid, so use the first.
+        slots_used = tuple(dict.fromkeys(staging_slots))
+        staging_slot_counts = tuple(
+            staging_slots.count(slot) for slot in slots_used
+        )
+        metadata_slot = slots_used[0]
         prior_unfinished_proposal_count = 0
         prior_candidate_copy_pending_count = 0
         for completion in self._pending_dflash_completions:
@@ -5808,13 +5865,18 @@ class FlashMTPDraftEngine:
         else:
             _grouped_cache_locs, packed_cache_locs, positions = grouped_rows
         tasks_prepared_ns = time.monotonic_ns()
-        staging = self._feature_staging_buffers[staging_slot]
-        hidden_rows = [staging[start:end] for start, end in row_ranges]
-        if all(
+        hidden_rows = [
+            self._feature_staging_buffers[slot][start:end]
+            for slot, (start, end) in zip(staging_slots, row_ranges, strict=True)
+        ]
+        if len(slots_used) == 1 and all(
             row_ranges[index][1] == row_ranges[index + 1][0]
             for index in range(len(row_ranges) - 1)
         ):
-            target_hidden = staging[row_ranges[0][0] : row_ranges[-1][1]]
+            # The contiguous-range view only exists within one slot's buffer.
+            target_hidden = self._feature_staging_buffers[slots_used[0]][
+                row_ranges[0][0] : row_ranges[-1][1]
+            ]
         else:
             target_hidden = torch.cat(hidden_rows, dim=0)
         materialize_start = torch.cuda.Event(enable_timing=True)
@@ -5833,13 +5895,13 @@ class FlashMTPDraftEngine:
             # Stage CPU-derived proposal metadata through per-slot pinned host
             # buffers.  The corresponding nonblocking H2D copies may be queued
             # behind a prior proposal without synchronizing the scheduler
-            # thread, and the staging slot owns the buffers until completion.
-            # Committed lengths are already authoritative CPU state, so
-            # seq_lens_cpu never needs a GPU round-trip.
+            # thread, and the batch's slot ownership retains the buffers until
+            # completion.  Committed lengths are already authoritative CPU
+            # state, so seq_lens_cpu never needs a GPU round-trip.
             committed_lens = [state.valid_committed_len for state in proposal_states]
             proposal_count = len(proposal_states)
             req_pool_indices_host = self._proposal_req_pool_indices_host_buffers[
-                staging_slot
+                metadata_slot
             ][:proposal_count]
             req_pool_indices_host.copy_(
                 torch.tensor(
@@ -5849,16 +5911,16 @@ class FlashMTPDraftEngine:
                 )
             )
             proposal_req_pool_indices = self._proposal_req_pool_indices_buffers[
-                staging_slot
+                metadata_slot
             ][:proposal_count]
             proposal_req_pool_indices.copy_(req_pool_indices_host, non_blocking=True)
-            prefix_lens_host = self._proposal_prefix_lens_host_buffers[staging_slot][
+            prefix_lens_host = self._proposal_prefix_lens_host_buffers[metadata_slot][
                 :proposal_count
             ]
             prefix_lens_host.copy_(
                 torch.tensor(committed_lens, dtype=torch.int64, device="cpu")
             )
-            proposal_prefix_lens = self._proposal_prefix_lens_buffers[staging_slot][
+            proposal_prefix_lens = self._proposal_prefix_lens_buffers[metadata_slot][
                 :proposal_count
             ]
             proposal_prefix_lens.copy_(prefix_lens_host, non_blocking=True)
@@ -5867,7 +5929,7 @@ class FlashMTPDraftEngine:
                 dtype=torch.int32,
                 device="cpu",
             )
-            bonus_tokens_host = self._proposal_bonus_tokens_host_buffers[staging_slot][
+            bonus_tokens_host = self._proposal_bonus_tokens_host_buffers[metadata_slot][
                 :proposal_count
             ]
             bonus_tokens_host.copy_(
@@ -5877,7 +5939,7 @@ class FlashMTPDraftEngine:
                     device="cpu",
                 )
             )
-            proposal_bonus_tokens = self._proposal_bonus_tokens_buffers[staging_slot][
+            proposal_bonus_tokens = self._proposal_bonus_tokens_buffers[metadata_slot][
                 :proposal_count
             ]
             proposal_bonus_tokens.copy_(bonus_tokens_host, non_blocking=True)
@@ -5922,12 +5984,13 @@ class FlashMTPDraftEngine:
             copy_stream = self._candidate_result_copy_stream
             if copy_stream is None:
                 raise RuntimeError("DFLASH candidate copy stream is unavailable")
-            candidate_rows_cpu = self._candidate_result_host_buffers[staging_slot][
+            candidate_rows_cpu = self._candidate_result_host_buffers[metadata_slot][
                 : len(proposal_tasks)
             ]
         completion = PendingDFlashCompletion(
             pending=pending,
-            staging_slot=staging_slot,
+            staging_slots=slots_used,
+            staging_slot_counts=staging_slot_counts,
             # The candidate-copy path replaces this with its own event after
             # ownership is registered and before submitting work to that stream.
             completion_event=proposal_done,
@@ -6722,7 +6785,7 @@ class FlashMTPDraftEngine:
                     ]
                 )
             self._complete_feature_compute(
-                completion.staging_slot, len(completion.pending)
+                completion.staging_slots, completion.staging_slot_counts
             )
             for handle in {task.draft_kv_handle for task in tasks}:
                 self._drain_deferred_persistent_release(handle)
