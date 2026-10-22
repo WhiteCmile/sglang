@@ -135,6 +135,7 @@ COALESCING_POLL_S = 0.0001
 # Queue candidate pushes behind the proposal at launch and let the Target
 # observe READY from GPU-written host records (dt_candidate_p2p).
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
+PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "0") == "1"
 DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
 RING_RETIRED_LIMIT = 65536
 # Provisional deadline for a §7.1 ring-record task; its Coordinator
@@ -990,8 +991,9 @@ class FlashMTPDraftEngine:
         # tombstone for the Target-owned generation.
         self._direct_tasks_by_transfer: dict[str, object] = {}
         # Transfers whose candidate push was queued at launch, behind the
-        # proposal on the push stream (DT_GPU_READY_RECORD).  Their completion
-        # handler must not push, expire, or tombstone them again.
+        # proposal on the push stream (DT_GPU_READY_RECORD or
+        # DT_PUSH_COMPLETION_RECORD).  Their completion handler must not push,
+        # expire, or tombstone them again.
         self._early_pushed_ids: set[str] = set()
         # Same-host Target -> Draft descriptor rings (DT_DIRECT_RING); created
         # on the first candidate arena registration.
@@ -2143,13 +2145,15 @@ class FlashMTPDraftEngine:
         """Queue the candidate push behind the proposal at launch time.
 
         The push stream waits on ``ready_event`` on the GPU, then copies the
-        rows into the Target arena and writes metadata and the host READY
-        record.  The Target sees READY without this loop reaching the
-        completion poll; that poll and the push poll still do the Coordinator
-        result, notice, KV and staging retirement.
+        rows into the Target arena and writes metadata and the host READY or
+        completion record.  The Target sees READY without this loop reaching
+        the completion poll; that poll and the push poll still do the
+        Coordinator result, notice, KV and staging retirement.
         """
 
-        if not GPU_READY_RECORD or candidates is None:
+        if not GPU_READY_RECORD and not PUSH_COMPLETION_RECORD:
+            return
+        if candidates is None:
             return
         transport = getattr(self, "_candidate_push_transport", None)
         if self.candidate_transport != "cuda-ipc" or transport is None:
@@ -2162,7 +2166,10 @@ class FlashMTPDraftEngine:
             and task.transfer_id not in self._cancelled_ids
         ]
         selected = [tasks[index] for index in indices]
-        if not selected or not transport.has_ready_records(selected):
+        if not selected or not (
+            transport.has_ready_records(selected)
+            or transport.has_completion_records(selected)
+        ):
             return
         stream = transport.push_stream
         stream.wait_event(ready_event)

@@ -13,6 +13,15 @@ and then the record (generation last) on its push stream, so the Target CPU
 observes READY from host memory without waiting for a Draft-side completion
 poll or the direct notice.  The notice stays as the retirement/fallback path.
 
+With DT_PUSH_COMPLETION_RECORD=1 the Draft instead queues a one-block kernel
+on its push stream after the candidate copy.  The kernel writes a per-slot
+completion record into a second shared file — payload words first, the
+reservation's authorization nonce (the seq word) published last with a
+system-scope release store.  For a negotiated Target the record carries a
+superset of the READY record words, so the legacy READY record writes and
+the ZMQ completion notice are both skipped: the Target observes READY only
+by scanning the completion records from host memory.
+
 Request, assignment, timeout, and retirement policy remain in the existing DT
 controller/router.  This module owns only allocation-relative CUDA transport
 and the local slot lifecycle.
@@ -20,16 +29,21 @@ and the local slot lifecycle.
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
+import hashlib
 import logging
 import mmap
 import os
 import secrets
+import subprocess
 import time
 import uuid
 import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from threading import Lock
 
 import msgspec
@@ -74,6 +88,20 @@ GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
 READY_RECORD_WORDS = 8
 READY_RECORD_BYTES = READY_RECORD_WORDS * 4
 PRODUCER_TAG_WORD = 5
+PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "0") == "1"
+# One 64-byte host completion record per slot: eight u64 words, the seq word
+# published last with a system-scope release store.
+COMPLETION_RECORD_WORDS = 8
+COMPLETION_RECORD_BYTES = COMPLETION_RECORD_WORDS * 8
+COMPLETION_SEQ_WORD = 0
+COMPLETION_META_WORD = 1  # generation (low u32), valid length (high u32)
+COMPLETION_HASH_WORD = 2  # transfer id hash
+COMPLETION_TOKEN_WORD = 3  # root token (low u32), producer tag (high u32)
+COMPLETION_PRODUCED_WORD = 4  # %globaltimer publication timestamp
+COMPLETION_OFFSET_WORD = 5  # producer's globaltimer->realtime offset (0 = none)
+GLOBALTIMER_CALIBRATION_SAMPLES = 64
+# A best-sample round trip above this cannot bound the offset usefully.
+GLOBALTIMER_CALIBRATION_MAX_UNCERTAINTY_NS = 1_000_000
 
 logger = logging.getLogger(__name__)
 
@@ -84,31 +112,46 @@ def producer_tag(draft_session_id: str) -> int:
     return (zlib.crc32(draft_session_id.encode()) & 0x7FFFFFFF) or 1
 
 
-class _ReadyRecordFile:
-    """A /dev/shm mapping of per-slot READY records shared by Target and Draft."""
+def transfer_id_hash(transfer_id: str) -> int:
+    """64-bit hash binding a host completion record to one transfer id."""
 
-    def __init__(self, path: str, *, slot_count: int = 0, create: bool) -> None:
+    return int.from_bytes(
+        hashlib.blake2b(transfer_id.encode(), digest_size=8).digest(), "little"
+    )
+
+
+class _ReadyRecordFile:
+    """A /dev/shm mapping of per-slot records shared by Target and Draft."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        record_bytes: int = READY_RECORD_BYTES,
+        slot_count: int = 0,
+        create: bool,
+    ) -> None:
         if create and slot_count <= 0:
-            raise ValueError("READY record file needs a positive slot count")
+            raise ValueError("record file needs a positive slot count")
         page = mmap.PAGESIZE
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
         fd = os.open(path, flags, 0o600)
         try:
             if create:
-                nbytes = -(-slot_count * READY_RECORD_BYTES // page) * page
+                nbytes = -(-slot_count * record_bytes // page) * page
                 os.ftruncate(fd, nbytes)
             else:
                 nbytes = os.fstat(fd).st_size
-            if nbytes <= 0 or nbytes % READY_RECORD_BYTES:
-                raise CandidateTransportError("READY record file has an invalid size")
+            if nbytes <= 0 or nbytes % record_bytes:
+                raise CandidateTransportError("record file has an invalid size")
             self._mm = mmap.mmap(fd, nbytes)
         finally:
             os.close(fd)
         self.path = path
         self.nbytes = nbytes
-        self.slot_capacity = nbytes // READY_RECORD_BYTES
+        self.slot_capacity = nbytes // record_bytes
         self.words = np.frombuffer(self._mm, dtype=np.uint32).reshape(
-            self.slot_capacity, READY_RECORD_WORDS
+            self.slot_capacity, record_bytes // 4
         )
         self.host_address = int(self.words.ctypes.data)
 
@@ -124,6 +167,162 @@ class _ReadyRecordFile:
                 os.unlink(self.path)
             except FileNotFoundError:
                 pass
+
+
+def _build_push_completion_library() -> Path:
+    source = Path(__file__).with_name("csrc") / "dt_push_completion.cu"
+    text = source.read_bytes()
+    digest = hashlib.sha256(text).hexdigest()[:16]
+    cache = Path(
+        os.environ.get(
+            "DT_PUSH_COMPLETION_BUILD_DIR",
+            Path.home() / ".cache" / "dt-push-completion",
+        )
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+    library = cache / f"dt_push_completion-{digest}.so"
+    if library.exists():
+        return library
+    arch = os.environ.get("DT_PUSH_COMPLETION_ARCH", "sm_90")
+    with open(cache / ".build.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not library.exists():
+            partial = library.with_suffix(f".so.{os.getpid()}")
+            subprocess.run(
+                [
+                    os.environ.get("NVCC", "nvcc"),
+                    "-O2",
+                    "-std=c++17",
+                    "-shared",
+                    "-Xcompiler",
+                    "-fPIC",
+                    f"-arch={arch}",
+                    "-cudart",
+                    "static",
+                    "-o",
+                    str(partial),
+                    str(source),
+                ],
+                check=True,
+            )
+            os.replace(partial, library)
+    return library
+
+
+class _PushCompletionKernel:
+    """ctypes handle for the one-block completion record publication kernel."""
+
+    def __init__(self) -> None:
+        lib = ctypes.CDLL(str(_build_push_completion_library()))
+        lib.dt_push_completion_launch.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.dt_push_completion_launch.restype = ctypes.c_int
+        lib.dt_push_completion_sample_globaltimer.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        lib.dt_push_completion_sample_globaltimer.restype = ctypes.c_int
+        self._lib = lib
+
+    def launch(
+        self,
+        *,
+        device: int,
+        record_address: int,
+        seq: int,
+        generation: int,
+        valid_length: int,
+        record_hash: int,
+        root_token: int,
+        tag: int,
+        globaltimer_offset_ns: int,
+        stream: int,
+    ) -> None:
+        rc = self._lib.dt_push_completion_launch(
+            device,
+            record_address,
+            seq,
+            generation,
+            valid_length,
+            record_hash,
+            root_token,
+            tag,
+            globaltimer_offset_ns,
+            stream,
+        )
+        if rc != 0:
+            raise CandidateTransportError(
+                f"push completion kernel launch failed with cudaError {rc}"
+            )
+
+    def sample_globaltimer(self, *, device: int, address: int, stream: int) -> None:
+        """Store the device %globaltimer into one mapped u64."""
+
+        rc = self._lib.dt_push_completion_sample_globaltimer(
+            device, address, stream
+        )
+        if rc != 0:
+            raise CandidateTransportError(
+                f"globaltimer sample kernel launch failed with cudaError {rc}"
+            )
+
+
+def _calibrate_globaltimer_offset(
+    runtime: CudaIpcRuntime, kernel: _PushCompletionKernel, device_index: int
+) -> int:
+    """Estimate CLOCK_REALTIME minus %globaltimer on the producer's device.
+
+    The completion kernel stamps records with %globaltimer; turning those
+    stamps into delivery latencies needs the offset from the GPU timebase to
+    host realtime, measured on the GPU whose kernel writes the stamps —
+    %globaltimer bases differ across same-host GPUs.  Each sample brackets a
+    one-block kernel with realtime reads; the median offset is the estimate
+    and the best round trip bounds its uncertainty.
+    """
+
+    page = mmap.PAGESIZE
+    sample_map = mmap.mmap(-1, page)
+    try:
+        view = np.frombuffer(sample_map, dtype=np.uint64)
+        device_ptr = 0
+        try:
+            device_ptr = runtime.host_register(int(view.ctypes.data), page)
+            offsets = []
+            best_uncertainty_ns = None
+            for _ in range(GLOBALTIMER_CALIBRATION_SAMPLES):
+                rt1 = time.time_ns()
+                kernel.sample_globaltimer(
+                    device=device_index, address=device_ptr, stream=0
+                )
+                runtime.stream_synchronize(0)
+                rt2 = time.time_ns()
+                offsets.append(((rt1 + rt2) // 2) - int(view[0]))
+                uncertainty = rt2 - rt1
+                if best_uncertainty_ns is None or uncertainty < best_uncertainty_ns:
+                    best_uncertainty_ns = uncertainty
+            if best_uncertainty_ns > GLOBALTIMER_CALIBRATION_MAX_UNCERTAINTY_NS:
+                raise CandidateTransportError(
+                    "globaltimer calibration round trip is too noisy"
+                )
+            return int(np.median(offsets))
+        finally:
+            if device_ptr:
+                runtime.host_unregister(int(view.ctypes.data))
+            # Drop the view before closing the mapping.
+            view = None
+    finally:
+        sample_map.close()
 
 
 class CandidateTransportError(RuntimeError):
@@ -194,6 +393,12 @@ class CandidateCompletion:
     metadata_submitted_ns: int = 0
     metadata_gpu_ns: int = 0
     ready_source: str = "notice"
+    # %globaltimer stamp written by the producer's completion kernel and the
+    # publication->discovery latency derived from it using the record's
+    # producer-stamped globaltimer offset; both 0 on paths that have no
+    # GPU-stamped record (notice, READY record) or an uncalibrated producer.
+    producer_globaltimer_ns: int = 0
+    delivery_ns: int = 0
 
 
 @dataclass(slots=True)
@@ -331,6 +536,13 @@ class TargetCandidateArena:
         )
         self._ready_records: _ReadyRecordFile | None = None
         self.ready_record_path = ""
+        self._completion_records: _ReadyRecordFile | None = None
+        self.completion_record_path = ""
+        if GPU_READY_RECORD or PUSH_COMPLETION_RECORD:
+            # Generation/tag a slot's record must carry to become READY; 0 means
+            # the slot is not waiting for a record (unassigned, done, cancelled).
+            self._record_generation = np.zeros(self.slot_count, dtype=np.uint32)
+            self._record_tag = np.zeros(self.slot_count, dtype=np.uint32)
         if GPU_READY_RECORD:
             self._ready_records = _ReadyRecordFile(
                 f"/dev/shm/dt-ready-{self.transport_session}",
@@ -338,10 +550,36 @@ class TargetCandidateArena:
                 create=True,
             )
             self.ready_record_path = self._ready_records.path
-            # Generation/tag a slot's record must carry to become READY; 0 means
-            # the slot is not waiting for a record (unassigned, done, cancelled).
-            self._record_generation = np.zeros(self.slot_count, dtype=np.uint32)
-            self._record_tag = np.zeros(self.slot_count, dtype=np.uint32)
+        if PUSH_COMPLETION_RECORD:
+            self._completion_records = _ReadyRecordFile(
+                f"/dev/shm/dt-completion-{self.transport_session}",
+                record_bytes=COMPLETION_RECORD_BYTES,
+                slot_count=self.slot_count,
+                create=True,
+            )
+            self.completion_record_path = self._completion_records.path
+            try:
+                # The Draft kernel writes through its own registration of the
+                # same pages; pin this mapping for the symmetric lifecycle.
+                self._runtime.host_register(
+                    self._completion_records.host_address,
+                    self._completion_records.nbytes,
+                )
+            except Exception:
+                self._completion_words = None
+                self.completion_record_path = ""
+                self._completion_records.close(unlink=True)
+                self._completion_records = None
+                raise
+            self._completion_words = self._completion_records.words.view(
+                np.uint64
+            ).reshape(
+                self._completion_records.slot_capacity, COMPLETION_RECORD_WORDS
+            )
+            # Reservation nonce a slot's completion record must carry; 0 means
+            # the slot is not waiting for a record (unassigned, done,
+            # cancelled).
+            self._record_seq_expected = np.zeros(self.slot_count, dtype=np.uint64)
 
     @property
     def free_slot_count(self) -> int:
@@ -384,6 +622,7 @@ class TargetCandidateArena:
             metadata_ipc_handle=metadata_allocation.ipc_handle,
             completion_endpoint=self.completion_endpoint,
             ready_record_path=self.ready_record_path,
+            completion_record_path=self.completion_record_path,
         )
 
     def reserve(self, transfer_id: str):
@@ -434,8 +673,10 @@ class TargetCandidateArena:
             slot.notice_received_ns = 0
             slot.metadata_submitted_ns = 0
             self._active[transfer_id] = slot_id
-            if getattr(self, "_ready_records", None) is not None:
+            if getattr(self, "_record_generation", None) is not None:
                 self._record_generation[slot_id] = 0
+            if getattr(self, "_record_seq_expected", None) is not None:
+                self._record_seq_expected[slot_id] = 0
 
         data_allocation = self._allocations[self._data_buffer.allocation_index]
         metadata_allocation = self._allocations[
@@ -517,15 +758,21 @@ class TargetCandidateArena:
             slot.draft_instance_id = assignment.draft_instance_id
             slot.draft_session_id = assignment.draft_session_id
             if (
-                getattr(self, "_ready_records", None) is not None
-                and slot.state is CandidateSlotState.ARMED
-                and not slot.cancel_pending
+                getattr(self, "_record_generation", None) is not None
+                and (
+                    (slot.state is CandidateSlotState.ARMED and not slot.cancel_pending)
+                    or (PUSH_COMPLETION_RECORD and assignable_cancel)
+                )
                 and not slot.completion_draft_instance_id
             ):
                 # A record is accepted only from the assigned producer, so the
                 # READY identity is the assignment's, as on the notice path.
+                # A cancel-pending slot keeps the expectation so the cancelled
+                # push's completion record can authenticate and retire it.
                 self._record_tag[slot_id] = producer_tag(assignment.draft_session_id)
                 self._record_generation[slot_id] = slot.generation
+                if getattr(self, "_record_seq_expected", None) is not None:
+                    self._record_seq_expected[slot_id] = slot.authorization_nonce
 
     def notify_host_completion(
         self,
@@ -972,6 +1219,7 @@ class TargetCandidateArena:
         if max_queries <= 0:
             raise ValueError("max_queries must be positive")
         self.poll_ready_records()
+        self.poll_completion_records()
         completed: list[CandidateCompletion] = []
         queries = min(max_queries, self.slot_count)
         for offset in range(queries):
@@ -1090,8 +1338,14 @@ class TargetCandidateArena:
             values = [int(value) for value in records.words[slot_id]]
             with self._lock:
                 generation = int(expected[slot_id])
-                expected[slot_id] = 0
                 slot = self._slots[slot_id]
+                if slot.cancel_pending and getattr(
+                    self, "_completion_records", None
+                ) is not None:
+                    # The cancelled push's completion record retires this
+                    # slot; keep the expectation for poll_completion_records.
+                    continue
+                expected[slot_id] = 0
                 if (
                     slot.generation != generation
                     or slot.state is not CandidateSlotState.ARMED
@@ -1142,6 +1396,134 @@ class TargetCandidateArena:
                     slot.draft_session_id,
                 )
             # The direct notice still follows; ACK it as a duplicate.
+            self._remember_notice(key)
+            accepted += 1
+        return accepted
+
+    def poll_completion_records(self) -> int:
+        """Mark assigned ARMED slots READY from GPU-written completion records.
+
+        The Draft push stream queues the candidate copy and then a one-block
+        kernel that writes the record payload words, fences system-wide, and
+        releases the reservation's authorization nonce (the seq word) last,
+        so an observed matching nonce proves every payload word is visible in
+        this arena.  The nonce is unique per reservation, so a stale record
+        from a prior reservation or producer can never match and slot reuse
+        needs no shared-counter reset.  The identity is the assignment's; the
+        generation, transfer id hash and producer tag reject records from any
+        other writer.  For a cancel-pending slot the authenticated record is
+        the cancelled push's quiescence proof — its kernel still publishes
+        the original nonce — and retires the slot directly, replacing the
+        suppressed notice's tombstone readback.  Accepted completions also
+        carry the record's %globaltimer stamp and, when the producer stamped
+        a nonzero globaltimer offset, the publication-to-discovery
+        delivery_ns derived from both; the monotonic observed-chain fields
+        are unaffected.
+        """
+
+        records = getattr(self, "_completion_records", None)
+        if records is None:
+            return 0
+        expected = self._record_generation
+        expected_seq = self._record_seq_expected
+        words = self._completion_words
+        hits = np.flatnonzero(
+            (expected_seq != 0)
+            & (words[: self.slot_count, COMPLETION_SEQ_WORD] == expected_seq)
+            & (
+                (words[: self.slot_count, COMPLETION_META_WORD] & 0xFFFFFFFF)
+                == expected
+            )
+        )
+        if hits.size == 0:
+            return 0
+        observed_ns = time.monotonic_ns()
+        accepted = 0
+        for slot_id in hits.tolist():
+            # The nonce was released last; the payload words cannot be
+            # reordered before it on this CPU, and the GPU released them
+            # beforehand.
+            meta = int(words[slot_id, COMPLETION_META_WORD])
+            record_hash = int(words[slot_id, COMPLETION_HASH_WORD])
+            token = int(words[slot_id, COMPLETION_TOKEN_WORD])
+            produced = int(words[slot_id, COMPLETION_PRODUCED_WORD])
+            record_offset = int(words[slot_id, COMPLETION_OFFSET_WORD])
+            with self._lock:
+                # A record is consumable exactly once: a failed authentication
+                # must not re-raise on every poll.
+                expected_seq[slot_id] = 0
+                generation = int(expected[slot_id])
+                slot = self._slots[slot_id]
+                if slot.generation != generation:
+                    continue
+                if (
+                    meta & 0xFFFFFFFF != generation
+                    or meta >> 32 != self.row_width
+                    or record_hash != transfer_id_hash(slot.transfer_id)
+                    or token >> 32 != int(self._record_tag[slot_id])
+                ):
+                    if slot.cancel_pending:
+                        slot.cancel_pending = False
+                    slot.state = CandidateSlotState.QUARANTINED
+                    raise CandidateTransportError(
+                        "candidate completion record failed generation/authentication"
+                    )
+                if (
+                    slot.state is CandidateSlotState.QUARANTINED
+                    and slot.cancel_pending
+                ):
+                    # Stream-ordered after the candidate copy, the record is
+                    # the cancelled push's quiescence proof; no tombstone
+                    # readback is needed.
+                    self._free_locked(slot_id)
+                    accepted += 1
+                    continue
+                if (
+                    slot.state is not CandidateSlotState.ARMED
+                    or slot.cancel_pending
+                    or slot.completion_draft_instance_id
+                    or not slot.draft_instance_id
+                ):
+                    continue
+                root = token & 0xFFFFFFFF
+                if root & 0x80000000:
+                    root -= 1 << 32
+                slot.completion_draft_instance_id = slot.draft_instance_id
+                slot.completion_draft_session_id = slot.draft_session_id
+                slot.completion = CandidateCompletion(
+                    transfer_id=slot.transfer_id,
+                    slot_id=slot_id,
+                    generation=slot.generation,
+                    authorization_nonce=slot.authorization_nonce,
+                    valid_length=meta >> 32,
+                    root_token=root,
+                    draft_instance_id=slot.draft_instance_id,
+                    draft_session_id=slot.draft_session_id,
+                    observed_ns=observed_ns,
+                    # No notice or readback precedes a record; keep one
+                    # monotonic chain for traces.
+                    notice_queued_ns=observed_ns,
+                    notice_received_ns=observed_ns,
+                    metadata_submitted_ns=observed_ns,
+                    ready_source="completion_record",
+                    producer_globaltimer_ns=produced,
+                    delivery_ns=(
+                        time.time_ns() - (produced + record_offset)
+                        if record_offset
+                        else 0
+                    ),
+                )
+                expected[slot_id] = 0
+                slot.state = CandidateSlotState.READY
+                key = (
+                    slot.transfer_id,
+                    slot_id,
+                    slot.generation,
+                    slot.authorization_nonce,
+                    slot.draft_instance_id,
+                    slot.draft_session_id,
+                )
+            # A straggler notice from a mixed-mode producer ACKs as a duplicate.
             self._remember_notice(key)
             accepted += 1
         return accepted
@@ -1318,6 +1700,15 @@ class TargetCandidateArena:
             # Draft mappings keep the inode alive; only the name goes away.
             self._ready_records.close(unlink=True)
             self._ready_records = None
+        if getattr(self, "_completion_records", None) is not None:
+            self._runtime.host_unregister(self._completion_records.host_address)
+            # Release the numpy view first: a live view fails the mmap close
+            # with BufferError and leaks the mapping.
+            self._completion_words = None
+            self.completion_record_path = ""
+            # Draft mappings keep the inode alive; only the name goes away.
+            self._completion_records.close(unlink=True)
+            self._completion_records = None
         return self.active_count, self.quarantined_slot_count
 
     def _free_locked(self, slot_id: int) -> None:
@@ -1332,8 +1723,10 @@ class TargetCandidateArena:
                 retired.popitem(last=False)
         generation = slot.generation
         self._slots[slot_id] = _CandidateSlot(generation=generation)
-        if getattr(self, "_ready_records", None) is not None:
+        if getattr(self, "_record_generation", None) is not None:
             self._record_generation[slot_id] = 0
+        if getattr(self, "_record_seq_expected", None) is not None:
+            self._record_seq_expected[slot_id] = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1385,6 +1778,14 @@ class DraftCandidatePushTransport:
         # Target READY record mappings: key -> (file, device base address).
         self._ready_records: dict[tuple[str, str, str, str], tuple[_ReadyRecordFile, int]] = {}
         self._producer_tag = producer_tag(draft_session_id)
+        # Target completion record mappings: key -> (file, device base
+        # address), plus the publication kernel.
+        self._completion_records: dict[tuple[str, str, str, str], tuple[_ReadyRecordFile, int]] = {}
+        self._completion_kernel: _PushCompletionKernel | None = None
+        # CLOCK_REALTIME minus this GPU's %globaltimer, calibrated once on
+        # first use; None when uncalibrated (records then carry offset 0).
+        self._globaltimer_offset_ns: int | None = None
+        self._globaltimer_calibrated = False
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
@@ -1482,6 +1883,40 @@ class DraftCandidatePushTransport:
                     records.close(unlink=False)
                     raise
                 self._ready_records[key] = (records, device_base)
+        if (
+            PUSH_COMPLETION_RECORD
+            and getattr(registration, "completion_record_path", "")
+            and key not in getattr(self, "_completion_records", {})
+        ):
+            try:
+                records = _ReadyRecordFile(
+                    registration.completion_record_path,
+                    record_bytes=COMPLETION_RECORD_BYTES,
+                    create=False,
+                )
+            except (OSError, CandidateTransportError):
+                # Not the same host or the file is gone: notice-only completion.
+                logger.warning(
+                    "Target completion record file unavailable, using notices: %s",
+                    registration.completion_record_path,
+                    exc_info=True,
+                )
+            else:
+                device_base = 0
+                try:
+                    device_base = self._runtime.host_register(
+                        records.host_address, records.nbytes
+                    )
+                    kernel = self._completion_kernel
+                    if kernel is None:
+                        kernel = self._completion_kernel = _PushCompletionKernel()
+                except Exception:
+                    if device_base:
+                        self._runtime.host_unregister(records.host_address)
+                    records.close(unlink=False)
+                    raise
+                self._completion_records[key] = (records, device_base)
+                self._ensure_globaltimer_offset()
 
     def has_ready_records(self, tasks: list[object]) -> bool:
         """Whether every task's Target arena accepts GPU-written READY records."""
@@ -1490,6 +1925,66 @@ class DraftCandidatePushTransport:
         return bool(tasks and records) and all(
             self._registration_key(task.candidate_destination) in records
             for task in tasks
+        )
+
+    def has_completion_records(self, tasks: list[object]) -> bool:
+        """Whether every task's Target arena accepts GPU-written completion records."""
+
+        records = getattr(self, "_completion_records", None)
+        return bool(tasks and records) and all(
+            self._registration_key(task.candidate_destination) in records
+            for task in tasks
+        )
+
+    def _ensure_globaltimer_offset(self) -> None:
+        """Calibrate this GPU's globaltimer offset exactly once, best effort.
+
+        The completion kernel stamps records on this device, so the offset
+        must come from this device: %globaltimer bases differ across
+        same-host GPUs.  Failure leaves the offset unset; records then carry
+        0 and the Target leaves delivery_ns at 0.
+        """
+
+        if self._globaltimer_calibrated:
+            return
+        self._globaltimer_calibrated = True
+        try:
+            self._globaltimer_offset_ns = _calibrate_globaltimer_offset(
+                self._runtime, self._completion_kernel, self.device_index
+            )
+        except Exception:
+            logger.warning(
+                "globaltimer calibration failed; completion records carry "
+                "offset 0 and Target delivery_ns stays 0",
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "globaltimer offset %d ns calibrated on device %d",
+                self._globaltimer_offset_ns,
+                self.device_index,
+            )
+
+    def _launch_completion_record(
+        self,
+        *,
+        destination,
+        record_hash: int,
+        root_token: int,
+        record_address: int,
+        stream: int,
+    ) -> None:
+        self._completion_kernel.launch(
+            device=self.device_index,
+            record_address=record_address,
+            seq=int(destination.authorization_nonce),
+            generation=int(destination.generation),
+            valid_length=int(destination.row_width),
+            record_hash=record_hash,
+            root_token=root_token,
+            tag=self._producer_tag,
+            globaltimer_offset_ns=self._globaltimer_offset_ns or 0,
+            stream=stream,
         )
 
     def _mapping(self, destination):
@@ -1529,6 +2024,15 @@ class DraftCandidatePushTransport:
                     "candidate completion references an unregistered arena"
                 )
             registration, _data_base, _metadata_base, socket = mapped
+            if (
+                not cancelled
+                and self._registration_key(destination)
+                in getattr(self, "_completion_records", {})
+            ):
+                # The push stream already published the completion record
+                # after the candidate copy; the Target polls it from host
+                # memory, so no notice is queued or retried.
+                continue
             notice = CandidateCompletionNotice(
                 protocol_version=PROTOCOL_VERSION,
                 target_instance_id=destination.target_instance_id,
@@ -1768,8 +2272,15 @@ class DraftCandidatePushTransport:
                     value=value,
                     stream=stream.cuda_stream,
                 )
-            record = getattr(self, "_ready_records", {}).get(
+            completion = getattr(self, "_completion_records", {}).get(
                 self._registration_key(destination)
+            )
+            record = (
+                None
+                if completion is not None
+                else getattr(self, "_ready_records", {}).get(
+                    self._registration_key(destination)
+                )
             )
             if record is not None:
                 records, device_base = record
@@ -1788,6 +2299,28 @@ class DraftCandidatePushTransport:
                         value=value,
                         stream=stream.cuda_stream,
                     )
+            if completion is not None:
+                records, device_base = completion
+                if destination.slot_id >= records.slot_capacity:
+                    raise CandidateTransportError(
+                        "completion record slot is out of range"
+                    )
+                # The completion record carries a superset of the READY
+                # record words, so the legacy writes above are skipped for
+                # this Target and READY comes only from the kernel.  The
+                # launch is stream-ordered after the copy and metadata: the
+                # kernel releases the reservation's authorization nonce last,
+                # so a Target CPU that observes it also observes the
+                # candidate payload.
+                self._launch_completion_record(
+                    destination=destination,
+                    record_hash=transfer_id_hash(task.transfer_id),
+                    root_token=int(task.next_token_id) & 0xFFFFFFFF,
+                    record_address=(
+                        device_base + destination.slot_id * COMPLETION_RECORD_BYTES
+                    ),
+                    stream=stream.cuda_stream,
+                )
         event = torch.cuda.Event(enable_timing=start_event is not None)
         event.record(stream)
         return CandidatePush(
@@ -1855,6 +2388,11 @@ class DraftCandidatePushTransport:
             self._runtime.host_unregister(records.host_address)
             records.close(unlink=False)
         records_by_key.clear()
+        completion_by_key = getattr(self, "_completion_records", {})
+        for records, _device_base in completion_by_key.values():
+            self._runtime.host_unregister(records.host_address)
+            records.close(unlink=False)
+        completion_by_key.clear()
         self._mapping_cache.close()
         self._registered.clear()
         for socket in self._completion_sockets.values():

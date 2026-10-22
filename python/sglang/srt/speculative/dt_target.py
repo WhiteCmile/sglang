@@ -4955,6 +4955,7 @@ class DTTargetController:
             # Direct Draft completion is intentionally observed before the
             # independent Coordinator retirement channel.
             self._candidate_arena.poll_completion_notices()
+            self._candidate_arena.poll_completion_records()
             if self._ring_outstanding:
                 self._poll_direct_ring_reads()
                 if self._ring_lease:
@@ -5130,6 +5131,10 @@ class DTTargetController:
                         metadata_gpu_ns=completion.metadata_gpu_ns,
                         completion_observed_ns=completion.observed_ns,
                         ready_source=getattr(completion, "ready_source", "notice"),
+                        producer_globaltimer_ns=getattr(
+                            completion, "producer_globaltimer_ns", 0
+                        ),
+                        delivery_ns=getattr(completion, "delivery_ns", 0),
                         export_ledger_ready_ns=export_ledger_ready_ns,
                         target_compute_batches_inflight=self._target_compute_batches_inflight,
                     )

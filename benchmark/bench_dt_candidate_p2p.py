@@ -84,17 +84,18 @@ def _draft_worker(config: dict, commands: mp.Queue, results: mp.Queue) -> None:
                     time.sleep(delay_s)
                 destination = CandidateDestinationRef(**row["destination"])
                 task = _task(row, destination)
-                if command["action"] == "cancel_wave":
-                    push = transport.publish_cancelled([task])
-                else:
-                    candidates = torch.full(
-                        (1, destination.row_width),
-                        int(row["value"]),
-                        dtype=torch.int32,
-                        device=f"cuda:{config['draft_gpu']}",
-                    )
-                    candidates[0, 0] = task.next_token_id
-                    push = transport.submit(tasks=[task], candidates=candidates)
+                with torch.cuda.stream(transport.push_stream):
+                    if command["action"] == "cancel_wave":
+                        push = transport.publish_cancelled([task])
+                    else:
+                        candidates = torch.full(
+                            (1, destination.row_width),
+                            int(row["value"]),
+                            dtype=torch.int32,
+                            device=f"cuda:{config['draft_gpu']}",
+                        )
+                        candidates[0, 0] = task.next_token_id
+                        push = transport.submit(tasks=[task], candidates=candidates)
                 results.put(
                     {
                         "kind": "submitted",
@@ -396,12 +397,32 @@ def main() -> None:
             )
             if authorize_late:
                 deadline_ns = _mono_ns() + int(args.timeout_s * 1_000_000_000)
-                while arena._slots[destination.slot_id].state.value == "armed":
-                    _pump_host_completions(arena, results)
-                    arena.poll()
-                    if _mono_ns() >= deadline_ns:
-                        raise TimeoutError("early candidate completion was not observed")
-                    time.sleep(0)
+                record_words = getattr(arena, "_completion_words", None)
+                if record_words is None:
+                    while arena._slots[destination.slot_id].state.value == "armed":
+                        _pump_host_completions(arena, results)
+                        arena.poll()
+                        if _mono_ns() >= deadline_ns:
+                            raise TimeoutError(
+                                "early candidate completion was not observed"
+                            )
+                        time.sleep(0)
+                else:
+                    # Completion records authenticate against the assignment:
+                    # the expectation is armed by authorize(), so a record
+                    # that beats it is consumed on the first later poll
+                    # instead of parking the slot.  Wait for the producer's
+                    # 64-bit nonce release, then prove nothing is exposed
+                    # before the assignment.
+                    nonce = destination.authorization_nonce
+                    while int(record_words[destination.slot_id, 0]) != nonce:
+                        _pump_host_completions(arena, results)
+                        arena.poll()
+                        if _mono_ns() >= deadline_ns:
+                            raise TimeoutError(
+                                "early completion record was not observed"
+                            )
+                        time.sleep(0)
                 if arena.poll():
                     raise RuntimeError("unassigned candidate completion was exposed")
                 arena.authorize(

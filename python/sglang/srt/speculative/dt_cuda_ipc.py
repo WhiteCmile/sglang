@@ -252,6 +252,13 @@ class CudaIpcRuntime:
         synchronize.restype = ctypes.c_int
         return int(synchronize(ctypes.c_void_p(stream)))
 
+    def stream_synchronize(self, stream: int) -> None:
+        """Block until one CUDA stream drains."""
+
+        self._check_runtime(
+            self._stream_synchronize(stream), "cudaStreamSynchronize"
+        )
+
     def stream_wait_value32(self, *, address: int, value: int, stream: int) -> None:
         """Queue an acquire-style equality wait without blocking the CPU."""
 
