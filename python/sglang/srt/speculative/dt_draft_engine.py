@@ -3598,7 +3598,15 @@ class FlashMTPDraftEngine:
             )
 
     def _expire_unconfirmed_direct(self) -> None:
-        """Drop never-confirmed direct work after its deadline (bounded leak)."""
+        """Fail never-confirmed direct work after its deadline.
+
+        A held result must not outlive its ring task: without the Coordinator
+        confirmation the Target can never apply it, so abandoning the task
+        owes the owning Target an authenticated terminal outcome.  Publish the
+        same failure the ring path already sends for a retired-then-dispatched
+        task.  Where the Coordinator never accepted its copy this failure is
+        stale there, and the Target's own round deadline retires the round.
+        """
         if not self._unconfirmed_direct:
             return
         now_ns = time.monotonic_ns()
@@ -3613,13 +3621,27 @@ class FlashMTPDraftEngine:
             self._held_direct_source_done.pop(transfer_id, None)
             self._pending_ids.discard(transfer_id)
             getattr(self, "_ring_pending_ids", set()).discard(transfer_id)
-            self._direct_tasks_by_transfer.pop(transfer_id, None)
-            if hasattr(self, "_ring_retired"):
-                self._remember_ring_retired(transfer_id, failed=True)
+            task = self._direct_tasks_by_transfer.pop(transfer_id, None)
+            self._ring_record_positions.pop(transfer_id, None)
             logger.warning(
                 "dropping direct Draft task never confirmed by Coordinator: %s",
                 transfer_id,
             )
+            if task is not None:
+                self._publish_failures(
+                    [
+                        (
+                            task,
+                            TimeoutError(
+                                "direct Draft task never confirmed by Coordinator"
+                            ),
+                        )
+                    ]
+                )
+            if hasattr(self, "_ring_retired"):
+                # The drop just reported this transfer; a later Coordinator
+                # copy must not publish a duplicate failure.
+                self._remember_ring_retired(transfer_id, failed=False)
 
     def _accept_dispatch(self, message) -> bool:
         received_ns = time.monotonic_ns()
