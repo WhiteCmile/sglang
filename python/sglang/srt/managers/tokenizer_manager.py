@@ -119,6 +119,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    ReapTimeoutError,
     configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
@@ -2927,6 +2928,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 os.getpid(),
                 include_parent=False,
                 wait_timeout=SIGTERM_CHILD_REAP_TIMEOUT_S,
+            )
+        except ReapTimeoutError as exc:
+            # Every descendant has already been sent SIGKILL; a survivor here is
+            # stuck in uninterruptible kernel teardown (CUDA context, pinned
+            # memory, NCCL) and exits as soon as the kernel delivers the pending
+            # signal. The supervisor waits for the whole process group to die and
+            # escalates itself if a straggler truly wedges, so self-SIGKILLing
+            # this leader would only corrupt the exit code of an otherwise clean
+            # shutdown. Surface the straggler and keep exiting normally.
+            logger.error(
+                "SGLang child processes were not reaped within %.1fs after "
+                "SIGKILL during graceful shutdown; they remain SIGKILLed and the "
+                "supervisor owns any further escalation: %s",
+                SIGTERM_CHILD_REAP_TIMEOUT_S,
+                exc,
             )
         except Exception:
             logger.exception(

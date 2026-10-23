@@ -2000,6 +2000,15 @@ def _still_holding_resources(procs):
     return alive
 
 
+class ReapTimeoutError(RuntimeError):
+    """A SIGKILLed process was still not reaped when `wait_timeout` expired.
+
+    Raised only after every targeted process has already been sent SIGKILL, so
+    the survivor is stuck in uninterruptible kernel teardown rather than still
+    running userspace code.
+    """
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
@@ -2021,7 +2030,7 @@ def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
             return
         now = time.monotonic()
         if now >= deadline:
-            raise RuntimeError(
+            raise ReapTimeoutError(
                 f"kill_process_tree: {len(alive)} process(es) not reaped within "
                 f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
             )
