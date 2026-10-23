@@ -1,5 +1,6 @@
 import json
 import struct
+import time
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -3697,6 +3698,140 @@ def test_timeout_then_pop_preserves_pending_cancel_payload(is_token_only) -> Non
     )
     if is_token_only:
         assert not controller._cancelled_transfers
+
+
+def test_stranded_parked_round_times_out_without_ledger_entry() -> None:
+    # A round whose Coordinator copy is still queued locally never entered the
+    # ledger; the local round deadline must still fail it terminally.
+    controller = object.__new__(DTTargetController)
+    req = SimpleNamespace(rid="request-0")
+    now_ns = time.monotonic_ns()
+    stranded = ParkedTargetRound(
+        req=req,
+        transfer_id="target-0:request-0:4:0",
+        round_id=4,
+        attempt=0,
+        bonus_token=1,
+        seq_len=2,
+        deadline_ns=now_ns - 1,
+    )
+    waiting = ParkedTargetRound(
+        req=req,
+        transfer_id="target-0:request-0:5:0",
+        round_id=5,
+        attempt=0,
+        bonus_token=1,
+        seq_len=2,
+        deadline_ns=now_ns + 600_000_000_000,
+    )
+    unfenced = ParkedTargetRound(
+        req=req,
+        transfer_id="target-0:request-0:6:0",
+        round_id=6,
+        attempt=0,
+        bonus_token=1,
+        seq_len=2,
+    )
+    controller.instance_id = "target-0"
+    controller.is_feature_backed = True
+    controller.is_token_only = False
+    controller.is_export_rank = True
+    controller._parked = {
+        state.transfer_id: state for state in (stranded, waiting, unfenced)
+    }
+    controller._feature_control_rounds = {}
+    controller._lifecycle_attempt_by_request = {req.rid: 0}
+    controller._cancelled_transfers = set()
+    controller._pending_send = deque()
+    controller._delivery_outbox = RetryOutbox(retry_interval_ns=1)
+    controller._ledger = SimpleNamespace(
+        expired=lambda **_kwargs: (),
+        finish=lambda _transfer_id: pytest.fail(
+            "stranded round was never in the ledger"
+        ),
+        get=lambda _transfer_id: None,
+    )
+    released = []
+    controller._release_draft_request = released.append
+    controller._flush_reliable_outbox = lambda: None
+    dropped = []
+    controller._drop_cancelled_unsent = lambda: dropped.append(
+        set(controller._cancelled_transfers)
+    )
+
+    events = controller._expire_local_rounds()
+
+    assert events == [("failed", stranded.transfer_id, "target_round_timeout")]
+    assert controller._cancelled_transfers == {stranded.transfer_id}
+    assert dropped == [{stranded.transfer_id}]
+    assert released == [req.rid]
+    cancellation = CancelTransfers(
+        protocol_version=PROTOCOL_VERSION,
+        target_instance_id=controller.instance_id,
+        transfer_ids=(stranded.transfer_id,),
+        reason="target_round_timeout",
+    )
+    assert (
+        controller._delivery_outbox.get(
+            CANCEL_TRANSFERS, cancel_transfers_id(cancellation)
+        )
+        == cancellation
+    )
+    assert waiting.failure is None
+    assert unfenced.failure is None
+
+
+def test_unconfirmed_direct_expiry_publishes_failure() -> None:
+    # Abandoning a never-confirmed ring task owes the owning Target a
+    # terminal failure instead of a silent drop.
+    engine = object.__new__(FlashMTPDraftEngine)
+    task = SimpleNamespace(
+        transfer_id="target-0:request-0:3:1",
+        request_id="request-0",
+        round_id=3,
+        attempt=1,
+        target_instance_id="target-0",
+    )
+    engine.instance_id = "draft-0"
+    engine.EntryStatus = EntryStatus
+    engine._unconfirmed_direct = {task.transfer_id: 0}
+    engine._held_direct_results = {task.transfer_id: object()}
+    engine._held_direct_source_done = {task.transfer_id: [object()]}
+    engine._pending_ids = {task.transfer_id}
+    engine._ring_pending_ids = {task.transfer_id}
+    engine._direct_tasks_by_transfer = {task.transfer_id: task}
+    engine._ring_record_positions = {task.transfer_id: (object(), 0)}
+    engine._ring_retired = {}
+    engine._cancelled_ids = set()
+    engine._result_sequence = 0
+    engine._delivery_outbox = RetryOutbox(retry_interval_ns=1)
+    engine._flush_reliable_outbox = lambda: None
+
+    engine._expire_unconfirmed_direct()
+
+    assert not engine._unconfirmed_direct
+    assert not engine._held_direct_results
+    assert not engine._held_direct_source_done
+    assert not engine._pending_ids
+    assert not engine._ring_pending_ids
+    assert not engine._direct_tasks_by_transfer
+    assert not engine._ring_record_positions
+    # The drop reported the transfer: a late Coordinator copy must not
+    # publish a duplicate failure.
+    assert engine._ring_retired[task.transfer_id] is False
+    pending = engine._delivery_outbox.pending()
+    assert len(pending) == 1
+    operation, _batch_id, message = pending[0]
+    assert operation == "result"
+    assert len(message.entries) == 1
+    entry = message.entries[0]
+    assert entry.transfer_id == task.transfer_id
+    assert entry.request_id == "request-0"
+    assert entry.round_id == 3
+    assert entry.attempt == 1
+    assert entry.target_instance_id == "target-0"
+    assert entry.status == EntryStatus.FINAL_ERROR
+    assert entry.error_code == "TimeoutError"
 
 
 def test_dflash_overlap_routes_staged_feature_boundaries_in_fifo_order() -> None:
