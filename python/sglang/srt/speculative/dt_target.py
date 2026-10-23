@@ -233,6 +233,10 @@ class ParkedTargetRound:
     candidate_completion: object | None = None
     failure: str | None = None
     draft_admitted: bool = False
+    # Local round-timeout fence for rounds that have not entered the task
+    # ledger yet (their Coordinator copy is still queued or unbuilt).  Zero
+    # disables the fence; parking sites stamp it with the round deadline.
+    deadline_ns: int = 0
     # Profiling-only provenance. Only the export rank consumes coordinator
     # result batches directly; these fields let its READY event distinguish
     # transport/poll delay from lane assembly without changing the TP payload.
@@ -2675,6 +2679,7 @@ class DTTargetController:
                     bonus_token=bonus_token,
                     seq_len=seq_len,
                     lane_id=lane_ids[active_index],
+                    deadline_ns=self._new_round_deadline_ns(),
                 )
                 parked_reqs.append(req)
 
@@ -2831,6 +2836,7 @@ class DTTargetController:
                     bonus_token=spec.bonus_token,
                     seq_len=spec.seq_len,
                     lane_id=self._lane_for_request(req),
+                    deadline_ns=self._new_round_deadline_ns(),
                 )
                 self._parked[spec.transfer_id] = round_state
                 parked_reqs.append(req)
@@ -2843,6 +2849,7 @@ class DTTargetController:
                     bonus_token=spec.bonus_token,
                     seq_len=spec.seq_len,
                     lane_id=self._lane_for_request(req),
+                    deadline_ns=self._new_round_deadline_ns(),
                 )
             if self.is_export_rank:
                 if staged.ring_publish:
@@ -5393,6 +5400,10 @@ class DTTargetController:
             # otherwise-uncollectable cancellation marker after retirement.
             self._cancelled_transfers.difference_update(transfer_ids)
 
+    def _new_round_deadline_ns(self) -> int:
+        timeout_ns = getattr(self, "round_timeout_ns", 0)
+        return time.monotonic_ns() + timeout_ns if timeout_ns else 0
+
     def _expire_local_rounds(self) -> list[tuple[str, str, object]]:
         from dt_protocol import (
             CANCEL_TRANSFERS,
@@ -5401,8 +5412,25 @@ class DTTargetController:
             cancel_transfers_id,
         )
 
-        expired = self._ledger.expired(now_ns=time.monotonic_ns())
-        if not expired:
+        now_ns = time.monotonic_ns()
+        expired = self._ledger.expired(now_ns=now_ns)
+        # A round whose Coordinator copy is still queued locally (or, for a
+        # kernel-published wave, not even built yet) never entered the ledger,
+        # so the ledger cannot time it out.  Its request-visible round started
+        # at staging, so the same local deadline applies and fails it without
+        # depending on the Coordinator path.
+        stranded = [
+            state
+            for state in (
+                *getattr(self, "_parked", {}).values(),
+                *getattr(self, "_feature_control_rounds", {}).values(),
+            )
+            if not state.failure
+            and state.deadline_ns
+            and state.deadline_ns <= now_ns
+            and self._ledger.get(state.transfer_id) is None
+        ]
+        if not expired and not stranded:
             return []
         transfer_ids = tuple(state.task.transfer_id for state in expired)
         for state in expired:
@@ -5416,17 +5444,26 @@ class DTTargetController:
                 == state.task.attempt
             ):
                 self._release_draft_request(state.task.request_id)
+        stranded_ids = tuple(state.transfer_id for state in stranded)
+        for state in stranded:
+            if (
+                self._lifecycle_attempt_by_request.get(state.req.rid)
+                == state.attempt
+            ):
+                self._release_draft_request(state.req.rid)
         self._cancelled_transfers.update(transfer_ids)
+        self._cancelled_transfers.update(stranded_ids)
         self._drop_cancelled_unsent()
         if self.is_token_only:
             # Token-only rounds have neither SourceReadDone nor an active
             # ledger entry after timeout.  A late result is therefore stale,
             # so no later event exists (or is needed) to retire this marker.
             self._cancelled_transfers.difference_update(transfer_ids)
+            self._cancelled_transfers.difference_update(stranded_ids)
         cancellation = CancelTransfers(
             protocol_version=PROTOCOL_VERSION,
             target_instance_id=self.instance_id,
-            transfer_ids=transfer_ids,
+            transfer_ids=(*transfer_ids, *stranded_ids),
             reason="target_round_timeout",
         )
         self._delivery_outbox.add(
@@ -5437,7 +5474,7 @@ class DTTargetController:
         self._flush_reliable_outbox()
         return [
             ("failed", transfer_id, "target_round_timeout")
-            for transfer_id in transfer_ids
+            for transfer_id in (*transfer_ids, *stranded_ids)
         ]
 
     def _validate_source_read_done(self, message) -> str:
