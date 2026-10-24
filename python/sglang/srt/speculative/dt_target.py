@@ -604,7 +604,7 @@ class DTTargetController:
         # §7.1 GPU ring publish (DT_RING_PUBLISH=1): eligible verify waves go
         # out as kernel-written ring records; the Coordinator confirmation
         # tasks are built by a deferred cleanup off the park critical path.
-        self._ring_publish = os.environ.get("DT_RING_PUBLISH", "0") == "1"
+        self._ring_publish = os.environ.get("DT_RING_PUBLISH", "1") == "1"
         self._ring_publishers: dict[str, object] = {}  # session -> RingGpuPublisher
         self._ring_publish_pending: deque = deque()
         self._ring_publish_transfers: set[str] = set()

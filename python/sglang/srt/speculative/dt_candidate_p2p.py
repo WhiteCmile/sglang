@@ -88,7 +88,7 @@ GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
 READY_RECORD_WORDS = 8
 READY_RECORD_BYTES = READY_RECORD_WORDS * 4
 PRODUCER_TAG_WORD = 5
-PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "0") == "1"
+PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
 # One 64-byte host completion record per slot: eight u64 words, the seq word
 # published last with a system-scope release store.
 COMPLETION_RECORD_WORDS = 8

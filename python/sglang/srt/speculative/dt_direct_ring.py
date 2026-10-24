@@ -85,7 +85,7 @@ STATE_CLOSED = 4
 # entry is a v2 record when the u32 at byte offset 12 is V2_VERSION (old
 # entries keep the high half of the source offset there, always 0 because
 # source allocations are smaller than 4 GiB — enforced by RingGpuPublisher).
-RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "0") == "1"
+RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "1") == "1"
 V2_VERSION = 2
 V2_HEADER_BYTES = 128
 V2_MAX_REQ = 56
