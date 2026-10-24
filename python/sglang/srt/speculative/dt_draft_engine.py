@@ -2791,7 +2791,11 @@ class FlashMTPDraftEngine:
             row_cost, kv_cost = self._persistent_task_allocation(task)
             if row_cost > available_rows or kv_cost > available_kv:
                 break
-            if task.requires_proposal and self._available_dflash_result_slots() <= 0:
+            if (
+                task.requires_proposal
+                and self.candidate_transport == "mmap"
+                and self._available_dflash_result_slots() <= 0
+            ):
                 break
             queue.popleft()
             available_rows -= row_cost
@@ -3831,7 +3835,11 @@ class FlashMTPDraftEngine:
             return []
         if self._uses_direct_gpu_source and not self._free_feature_staging_slots:
             return []
-        if not self._is_feature_backed and not self._free_result_slots:
+        if (
+            self.candidate_transport == "mmap"
+            and not self._is_feature_backed
+            and not self._free_result_slots
+        ):
             return []
         if (
             not getattr(self, "continuous_batching", False)
@@ -3859,7 +3867,10 @@ class FlashMTPDraftEngine:
         feature_token_count = 0
         persistent_prefill_token_count = 0
         reserves_result_slot = False
-        result_slot_available = self._available_dflash_result_slots() > 0
+        result_slot_available = (
+            self.candidate_transport == "cuda-ipc"
+            or self._available_dflash_result_slots() > 0
+        )
         stop_reason = "queue_exhausted"
         # Examine each currently queued row once. Incompatible or temporarily
         # blocked rows retain their relative FIFO order for the next round.
@@ -4096,6 +4107,7 @@ class FlashMTPDraftEngine:
             or not self._pending
             or (
                 self._uses_direct_gpu_source
+                and self.candidate_transport == "mmap"
                 and self._pending[0].requires_proposal
                 and self._available_dflash_result_slots() <= 0
             )
@@ -4103,7 +4115,11 @@ class FlashMTPDraftEngine:
                 self._uses_direct_gpu_source
                 and not self._free_feature_staging_slots
             )
-            or (not self._is_feature_backed and not self._free_result_slots)
+            or (
+                self.candidate_transport == "mmap"
+                and not self._is_feature_backed
+                and not self._free_result_slots
+            )
             or len(self._pending) >= self.batch_ready_threshold
             or self.batch_wait_s == 0
         ):
@@ -4135,6 +4151,38 @@ class FlashMTPDraftEngine:
             for completion in getattr(self, "_pending_eagle3_completions", ())
         )
         return max(0, len(self._free_result_slots) - reserved)
+
+    def _direct_candidate_row_headroom(self) -> int:
+        """Free Target candidate rows the direct path can still publish into.
+
+        The cuda-ipc path has no Draft-side result pool: a published wave
+        occupies Target-owned candidate destinations until the Target consumes
+        them, so destination capacity minus in-flight pushed rows is the
+        remaining result-row bound (telemetry only; the Coordinator does not
+        gate on it).
+        """
+
+        transport = getattr(self, "_candidate_push_transport", None)
+        if transport is None:
+            return 0
+        total = 0
+        seen: set[tuple[str, str]] = set()
+        for mapped in getattr(transport, "_registered", {}).values():
+            registration = mapped[0]
+            key = (registration.target_instance_id, registration.target_session_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            row_bytes = int(registration.row_width) * 4
+            if row_bytes > 0:
+                total += int(registration.data_allocation_length) // row_bytes
+        inflight = sum(
+            len(pending.tasks)
+            for pending in getattr(self, "_pending_candidate_pushes", ())
+        ) + sum(
+            len(tasks) for tasks, _, _ in getattr(self, "_held_ring_pushes", ())
+        )
+        return max(0, total - inflight)
 
     @torch.inference_mode()
     def _execute_batch(self, pending: list[PendingDraftTask]) -> None:
@@ -6887,7 +6935,12 @@ class FlashMTPDraftEngine:
         decode_graph_replays = 0
         result_slot = None
         try:
-            if getattr(self, "continuous_batching", False):
+            if (
+                getattr(self, "continuous_batching", False)
+                and self.candidate_transport == "mmap"
+            ):
+                # The mmap completion path indexes its pinned host result
+                # buffer by this slot; the direct path carries no pooled id.
                 result_slot = self._free_result_slots.popleft()
             states = [self._prepare_persistent_task(task) for task in tasks]
             oversized_bootstrap = (
@@ -8814,7 +8867,8 @@ class FlashMTPDraftEngine:
                 candidates=push_candidates,
             )
         except Exception:
-            self._free_result_slots.append(result_slot)
+            if result_slot is not None:
+                self._free_result_slots.append(result_slot)
             raise
         self._pending_candidate_pushes.append(
             PendingCandidatePush(
@@ -8906,8 +8960,10 @@ class FlashMTPDraftEngine:
                     self._retire_cancelled_transfer_identity(task)
             if not live_tasks:
                 # Every task cancelled: retire the result slot like a failed
-                # submit.  A live task keeps its slot and its push.
-                self._free_result_slots.append(result_slot)
+                # submit.  A live task keeps its slot and its push.  Direct
+                # pushes carry no pooled slot (None).
+                if result_slot is not None:
+                    self._free_result_slots.append(result_slot)
                 continue
             # Push the adopted Coordinator copies: they carry the candidate
             # destinations the provisional record tasks lacked.  Gather the
@@ -9014,7 +9070,15 @@ class FlashMTPDraftEngine:
         publish_started_ns = time.monotonic_ns() if profile else 0
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
-        slot_id = self._free_result_slots.popleft() if result_slot is None else result_slot
+        if result_slot is not None:
+            slot_id = result_slot
+        elif self.candidate_transport == "cuda-ipc":
+            # The direct path publishes GPU→GPU into Target-owned candidate
+            # destinations; there is no Draft-side result buffer to lease, so
+            # the wave carries no pooled slot id.
+            slot_id = None
+        else:
+            slot_id = self._free_result_slots.popleft()
         if self.candidate_transport == "cuda-ipc":
             if self._candidate_push_transport is None:
                 raise RuntimeError("direct candidate push transport is unavailable")
@@ -9815,9 +9879,13 @@ class FlashMTPDraftEngine:
             capacity_sequence=self._capacity_sequence,
             max_pending_tasks=self.max_pending_tasks,
             free_result_rows=(
-                self._available_dflash_result_slots() * self.max_batch_size
-                if self._uses_direct_gpu_source
-                else len(self._free_result_slots) * self.max_batch_size
+                self._direct_candidate_row_headroom()
+                if self.candidate_transport == "cuda-ipc"
+                else (
+                    self._available_dflash_result_slots() * self.max_batch_size
+                    if self._uses_direct_gpu_source
+                    else len(self._free_result_slots) * self.max_batch_size
+                )
             ),
             healthy=not self._stop,
             observed_ns=time.monotonic_ns(),
