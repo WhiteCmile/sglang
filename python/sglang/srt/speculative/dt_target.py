@@ -6488,6 +6488,9 @@ class DTTargetController:
 
         from msgspec.structs import replace
 
+        from sglang.srt.speculative.dt_candidate_p2p import (
+            CandidateSlotsExhaustedError,
+        )
         from sglang.srt.speculative.dt_direct_ring import (
             ENTRY_BYTES,
             V2_HEADER_BYTES,
@@ -6499,7 +6502,8 @@ class DTTargetController:
 
         pool = self._feature_source_pool
         retained = deque()
-        for wave in self._ring_publish_pending:
+        waves = list(self._ring_publish_pending)
+        for wave_index, wave in enumerate(waves):
             writer = self._ring_writers.get(wave.session_id)
             if writer is None:
                 # The owner lease was revoked; the fence machinery retires the
@@ -6552,12 +6556,45 @@ class DTTargetController:
             live_set = set(live_positions)
             destinations = {}
             if self._candidate_arena is not None and live_positions:
+                if self._candidate_arena.free_slot_count < len(live_positions):
+                    # Slot exhaustion must backpressure, never crash: hold the
+                    # wave unconfirmed and retry on a later poll.  The Draft
+                    # already holds its push for unconfirmed ring tasks, and a
+                    # slot is freed only when a verify consumes it, so pending
+                    # waves cannot starve the completions that release slots.
+                    # Later waves are held too, keeping confirmations in wave
+                    # order per session.
+                    now_ns = time.monotonic_ns()
+                    if (
+                        now_ns - getattr(self, "_ring_publish_hold_log_ns", 0)
+                        > 5_000_000_000
+                    ):
+                        self._ring_publish_hold_log_ns = now_ns
+                        logger.info(
+                            "candidate arena exhausted; holding %d "
+                            "ring-published wave(s) until verify completions "
+                            "free slots",
+                            len(waves) - wave_index,
+                        )
+                    retained.extend(waves[wave_index:])
+                    break
                 try:
                     for position in live_positions:
                         transfer_id = specs[position][1]
                         destinations[transfer_id] = self._candidate_arena.reserve(
                             transfer_id
                         )
+                except CandidateSlotsExhaustedError:
+                    # Defensive: the free-count gate above is exact only while
+                    # cleanup and dispatch share the scheduler thread; retain
+                    # and retry here as well so the invariant survives moving
+                    # this cleanup off that thread.
+                    for transfer_id in destinations:
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    retained.extend(waves[wave_index:])
+                    break
                 except Exception:
                     for transfer_id in destinations:
                         self._candidate_arena.cancel(

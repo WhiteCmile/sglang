@@ -329,6 +329,12 @@ class CandidateTransportError(RuntimeError):
     pass
 
 
+class CandidateSlotsExhaustedError(CandidateTransportError):
+    """No candidate arena slot is free; the caller may retry after a verify
+    completion releases one.  Distinct from the other (non-transient)
+    CandidateTransportError failures so backpressure paths can retry."""
+
+
 class _RingDebugLog:
     """Rate-limited DT_RING_DEBUG=1 counters for the completion channel."""
 
@@ -646,7 +652,9 @@ class TargetCandidateArena:
                 None,
             )
             if slot_id is None:
-                raise CandidateTransportError("all candidate arena slots are active")
+                raise CandidateSlotsExhaustedError(
+                    "all candidate arena slots are active"
+                )
             slot = self._slots[slot_id]
             generation = slot.generation + 1
             if generation > 0x7FFFFFFF:
