@@ -4229,6 +4229,100 @@ def test_dflash_pipeline_reserves_one_result_slot_per_submitted_batch() -> None:
     assert [item.task.transfer_id for item in second] == ["proposal", "proposal-2"]
 
 
+def test_cuda_ipc_take_batch_ignores_result_slot_pool() -> None:
+    """The direct path has no pooled result resource: an empty pool and full
+    reservation accounting must not stop proposal selection."""
+
+    def task(transfer_id: str, *, requires_proposal: bool):
+        return SimpleNamespace(
+            transfer_id=transfer_id,
+            draft_kv_handle=f"kv-{transfer_id}",
+            target_instance_id="target-0",
+            created_ns=1,
+            deadline_ns=2**63 - 1,
+            feature_token_count=1,
+            source_read_migration_id=None,
+            requires_proposal=requires_proposal,
+        )
+
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine.candidate_transport = "cuda-ipc"
+    engine._is_dflash = True
+    engine._is_eagle3 = False
+    engine._is_feature_backed = True
+    engine._persistent = True
+    engine._free_result_slots = deque()
+    engine._free_feature_staging_slots = deque((0, 1))
+    reserved_feature = PendingDraftTask(task("feature", requires_proposal=True))
+    engine._pending_feature_batches = deque(
+        (SimpleNamespace(pending=(reserved_feature,)),)
+    )
+    engine._pending_dflash_completions = deque(
+        (SimpleNamespace(proposal_tasks=(object(),)),)
+    )
+    engine.batch_ready_threshold = 1
+    engine.batch_wait_s = 0
+    engine.max_batch_size = 8
+    engine.feature_buffer_max_tokens = 8
+    engine._cancelled_ids = set()
+    engine._received_ns_by_transfer = {}
+    engine._pending = deque((task("proposal", requires_proposal=True),))
+    engine._pending_ids = {item.transfer_id for item in engine._pending}
+
+    assert engine._available_dflash_result_slots() == 0
+    batch = engine._take_batch()
+    assert [item.task.transfer_id for item in batch] == ["proposal"]
+    assert not engine._free_result_slots
+
+
+def test_cuda_ipc_publish_successes_carries_no_pooled_result_slot() -> None:
+    """A direct publish must neither pop nor later return a pool slot."""
+
+    class CandidateTransport:
+        def __init__(self) -> None:
+            self.submitted = []
+
+        def submit(self, *, tasks, candidates):
+            self.submitted.append((list(tasks), candidates))
+            return SimpleNamespace(
+                candidate_bytes=0,
+                cold_mapping_count=0,
+                submitted_ns=0,
+                event=None,
+            )
+
+    task = SimpleNamespace(
+        transfer_id="transfer-0",
+        request_id="request-0",
+        round_id=0,
+        attempt=1,
+        target_instance_id="target-0",
+        candidate_destination=object(),
+        direct_ring_seq=0,
+    )
+    engine = object.__new__(FlashMTPDraftEngine)
+    engine.EntryStatus = EntryStatus
+    engine.instance_id = "draft-0"
+    engine.candidate_transport = "cuda-ipc"
+    engine._candidate_push_transport = CandidateTransport()
+    engine._pending_candidate_pushes = deque()
+    engine._held_ring_pushes = []
+    engine._direct_tasks_by_transfer = {}
+    engine._unconfirmed_direct = {}
+    engine._cancelled_ids = set()
+    engine._result_sequence = 0
+    engine._free_result_slots = deque((7,))
+    engine._profile_active = False
+
+    candidates = torch.zeros((1, 7), dtype=torch.int32)
+    engine._publish_successes([task], candidates)
+
+    assert len(engine._candidate_push_transport.submitted) == 1
+    assert len(engine._pending_candidate_pushes) == 1
+    assert engine._pending_candidate_pushes[0].result_slot is None
+    assert list(engine._free_result_slots) == [7]
+
+
 def test_flashmtp_pending_completion_reserves_result_slot() -> None:
     engine = object.__new__(FlashMTPDraftEngine)
     engine._is_feature_backed = False
