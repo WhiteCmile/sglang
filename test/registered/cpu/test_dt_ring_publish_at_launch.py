@@ -2,9 +2,10 @@
 
 CUDA/publisher doubles do not establish GPU parity; they pin the ownership
 and fallback bookkeeping around the launch-time ring publish: the in-place
-lease is consumed exactly once, pre-kernel failures restore the park path
-verbatim, post-kernel failures fail closed, and rows ending in the wave stay
-in the record for the tombstone/cancel path.
+lease is consumed exactly once, the launch never touches the candidate arena
+(the cleanup reserves destinations as on the park path), pre-kernel failures
+restore the park path verbatim, post-kernel failures fail closed, and rows
+ending in the wave stay in the record for the tombstone/cancel path.
 
 Run only after the task's external release/gate; imports can load heavy modules.
 """
@@ -184,15 +185,14 @@ def test_launch_publish_stages_record_and_finalize():
     assert result.dt_ring_publish_launch_error is None
     assert launch is not None and launch.wave_seq == 41
     assert [item[0] for item in launch.staged_meta] == [0, 1]
-    assert launch.destinations.keys() == {"target:a:1:5", "target:b:1:7"}
+    # The launch never touches the candidate arena; the cleanup reserves
+    # and writes destinations exactly as on the park path.
+    assert not arena.reserved and not arena.cancelled
     # The in-place lease is consumed by the launch staging, not by park.
     assert not c._inplace_hidden
-    # Destinations are written before the kernel launch so the record's
-    # release store is the last thing the Draft can observe.
     order = [call[0] for call in publisher.calls]
-    assert order == ["destinations", "stage", "publish"]
-    assert publisher.calls[0][1][0] == 41  # destinations for the wave's seq
-    publish = publisher.calls[2][1]
+    assert order == ["stage", "publish"]
+    publish = publisher.calls[1][1]
     assert publish["stream"] == 0xBEEF  # the verify stream
     assert publish["offset_stride"] == c.block_size  # in-place layout
     assert publish["row_count"] == 8
@@ -214,23 +214,20 @@ def test_launch_publish_stages_record_and_finalize():
     assert c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
     assert len(c._ring_publish_pending) == 1
     wave = c._ring_publish_pending[0]
-    assert wave.destinations is launch.destinations
     assert wave.wave_seq == 41 and wave.slot_id == 3 and wave.generation == 11
     assert result.dt_ring_publish_wave is wave
 
 
-def test_launch_fallback_restores_inplace_lease():
+def test_launch_never_reserves_arena():
     c, batch, result, publisher, arena, packed = make_wave(make_controller())
-    arena.fail_at = 1  # the second reservation fails
+    arena.fail_at = 0  # any reservation would fail
     c._stage_dflash_ring_publish_at_launch(batch, result)
-    assert result.dt_ring_publish_launch is None
+    # The publish does not consult the arena at launch: no fallback, no
+    # reservation attempt, the kernel goes out.
+    assert result.dt_ring_publish_launch is not None
     assert result.dt_ring_publish_launch_error is None
-    # The failed reservation is cancelled and the wave's lease is restored
-    # for the park path exactly as if launch staging had not run.
-    assert arena.reserved == ["target:a:1:5"]
-    assert arena.cancelled == [("target:a:1:5", True)]
-    assert c._inplace_hidden[int(packed.data_ptr())][0] == 3
-    assert not publisher.calls
+    assert not arena.reserved and not arena.cancelled
+    assert [call[0] for call in publisher.calls] == ["stage", "publish"]
 
 
 def test_launch_kernel_failure_restores_lease():
@@ -243,10 +240,7 @@ def test_launch_kernel_failure_restores_lease():
     c._stage_dflash_ring_publish_at_launch(batch, result)
     assert result.dt_ring_publish_launch is None
     assert result.dt_ring_publish_launch_error is None
-    assert sorted(arena.cancelled) == [
-        ("target:a:1:5", True),
-        ("target:b:1:7", True),
-    ]
+    assert not arena.reserved and not arena.cancelled
     assert c._inplace_hidden[int(packed.data_ptr())][0] == 3
 
 
@@ -355,47 +349,33 @@ def _finalize_launch_wave(c, batch, result):
     return launch, specs
 
 
-def test_cleanup_reuses_launch_destinations_and_cancels():
+def test_cleanup_reserves_destinations_and_cancels():
     c, batch, result, publisher, arena, packed = make_wave(make_controller())
     c._stage_dflash_ring_publish_at_launch(batch, result)
-    launch, _specs = _finalize_launch_wave(c, batch, result)
+    _finalize_launch_wave(c, batch, result)
     # The first row ended in the wave: park's finished branch cancelled it.
     c._cancelled_transfers.add("target:a:1:5")
     published, made = _setup_cleanup_doubles(c)
-    arena_writes = arena.reserved.copy()
     c._ring_publish_cleanup()
-    # Launch destinations are reused: no fresh reservation, no rewrite at
-    # cleanup; the cancelled row's arena slot is retired through it, and the
-    # cancellation marker itself is removed (quiescence must not leak it).
-    assert arena.reserved == arena_writes
-    assert arena.cancelled == [("target:a:1:5", True)]
+    # The cleanup reserves only the live row (the launch reserved nothing);
+    # the cancelled row holds no destination, so its source-share cancel is
+    # the whole retirement, and the marker itself is removed (quiescence
+    # must not leak it).
+    assert arena.reserved == ["target:b:1:7"]
+    assert not arena.cancelled
     assert "target:a:1:5" not in c._cancelled_transfers
     assert len(made) == 1
     assert made[0].transfer_id == "target:b:1:7"
     assert made[0].direct_ring_seq == 41
-    assert made[0].candidate_destination is launch.destinations["target:b:1:7"]
+    assert made[0].candidate_destination.slot_id == 1
     assert len(published) == 1
     assert not c._ring_publish_pending
-
-
-def test_launch_skips_destinations_when_arena_headroom_low():
-    c, batch, result, publisher, arena, packed = make_wave(make_controller())
-    arena.free_slots = 60  # < 2 * V2_MAX_REQ headroom after this wave
-    c._stage_dflash_ring_publish_at_launch(batch, result)
-    launch = result.dt_ring_publish_launch
-    assert launch is not None
-    # The kernel and the record still go out at launch; only the arena
-    # reservation moves back to the cleanup, exactly like the park path.
-    assert launch.destinations is None
-    assert not arena.reserved
-    assert [call[0] for call in publisher.calls] == ["stage", "publish"]
 
 
 def test_cleanup_defers_when_arena_is_full():
     from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
 
     c, batch, result, publisher, arena, packed = make_wave(make_controller())
-    arena.free_slots = 60  # headroom skip: the cleanup must reserve
     c._stage_dflash_ring_publish_at_launch(batch, result)
     launch = result.dt_ring_publish_launch
     specs = c._dflash_commit_specs(
@@ -406,7 +386,6 @@ def test_cleanup_defers_when_arena_is_full():
     )
     c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
     _setup_cleanup_doubles(c)
-    arena.free_slots = 0
     arena.fail_at = 1  # first reservation lands, the second sees a full arena
     arena.fail_exc = CandidateTransportError("all candidate arena slots are active")
     # A full arena is backpressure: the wave stays pending, the partial
@@ -415,24 +394,21 @@ def test_cleanup_defers_when_arena_is_full():
     assert len(c._ring_publish_pending) == 1
     assert arena.cancelled == [("target:a:1:5", True)]
     arena.fail_at = None
-    arena.free_slots = 256
     c._ring_publish_cleanup()
     assert not c._ring_publish_pending
 
 
-def test_cleanup_retires_launch_destinations_when_writer_gone():
+def test_cleanup_quarantines_wave_when_writer_gone():
     c, batch, result, publisher, arena, packed = make_wave(make_controller())
     c._stage_dflash_ring_publish_at_launch(batch, result)
-    launch, _specs = _finalize_launch_wave(c, batch, result)
+    _finalize_launch_wave(c, batch, result)
     quarantined = []
     c._feature_source_pool.quarantine_reserved = lambda *args: quarantined.append(args)
     c._ring_writers = {}  # owner lease revoked before the cleanup
     c._ring_publish_cleanup()
     assert quarantined == [(3, 11)]
-    assert sorted(arena.cancelled) == [
-        ("target:a:1:5", True),
-        ("target:b:1:7", True),
-    ]
+    # Nothing was ever reserved for this wave, so there is nothing to retire.
+    assert not arena.cancelled
     assert not c._ring_publish_pending
 
 

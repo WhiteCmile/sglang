@@ -308,9 +308,6 @@ class RingPublishLaunch:
     generation: int
     row_count: int
     ready_event: object
-    # Launch-time arena reservations (None: the cleanup reserves as on the
-    # park path — no arena at launch, or the arena headroom check deferred).
-    destinations: dict | None
     marks: tuple  # launch staging breakdown ((name, ns), ...)
     publish_ns: int
 
@@ -338,10 +335,6 @@ class RingPublishWave:
     # Filled by _park_dflash_completed_batch: transfer_id ->
     # (requires_proposal, previous_transfer_id).
     proposals: dict
-    # Launch-published waves (DT_RING_PUBLISH_AT_LAUNCH) reserved and wrote
-    # their candidate destinations at launch: transfer_id -> descriptor.
-    # None for park-published waves (cleanup reserves and writes as before).
-    destinations: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5328,36 +5321,6 @@ class DTTargetController:
         self._last_lifecycle_status_sample_ns = now_ns
         status = self._lifecycle_status()
         quiescent = bool(status["quiescent"])
-        # DIAGNOSTIC (issue-39 leak hunt; remove before merge): when the
-        # controller stays non-quiescent for >5 s, dump the stuck identities.
-        if not quiescent and os.environ.get("DT_LEAK_DEBUG"):
-            first_ns = getattr(self, "_leak_debug_first_active_ns", 0)
-            if not first_ns:
-                self._leak_debug_first_active_ns = first_ns = now_ns
-            if now_ns - first_ns > 5_000_000_000:
-                self._leak_debug_first_active_ns = now_ns
-                logger.warning(
-                    "DT leak debug: inflight_reqs=%s verify_transfers=%s parked=%s "
-                    "feature_control=%s next_round=%s kv_handles=%s committed=%s "
-                    "attempts=%s lanes=%s ledger=%s source_slots=%s deferred=%s "
-                    "pending_waves=%s cancelled=%s",
-                    list(getattr(self, "_target_inflight_reqs", {}).keys())[:4],
-                    list(getattr(self, "_verify_transfer_by_request", {}).items())[:4],
-                    list(getattr(self, "_parked", {}).keys())[:4],
-                    list(getattr(self, "_feature_control_rounds", {}).keys())[:4],
-                    list(getattr(self, "_next_round", {}).items())[:4],
-                    list(getattr(self, "_draft_kv_handle_by_request", {}).items())[:4],
-                    list(getattr(self, "_draft_committed_len", {}).items())[:4],
-                    list(getattr(self, "_lifecycle_attempt_by_request", {}).items())[:4],
-                    list(getattr(self, "_lane_by_request", {}).items())[:4],
-                    getattr(getattr(self, "_ledger", None), "lifecycle_counts", lambda: {})(),
-                    list(getattr(self, "_source_slot_by_transfer", {}).items())[:4],
-                    getattr(self, "_deferred_dflash_feature_stages", -1),
-                    [getattr(w, "wave_seq", None) for w in getattr(self, "_ring_publish_pending", ())][:6],
-                    list(getattr(self, "_cancelled_transfers", ()))[:6],
-                )
-        elif quiescent:
-            self._leak_debug_first_active_ns = 0
         became_quiescent = (
             quiescent and self._last_lifecycle_quiescent is False
         )
@@ -6315,14 +6278,18 @@ class DTTargetController:
         """Publish an eligible deferred verify wave on the verify stream (Q15b).
 
         Runs inside stage_overlap_pivot_copy, right after the verify forward
-        was enqueued on the forward stream.  The request table, the ring
-        credit and the candidate destinations are staged from launch-time
-        state; the kernel reads the committed counts, bonus and seq-lens from
-        the verify's device tensors, so the record lands at the wave's GPU
-        end instead of one result boundary later at park.  Any ineligibility
-        or reservation failure leaves no trace and the wave falls back to the
-        ordinary park path; a failure after the kernel went out is carried to
-        park and fails closed there like a park-time RingPublishCommittedError.
+        was enqueued on the forward stream.  The request table is staged and
+        the ring credit claimed from launch-time state; the kernel reads the
+        committed counts, bonus and seq-lens from the verify's device
+        tensors, so the record lands at the wave's GPU end instead of one
+        result boundary later at park.  Candidate destinations stay with the
+        cleanup (reserving them at launch holds each arena slot about two
+        scheduler iterations longer, which measurably regresses TPOT p90 at
+        high load while the completion round-trip is confirmation-bound
+        either way).  Any ineligibility leaves no trace and the wave falls
+        back to the ordinary park path; a failure after the kernel went out
+        is carried to park and fails closed there like a park-time
+        RingPublishCommittedError.
         """
 
         launch = None
@@ -6416,7 +6383,6 @@ class DTTargetController:
         # per-request scalar the table reads between launch and park.
         staged_meta = []
         entries = []
-        transfer_ids = []
         session_id = None
         publisher = None
         chunked_req = getattr(batch, "chunked_req", None)
@@ -6478,9 +6444,6 @@ class DTTargetController:
                     + index * self.block_size * candidates_gpu.element_size(),
                 )
             )
-            transfer_ids.append(
-                f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
-            )
         if not staged_meta:
             return self._launch_fallback("empty")
         _mark("eligibility")
@@ -6493,33 +6456,16 @@ class DTTargetController:
             return self._launch_fallback("credit")
         if row_count * self.pivot_width * 2 > publisher.writer.max_entry_bytes:
             return self._launch_fallback("landing")
-        # Candidate destinations and the ring credit are claimed before the
-        # kernel goes on the stream; a failure releases everything and the
-        # wave falls back to the park path with its in-place lease restored.
-        # A launch reservation holds its arena slot from launch until the
-        # Draft's completion is read — roughly two scheduler iterations
-        # longer than the cleanup-time reservation.  When the arena cannot
-        # cover this wave with two more waves of headroom, leave the
-        # reservation to the cleanup (the push then waits for it, as on the
-        # park path) instead of tipping a full arena into a fatal one.
-        destinations = None
-        if self._candidate_arena is not None:
-            headroom = self._candidate_arena.free_slot_count - len(staged_meta)
-            if headroom < 2 * V2_MAX_REQ:
-                self._launch_fallback("arena_headroom")
-            else:
-                destinations = {}
-                try:
-                    for transfer_id in transfer_ids:
-                        destinations[transfer_id] = self._candidate_arena.reserve(
-                            transfer_id
-                        )
-                except Exception:
-                    for transfer_id in destinations:
-                        self._candidate_arena.cancel(
-                            transfer_id, remote_quiescent=True
-                        )
-                    return self._launch_fallback("arena")
+        # Ring credit is claimed before the kernel goes on the stream (the
+        # free-entries check above); candidate destinations are deliberately
+        # NOT reserved here.  A launch reservation holds its arena slot from
+        # launch until the Draft's completion is read — roughly two scheduler
+        # iterations longer than the cleanup-time reservation — and the
+        # aggregate occupancy tipped the 256-slot arena into backpressure at
+        # r24 (TPOT p90 +8.9%, attainment 0.80 vs 0.91; issue-39 trace-2).
+        # The completion round-trip is confirmation-bound either way, so the
+        # cleanup reserves and writes destinations exactly as on the park
+        # path while the record itself is already visible at GPU end.
         _mark("reserve")
         event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
         if event_handle is None:
@@ -6532,7 +6478,6 @@ class DTTargetController:
                 pool,
                 staged_meta=staged_meta,
                 entries=entries,
-                destinations=destinations,
                 slot_id=slot_id,
                 generation=generation,
                 ready_event=ready_event,
@@ -6548,8 +6493,6 @@ class DTTargetController:
             self._inplace_hidden.pop(packed.data_ptr(), None)
             raise
         except Exception:
-            for transfer_id in destinations:
-                self._candidate_arena.cancel(transfer_id, remote_quiescent=True)
             # The kernel never went out: restore the in-place lease so the
             # park path sees this wave exactly as if launch staging had not
             # run.
@@ -6566,7 +6509,6 @@ class DTTargetController:
             generation=generation,
             row_count=row_count,
             ready_event=ready_event,
-            destinations=destinations,
             marks=tuple(_marks),
             publish_ns=time.monotonic_ns() - publish_started_ns,
         )
@@ -6591,7 +6533,6 @@ class DTTargetController:
         *,
         staged_meta,
         entries,
-        destinations,
         slot_id,
         generation,
         ready_event,
@@ -6609,33 +6550,6 @@ class DTTargetController:
         the graph-owned buffers before the kernel has read them.
         """
 
-        writer = publisher.writer
-        seq = writer.next_seq
-        if destinations:
-            # Publish the candidate destinations before the record can land:
-            # the kernel's release store of the seq word is what makes the
-            # record visible, and this CPU write precedes the kernel launch
-            # in host program order.  Positions align with the request table.
-            writer.write_destinations(
-                seq,
-                [
-                    (
-                        destinations[transfer_id].slot_id,
-                        destinations[transfer_id].generation,
-                        destinations[transfer_id].authorization_nonce,
-                    )
-                    for transfer_id in (
-                        f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
-                        for _i, req, _o, round_id, attempt, _h in staged_meta
-                    )
-                ],
-                data_buffer_offset=(
-                    self._candidate_arena._data_buffer.allocation_offset
-                ),
-                metadata_buffer_offset=(
-                    self._candidate_arena._metadata_buffer.allocation_offset
-                ),
-            )
         staging_slot = publisher.next_launch_slot()
         publisher.stage_requests(entries, staging_slot=staging_slot)
         source_byte_offset = pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
@@ -6672,11 +6586,12 @@ class DTTargetController:
     ):
         """Queue a launch-published wave for the deferred cleanup.
 
-        The record and its destinations are already on the ring; what remains
-        is exactly the park path's wave bookkeeping.  The specs were rebuilt
-        from the launch-time request table and this result's CPU scalars, so
-        the cleanup's read-back geometry checks see a record identical in
-        shape to a park-published one.
+        The record is already on the ring; what remains is exactly the park
+        path's wave bookkeeping (candidate destinations included — the
+        cleanup reserves and writes them as on the park path).  The specs
+        were rebuilt from the launch-time request table and this result's
+        CPU scalars, so the cleanup's read-back geometry checks see a record
+        identical in shape to a park-published one.
         """
 
         wave = RingPublishWave(
@@ -6690,7 +6605,6 @@ class DTTargetController:
             reqs={req.rid: req for req in batch.reqs},
             active_slots=tuple(index for index, *_ in launch.staged_meta),
             proposals={},
-            destinations=launch.destinations,
         )
         self._ring_publish_pending.append(wave)
         batch_result.dt_ring_publish_wave = wave
@@ -7018,14 +6932,6 @@ class DTTargetController:
                 self._feature_source_pool.quarantine_reserved(
                     wave.slot_id, wave.generation
                 )
-                if self._candidate_arena is not None and wave.destinations:
-                    # A launch-published wave already holds its arena
-                    # destinations; they are not reachable by the cleanup's
-                    # cancel path, so retire them here or the slots leak.
-                    for transfer_id in wave.destinations:
-                        self._candidate_arena.cancel(
-                            transfer_id, remote_quiescent=True
-                        )
                 continue
             base = (
                 writer._ring.entries_offset
@@ -7062,9 +6968,8 @@ class DTTargetController:
             # Reserve each live request's arena destination now and publish
             # it in the ring: the owning Draft's candidate push reads it from
             # the destination region instead of waiting for this cleanup's
-            # Coordinator copy to arrive.  Launch-published waves reserved
-            # and wrote their destinations at launch; reuse those (the cancel
-            # path below still retires rows that ended in the wave).
+            # Coordinator copy to arrive.  The cancel path below still
+            # retires rows that ended in the wave.
             live_positions = [
                 position
                 for position, spec in enumerate(specs)
@@ -7072,9 +6977,7 @@ class DTTargetController:
             ]
             live_set = set(live_positions)
             destinations = {}
-            if wave.destinations is not None:
-                destinations = wave.destinations
-            elif self._candidate_arena is not None and live_positions:
+            if self._candidate_arena is not None and live_positions:
                 try:
                     for position in live_positions:
                         transfer_id = specs[position][1]
