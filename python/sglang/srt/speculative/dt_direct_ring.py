@@ -86,6 +86,15 @@ STATE_CLOSED = 4
 # entries keep the high half of the source offset there, always 0 because
 # source allocations are smaller than 4 GiB — enforced by RingGpuPublisher).
 RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "1") == "1"
+# Q15b (DT_RING_PUBLISH_AT_LAUNCH=1): eligible deferred verify waves enqueue
+# the publish kernel on the verify stream at launch, right behind the verify
+# forward, instead of from host park one result boundary later.  Launch-time
+# publishes need their own staging slots: the host stages wave k+1 while the
+# GPU may still hold wave k-1's kernel queued behind its forward, so a single
+# staging buffer could be overwritten before the queued kernel reads it.  The
+# launch slots rotate; slot 0 remains the park path's staging.
+RING_PUBLISH_AT_LAUNCH = os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "0") == "1"
+LAUNCH_STAGING_SLOTS = 8
 V2_VERSION = 2
 V2_HEADER_BYTES = 128
 V2_MAX_REQ = 56
@@ -467,6 +476,21 @@ class RingGpuPublisher:
         self._active_offset = self.max_batch_slots * V2_STAGING_ENTRY_BYTES
         self._counts_offset = self._active_offset + 4 * V2_MAX_REQ
         nbytes = self._counts_offset + 4 * self.max_batch_slots
+        if RING_PUBLISH_AT_LAUNCH:
+            # Launch slots 1..LAUNCH_STAGING_SLOTS (slot 0 is the park path):
+            # each carries its own compacted entries and active list.  The
+            # host can stage at most a handful of unpublished waves ahead of
+            # the GPU (every park syncs the previous wave's copy_done), so
+            # eight slots bound the rotation with margin.
+            self._launch_slot_stride = (
+                V2_MAX_REQ * V2_STAGING_ENTRY_BYTES + 4 * V2_MAX_REQ
+            )
+            self._launch_entries_base = nbytes
+            self._launch_active_base = self._launch_entries_base + (
+                LAUNCH_STAGING_SLOTS * self._launch_slot_stride
+            )
+            nbytes = self._launch_active_base + LAUNCH_STAGING_SLOTS * 4 * V2_MAX_REQ
+            self._launch_slot_cycle = -1
         self._staging_host, self._staging_dev = self._ext.staging_alloc(nbytes)
         buf = (ctypes.c_uint8 * nbytes).from_address(self._staging_host)
         flat = np.frombuffer(buf, dtype=np.uint8)
@@ -499,7 +523,24 @@ class RingGpuPublisher:
             self._hash_by_rid[rid] = value
         return value
 
-    def stage_requests(self, entries) -> None:
+    def next_launch_slot(self) -> int:
+        """Rotate the launch-time staging slots (1..LAUNCH_STAGING_SLOTS)."""
+
+        if not RING_PUBLISH_AT_LAUNCH:
+            raise DirectRingError("launch staging requires DT_RING_PUBLISH_AT_LAUNCH=1")
+        self._launch_slot_cycle = (self._launch_slot_cycle + 1) % LAUNCH_STAGING_SLOTS
+        return self._launch_slot_cycle + 1
+
+    def _slot_offsets(self, staging_slot: int) -> tuple[int, int]:
+        if staging_slot == 0:
+            return 0, self._active_offset
+        base = staging_slot - 1
+        return (
+            self._launch_entries_base + base * self._launch_slot_stride,
+            self._launch_active_base + base * 4 * V2_MAX_REQ,
+        )
+
+    def stage_requests(self, entries, *, staging_slot: int = 0) -> None:
         """Write the compacted request staging entries in one pack+copy.
 
         entries: [(rid_hash, round_id, attempt, owner_epoch, token_src)] in
@@ -510,7 +551,10 @@ class RingGpuPublisher:
         for value, round_id, attempt, owner_epoch, token_src in entries:
             flat += (value, round_id, attempt, owner_epoch, token_src)
         packed = struct.pack("<" + "QIIQQ" * len(entries), *flat)
-        self._stg_u8[: len(packed)] = np.frombuffer(packed, dtype=np.uint8)
+        entries_offset, _ = self._slot_offsets(staging_slot)
+        self._stg_u8[entries_offset : entries_offset + len(packed)] = np.frombuffer(
+            packed, dtype=np.uint8
+        )
 
     def stage_request(
         self,
@@ -550,13 +594,16 @@ class RingGpuPublisher:
         seq_lens_dev: int,
         offset_stride: int = 0,
         token_total: int | None = None,
+        staging_slot: int = 0,
     ) -> int:
         """Launch the publish kernel; the caller staged every active slot.
 
         offset_stride 0 packs each request's rows at the prefix sum of the
         committed counts; a nonzero stride places them at batch_slot*stride
         (in-place reservation layout, where the slot holds the whole packed
-        wave)."""
+        wave).  staging_slot selects the staging region the kernel reads;
+        the launch-time path rotates nonzero slots so a queued kernel never
+        reads entries a later wave's host staging has overwritten."""
 
         writer = self._writer
         request_count = len(active_slots)
@@ -591,7 +638,8 @@ class RingGpuPublisher:
             index, V2_POOL_TAG_OFFSET, self._pool_tag.to_bytes(8, "little")
         )
         writer._ring.header[(GENERATION_TABLE_OFFSET >> 2) + slot_id] = generation
-        base = self._active_offset >> 2
+        entries_offset, active_offset = self._slot_offsets(staging_slot)
+        base = active_offset >> 2
         self._stg_u32[base : base + request_count] = list(active_slots)
         self._ext.publish(
             stream=stream,
@@ -608,8 +656,8 @@ class RingGpuPublisher:
             block_size=self.block_size,
             offset_stride=offset_stride,
             staging_dev=self._staging_dev,
-            staging_entries_offset=0,
-            staging_active_offset=self._active_offset,
+            staging_entries_offset=entries_offset,
+            staging_active_offset=active_offset,
             accept_dev=accept_dev,
             bonus_dev=bonus_dev,
             seq_lens_dev=seq_lens_dev,
