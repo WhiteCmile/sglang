@@ -5328,6 +5328,36 @@ class DTTargetController:
         self._last_lifecycle_status_sample_ns = now_ns
         status = self._lifecycle_status()
         quiescent = bool(status["quiescent"])
+        # DIAGNOSTIC (issue-39 leak hunt; remove before merge): when the
+        # controller stays non-quiescent for >5 s, dump the stuck identities.
+        if not quiescent and os.environ.get("DT_LEAK_DEBUG"):
+            first_ns = getattr(self, "_leak_debug_first_active_ns", 0)
+            if not first_ns:
+                self._leak_debug_first_active_ns = first_ns = now_ns
+            if now_ns - first_ns > 5_000_000_000:
+                self._leak_debug_first_active_ns = now_ns
+                logger.warning(
+                    "DT leak debug: inflight_reqs=%s verify_transfers=%s parked=%s "
+                    "feature_control=%s next_round=%s kv_handles=%s committed=%s "
+                    "attempts=%s lanes=%s ledger=%s source_slots=%s deferred=%s "
+                    "pending_waves=%s cancelled=%s",
+                    list(getattr(self, "_target_inflight_reqs", {}).keys())[:4],
+                    list(getattr(self, "_verify_transfer_by_request", {}).items())[:4],
+                    list(getattr(self, "_parked", {}).keys())[:4],
+                    list(getattr(self, "_feature_control_rounds", {}).keys())[:4],
+                    list(getattr(self, "_next_round", {}).items())[:4],
+                    list(getattr(self, "_draft_kv_handle_by_request", {}).items())[:4],
+                    list(getattr(self, "_draft_committed_len", {}).items())[:4],
+                    list(getattr(self, "_lifecycle_attempt_by_request", {}).items())[:4],
+                    list(getattr(self, "_lane_by_request", {}).items())[:4],
+                    getattr(getattr(self, "_ledger", None), "lifecycle_counts", lambda: {})(),
+                    list(getattr(self, "_source_slot_by_transfer", {}).items())[:4],
+                    getattr(self, "_deferred_dflash_feature_stages", -1),
+                    [getattr(w, "wave_seq", None) for w in getattr(self, "_ring_publish_pending", ())][:6],
+                    list(getattr(self, "_cancelled_transfers", ()))[:6],
+                )
+        elif quiescent:
+            self._leak_debug_first_active_ns = 0
         became_quiescent = (
             quiescent and self._last_lifecycle_quiescent is False
         )
@@ -7134,6 +7164,11 @@ class DTTargetController:
                         self._candidate_arena.cancel(
                             transfer_id, remote_quiescent=True
                         )
+                    # The cancellation is complete once its source share and
+                    # candidate destination are retired here; there is no
+                    # Coordinator task for this transfer, so nothing else
+                    # would ever remove the marker (quiescence leak).
+                    self._cancelled_transfers.discard(transfer_id)
                     continue
                 requires_proposal, previous_transfer_id = wave.proposals.get(
                     transfer_id, (True, spec[9])

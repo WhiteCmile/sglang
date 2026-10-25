@@ -365,9 +365,11 @@ def test_cleanup_reuses_launch_destinations_and_cancels():
     arena_writes = arena.reserved.copy()
     c._ring_publish_cleanup()
     # Launch destinations are reused: no fresh reservation, no rewrite at
-    # cleanup; the cancelled row's arena slot is retired through it.
+    # cleanup; the cancelled row's arena slot is retired through it, and the
+    # cancellation marker itself is removed (quiescence must not leak it).
     assert arena.reserved == arena_writes
     assert arena.cancelled == [("target:a:1:5", True)]
+    assert "target:a:1:5" not in c._cancelled_transfers
     assert len(made) == 1
     assert made[0].transfer_id == "target:b:1:7"
     assert made[0].direct_ring_seq == 41
