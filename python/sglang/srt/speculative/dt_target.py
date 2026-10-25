@@ -308,7 +308,9 @@ class RingPublishLaunch:
     generation: int
     row_count: int
     ready_event: object
-    destinations: dict  # transfer_id -> arena descriptor ({} when no arena)
+    # Launch-time arena reservations (None: the cleanup reserves as on the
+    # park path — no arena at launch, or the arena headroom check deferred).
+    destinations: dict | None
     marks: tuple  # launch staging breakdown ((name, ns), ...)
     publish_ns: int
 
@@ -6464,19 +6466,30 @@ class DTTargetController:
         # Candidate destinations and the ring credit are claimed before the
         # kernel goes on the stream; a failure releases everything and the
         # wave falls back to the park path with its in-place lease restored.
-        destinations = {}
+        # A launch reservation holds its arena slot from launch until the
+        # Draft's completion is read — roughly two scheduler iterations
+        # longer than the cleanup-time reservation.  When the arena cannot
+        # cover this wave with two more waves of headroom, leave the
+        # reservation to the cleanup (the push then waits for it, as on the
+        # park path) instead of tipping a full arena into a fatal one.
+        destinations = None
         if self._candidate_arena is not None:
-            try:
-                for transfer_id in transfer_ids:
-                    destinations[transfer_id] = self._candidate_arena.reserve(
-                        transfer_id
-                    )
-            except Exception:
-                for transfer_id in destinations:
-                    self._candidate_arena.cancel(
-                        transfer_id, remote_quiescent=True
-                    )
-                return self._launch_fallback("arena")
+            headroom = self._candidate_arena.free_slot_count - len(staged_meta)
+            if headroom < 2 * V2_MAX_REQ:
+                self._launch_fallback("arena_headroom")
+            else:
+                destinations = {}
+                try:
+                    for transfer_id in transfer_ids:
+                        destinations[transfer_id] = self._candidate_arena.reserve(
+                            transfer_id
+                        )
+                except Exception:
+                    for transfer_id in destinations:
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    return self._launch_fallback("arena")
         _mark("reserve")
         event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
         if event_handle is None:
@@ -6962,6 +6975,7 @@ class DTTargetController:
             V2_REQ_ENTRY_BYTES,
             V2_TOKEN_OFFSET,
         )
+        from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
         from sglang.srt.speculative.dt_feature_p2p import FeatureTransferSlice
 
         pool = self._feature_source_pool
@@ -6974,6 +6988,14 @@ class DTTargetController:
                 self._feature_source_pool.quarantine_reserved(
                     wave.slot_id, wave.generation
                 )
+                if self._candidate_arena is not None and wave.destinations:
+                    # A launch-published wave already holds its arena
+                    # destinations; they are not reachable by the cleanup's
+                    # cancel path, so retire them here or the slots leak.
+                    for transfer_id in wave.destinations:
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
                 continue
             base = (
                 writer._ring.entries_offset
@@ -7029,11 +7051,19 @@ class DTTargetController:
                         destinations[transfer_id] = self._candidate_arena.reserve(
                             transfer_id
                         )
-                except Exception:
+                except CandidateTransportError as exc:
                     for transfer_id in destinations:
                         self._candidate_arena.cancel(
                             transfer_id, remote_quiescent=True
                         )
+                    if "slots are active" in str(exc):
+                        # A full arena must apply backpressure, not kill the
+                        # scheduler: the wave's record stays on the ring and
+                        # the reservation is retried at the next poll.  The
+                        # ring's seq word was the launch/park proof; the Draft
+                        # falls back to the Coordinator copy meanwhile.
+                        retained.append(wave)
+                        continue
                     raise
                 writer.write_destinations(
                     wave.wave_seq,

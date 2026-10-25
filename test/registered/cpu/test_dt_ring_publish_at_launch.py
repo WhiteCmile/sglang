@@ -75,16 +75,22 @@ class FakePublisher:
 
 
 class FakeArena:
-    def __init__(self, fail_at=None):
+    def __init__(self, fail_at=None, free_slots=256):
         self.reserved = []
         self.cancelled = []
         self.fail_at = fail_at
+        self.fail_exc = RuntimeError("arena full")
+        self.free_slots = free_slots
         self._data_buffer = SimpleNamespace(allocation_offset=4096)
         self._metadata_buffer = SimpleNamespace(allocation_offset=8192)
 
+    @property
+    def free_slot_count(self):
+        return self.free_slots
+
     def reserve(self, transfer_id):
         if self.fail_at is not None and len(self.reserved) >= self.fail_at:
-            raise RuntimeError("arena full")
+            raise self.fail_exc
         self.reserved.append(transfer_id)
         return SimpleNamespace(
             slot_id=len(self.reserved), generation=1, authorization_nonce=7
@@ -286,19 +292,8 @@ def _pack_record(buf, base, *, seq, row_count, reqs, tokens):
     struct.pack_into(f"<{len(tokens)}I", buf, base + V2_TOKEN_OFFSET, *tokens)
 
 
-def test_cleanup_reuses_launch_destinations_and_cancels(monkeypatch):
-    c, batch, result, publisher, arena, packed = make_wave(make_controller())
-    c._stage_dflash_ring_publish_at_launch(batch, result)
-    launch = result.dt_ring_publish_launch
-    specs = c._dflash_commit_specs(
-        list(launch.staged_meta),
-        result.accept_lens.numpy(),
-        result.next_draft_input.bonus_tokens.numpy(),
-        result.next_draft_input.new_seq_lens.numpy(),
-    )
-    c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
-    # The first row ended in the wave: park's finished branch cancelled it.
-    c._cancelled_transfers.add("target:a:1:5")
+def _setup_cleanup_doubles(c):
+    """Ring record for wave 41 plus the pool/task doubles cleanup consumes."""
 
     raw = np.zeros(ENTRY_BYTES * 64, dtype=np.uint8)
     base = 41 % 64 * ENTRY_BYTES
@@ -307,11 +302,13 @@ def test_cleanup_reuses_launch_destinations_and_cancels(monkeypatch):
         (0xA5 ^ 1, 1, 7, 4, 4, 88, 24),
     ]
     _pack_record(raw, base, seq=41, row_count=8, reqs=reqs, tokens=(10, 11, 20, 21, 22, 23))
-    writer = SimpleNamespace(
-        _ring=SimpleNamespace(entries_offset=0, raw=raw),
-        capacity=64,
-    )
-    c._ring_writers = {"session": writer}
+    c._ring_writers = {
+        "session": SimpleNamespace(
+            _ring=SimpleNamespace(entries_offset=0, raw=raw),
+            capacity=64,
+            write_destinations=lambda *args, **kwargs: None,
+        )
+    }
     published = []
 
     def publish_reserved(**kwargs):
@@ -343,6 +340,28 @@ def test_cleanup_reuses_launch_destinations_and_cancels(monkeypatch):
     c._make_task = lambda **kwargs: Task(transfer_id=kwargs["transfer_id"])
     c._queue_task_batch = lambda tasks: made.extend(tasks)
     c._flush_pending_send = lambda: None
+    return published, made
+
+
+def _finalize_launch_wave(c, batch, result):
+    launch = result.dt_ring_publish_launch
+    specs = c._dflash_commit_specs(
+        list(launch.staged_meta),
+        result.accept_lens.numpy(),
+        result.next_draft_input.bonus_tokens.numpy(),
+        result.next_draft_input.new_seq_lens.numpy(),
+    )
+    c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
+    return launch, specs
+
+
+def test_cleanup_reuses_launch_destinations_and_cancels():
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch, _specs = _finalize_launch_wave(c, batch, result)
+    # The first row ended in the wave: park's finished branch cancelled it.
+    c._cancelled_transfers.add("target:a:1:5")
+    published, made = _setup_cleanup_doubles(c)
     arena_writes = arena.reserved.copy()
     c._ring_publish_cleanup()
     # Launch destinations are reused: no fresh reservation, no rewrite at
@@ -354,6 +373,64 @@ def test_cleanup_reuses_launch_destinations_and_cancels(monkeypatch):
     assert made[0].direct_ring_seq == 41
     assert made[0].candidate_destination is launch.destinations["target:b:1:7"]
     assert len(published) == 1
+    assert not c._ring_publish_pending
+
+
+def test_launch_skips_destinations_when_arena_headroom_low():
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    arena.free_slots = 60  # < 2 * V2_MAX_REQ headroom after this wave
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch = result.dt_ring_publish_launch
+    assert launch is not None
+    # The kernel and the record still go out at launch; only the arena
+    # reservation moves back to the cleanup, exactly like the park path.
+    assert launch.destinations is None
+    assert not arena.reserved
+    assert [call[0] for call in publisher.calls] == ["stage", "publish"]
+
+
+def test_cleanup_defers_when_arena_is_full():
+    from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
+
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    arena.free_slots = 60  # headroom skip: the cleanup must reserve
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch = result.dt_ring_publish_launch
+    specs = c._dflash_commit_specs(
+        list(launch.staged_meta),
+        result.accept_lens.numpy(),
+        result.next_draft_input.bonus_tokens.numpy(),
+        result.next_draft_input.new_seq_lens.numpy(),
+    )
+    c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
+    _setup_cleanup_doubles(c)
+    arena.free_slots = 0
+    arena.fail_at = 1  # first reservation lands, the second sees a full arena
+    arena.fail_exc = CandidateTransportError("all candidate arena slots are active")
+    # A full arena is backpressure: the wave stays pending, the partial
+    # reservation is cancelled, and nothing raises.
+    c._ring_publish_cleanup()
+    assert len(c._ring_publish_pending) == 1
+    assert arena.cancelled == [("target:a:1:5", True)]
+    arena.fail_at = None
+    arena.free_slots = 256
+    c._ring_publish_cleanup()
+    assert not c._ring_publish_pending
+
+
+def test_cleanup_retires_launch_destinations_when_writer_gone():
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch, _specs = _finalize_launch_wave(c, batch, result)
+    quarantined = []
+    c._feature_source_pool.quarantine_reserved = lambda *args: quarantined.append(args)
+    c._ring_writers = {}  # owner lease revoked before the cleanup
+    c._ring_publish_cleanup()
+    assert quarantined == [(3, 11)]
+    assert sorted(arena.cancelled) == [
+        ("target:a:1:5", True),
+        ("target:b:1:7", True),
+    ]
     assert not c._ring_publish_pending
 
 
