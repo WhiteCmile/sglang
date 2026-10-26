@@ -4228,38 +4228,6 @@ class FlashMTPDraftEngine:
             )
         return not self._free_result_slots
 
-    def _direct_candidate_row_headroom(self) -> int:
-        """Free Target candidate rows the direct path can still publish into.
-
-        The cuda-ipc path has no Draft-side result pool: a published wave
-        occupies Target-owned candidate destinations until the Target consumes
-        them, so destination capacity minus in-flight pushed rows is the
-        remaining result-row bound (telemetry only; the Coordinator does not
-        gate on it).
-        """
-
-        transport = getattr(self, "_candidate_push_transport", None)
-        if transport is None:
-            return 0
-        total = 0
-        seen: set[tuple[str, str]] = set()
-        for mapped in getattr(transport, "_registered", {}).values():
-            registration = mapped[0]
-            key = (registration.target_instance_id, registration.target_session_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            row_bytes = int(registration.row_width) * 4
-            if row_bytes > 0:
-                total += int(registration.data_allocation_length) // row_bytes
-        inflight = sum(
-            len(pending.tasks)
-            for pending in getattr(self, "_pending_candidate_pushes", ())
-        ) + sum(
-            len(tasks) for tasks, _, _ in getattr(self, "_held_ring_pushes", ())
-        )
-        return max(0, total - inflight)
-
     @torch.inference_mode()
     def _execute_batch(self, pending: list[PendingDraftTask]) -> None:
         self._last_batch_size = len(pending)
@@ -10020,7 +9988,7 @@ class FlashMTPDraftEngine:
             capacity_sequence=self._capacity_sequence,
             max_pending_tasks=self.max_pending_tasks,
             free_result_rows=(
-                self._direct_candidate_row_headroom()
+                self._available_direct_proposal_admission() * self.max_batch_size
                 if self.candidate_transport == "cuda-ipc"
                 else (
                     self._available_dflash_result_slots() * self.max_batch_size
