@@ -2,9 +2,10 @@
 
 The direct path no longer draws on the mmap result-slot pool; an explicit
 credit counter (default 64) bounds proposal admission instead.  These tests
-pin the accounting semantics: the counter charges exactly what the old pool
-accounting charged, and every acquire is released exactly once (push
-completion, held-push drop, cancel, or exception).
+pin the accounting semantics: the credit is a hard per-request bound — every
+proposal task holds one unit from admission until its wave's push retires —
+and every acquire is released exactly once (push completion, held-push drop,
+cancel, or exception).
 """
 
 from collections import deque
@@ -17,14 +18,14 @@ import torch
 from sglang.srt.speculative.dt_draft_engine import FlashMTPDraftEngine
 
 
-def _task(transfer_id, *, destination="dest", ring_seq=0):
+def _task(transfer_id, *, destination="dest", ring_seq=0, requires_proposal=True):
     return SimpleNamespace(
         transfer_id=transfer_id,
         request_id=f"req-{transfer_id}",
         round_id=1,
         attempt=0,
         target_instance_id="target-0",
-        requires_proposal=True,
+        requires_proposal=requires_proposal,
         candidate_destination=destination,
         direct_ring_seq=ring_seq,
     )
@@ -122,6 +123,67 @@ def test_availability_counts_reservations_and_inflight_waves():
     assert engine._available_direct_proposal_admission() == 0
     engine._pending_dflash_completions.pop()
     assert not engine._proposal_admission_blocked()
+
+
+def test_feature_batch_reserves_one_credit_per_proposal_task():
+    engine = _engine(limit=4)
+    # One pull batch holding three proposal tasks reserves three units, not
+    # one: promotion into INPUT_READY swaps the units 1:1, so the limit stays
+    # a hard bound across the handoff instead of expanding past it.
+    engine._pending_feature_batches.append(
+        SimpleNamespace(
+            pending=[
+                SimpleNamespace(task=_task("t1")),
+                SimpleNamespace(task=_task("t2")),
+                SimpleNamespace(task=_task("t3")),
+                SimpleNamespace(task=_task("t4", requires_proposal=False)),
+            ]
+        )
+    )
+    assert engine._available_direct_proposal_admission() == 1
+    engine._pending_feature_batches.clear()
+    engine._input_ready_features.extend(
+        SimpleNamespace(pending=SimpleNamespace(task=_task(f"t{i}")))
+        for i in (1, 2, 3)
+    )
+    assert engine._available_direct_proposal_admission() == 1
+
+
+def _take_task(transfer_id, *, requires_proposal=True):
+    return SimpleNamespace(
+        transfer_id=transfer_id,
+        request_id=f"req-{transfer_id}",
+        draft_kv_handle=f"kv-{transfer_id}",
+        target_instance_id="target-0",
+        created_ns=1,
+        deadline_ns=2**63 - 1,
+        feature_token_count=1,
+        source_read_migration_id=None,
+        requires_proposal=requires_proposal,
+    )
+
+
+def test_take_batch_stops_at_the_admission_limit():
+    engine = _engine(limit=2)
+    engine._is_dflash = True
+    engine._is_eagle3 = False
+    engine._free_feature_staging_slots = deque((0, 1))
+    engine.batch_ready_threshold = 1
+    engine.batch_wait_s = 0
+    engine.max_batch_size = 8
+    engine.feature_buffer_max_tokens = 8
+    engine._pending = deque(_take_task(f"t{i}") for i in range(4))
+
+    # Two remaining credits admit two proposal tasks; the rest wait.
+    taken = engine._take_batch()
+    assert [item.task.transfer_id for item in taken] == ["t0", "t1"]
+    assert [task.transfer_id for task in engine._pending] == ["t2", "t3"]
+
+    # Submitted as one pull batch, the taken tasks keep one unit each, so no
+    # further proposal wave can start until a push retires.
+    engine._pending_feature_batches.append(SimpleNamespace(pending=taken))
+    assert engine._proposal_admission_blocked()
+    assert engine._take_batch() == []
 
 
 def test_publish_wave_credit_retires_with_gpu_push_completion():

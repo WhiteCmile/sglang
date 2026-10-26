@@ -3895,6 +3895,23 @@ class FlashMTPDraftEngine:
         persistent_prefill_token_count = 0
         reserves_result_slot = False
         result_slot_available = not self._proposal_admission_blocked()
+        # The cuda-ipc credit is a hard per-request bound: each proposal task
+        # queued below claims one of the remaining units, so a pull wave stops
+        # at the limit instead of reserving one unit and then expanding past
+        # it when its feature batch promotes into INPUT_READY entries.
+        admission_units_left = (
+            self._available_direct_proposal_admission()
+            if self.candidate_transport == "cuda-ipc"
+            else 0
+        )
+
+        def proposal_blocked(task) -> bool:
+            if not task.requires_proposal:
+                return False
+            if self.candidate_transport == "cuda-ipc":
+                return admission_units_left <= 0
+            return not reserves_result_slot and not result_slot_available
+
         stop_reason = "queue_exhausted"
         # Examine each currently queued row once. Incompatible or temporarily
         # blocked rows retain their relative FIFO order for the next round.
@@ -3968,11 +3985,7 @@ class FlashMTPDraftEngine:
                         deferred.append(self._pending.popleft())
                         continue
                     break
-                if (
-                    next_task.requires_proposal
-                    and not reserves_result_slot
-                    and not result_slot_available
-                ):
+                if proposal_blocked(next_task):
                     if profile_eagle3_batch:
                         stop_reason = "result_slot_unavailable"
                     if getattr(self, "continuous_batching", False):
@@ -4036,7 +4049,9 @@ class FlashMTPDraftEngine:
             queued.append(
                 PendingDraftTask(task=task)
             )
-            reserves_result_slot = reserves_result_slot or bool(task.requires_proposal)
+            if task.requires_proposal:
+                reserves_result_slot = True
+                admission_units_left -= 1
             if self._persistent:
                 selected_handles.add(task.draft_kv_handle)
                 if getattr(self, "continuous_batching", False):
@@ -4058,10 +4073,7 @@ class FlashMTPDraftEngine:
                 != bool(queued[0].task.requires_proposal)
             )
             result_available = not (
-                self._uses_direct_gpu_source
-                and next_task.requires_proposal
-                and not reserves_result_slot
-                and not result_slot_available
+                self._uses_direct_gpu_source and proposal_blocked(next_task)
             )
             next_feature_tokens = (
                 int(next_task.feature_token_count)
@@ -4159,12 +4171,24 @@ class FlashMTPDraftEngine:
         Ring admission, INPUT_READY proposal entries, and pending
         feature/FlashMTP/DFlash/EAGLE3 completions each reserve one unit until
         their wave publishes (the same terms the result-pool accounting used).
+        The cuda-ipc credit is a hard per-request bound, so its pending
+        feature batches reserve one unit per proposal task — promotion into
+        INPUT_READY then swaps units 1:1 and cannot expand past the limit.
+        The mmap pool keeps the per-batch reservation it always had.
         """
 
-        return sum(
-            any(item.task.requires_proposal for item in batch.pending)
-            for batch in self._pending_feature_batches
-        ) + sum(
+        if self.candidate_transport == "cuda-ipc":
+            pending_feature = sum(
+                bool(item.task.requires_proposal)
+                for batch in self._pending_feature_batches
+                for item in batch.pending
+            )
+        else:
+            pending_feature = sum(
+                any(item.task.requires_proposal for item in batch.pending)
+                for batch in self._pending_feature_batches
+            )
+        return pending_feature + sum(
             bool(entry.pending.task.requires_proposal)
             for entry in getattr(self, "_input_ready_features", ())
         ) + len(
@@ -9133,60 +9157,6 @@ class FlashMTPDraftEngine:
             return None
         return self._ring_destination_ref(task, resolved)
 
-    def _publish_direct_wave(self, tasks, candidates, slot_id) -> None:
-        """Queue one cuda-ipc wave's push (or hold it for confirmation).
-
-        The caller owns the wave's proposal-admission credit; it leaves with
-        the held entry or the queued push.  A raise means no transfer happened
-        and the caller must release the credit.
-        """
-
-        if self._candidate_push_transport is None:
-            raise RuntimeError("direct candidate push transport is unavailable")
-        if not isinstance(candidates, torch.Tensor):
-            raise TypeError("direct candidate return requires GPU tensor rows")
-        push_candidates = candidates.contiguous()
-        # §7.1 record tasks adopt their Coordinator copy (destination,
-        # scheduling metadata) at confirmation; hold the wave's whole push
-        # while any of its tasks is still unconfirmed.  The destination
-        # itself arrives earlier through the ring's destination region.
-        tasks = [
-            self._direct_tasks_by_transfer.get(task.transfer_id, task)
-            for task in tasks
-        ]
-        if any(
-            task.candidate_destination is None and task.direct_ring_seq
-            for task in tasks
-        ):
-            from msgspec.structs import replace
-
-            resolved = []
-            missing = False
-            for task in tasks:
-                if task.candidate_destination is None and task.direct_ring_seq:
-                    destination = self._resolve_ring_destination(task)
-                    if destination is None:
-                        missing = True
-                        break
-                    resolved.append(
-                        replace(task, candidate_destination=destination)
-                    )
-                else:
-                    resolved.append(task)
-            if missing:
-                self._held_ring_pushes.append((tasks, push_candidates, slot_id))
-                return
-            tasks = resolved
-        if any(
-            task.candidate_destination is None
-            and task.direct_ring_seq
-            and task.transfer_id in self._unconfirmed_direct
-            for task in tasks
-        ):
-            self._held_ring_pushes.append((tasks, push_candidates, slot_id))
-            return
-        self._submit_candidate_push(tasks, push_candidates, result_slot=slot_id)
-
     def _publish_successes(
         self,
         tasks: list[object],
@@ -9222,11 +9192,60 @@ class FlashMTPDraftEngine:
         else:
             slot_id = self._free_result_slots.popleft()
         if self.candidate_transport == "cuda-ipc":
+            # The credit this call holds leaves only with a queued push or a
+            # held wave; a raise before either means it is still owned here.
             try:
-                self._publish_direct_wave(tasks, candidates, slot_id)
+                if self._candidate_push_transport is None:
+                    raise RuntimeError("direct candidate push transport is unavailable")
+                if not isinstance(candidates, torch.Tensor):
+                    raise TypeError("direct candidate return requires GPU tensor rows")
+                push_candidates = candidates.contiguous()
+                # §7.1 record tasks adopt their Coordinator copy (destination,
+                # scheduling metadata) at confirmation; hold the wave's whole
+                # push while any of its tasks is still unconfirmed.  The
+                # destination itself arrives earlier through the ring's
+                # destination region.
+                tasks = [
+                    self._direct_tasks_by_transfer.get(task.transfer_id, task)
+                    for task in tasks
+                ]
+                if any(
+                    task.candidate_destination is None and task.direct_ring_seq
+                    for task in tasks
+                ):
+                    from msgspec.structs import replace
+
+                    resolved = []
+                    missing = False
+                    for task in tasks:
+                        if task.candidate_destination is None and task.direct_ring_seq:
+                            destination = self._resolve_ring_destination(task)
+                            if destination is None:
+                                missing = True
+                                break
+                            resolved.append(
+                                replace(task, candidate_destination=destination)
+                            )
+                        else:
+                            resolved.append(task)
+                    if missing:
+                        self._held_ring_pushes.append(
+                            (tasks, push_candidates, slot_id)
+                        )
+                        return
+                    tasks = resolved
+                if any(
+                    task.candidate_destination is None
+                    and task.direct_ring_seq
+                    and task.transfer_id in self._unconfirmed_direct
+                    for task in tasks
+                ):
+                    self._held_ring_pushes.append((tasks, push_candidates, slot_id))
+                    return
+                self._submit_candidate_push(
+                    tasks, push_candidates, result_slot=slot_id
+                )
             except Exception:
-                # The credit only leaves with a queued push or a held wave; a
-                # raise before either means this call still owns it.
                 if credit_held:
                     self._release_direct_proposal_admission()
                 raise
