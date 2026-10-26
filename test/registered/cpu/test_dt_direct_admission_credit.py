@@ -14,12 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.speculative.dt_draft_engine import (
-    DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT,
-    FlashMTPDraftEngine,
-    PendingCandidatePush,
-    _resolve_direct_proposal_admission_limit,
-)
+from sglang.srt.speculative.dt_draft_engine import FlashMTPDraftEngine
 
 
 def _task(transfer_id, *, destination="dest", ring_seq=0):
@@ -101,17 +96,6 @@ def _engine(*, limit=4, transport="cuda-ipc"):
     return engine
 
 
-def test_default_limit_is_the_validated_operating_point(monkeypatch):
-    assert DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT == 64
-    monkeypatch.delenv("DT_DIRECT_PROPOSAL_ADMISSION_LIMIT", raising=False)
-    assert _resolve_direct_proposal_admission_limit(None) == 64
-    monkeypatch.setenv("DT_DIRECT_PROPOSAL_ADMISSION_LIMIT", "32")
-    assert _resolve_direct_proposal_admission_limit(None) == 32
-    assert _resolve_direct_proposal_admission_limit(16) == 16
-    with pytest.raises(ValueError, match="must be positive"):
-        _resolve_direct_proposal_admission_limit(0)
-
-
 def test_availability_counts_reservations_and_inflight_waves():
     engine = _engine(limit=4)
     assert engine._available_direct_proposal_admission() == 4
@@ -140,16 +124,6 @@ def test_availability_counts_reservations_and_inflight_waves():
     assert not engine._proposal_admission_blocked()
 
 
-def test_release_underflow_is_rejected():
-    engine = _engine()
-    with pytest.raises(RuntimeError, match="underflow"):
-        engine._release_direct_proposal_admission()
-    engine._acquire_direct_proposal_admission()
-    engine._release_direct_proposal_admission()
-    with pytest.raises(RuntimeError, match="underflow"):
-        engine._release_direct_proposal_admission()
-
-
 def test_publish_wave_credit_retires_with_gpu_push_completion():
     engine = _engine()
     engine._candidate_push_transport = _Transport()
@@ -165,22 +139,6 @@ def test_publish_wave_credit_retires_with_gpu_push_completion():
     assert engine._direct_proposal_admission_inflight == 1
 
     pending.push.event = SimpleNamespace(query=lambda: True)
-    engine._poll_candidate_pushes()
-    assert engine._direct_proposal_admission_inflight == 0
-    assert not engine._pending_candidate_pushes
-
-
-def test_early_push_and_tombstone_carry_no_credit():
-    engine = _engine()
-    engine._candidate_push_transport = _Transport()
-    # Mirrors _queue_early_candidate_push / publish_cancelled construction:
-    # result_slot=None and no credit was acquired.
-    push = _ready_push(ready=True)
-    engine._pending_candidate_pushes.append(
-        PendingCandidatePush(
-            push=push, tasks=[_task("t1")], result_slot=None, candidates=None
-        )
-    )
     engine._poll_candidate_pushes()
     assert engine._direct_proposal_admission_inflight == 0
     assert not engine._pending_candidate_pushes

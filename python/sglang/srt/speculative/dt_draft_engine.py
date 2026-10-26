@@ -144,21 +144,20 @@ RING_RETIRED_LIMIT = 65536
 DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT = 64
 
 
-def _resolve_direct_proposal_admission_limit(value: int | None) -> int:
+def _resolve_direct_proposal_admission_limit() -> int:
     """Resolve the cuda-ipc proposal admission bound.
 
     Unset reproduces the validated 64; DT_DIRECT_PROPOSAL_ADMISSION_LIMIT
     overrides it for experiments without touching launch argv.
     """
 
-    if value is None:
-        env_limit = os.environ.get("DT_DIRECT_PROPOSAL_ADMISSION_LIMIT")
-        value = (
-            int(env_limit) if env_limit else DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT
-        )
-    if value <= 0:
+    env_limit = os.environ.get("DT_DIRECT_PROPOSAL_ADMISSION_LIMIT")
+    limit = int(env_limit) if env_limit else DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT
+    if limit <= 0:
         raise ValueError("direct_proposal_admission_limit must be positive")
-    return int(value)
+    return limit
+
+
 # Provisional deadline for a §7.1 ring-record task; its Coordinator
 # confirmation copy carries the authoritative one.
 _RING_RECORD_TIMEOUT_NS = (
@@ -839,7 +838,6 @@ class FlashMTPDraftEngine:
         dflash_submit_pipeline: bool = False,
         continuous_batching: bool = True,
         candidate_transport: str = "mmap",
-        direct_proposal_admission_limit: int | None = None,
     ) -> None:
         try:
             from dt_client import DraftCoordinatorClient
@@ -875,9 +873,6 @@ class FlashMTPDraftEngine:
             raise ValueError("feature buffer dimensions must be positive")
         if candidate_transport not in {"mmap", "cuda-ipc"}:
             raise ValueError("candidate_transport must be 'mmap' or 'cuda-ipc'")
-        direct_proposal_admission_limit = _resolve_direct_proposal_admission_limit(
-            direct_proposal_admission_limit
-        )
 
         self.EntryStatus = EntryStatus
         self.instance_id = instance_id
@@ -968,7 +963,9 @@ class FlashMTPDraftEngine:
         self._source_done_batch_remaining: dict[str, set[str]] = {}
         self._pull_done_applied_ids: set[str] = set()
         self._free_result_slots = deque(range(result_slot_count))
-        self.direct_proposal_admission_limit = int(direct_proposal_admission_limit)
+        self.direct_proposal_admission_limit = (
+            _resolve_direct_proposal_admission_limit()
+        )
         # Credits held by published-but-incomplete cuda-ipc waves.  This is an
         # independent counter, not derived from any deque: every acquire must
         # be balanced by exactly one release (push completion, held-push drop,
@@ -4190,16 +4187,13 @@ class FlashMTPDraftEngine:
 
     def _acquire_direct_proposal_admission(self) -> None:
         """Hold one cuda-ipc proposal-admission credit for a published wave."""
-        self._direct_proposal_admission_inflight = (
-            getattr(self, "_direct_proposal_admission_inflight", 0) + 1
-        )
+        self._direct_proposal_admission_inflight += 1
 
     def _release_direct_proposal_admission(self) -> None:
         """Return one wave's credit; every holder must release exactly once."""
-        inflight = getattr(self, "_direct_proposal_admission_inflight", 0)
-        if inflight <= 0:
+        if self._direct_proposal_admission_inflight <= 0:
             raise RuntimeError("direct proposal admission credit underflow")
-        self._direct_proposal_admission_inflight = inflight - 1
+        self._direct_proposal_admission_inflight -= 1
 
     def _available_direct_proposal_admission(self) -> int:
         """cuda-ipc proposal-admission credits left for scheduling decisions.
@@ -4211,11 +4205,10 @@ class FlashMTPDraftEngine:
         is an explicit counter, never a deque length.
         """
 
-        available = getattr(
-            self,
-            "direct_proposal_admission_limit",
-            DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT,
-        ) - getattr(self, "_direct_proposal_admission_inflight", 0)
+        available = (
+            self.direct_proposal_admission_limit
+            - self._direct_proposal_admission_inflight
+        )
         if self._uses_direct_gpu_source:
             available -= self._dflash_admission_reserved()
         return max(0, available)
@@ -4230,12 +4223,8 @@ class FlashMTPDraftEngine:
         """Raw per-wave publish buffer exhaustion (no reservation accounting)."""
         if self.candidate_transport == "cuda-ipc":
             return (
-                getattr(self, "_direct_proposal_admission_inflight", 0)
-                >= getattr(
-                    self,
-                    "direct_proposal_admission_limit",
-                    DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT,
-                )
+                self._direct_proposal_admission_inflight
+                >= self.direct_proposal_admission_limit
             )
         return not self._free_result_slots
 
