@@ -492,3 +492,79 @@ def test_publisher_launch_slot_rotation(monkeypatch):
     assert int(header[(direct_ring.GENERATION_TABLE_OFFSET >> 2) + 3]) == 11
     # Slot 0 keeps the park path's legacy layout.
     assert publisher._slot_offsets(0) == (0, publisher._active_offset)
+
+
+
+def test_tombstoned_ring_push_row_is_retired_draft_side():
+    """A row ending in a launch-published wave gets a zero destination triple
+    from the Target's cleanup, and no Coordinator confirmation copy can ever
+    route for it (the Coordinator only routes cancellations for tasks it
+    dispatched).  The Draft must retire the row from the ring tombstone, or
+    the wave's held candidate push waits forever (the issue-39 warmup wedge).
+    """
+    import sglang.srt.speculative.dt_draft_engine as draft_mod
+
+    engine = object.__new__(draft_mod.FlashMTPDraftEngine)
+    engine._cancelled_ids = set()
+    engine._unconfirmed_direct = {
+        "target:t:live:1:0": 1,
+        "target:t:zombie:1:0": 1,
+        "target:t:pending:1:0": 1,
+    }
+    live_endpoint = SimpleNamespace(
+        destination=lambda seq, position: (4, 9, 123, 4096, 2048)
+    )
+    dead_endpoint = SimpleNamespace(destination=lambda seq, position: (0, 0, 0, 0, 0))
+    stale_endpoint = SimpleNamespace(destination=lambda seq, position: None)
+    engine._ring_record_positions = {
+        "target:t:live:1:0": (live_endpoint, 0),
+        "target:t:zombie:1:0": (dead_endpoint, 1),
+        "target:t:pending:1:0": (stale_endpoint, 2),
+    }
+
+    def _task(transfer_id):
+        return SimpleNamespace(
+            transfer_id=transfer_id, candidate_destination=None, direct_ring_seq=7
+        )
+
+    tasks = [_task("target:t:live:1:0"), _task("target:t:zombie:1:0"), _task("target:t:pending:1:0")]
+    engine._held_ring_pushes = [(tasks, b"candidates", 3)]
+    releases = []
+    engine._release_held_ring_pushes = lambda: releases.append(True)
+
+    engine._retire_tombstoned_ring_pushes()
+
+    assert "target:t:zombie:1:0" in engine._cancelled_ids
+    assert "target:t:live:1:0" not in engine._cancelled_ids
+    assert "target:t:pending:1:0" not in engine._cancelled_ids
+    assert releases == [True]
+
+    # Already-retired rows are not retired twice.
+    releases.clear()
+    engine._retire_tombstoned_ring_pushes()
+    assert releases == []
+
+
+def test_cleanup_writes_zero_destinations_for_all_cancelled_wave():
+    """An all-cancelled wave still gets its destination region written (zero
+    triples).  Without it the region stays stale and the Draft cannot retire
+    its held push — the all-cancelled-wave form of the issue-39 wedge."""
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    _finalize_launch_wave(c, batch, result)
+    # Both rows ended in the wave: park's finished branch cancelled them.
+    c._cancelled_transfers.add("target:a:1:5")
+    c._cancelled_transfers.add("target:b:1:7")
+    writes = []
+    published, made = _setup_cleanup_doubles(c)
+    c._ring_writers["session"].write_destinations = (
+        lambda seq, entries, **kwargs: writes.append((seq, entries))
+    )
+    c._ring_publish_cleanup()
+    assert not arena.reserved
+    assert not made
+    assert len(writes) == 1
+    seq, entries = writes[0]
+    assert seq == 41
+    assert len(entries) == 2
+    assert all(entry == (0, 0, 0) for entry in entries)

@@ -2103,6 +2103,8 @@ class FlashMTPDraftEngine:
                 self._poll_candidate_pushes()
             if self._ring_worker is not None:
                 self._poll_direct_rings()
+            if self._held_ring_pushes:
+                self._retire_tombstoned_ring_pushes()
 
             if (
                 not self._pending
@@ -8777,6 +8779,48 @@ class FlashMTPDraftEngine:
                 cold_mapping_count=push.cold_mapping_count,
                 submitted_ns=push.submitted_ns,
             )
+
+    def _retire_tombstoned_ring_pushes(self) -> None:
+        """Retire held ring-push rows whose ring destination is a tombstone.
+
+        The Target's cleanup writes one (slot, generation, nonce) triple per
+        record row into the ring's destination region about one scheduler
+        iteration after the record itself.  A row that ended in its wave gets
+        a zero triple, and no Coordinator confirmation copy will ever exist
+        for it (the Coordinator only routes cancellations for tasks it
+        dispatched).  Reading the tombstone through the same ring the record
+        came through is the only way for the Draft to learn that cancellation;
+        without it the wave's held push would wait for the confirmation
+        forever and stall every other row of the wave.
+        """
+
+        changed = False
+        for tasks, _push_candidates, _result_slot in self._held_ring_pushes:
+            for task in tasks:
+                if (
+                    task.transfer_id in self._cancelled_ids
+                    or task.transfer_id not in self._unconfirmed_direct
+                    or task.candidate_destination is not None
+                    or not task.direct_ring_seq
+                ):
+                    continue
+                location = self._ring_record_positions.get(task.transfer_id)
+                if location is None:
+                    continue
+                endpoint, position = location
+                resolved = endpoint.destination(task.direct_ring_seq, position)
+                if resolved is None:
+                    # Not written yet (stale or a mid-rewrite lap).
+                    continue
+                slot_id, generation, nonce, _data_off, _meta_off = resolved
+                if (slot_id, generation, nonce) != (0, 0, 0):
+                    # A live row: its destination arrives here or with the
+                    # Coordinator copy; nothing to retire.
+                    continue
+                self._cancelled_ids.add(task.transfer_id)
+                changed = True
+        if changed:
+            self._release_held_ring_pushes()
 
     def _release_held_ring_pushes(self) -> None:
         """Submit or drop §7.1 wave pushes held for Coordinator confirmation."""
