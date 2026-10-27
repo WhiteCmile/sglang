@@ -6977,7 +6977,11 @@ class DTTargetController:
             ]
             live_set = set(live_positions)
             destinations = {}
-            if self._candidate_arena is not None and live_positions:
+            # The destination region is written for every wave — with zeros
+            # for cancelled rows — even when every row ended.  An all-cancelled
+            # wave otherwise leaves the region stale, and the Draft could not
+            # tell its held push that every row is retired.
+            if self._candidate_arena is not None:
                 try:
                     for position in live_positions:
                         transfer_id = specs[position][1]
