@@ -699,17 +699,6 @@ class DTTargetController:
                     slot_count = (
                         configured_slots if configured_slots > 0 else minimum_slots
                     )
-                    if slot_count < minimum_slots:
-                        # _ring_publish_cleanup holds a wave until the whole
-                        # wave fits in free slots; a slot count below the
-                        # default can never fit one wave and would stall
-                        # every wave forever.
-                        raise ValueError(
-                            "draft-target-candidate-slots must be at least "
-                            f"{minimum_slots} (the launcher default, 2x "
-                            "max-running-requests); larger explicit values "
-                            f"are allowed, got {slot_count}"
-                        )
                     self._candidate_arena = TargetCandidateArena(
                         target_instance_id=self.instance_id,
                         target_session_id=self._client.instance_session_id,
@@ -6518,7 +6507,14 @@ class DTTargetController:
         pool = self._feature_source_pool
         retained = deque()
         waves = list(self._ring_publish_pending)
-        for wave_index, wave in enumerate(waves):
+        # Waves of one session must confirm in wave order, so once a session's
+        # wave is held on slot exhaustion every later wave of that session is
+        # held too; waves of other sessions are independent and still fit.
+        blocked_sessions = set()
+        for wave in waves:
+            if wave.session_id in blocked_sessions:
+                retained.append(wave)
+                continue
             writer = self._ring_writers.get(wave.session_id)
             if writer is None:
                 # The owner lease was revoked; the fence machinery retires the
@@ -6577,8 +6573,9 @@ class DTTargetController:
                     # already holds its push for unconfirmed ring tasks, and a
                     # slot is freed only when a verify consumes it, so pending
                     # waves cannot starve the completions that release slots.
-                    # Later waves are held too, keeping confirmations in wave
-                    # order per session.
+                    # Only this session's later waves are held, keeping
+                    # confirmations in wave order per session.
+                    blocked_sessions.add(wave.session_id)
                     now_ns = time.monotonic_ns()
                     if (
                         now_ns - getattr(self, "_ring_publish_hold_log_ns", 0)
@@ -6587,12 +6584,17 @@ class DTTargetController:
                         self._ring_publish_hold_log_ns = now_ns
                         logger.info(
                             "candidate arena exhausted; holding %d "
-                            "ring-published wave(s) until verify completions "
-                            "free slots",
-                            len(waves) - wave_index,
+                            "ring-published wave(s) for session %s until "
+                            "verify completions free slots",
+                            sum(
+                                1
+                                for pending in waves
+                                if pending.session_id == wave.session_id
+                            ),
+                            wave.session_id,
                         )
-                    retained.extend(waves[wave_index:])
-                    break
+                    retained.append(wave)
+                    continue
                 try:
                     for position in live_positions:
                         transfer_id = specs[position][1]
