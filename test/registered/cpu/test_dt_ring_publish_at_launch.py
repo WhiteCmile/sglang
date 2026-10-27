@@ -248,6 +248,28 @@ def test_launch_post_kernel_failure_fails_closed():
     assert len(c._ring_publish_orphaned_events) == 1
 
 
+def test_launch_pre_kernel_failure_falls_back_to_park():
+    from sglang.srt.speculative.dt_direct_ring import DirectRingError
+
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+
+    def not_serving(**_kwargs):
+        raise DirectRingError("ring is not serving")
+
+    publisher.publish = not_serving
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    # publish() raised from its pre-launch validation: the kernel never went
+    # out and no record can appear.  The wave must fall back to the park
+    # path with the in-place lease restored — not quarantine a healthy slot
+    # and fail the wave closed over an owner-revocation race.
+    assert result.dt_ring_publish_launch is None
+    assert result.dt_ring_publish_launch_error is None
+    assert c._quarantined is None
+    assert not c._ring_publish_orphaned_events
+    assert c._inplace_hidden[int(packed.data_ptr())][0] == 3
+    assert not arena.reserved and not arena.cancelled
+
+
 def test_launch_ineligible_without_inplace_lease_or_binding():
     c, batch, result, publisher, arena, packed = make_wave(make_controller())
     c._inplace_hidden.clear()
@@ -380,9 +402,27 @@ def test_cleanup_defers_when_arena_is_full():
     c._ring_publish_cleanup()
     assert len(c._ring_publish_pending) == 1
     assert arena.cancelled == [("target:a:1:5", True)]
+    # The Draft consumes records independently and the producer wraps after
+    # `capacity` further publications: overwrite the slot with a newer
+    # sequence.  The deferred wave must still be processed from its record
+    # snapshot; waiting for the old seq word to reappear would strand it
+    # (and its source reservation and parked requests) forever.
+    raw = c._ring_writers["session"]._ring.raw
+    _pack_record(
+        raw,
+        41 % 64 * ENTRY_BYTES,
+        seq=41 + 64,
+        row_count=8,
+        reqs=[(0xA5 ^ 1, 1, 5, 0, 2, 99, 12), (0xA5 ^ 1, 1, 7, 4, 4, 88, 24)],
+        tokens=(10, 11, 20, 21, 22, 23),
+    )
     arena.fail_at = None
     c._ring_publish_cleanup()
     assert not c._ring_publish_pending
+    # The retry reserves both rows from the snapshot (the first call's
+    # partial reservation stayed recorded on the double even though it was
+    # cancelled).
+    assert arena.reserved[-2:] == ["target:a:1:5", "target:b:1:7"]
 
 
 def test_cleanup_quarantines_wave_when_writer_gone():
@@ -405,16 +445,26 @@ def test_tombstoned_ring_push_row_is_retired_draft_side():
     route for it (the Coordinator only routes cancellations for tasks it
     dispatched).  The Draft must retire the row from the ring tombstone, or
     the wave's held candidate push waits forever (the issue-39 warmup wedge).
+    The real release path runs (no mocks) so the test proves the terminal
+    bookkeeping, not the scanner's own bookkeeping.
     """
     import sglang.srt.speculative.dt_draft_engine as draft_mod
 
+    tids = ("target:t:live:1:0", "target:t:zombie:1:0", "target:t:pending:1:0")
     engine = object.__new__(draft_mod.FlashMTPDraftEngine)
     engine._cancelled_ids = set()
-    engine._unconfirmed_direct = {
-        "target:t:live:1:0": 1,
-        "target:t:zombie:1:0": 1,
-        "target:t:pending:1:0": 1,
+    engine._unconfirmed_direct = {tid: 1 for tid in tids}
+    engine._direct_tasks_by_transfer = {
+        tid: SimpleNamespace(
+            transfer_id=tid, candidate_destination=None, direct_ring_seq=7
+        )
+        for tid in tids
     }
+    engine._held_direct_source_done = {tid: ["held-source-done"] for tid in tids}
+    engine._held_direct_results = {tid: "held-result" for tid in tids}
+    engine._pending_ids = set(tids)
+    engine._ring_pending_ids = set(tids)
+    engine._received_ns_by_transfer = {tid: 1 for tid in tids}
     live_endpoint = SimpleNamespace(
         destination=lambda seq, position: (4, 9, 123, 4096, 2048)
     )
@@ -425,28 +475,48 @@ def test_tombstoned_ring_push_row_is_retired_draft_side():
         "target:t:zombie:1:0": (dead_endpoint, 1),
         "target:t:pending:1:0": (stale_endpoint, 2),
     }
-
-    def _task(transfer_id):
-        return SimpleNamespace(
-            transfer_id=transfer_id, candidate_destination=None, direct_ring_seq=7
-        )
-
-    tasks = [_task("target:t:live:1:0"), _task("target:t:zombie:1:0"), _task("target:t:pending:1:0")]
-    engine._held_ring_pushes = [(tasks, b"candidates", 3)]
-    releases = []
-    engine._release_held_ring_pushes = lambda: releases.append(True)
+    engine._held_ring_pushes = [
+        (list(engine._direct_tasks_by_transfer.values()), b"candidates", 3)
+    ]
+    engine._candidate_push_transport = SimpleNamespace()
+    engine._free_result_slots = []
 
     engine._retire_tombstoned_ring_pushes()
 
-    assert "target:t:zombie:1:0" in engine._cancelled_ids
-    assert "target:t:live:1:0" not in engine._cancelled_ids
-    assert "target:t:pending:1:0" not in engine._cancelled_ids
-    assert releases == [True]
+    # The zombie row is marked cancelled; its identity retires when the hold
+    # releases (the wave's live rows are still awaiting confirmation), so the
+    # wave stays held and the live rows' bookkeeping is untouched.
+    zombie = "target:t:zombie:1:0"
+    assert zombie in engine._cancelled_ids
+    for tid in ("target:t:live:1:0", "target:t:pending:1:0"):
+        assert tid in engine._unconfirmed_direct
+        assert tid in engine._direct_tasks_by_transfer
+    assert len(engine._held_ring_pushes) == 1
+    assert engine._free_result_slots == []
 
-    # Already-retired rows are not retired twice.
-    releases.clear()
+    # A second scan is idempotent: nothing is retired twice, the wave stays
+    # held while any row is still unconfirmed.
     engine._retire_tombstoned_ring_pushes()
-    assert releases == []
+    assert len(engine._held_ring_pushes) == 1
+    assert "target:t:live:1:0" in engine._unconfirmed_direct
+
+    # Tombstone the remaining rows too: the hold releases and every row must
+    # reach its terminal state through the real release path — cancelled
+    # identity, no unconfirmed/direct/source-done/held-result bookkeeping, no
+    # record position — and the result slot is freed.  A leak here would
+    # accumulate per finished row and weaken the Coordinator queue-capacity
+    # bound.
+    engine._ring_record_positions["target:t:live:1:0"] = (dead_endpoint, 0)
+    engine._ring_record_positions["target:t:pending:1:0"] = (dead_endpoint, 2)
+    engine._retire_tombstoned_ring_pushes()
+    assert engine._held_ring_pushes == []
+    assert engine._free_result_slots == [3]
+    assert not engine._unconfirmed_direct
+    assert not engine._direct_tasks_by_transfer
+    assert not engine._held_direct_source_done
+    assert not engine._held_direct_results
+    assert not engine._cancelled_ids
+    assert not engine._ring_record_positions
 
 
 def test_cleanup_writes_zero_destinations_for_all_cancelled_wave():

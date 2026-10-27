@@ -643,8 +643,11 @@ class TargetCandidateArena:
             # O(1) claim from the free list; the per-slot completion resources
             # (wait stream, pinned metadata buffer) are created once and kept
             # across generations, so a reservation stays a few microseconds
-            # even when the arena is nearly full.
-            slot_id = self._free_ids.popleft()
+            # even when the arena is nearly full.  Peek, don't claim: every
+            # fallible step below (generation bound, lazy stream/pinned-buffer
+            # allocation) must leave the FREE slot on the free list, or an
+            # exception would permanently lose arena capacity.
+            slot_id = self._free_ids[0]
             slot = self._slots[slot_id]
             if slot.state is not CandidateSlotState.FREE:
                 raise CandidateTransportError("candidate arena free list diverged")
@@ -660,6 +663,8 @@ class TargetCandidateArena:
                 metadata_host = slot.metadata_host = torch.empty(
                     (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
                 )
+            # All fallible work succeeded: claim the slot now.
+            self._free_ids.popleft()
             slot.generation = generation
             slot.state = CandidateSlotState.ARMED
             slot.transfer_id = transfer_id

@@ -335,6 +335,11 @@ class RingPublishWave:
     # Filled by _park_dflash_completed_batch: transfer_id ->
     # (requires_proposal, previous_transfer_id).
     proposals: dict
+    # Record snapshot taken by _ring_publish_cleanup on the poll that first
+    # sees the wave's seq word in the ring.  A deferred wave (full arena)
+    # must not re-read the ring: the Draft consumes records and the producer
+    # wraps, after which the old seq word can never reappear at its slot.
+    record: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -6312,7 +6317,11 @@ class DTTargetController:
     def _dflash_ring_publish_at_launch_impl(
         self, batch: ScheduleBatch, batch_result
     ) -> RingPublishLaunch | None:
-        from sglang.srt.speculative.dt_direct_ring import V2_MAX_REQ, V2_MAX_TOK
+        from sglang.srt.speculative.dt_direct_ring import (
+            DirectRingError,
+            V2_MAX_REQ,
+            V2_MAX_TOK,
+        )
 
         if not self.is_export_rank:
             return None
@@ -6493,6 +6502,14 @@ class DTTargetController:
             # record so park's release path cannot free a quarantined slot.
             self._inplace_hidden.pop(packed.data_ptr(), None)
             raise
+        except DirectRingError:
+            # publish()'s pre-launch validation failed (e.g. the ring stopped
+            # serving in an owner-revocation race): the kernel never went out
+            # and no record can appear.  Restore the in-place lease and leave
+            # the wave to the park path, exactly as for any other
+            # ineligibility, instead of quarantining a healthy slot.
+            self._inplace_hidden[packed.data_ptr()] = reservation
+            return self._launch_fallback("publish")
         except Exception:
             # The kernel never went out: restore the in-place lease so the
             # park path sees this wave exactly as if launch staging had not
@@ -6551,6 +6568,8 @@ class DTTargetController:
         the graph-owned buffers before the kernel has read them.
         """
 
+        from sglang.srt.speculative.dt_direct_ring import DirectRingError
+
         staging_slot = publisher.next_launch_slot()
         publisher.stage_requests(entries, staging_slot=staging_slot)
         source_byte_offset = pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
@@ -6571,10 +6590,17 @@ class DTTargetController:
                 token_total=token_bound,
                 staging_slot=staging_slot,
             )
+        except DirectRingError:
+            # publish() raises DirectRingError only from validation that runs
+            # before the kernel is enqueued and before any ring state
+            # advances (ring not serving, geometry, credit).  No record can
+            # appear, so the caller restores the in-place lease and the wave
+            # falls back to the park path — an ordinary owner-revocation race
+            # must not quarantine a healthy slot.
+            raise
         except Exception as exc:
-            # publish() raises only from the post-launch error check, so the
-            # kernel may already be on the ring: fail closed rather than let
-            # the park path double-publish the wave.
+            # The kernel may already be on the ring: fail closed rather than
+            # let the park path double-publish the wave.
             pool.quarantine_reserved(slot_id, generation)
             orphaned = getattr(self, "_ring_publish_orphaned_events", None)
             if orphaned is None:
@@ -6934,31 +6960,53 @@ class DTTargetController:
                     wave.slot_id, wave.generation
                 )
                 continue
-            base = (
-                writer._ring.entries_offset
-                + (wave.wave_seq % writer.capacity) * ENTRY_BYTES
-            )
-            raw = writer._ring.raw
-            if _struct.unpack_from("<Q", raw, base)[0] != wave.wave_seq:
-                retained.append(wave)  # kernel has not landed yet; next poll
-                continue
-            row_count = _struct.unpack_from("<I", raw, base + 48)[0]
-            request_count = _struct.unpack_from("<I", raw, base + 56)[0]
-            record_reqs = [
-                _struct.unpack_from(
-                    "<Q6I", raw, base + V2_HEADER_BYTES + i * V2_REQ_ENTRY_BYTES
+            record = wave.record
+            if record is None:
+                base = (
+                    writer._ring.entries_offset
+                    + (wave.wave_seq % writer.capacity) * ENTRY_BYTES
                 )
-                for i in range(request_count)
-            ]
-            record_counts = [rec[4] for rec in record_reqs]
-            token_total = sum(record_counts)
-            # Feature row offsets come from the record (block-strided for
-            # in-place waves); token ids sit at compacted prefix positions.
-            row_offsets = [rec[3] for rec in record_reqs]
-            tokens = _struct.unpack_from(
-                f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
+                raw = writer._ring.raw
+                if _struct.unpack_from("<Q", raw, base)[0] != wave.wave_seq:
+                    retained.append(wave)  # kernel has not landed yet; next poll
+                    continue
+                # Snapshot the record the first time its seq word is visible.
+                # The Draft consumes records independently and the producer
+                # wraps after `capacity` further publications, so a deferred
+                # wave (full arena below) can never rely on reading the ring
+                # again: its slot may already hold a newer sequence, and
+                # waiting for the old one would strand the wave, its source
+                # reservation and its parked requests forever.
+                row_count = _struct.unpack_from("<I", raw, base + 48)[0]
+                request_count = _struct.unpack_from("<I", raw, base + 56)[0]
+                record_reqs = [
+                    _struct.unpack_from(
+                        "<Q6I", raw, base + V2_HEADER_BYTES + i * V2_REQ_ENTRY_BYTES
+                    )
+                    for i in range(request_count)
+                ]
+                record_counts = [rec[4] for rec in record_reqs]
+                token_total = sum(record_counts)
+                # Feature row offsets come from the record (block-strided for
+                # in-place waves); token ids sit at compacted prefix positions.
+                row_offsets = [rec[3] for rec in record_reqs]
+                tokens = _struct.unpack_from(
+                    f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
+                )
+                hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+                record = wave.record = (
+                    row_count,
+                    request_count,
+                    record_counts,
+                    row_offsets,
+                    tokens,
+                    hidden_produced_ns,
+                )
+            row_count, request_count, record_counts, row_offsets, tokens, hidden_ns = (
+                record
             )
-            hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+            token_total = sum(record_counts)
+            hidden_produced_ns = hidden_ns
             specs = wave.specs
             if (
                 request_count != len(specs)
@@ -6996,10 +7044,11 @@ class DTTargetController:
                         )
                     if "slots are active" in str(exc):
                         # A full arena must apply backpressure, not kill the
-                        # scheduler: the wave's record stays on the ring and
-                        # the reservation is retried at the next poll.  The
-                        # ring's seq word was the launch/park proof; the Draft
-                        # falls back to the Coordinator copy meanwhile.
+                        # scheduler: the record was snapshotted above, so the
+                        # reservation is retried from the snapshot at the next
+                        # poll no matter what happens to the ring slot (the
+                        # Draft consumes records and the producer wraps).  The
+                        # Draft falls back to the Coordinator copy meanwhile.
                         retained.append(wave)
                         continue
                     raise

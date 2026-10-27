@@ -1046,9 +1046,19 @@ class FlashMTPDraftEngine:
         # §7.1 kernel-published records carry request-id hashes only; this
         # ledger maps them back.  Populated at bootstrap admission; only
         # needed (and built) when kernel publication is enabled.
-        from sglang.srt.speculative.dt_direct_ring import RING_PUBLISH, NativeRidLedger
+        from sglang.srt.speculative.dt_direct_ring import (
+            RING_PUBLISH,
+            RING_PUBLISH_AT_LAUNCH,
+            NativeRidLedger,
+        )
 
         self._rid_ledger = NativeRidLedger() if RING_PUBLISH else None
+        # Ring tombstones (zero destination triples for rows that ended in
+        # their wave) exist only in launch-published records: park staging
+        # runs after result processing and never publishes finished rows.
+        # Gate the held-push tombstone scan on the flag so the default Draft
+        # loop does no per-held-request shared-memory scanning.
+        self._ring_publish_at_launch = RING_PUBLISH_AT_LAUNCH
         # Kernel-published record transfer -> (endpoint, request-table
         # position), for arena destination resolution from the ring region.
         self._ring_record_positions: dict = {}
@@ -2103,7 +2113,7 @@ class FlashMTPDraftEngine:
                 self._poll_candidate_pushes()
             if self._ring_worker is not None:
                 self._poll_direct_rings()
-            if self._held_ring_pushes:
+            if self._held_ring_pushes and self._ring_publish_at_launch:
                 self._retire_tombstoned_ring_pushes()
 
             if (
@@ -9568,7 +9578,15 @@ class FlashMTPDraftEngine:
             self._drain_deferred_persistent_release(draft_kv_handle)
 
     def _retire_cancelled_transfer_identity(self, task) -> None:
-        """Retire mmap cancellation; direct tombstones retire on result ACK."""
+        """Retire a cancelled transfer identity and all of its direct holds.
+
+        None of the direct-dispatch bookkeeping can be cleaned later for a
+        cancelled identity: it has no Coordinator confirmation task, and the
+        unconfirmed-direct timeout only sweeps transfers with held results.
+        Leaving any entry live leaks it per finished row, and unconfirmed
+        entries are subtracted from the Coordinator queue-capacity bound, so
+        the leak progressively weakens admission enforcement.
+        """
 
         if getattr(task, "candidate_destination", None) is None:
             self._pending_ids.discard(task.transfer_id)
@@ -9576,6 +9594,15 @@ class FlashMTPDraftEngine:
         self._cancelled_ids.discard(task.transfer_id)
         self._received_ns_by_transfer.pop(task.transfer_id, None)
         self._ring_record_positions.pop(task.transfer_id, None)
+        for book in (
+            "_unconfirmed_direct",
+            "_direct_tasks_by_transfer",
+            "_held_direct_source_done",
+            "_held_direct_results",
+        ):
+            state = getattr(self, book, None)
+            if state is not None:
+                state.pop(task.transfer_id, None)
 
     def _release_result(self, published: PublishedResult) -> None:
         if self._published_by_batch.pop(published.batch_id, None) is None:
