@@ -4348,7 +4348,14 @@ class DTTargetController:
                 # own ownership atomically before dropping its last reference.
                 active_leases, quarantined_slots = source_pool.close()
                 source_pool_fenced = True
-                if active_leases or quarantined_slots:
+                if quarantined_slots:
+                    logger.info(
+                        "DT Target shutdown quarantined %d direct-GPU source "
+                        "slot(s) with possibly ring-published records; slots "
+                        "stay fenced from reuse until process teardown",
+                        quarantined_slots,
+                    )
+                if active_leases:
                     raise RuntimeError(
                         "DT Target shutdown found unresolved direct-GPU source "
                         "pool ownership after controller drain: "
@@ -4413,16 +4420,17 @@ class DTTargetController:
         for transfer_id in tuple(self._staged_flashmtp_source_leases):
             self._release_source_slot(transfer_id)
 
-        # Ring-published waves still awaiting confirmation hold feature-source
-        # reservations that were never published (candidate-arena exhaustion
-        # holds them, or the kernel record has not landed), so they are absent
-        # from _source_slot_by_transfer above.  No confirmation tasks were
-        # queued for them, so no remote reader can exist; return each
-        # reservation so pool close() finds no RESERVED slots.
+        # Every wave in _ring_publish_pending had its publish kernel launched
+        # (a wave enters the deque only after publisher.publish() succeeds),
+        # so its record may already be on the ring even though no
+        # confirmation task was ever queued: the Draft can pull such a
+        # source before any Coordinator confirmation.  Release would let the
+        # slot recycle under a potential reader, so quarantine each pending
+        # wave instead; quarantine is always safe at shutdown.
         pending_waves = getattr(self, "_ring_publish_pending", None)
         if pending_waves:
             for wave in tuple(pending_waves):
-                self._feature_source_pool.release_reserved(
+                self._feature_source_pool.quarantine_reserved(
                     wave.slot_id, wave.generation
                 )
             pending_waves.clear()

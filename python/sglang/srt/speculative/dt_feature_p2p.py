@@ -807,7 +807,9 @@ class TargetFeatureSourcePool:
         The returned pair is ``(active_leases, quarantined_slots)``.  Taking
         that snapshot under the same lock that closes admission lets the
         Target controller decide whether it may detach the pool without a new
-        publication racing the shutdown ownership check.
+        publication racing the shutdown ownership check.  Quarantined slots
+        are accepted terminal ownership at shutdown: quarantine already
+        fences them from reuse permanently, so they never block detaching.
         """
         with self._lock:
             self._closed = True
