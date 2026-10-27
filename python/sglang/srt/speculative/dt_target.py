@@ -696,6 +696,19 @@ class DTTargetController:
                     configured_slots = int(
                         self.server_args.draft_target_candidate_slots
                     )
+                    # _ring_publish_cleanup admits a ring-published wave only
+                    # when the whole wave fits in free arena slots; a count
+                    # below the largest wave the ring can publish would hold
+                    # every wave forever.  Zero keeps the launcher default.
+                    from sglang.srt.speculative.dt_direct_ring import V2_MAX_REQ
+
+                    if 0 < configured_slots < V2_MAX_REQ:
+                        raise ValueError(
+                            "draft-target-candidate-slots must be at least "
+                            f"{V2_MAX_REQ} (dt_direct_ring.V2_MAX_REQ, the "
+                            "largest wave the direct ring can publish); got "
+                            f"{configured_slots}"
+                        )
                     slot_count = (
                         configured_slots if configured_slots > 0 else minimum_slots
                     )
