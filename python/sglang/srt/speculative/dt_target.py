@@ -360,6 +360,7 @@ class DTTargetController:
                 TargetCoordinatorClient,
                 TargetRoundLedger,
             )
+            from dt_launcher.topology import default_candidate_slots
             from dt_profile import emit as profile_emit
             from dt_profile import flush as profile_flush
         except ImportError as exc:
@@ -685,18 +686,35 @@ class DTTargetController:
                         TargetCandidateArena,
                     )
 
+                    # Zero derives the launcher default from
+                    # max_running_requests; the derivation lives in
+                    # dt_launcher.topology (imported above) so sglang does
+                    # not restate it.
+                    minimum_slots = default_candidate_slots(
+                        int(scheduler.max_running_requests)
+                    )
                     configured_slots = int(
                         self.server_args.draft_target_candidate_slots
                     )
+                    slot_count = (
+                        configured_slots if configured_slots > 0 else minimum_slots
+                    )
+                    if slot_count < minimum_slots:
+                        # _ring_publish_cleanup holds a wave until the whole
+                        # wave fits in free slots; a slot count below the
+                        # default can never fit one wave and would stall
+                        # every wave forever.
+                        raise ValueError(
+                            "draft-target-candidate-slots must be at least "
+                            f"{minimum_slots} (the launcher default, 2x "
+                            "max-running-requests); larger explicit values "
+                            f"are allowed, got {slot_count}"
+                        )
                     self._candidate_arena = TargetCandidateArena(
                         target_instance_id=self.instance_id,
                         target_session_id=self._client.instance_session_id,
                         device=scheduler.device,
-                        slot_count=(
-                            configured_slots
-                            if configured_slots > 0
-                            else max(2, int(scheduler.max_running_requests) * 2)
-                        ),
+                        slot_count=slot_count,
                         row_width=self.block_size,
                         profile_timing=self._profile_active,
                     )
@@ -6488,9 +6506,6 @@ class DTTargetController:
 
         from msgspec.structs import replace
 
-        from sglang.srt.speculative.dt_candidate_p2p import (
-            CandidateSlotsExhaustedError,
-        )
         from sglang.srt.speculative.dt_direct_ring import (
             ENTRY_BYTES,
             V2_HEADER_BYTES,
@@ -6584,17 +6599,6 @@ class DTTargetController:
                         destinations[transfer_id] = self._candidate_arena.reserve(
                             transfer_id
                         )
-                except CandidateSlotsExhaustedError:
-                    # Defensive: the free-count gate above is exact only while
-                    # cleanup and dispatch share the scheduler thread; retain
-                    # and retry here as well so the invariant survives moving
-                    # this cleanup off that thread.
-                    for transfer_id in destinations:
-                        self._candidate_arena.cancel(
-                            transfer_id, remote_quiescent=True
-                        )
-                    retained.extend(waves[wave_index:])
-                    break
                 except Exception:
                     for transfer_id in destinations:
                         self._candidate_arena.cancel(
