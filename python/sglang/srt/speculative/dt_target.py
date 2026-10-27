@@ -632,9 +632,10 @@ class DTTargetController:
         # enqueue the publish kernel on the verify stream at launch, right
         # behind the verify forward, instead of from host park.  The park
         # path stays as the fallback whenever launch staging is ineligible.
-        self._ring_publish_at_launch = (
-            os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "0") == "1"
-        )
+        # The env default is parsed once in dt_direct_ring (SSOT).
+        from sglang.srt.speculative.dt_direct_ring import RING_PUBLISH_AT_LAUNCH
+
+        self._ring_publish_at_launch = RING_PUBLISH_AT_LAUNCH
         self._ring_publishers: dict[str, object] = {}  # session -> RingGpuPublisher
         self._ring_publish_pending: deque = deque()
         self._ring_publish_transfers: set[str] = set()

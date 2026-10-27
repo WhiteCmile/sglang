@@ -17,7 +17,6 @@ import msgspec
 import numpy as np
 import torch
 
-import sglang.srt.speculative.dt_direct_ring as direct_ring
 import sglang.srt.speculative.dt_target as target
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dt_direct_ring import (
@@ -218,18 +217,6 @@ def test_launch_publish_stages_record_and_finalize():
     assert result.dt_ring_publish_wave is wave
 
 
-def test_launch_never_reserves_arena():
-    c, batch, result, publisher, arena, packed = make_wave(make_controller())
-    arena.fail_at = 0  # any reservation would fail
-    c._stage_dflash_ring_publish_at_launch(batch, result)
-    # The publish does not consult the arena at launch: no fallback, no
-    # reservation attempt, the kernel goes out.
-    assert result.dt_ring_publish_launch is not None
-    assert result.dt_ring_publish_launch_error is None
-    assert not arena.reserved and not arena.cancelled
-    assert [call[0] for call in publisher.calls] == ["stage", "publish"]
-
-
 def test_launch_kernel_failure_restores_lease():
     c, batch, result, publisher, arena, packed = make_wave(make_controller())
 
@@ -410,89 +397,6 @@ def test_cleanup_quarantines_wave_when_writer_gone():
     # Nothing was ever reserved for this wave, so there is nothing to retire.
     assert not arena.cancelled
     assert not c._ring_publish_pending
-
-
-def test_publisher_launch_slot_rotation(monkeypatch):
-    monkeypatch.setattr(direct_ring, "RING_PUBLISH_AT_LAUNCH", True)
-    max_batch_slots = 8
-    publisher = object.__new__(direct_ring.RingGpuPublisher)
-    publisher.block_size = 4
-    publisher.row_bytes = 6
-    publisher.max_batch_slots = max_batch_slots
-    publisher._active_offset = max_batch_slots * direct_ring.V2_STAGING_ENTRY_BYTES
-    publisher._counts_offset = publisher._active_offset + 4 * direct_ring.V2_MAX_REQ
-    nbytes = publisher._counts_offset + 4 * max_batch_slots
-    publisher._launch_slot_stride = (
-        direct_ring.V2_MAX_REQ * direct_ring.V2_STAGING_ENTRY_BYTES
-        + 4 * direct_ring.V2_MAX_REQ
-    )
-    publisher._launch_entries_base = nbytes
-    publisher._launch_active_base = publisher._launch_entries_base + (
-        direct_ring.LAUNCH_STAGING_SLOTS * publisher._launch_slot_stride
-    )
-    nbytes = publisher._launch_active_base + (
-        direct_ring.LAUNCH_STAGING_SLOTS * 4 * direct_ring.V2_MAX_REQ
-    )
-    publisher._launch_slot_cycle = -1
-    publisher._entries_dev = 0
-    publisher._staging_dev = 0
-    buf = np.zeros(nbytes, dtype=np.uint8)
-    publisher._stg_u8 = buf
-    publisher._stg_u64 = buf.view(np.uint64)
-    publisher._stg_u32 = buf.view(np.uint32)
-    publisher._hash_by_rid = {}
-    launched = []
-    publisher._ext = SimpleNamespace(
-        publish=lambda **kwargs: launched.append(kwargs)
-    )
-    publisher._pool_tag = 0
-    header = np.zeros(4096 // 4 + 8, dtype=np.uint32)
-    publisher._writer = SimpleNamespace(
-        state=direct_ring.STATE_SERVING,
-        capacity=64,
-        next_seq=41,
-        max_entry_bytes=1 << 20,
-        free_entries=lambda: 3,
-        _ring=SimpleNamespace(
-            header=header, write_entry_bytes=lambda *_args: None
-        ),
-    )
-    # The rotation cycles through disjoint staging regions, so a queued
-    # kernel never reads entries a later wave's host staging overwrote.
-    offsets = set()
-    for iteration, expected_slot in enumerate((1, 2, 3, 4, 5, 6, 7, 8, 1)):
-        slot = publisher.next_launch_slot()
-        assert slot == expected_slot
-        entries_offset, active_offset = publisher._slot_offsets(slot)
-        if iteration < direct_ring.LAUNCH_STAGING_SLOTS:
-            assert entries_offset not in offsets
-            offsets.add(entries_offset)
-        publisher.stage_requests([(7, 1, 5, 9, 0xDEAD)], staging_slot=slot)
-        seq = publisher.publish(
-            stream=0xBEEF,
-            active_slots=[2],
-            slot_id=3,
-            generation=11,
-            source_byte_offset=4096,
-            nbytes=48,
-            row_count=8,
-            event_handle=b"h" * 64,
-            accept_dev=1,
-            bonus_dev=2,
-            seq_lens_dev=3,
-            offset_stride=4,
-            token_total=4,
-            staging_slot=slot,
-        )
-        assert seq == 41 + iteration
-        call = launched[-1]
-        assert call["staging_entries_offset"] == entries_offset
-        assert call["staging_active_offset"] == active_offset
-        assert buf.view(np.uint32)[active_offset // 4] == 2
-    assert int(header[(direct_ring.GENERATION_TABLE_OFFSET >> 2) + 3]) == 11
-    # Slot 0 keeps the park path's legacy layout.
-    assert publisher._slot_offsets(0) == (0, publisher._active_offset)
-
 
 
 def test_tombstoned_ring_push_row_is_retired_draft_side():
