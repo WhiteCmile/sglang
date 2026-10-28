@@ -10,8 +10,7 @@ from contextlib import contextmanager
 from multiprocessing import Process
 from typing import Callable, List, Optional
 
-import psutil
-
+from sglang.srt.utils.common import ParentSigquitGuard
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
@@ -117,7 +116,7 @@ class WatchdogRaw:
         self.soft = soft
         self.dump_info = dump_info
 
-        self.parent_process = psutil.Process().parent()
+        self.parent_guard = ParentSigquitGuard()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
 
@@ -160,7 +159,7 @@ class WatchdogRaw:
         if not self.soft:
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
-            self.parent_process.send_signal(signal.SIGQUIT)
+            self.parent_guard.send_sigquit()
 
 
 class SubprocessWatchdog:

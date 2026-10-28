@@ -31,7 +31,6 @@ from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
-import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -256,6 +255,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
+    ParentSigquitGuard,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -5287,7 +5287,7 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
-    parent_process = psutil.Process().parent()
+    parent_guard = ParentSigquitGuard()
 
     # Set up tracing
     if server_args.enable_trace:
@@ -5327,7 +5327,7 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        parent_guard.send_sigquit()
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
         if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
