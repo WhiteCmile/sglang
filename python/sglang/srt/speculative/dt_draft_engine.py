@@ -2615,6 +2615,28 @@ class FlashMTPDraftEngine:
             if abandoned or transfer_id in self._cancelled_ids:
                 self._drop_ring_record_task(record, task, report=not abandoned)
                 continue
+            if self._ring_publish_at_launch:
+                # Scan the destination region while this record's ring
+                # generation is still observable.  The Target's cleanup
+                # normally trails the record by about one scheduler
+                # iteration, but when it already ran (a slow consumer), a
+                # tombstoned row — one that ended in its wave, with no
+                # Coordinator task — is retired here, before candidate
+                # compute creates the wave's held push; by then the ring may
+                # have wrapped and the tombstone would be unrecoverable.
+                # A live triple is latched onto the task: it is the same
+                # destination the publish path would resolve later, observed
+                # at the only moment its generation is provably current.
+                resolved = endpoint.destination(record.seq, position)
+                if resolved is not None:
+                    if (resolved[0], resolved[1], resolved[2]) == (0, 0, 0):
+                        self._drop_ring_record_task(record, task, report=True)
+                        continue
+                    destination = self._ring_destination_ref(task, resolved)
+                    if destination is not None:
+                        from msgspec.structs import replace
+
+                        task = replace(task, candidate_destination=destination)
             received_ns = time.monotonic_ns()
             self._direct_tasks_by_transfer[transfer_id] = task
             self._unconfirmed_direct[transfer_id] = task.deadline_ns
@@ -3618,15 +3640,36 @@ class FlashMTPDraftEngine:
         same failure the ring path already sends for a retired-then-dispatched
         task.  Where the Coordinator never accepted its copy this failure is
         stale there, and the Target's own round deadline retires the round.
+
+        A row of a §7.1 held candidate push has no result yet and never will
+        once its record deadline passed with neither the ring destination
+        nor the Coordinator confirmation arriving (its ring generation may
+        already be gone).  Retire it as cancelled so the held push cannot
+        outlive the ring data it waits on; the release path retires the
+        identity.  A genuinely live row is later answered by the Target's own
+        round deadline, and a late Coordinator copy is dropped as a duplicate
+        by the seen-set.
         """
+
         if not self._unconfirmed_direct:
             return
+        held_push_ids = {
+            task.transfer_id
+            for tasks, _candidates, _slot in getattr(self, "_held_ring_pushes", ())
+            for task in tasks
+        }
+        expired_held_push = False
         now_ns = time.monotonic_ns()
         for transfer_id, deadline_ns in tuple(self._unconfirmed_direct.items()):
-            if (
-                now_ns < deadline_ns + UNCONFIRMED_DIRECT_GRACE_NS
-                or transfer_id not in self._held_direct_results
-            ):
+            if now_ns < deadline_ns + UNCONFIRMED_DIRECT_GRACE_NS:
+                continue
+            if transfer_id in held_push_ids:
+                self._unconfirmed_direct.pop(transfer_id)
+                self._held_direct_source_done.pop(transfer_id, None)
+                self._cancelled_ids.add(transfer_id)
+                expired_held_push = True
+                continue
+            if transfer_id not in self._held_direct_results:
                 continue
             self._unconfirmed_direct.pop(transfer_id)
             self._held_direct_results.pop(transfer_id)
@@ -3654,6 +3697,8 @@ class FlashMTPDraftEngine:
                 # The drop just reported this transfer; a later Coordinator
                 # copy must not publish a duplicate failure.
                 self._remember_ring_retired(transfer_id, failed=False)
+        if expired_held_push:
+            self._release_held_ring_pushes()
 
     def _accept_dispatch(self, message) -> bool:
         received_ns = time.monotonic_ns()
@@ -8883,25 +8928,18 @@ class FlashMTPDraftEngine:
                 )
         self._held_ring_pushes = remaining
 
-    def _resolve_ring_destination(self, task):
-        """Build a record task's arena destination from the ring region.
+    def _ring_destination_ref(self, task, resolved):
+        """Build a record task's arena destination from a resolved triple.
 
-        The Target CPU-writes (slot_id, generation, nonce) for the wave when
-        its cleanup lands the arena reservation — long before the Coordinator
-        confirmation copy.  Returns None when the region is not populated yet.
+        ``resolved`` is the (slot_id, generation, nonce, data_offset,
+        metadata_offset) the destination region returned for the task's ring
+        seq and position.  The Target CPU-writes the triple when its cleanup
+        lands the arena reservation — long before the Coordinator
+        confirmation copy.
         """
 
         from dt_protocol import CandidateDestinationRef
 
-        if not self._ring_dest_region:
-            return None
-        location = self._ring_record_positions.get(task.transfer_id)
-        if location is None:
-            return None
-        endpoint, position = location
-        resolved = endpoint.destination(task.direct_ring_seq, position)
-        if resolved is None:
-            return None
         slot_id, generation, nonce, data_offset, metadata_offset = resolved
         if (slot_id, generation, nonce) == (0, 0, 0):
             return None
@@ -8938,6 +8976,25 @@ class FlashMTPDraftEngine:
             metadata_ipc_handle=b"",
             notification_backend="transport-host-completion",
         )
+
+    def _resolve_ring_destination(self, task):
+        """Read the ring's destination region for one record task.
+
+        Returns None when the region is not populated yet, when it holds a
+        tombstone (the Target cancelled the row), or when the wave's ring
+        generation is no longer observable (wrapped).
+        """
+
+        if not self._ring_dest_region:
+            return None
+        location = self._ring_record_positions.get(task.transfer_id)
+        if location is None:
+            return None
+        endpoint, position = location
+        resolved = endpoint.destination(task.direct_ring_seq, position)
+        if resolved is None:
+            return None
+        return self._ring_destination_ref(task, resolved)
 
     def _publish_successes(
         self,
@@ -9582,10 +9639,11 @@ class FlashMTPDraftEngine:
 
         None of the direct-dispatch bookkeeping can be cleaned later for a
         cancelled identity: it has no Coordinator confirmation task, and the
-        unconfirmed-direct timeout only sweeps transfers with held results.
-        Leaving any entry live leaks it per finished row, and unconfirmed
-        entries are subtracted from the Coordinator queue-capacity bound, so
-        the leak progressively weakens admission enforcement.
+        unconfirmed-direct timeout retires it without the held-result
+        machinery.  Leaving any entry live leaks it per finished row, and
+        unconfirmed entries are subtracted from the Coordinator
+        queue-capacity bound, so the leak progressively weakens admission
+        enforcement.
         """
 
         if getattr(task, "candidate_destination", None) is None:

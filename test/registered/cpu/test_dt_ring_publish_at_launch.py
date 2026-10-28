@@ -135,6 +135,7 @@ def make_controller():
     c._slot_event_handles = {}
     c._ring_publish_pending = target.deque()
     c._ring_publish_orphaned_events = target.deque(maxlen=1024)
+    c._ring_publish_backpressure = set()
     c._cancelled_transfers = set()
     c._profile_active = False
     c._profile_emit = lambda *_args, **_kwargs: None
@@ -394,14 +395,22 @@ def test_cleanup_defers_when_arena_is_full():
         result.next_draft_input.new_seq_lens.numpy(),
     )
     c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
-    _setup_cleanup_doubles(c)
+    published, made = _setup_cleanup_doubles(c)
+    writes = []
+    c._ring_writers["session"].write_destinations = (
+        lambda seq, entries, **kwargs: writes.append((seq, entries))
+    )
     arena.fail_at = 1  # first reservation lands, the second sees a full arena
     arena.fail_exc = CandidateTransportError("all candidate arena slots are active")
-    # A full arena is backpressure: the wave stays pending, the partial
-    # reservation is cancelled, and nothing raises.
+    # A full arena is backpressure, not kill the scheduler: the wave stays
+    # pending, the partial reservation is cancelled, nothing raises, and the
+    # session's ring publication is backpressured so no new record can reuse
+    # this wave's slot while it is retained.
     c._ring_publish_cleanup()
     assert len(c._ring_publish_pending) == 1
+    assert c._ring_publish_backpressure == {"session"}
     assert arena.cancelled == [("target:a:1:5", True)]
+    assert not writes
     # The Draft consumes records independently and the producer wraps after
     # `capacity` further publications: overwrite the slot with a newer
     # sequence.  The deferred wave must still be processed from its record
@@ -419,10 +428,55 @@ def test_cleanup_defers_when_arena_is_full():
     arena.fail_at = None
     c._ring_publish_cleanup()
     assert not c._ring_publish_pending
+    assert c._ring_publish_backpressure == set()
     # The retry reserves both rows from the snapshot (the first call's
     # partial reservation stayed recorded on the double even though it was
-    # cancelled).
+    # cancelled) and builds the Coordinator confirmation copies as usual.
     assert arena.reserved[-2:] == ["target:a:1:5", "target:b:1:7"]
+    assert len(made) == 2
+    # Generation ownership: the destination slot now shows the newer lap, so
+    # the retried write must NOT publish the old seq into it — that would
+    # clobber the newer wave's destinations.  The Coordinator copies built
+    # above already carry these rows' destinations.
+    assert not writes
+
+
+def test_cleanup_drops_wave_when_record_slot_wrapped_before_snapshot():
+    """If the ring wrapped before the wave's first cleanup sighting, the slot
+    shows a newer lap and the record is unrecoverable from the ring.  The
+    wave must be dropped (slot quarantined), not retained to poll a seq word
+    that can never reappear; its parked rounds fail at their own deadlines.
+    With the publication backpressure active this requires a full ring of
+    cleanup lag."""
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    _finalize_launch_wave(c, batch, result)
+    _setup_cleanup_doubles(c)
+    raw = c._ring_writers["session"]._ring.raw
+    _pack_record(
+        raw,
+        41 % 64 * ENTRY_BYTES,
+        seq=41 + 64,
+        row_count=8,
+        reqs=[(0xA5 ^ 1, 1, 5, 0, 2, 99, 12), (0xA5 ^ 1, 1, 7, 4, 4, 88, 24)],
+        tokens=(10, 11, 20, 21, 22, 23),
+    )
+    c._ring_publish_cleanup()
+    assert not c._ring_publish_pending
+    assert c._quarantined == (3, 11)
+    assert not c._ring_publish_backpressure
+
+
+def test_launch_falls_back_when_ring_backpressured():
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    # Another wave of this Draft session is arena-retained: no new record may
+    # publish on its ring until the retained cleanup lands.
+    c._ring_publish_backpressure = {"session"}
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    assert result.dt_ring_publish_launch is None
+    assert result.dt_ring_publish_launch_error is None
+    assert not publisher.calls
+    assert c._inplace_hidden  # lease untouched for the park path
 
 
 def test_cleanup_quarantines_wave_when_writer_gone():
@@ -542,3 +596,218 @@ def test_cleanup_writes_zero_destinations_for_all_cancelled_wave():
     assert seq == 41
     assert len(entries) == 2
     assert all(entry == (0, 0, 0) for entry in entries)
+
+
+def _make_record_engine(destination, *, at_launch=True):
+    """Engine doubles for _accept_ring_record with a one-row wave at seq 7.
+
+    ``destination`` is what the endpoint's destination region returns for the
+    record's seq and position: a live triple, a (0,0,0) tombstone, or None.
+    """
+
+    import sglang.srt.speculative.dt_draft_engine as draft_mod
+    from sglang.srt.speculative.dt_direct_ring import (
+        RingRecordV2,
+        RingRecordV2Request,
+        rid_hash,
+    )
+
+    engine = object.__new__(draft_mod.FlashMTPDraftEngine)
+    engine._ring_publish_at_launch = at_launch
+    engine._rid_ledger = object()
+    engine._ring_source_registration = {0: (b"h" * 64, 1 << 20)}
+    engine._ring_targets = {0: "target"}
+    engine._landing_slot_base = 0
+    engine._landing_taken = [0]
+    engine._feature_staging_refcounts = {}
+    engine._ring_admission = []
+    engine._pending_ids = set()
+    engine._ring_abandoned = set()
+    engine._cancelled_ids = set()
+    engine._seen_transfers = set()
+    engine._seen_transfer_order = []
+    engine._received_ns_by_transfer = {}
+    engine._direct_tasks_by_transfer = {}
+    engine._unconfirmed_direct = {}
+    engine._ring_pending_ids = set()
+    engine._ring_record_positions = {}
+    engine._ring_waiting = {}
+    engine._ring_retired = {}
+    engine._persistent_requests = {}
+    engine._deferred_persistent_releases = {}
+    engine.profile = SimpleNamespace(
+        profile_id="p",
+        draft_k=3,
+        block_size=4,
+        vocab_size=1000,
+        feature_schema=SimpleNamespace(schema_id="schema"),
+    )
+    engine.candidate_transport = "cuda-ipc"
+    engine._is_feature_backed = True
+    engine._pivot_width = 4
+    engine.feature_buffer_max_tokens = 512
+    engine.batch_source_read_done = True
+    engine._source_done_pending = []
+    engine._held_direct_source_done = {}
+    engine._held_direct_results = {}
+    engine.instance_id = "draft"
+    engine._client = SimpleNamespace(
+        instance_session_id="draft-session", coordinator_session_id="coordinator"
+    )
+    engine._candidate_push_transport = SimpleNamespace(
+        _registered={
+            "di": (
+                SimpleNamespace(
+                    target_instance_id="target",
+                    target_session_id="session",
+                    pool_generation="pool",
+                    transport_session="transport",
+                    target_device_id=0,
+                    device_uuid="uuid",
+                    row_width=4,
+                    data_allocation_length=1 << 20,
+                    metadata_allocation_length=1 << 16,
+                    metadata_words=8,
+                ),
+            )
+        }
+    )
+    engine._ring_dest_region = True
+    endpoint = SimpleNamespace(
+        ring_id=0,
+        target_session_id="session",
+        source_session_id="source-session",
+        pool_generation="pool",
+        destination=lambda seq, position: destination,
+    )
+    record = RingRecordV2(
+        seq=7,
+        owner_epoch=0,
+        source_slot_id=1,
+        slot_generation=1,
+        source_byte_offset=0,
+        nbytes=8 * 8,
+        row_count=8,
+        row_bytes=8,
+        block_size=4,
+        hidden_produced_ns=0,
+        requests=(
+            RingRecordV2Request(
+                rid_hash=rid_hash("req-a"),
+                round_id=1,
+                attempt=5,
+                token_offset=0,
+                token_count=2,
+                bonus_token=99,
+                seq_len=12,
+                rid="req-a",
+            ),
+        ),
+        token_ids=(10, 11),
+        producer_event_handle=b"h" * 64,
+        landing_index=0,
+        landing_offset=0,
+        dropped_mask=0,
+    )
+    return engine, endpoint, record, "target:req-a:1:5"
+
+
+def test_record_take_scans_destination_while_generation_is_observable():
+    """The record take is the one moment the ring generation is provably
+    current.  A tombstoned row (finished in its wave, no Coordinator task) is
+    retired right there, before candidate compute can create the wave's held
+    push — by then the ring may have wrapped and the tombstone would be
+    unrecoverable.  A live triple is latched onto the task as its arena
+    destination; a not-yet-written region (None) leaves the row pending."""
+
+    # Tombstone at take: the row is dropped, never admitted.
+    engine, endpoint, record, tid = _make_record_engine((0, 0, 0, 0, 0))
+    engine._accept_ring_record(endpoint, record)
+    assert engine._pending_ids == set()
+    assert engine._ring_admission == []
+    assert engine._unconfirmed_direct == {}
+    assert engine._direct_tasks_by_transfer == {}
+    assert engine._ring_record_positions == {}
+    assert engine._landing_taken == [1]  # the wave landing is claimed once
+
+    # Live destination at take: latched onto the admitted task.
+    engine, endpoint, record, tid = _make_record_engine((3, 9, 123, 4096, 2048))
+    engine._accept_ring_record(endpoint, record)
+    assert tid in engine._pending_ids
+    destination = engine._direct_tasks_by_transfer[tid].candidate_destination
+    assert destination is not None
+    assert (destination.slot_id, destination.generation) == (3, 9)
+    assert destination.authorization_nonce == 123
+    assert destination.data_allocation_offset == 4096 + 3 * 4 * 4
+
+    # Not yet written: the row is admitted pending, exactly as before.
+    engine, endpoint, record, tid = _make_record_engine(None)
+    engine._accept_ring_record(endpoint, record)
+    assert tid in engine._pending_ids
+    assert engine._direct_tasks_by_transfer[tid].candidate_destination is None
+
+    # The probe is launch-path only: flag off keeps the park-path behavior.
+    engine, endpoint, record, tid = _make_record_engine(
+        (0, 0, 0, 0, 0), at_launch=False
+    )
+    engine._accept_ring_record(endpoint, record)
+    assert tid in engine._pending_ids
+
+
+def test_held_ring_push_expires_after_record_deadline():
+    """A held ring push row whose ring destination or tombstone never became
+    observable — the ring may have wrapped long ago — must not hold its wave
+    forever.  Past the record deadline it retires as cancelled, like a
+    tombstone row; the wave holds only while genuinely unconfirmed rows
+    remain."""
+
+    import sglang.srt.speculative.dt_draft_engine as draft_mod
+
+    future = __import__("time").monotonic_ns() + 60 * 10**9
+    tids = ("target:t:live:1:0", "target:t:zombie:1:0")
+    engine = object.__new__(draft_mod.FlashMTPDraftEngine)
+    engine._cancelled_ids = set()
+    engine._unconfirmed_direct = {tids[0]: future, tids[1]: 0}
+    engine._direct_tasks_by_transfer = {
+        tid: SimpleNamespace(
+            transfer_id=tid, candidate_destination=None, direct_ring_seq=7
+        )
+        for tid in tids
+    }
+    engine._held_direct_source_done = {tid: ["held-source-done"] for tid in tids}
+    engine._held_direct_results = {}
+    engine._pending_ids = set(tids)
+    engine._ring_pending_ids = set(tids)
+    engine._received_ns_by_transfer = {tid: 1 for tid in tids}
+    unresolved_endpoint = SimpleNamespace(destination=lambda seq, position: None)
+    engine._ring_record_positions = {
+        tid: (unresolved_endpoint, index) for index, tid in enumerate(tids)
+    }
+    engine._held_ring_pushes = [
+        (list(engine._direct_tasks_by_transfer.values()), b"candidates", 3)
+    ]
+    engine._candidate_push_transport = SimpleNamespace()
+    engine._free_result_slots = []
+
+    # Only the zombie is past its deadline: it retires as cancelled, the live
+    # row keeps the wave held with its bookkeeping untouched.
+    engine._expire_unconfirmed_direct()
+    assert tids[1] in engine._cancelled_ids
+    assert tids[1] not in engine._unconfirmed_direct
+    assert tids[1] not in engine._held_direct_source_done
+    assert tids[0] in engine._unconfirmed_direct
+    assert engine._held_direct_source_done[tids[0]] == ["held-source-done"]
+    assert len(engine._held_ring_pushes) == 1
+    assert engine._free_result_slots == []
+
+    # Past the live row's deadline too: the hold releases through the real
+    # path — cancelled identities retired, result slot freed, no ledgers.
+    engine._unconfirmed_direct[tids[0]] = 0
+    engine._expire_unconfirmed_direct()
+    assert engine._held_ring_pushes == []
+    assert engine._free_result_slots == [3]
+    assert not engine._unconfirmed_direct
+    assert not engine._direct_tasks_by_transfer
+    assert not engine._held_direct_source_done
+    assert not engine._cancelled_ids
+    assert not engine._ring_record_positions

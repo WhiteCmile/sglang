@@ -497,7 +497,6 @@ class TargetCandidateArena:
             raise CandidateTransportError("candidate arena registration is incomplete")
         self._data_buffer, self._metadata_buffer = buffers
         self._slots = [_CandidateSlot() for _ in range(self.slot_count)]
-        self._free_ids: deque[int] = deque(range(self.slot_count))
         self._active: dict[str, int] = {}
         self._poll_cursor = 0
         self._retired_transfers: OrderedDict[str, None] = OrderedDict()
@@ -586,7 +585,7 @@ class TargetCandidateArena:
     def free_slot_count(self) -> int:
         self.poll_releases()
         with self._lock:
-            return len(self._free_ids)
+            return sum(slot.state is CandidateSlotState.FREE for slot in self._slots)
 
     @property
     def quarantined_slot_count(self) -> int:
@@ -638,39 +637,33 @@ class TargetCandidateArena:
                 raise CandidateTransportError("candidate arena is closed")
             if transfer_id in self._active:
                 raise CandidateTransportError("candidate transfer is already reserved")
-            if not self._free_ids:
+            slot_id = next(
+                (
+                    index
+                    for index, slot in enumerate(self._slots)
+                    if slot.state is CandidateSlotState.FREE
+                ),
+                None,
+            )
+            if slot_id is None:
                 raise CandidateTransportError("all candidate arena slots are active")
-            # O(1) claim from the free list; the per-slot completion resources
-            # (wait stream, pinned metadata buffer) are created once and kept
-            # across generations, so a reservation stays a few microseconds
-            # even when the arena is nearly full.  Peek, don't claim: every
-            # fallible step below (generation bound, lazy stream/pinned-buffer
-            # allocation) must leave the FREE slot on the free list, or an
-            # exception would permanently lose arena capacity.
-            slot_id = self._free_ids[0]
             slot = self._slots[slot_id]
-            if slot.state is not CandidateSlotState.FREE:
-                raise CandidateTransportError("candidate arena free list diverged")
             generation = slot.generation + 1
             if generation > 0x7FFFFFFF:
                 raise CandidateTransportError("candidate slot generation exhausted")
             nonce = secrets.randbits(63) or 1
-            wait_stream = slot.wait_stream
-            if wait_stream is None:
-                wait_stream = slot.wait_stream = torch.cuda.Stream(device=self.device)
-            metadata_host = slot.metadata_host
-            if metadata_host is None:
-                metadata_host = slot.metadata_host = torch.empty(
-                    (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
-                )
-            # All fallible work succeeded: claim the slot now.
-            self._free_ids.popleft()
+            wait_stream = torch.cuda.Stream(device=self.device)
+            metadata_host = torch.empty(
+                (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
             slot.generation = generation
             slot.state = CandidateSlotState.ARMED
             slot.transfer_id = transfer_id
             slot.authorization_nonce = nonce
+            slot.wait_stream = wait_stream
             slot.completion_event = None
             slot.metadata_start_event = None
+            slot.metadata_host = metadata_host
             slot.draft_instance_id = ""
             slot.draft_session_id = ""
             slot.completion = None
@@ -1729,14 +1722,7 @@ class TargetCandidateArena:
             if len(retired) > RETIRED_TRANSFER_LIMIT:
                 retired.popitem(last=False)
         generation = slot.generation
-        was_free = slot.state is CandidateSlotState.FREE
-        self._slots[slot_id] = _CandidateSlot(
-            generation=generation,
-            wait_stream=slot.wait_stream,
-            metadata_host=slot.metadata_host,
-        )
-        if not was_free:
-            self._free_ids.append(slot_id)
+        self._slots[slot_id] = _CandidateSlot(generation=generation)
         if getattr(self, "_record_generation", None) is not None:
             self._record_generation[slot_id] = 0
         if getattr(self, "_record_seq_expected", None) is not None:

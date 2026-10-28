@@ -644,6 +644,11 @@ class DTTargetController:
         self._ring_publishers: dict[str, object] = {}  # session -> RingGpuPublisher
         self._ring_publish_pending: deque = deque()
         self._ring_publish_transfers: set[str] = set()
+        # Draft sessions whose ring publication is backpressured because a
+        # wave's cleanup is arena-deferred: no new record may publish on that
+        # ring until the deferred wave lands, or the modulo-reused destination
+        # slot would be clobbered (CI review, PR #68 round 6).
+        self._ring_publish_backpressure: set[str] = set()
         # Producer events of waves that failed after publication; the records
         # on the ring still reference them, so ownership cannot be dropped.
         self._ring_publish_orphaned_events: deque = deque(maxlen=1024)
@@ -6456,6 +6461,11 @@ class DTTargetController:
             )
         if not staged_meta:
             return self._launch_fallback("empty")
+        if session_id in getattr(self, "_ring_publish_backpressure", ()):
+            # An earlier wave of this Draft session is arena-retained; its
+            # ring slots must not be reused until its cleanup lands, so no
+            # new record publishes on this ring in the meantime.
+            return self._launch_fallback("backpressure")
         _mark("eligibility")
         # The exact token total lands in the record from the device counts;
         # only the record-geometry bound is decided here, so use the wave's
@@ -6768,6 +6778,12 @@ class DTTargetController:
                 )
             )
 
+        if session_id in getattr(self, "_ring_publish_backpressure", ()):
+            # An earlier wave of this Draft session is arena-retained; its
+            # ring slots must not be reused until its cleanup lands.  Fall
+            # back to the Python publication path for this wave.
+            return None
+
         row_count = int(counts[active].sum())
         token_total = row_count
         if row_count > V2_MAX_TOK or publisher.free_entries() <= 0:
@@ -6961,14 +6977,38 @@ class DTTargetController:
                 )
                 continue
             record = wave.record
+            base = (
+                writer._ring.entries_offset
+                + (wave.wave_seq % writer.capacity) * ENTRY_BYTES
+            )
+            raw = writer._ring.raw
+            slot_seq = _struct.unpack_from("<Q", raw, base)[0]
             if record is None:
-                base = (
-                    writer._ring.entries_offset
-                    + (wave.wave_seq % writer.capacity) * ENTRY_BYTES
-                )
-                raw = writer._ring.raw
-                if _struct.unpack_from("<Q", raw, base)[0] != wave.wave_seq:
-                    retained.append(wave)  # kernel has not landed yet; next poll
+                if slot_seq < wave.wave_seq:
+                    # The kernel has not landed yet (the slot still shows the
+                    # previous lap); the next poll sees this wave again.
+                    retained.append(wave)
+                    continue
+                if slot_seq > wave.wave_seq:
+                    # The slot already holds a newer lap: the ring wrapped
+                    # before this wave's first cleanup sighting.  The record
+                    # is unrecoverable from the ring; retaining would poll a
+                    # seq word that can never reappear and strand the wave,
+                    # its source reservation and its parked requests forever.
+                    # Quarantine the slot (the record may still reference it)
+                    # and drop the wave; its parked rounds fail loudly at
+                    # their own deadlines.  With the publication backpressure
+                    # below, new records cannot publish while a wave is
+                    # retained, so this requires a full ring of cleanup lag.
+                    logger.critical(
+                        "DT ring publish wave %s lost to ring wrap before "
+                        "cleanup; quarantining slot %s",
+                        wave.wave_seq,
+                        wave.slot_id,
+                    )
+                    self._feature_source_pool.quarantine_reserved(
+                        wave.slot_id, wave.generation
+                    )
                     continue
                 # Snapshot the record the first time its seq word is visible.
                 # The Draft consumes records independently and the producer
@@ -7048,31 +7088,51 @@ class DTTargetController:
                         # reservation is retried from the snapshot at the next
                         # poll no matter what happens to the ring slot (the
                         # Draft consumes records and the producer wraps).  The
-                        # Draft falls back to the Coordinator copy meanwhile.
+                        # Draft falls back to the Coordinator copy meanwhile,
+                        # and the publication backpressure below stops new
+                        # records from reusing this wave's destination slot
+                        # while it is retained.
                         retained.append(wave)
                         continue
                     raise
-                writer.write_destinations(
-                    wave.wave_seq,
-                    [
-                        (
+                # Generation ownership: the destination slot is modulo-reused
+                # after `capacity` further publications.  Publication is
+                # backpressured while this wave is retained, so the slot must
+                # still show this wave's seq; if it does not, writing the old
+                # seq would clobber a newer wave's destinations (its cancelled
+                # rows would lose their only terminal signal).  Skip the ring
+                # write: live rows still carry their destinations on the
+                # Coordinator copies built below.
+                if slot_seq == wave.wave_seq:
+                    writer.write_destinations(
+                        wave.wave_seq,
+                        [
                             (
-                                destinations[spec[1]].slot_id,
-                                destinations[spec[1]].generation,
-                                destinations[spec[1]].authorization_nonce,
+                                (
+                                    destinations[spec[1]].slot_id,
+                                    destinations[spec[1]].generation,
+                                    destinations[spec[1]].authorization_nonce,
+                                )
+                                if position in live_set
+                                else (0, 0, 0)
                             )
-                            if position in live_set
-                            else (0, 0, 0)
-                        )
-                        for position, spec in enumerate(specs)
-                    ],
-                    data_buffer_offset=(
-                        self._candidate_arena._data_buffer.allocation_offset
-                    ),
-                    metadata_buffer_offset=(
-                        self._candidate_arena._metadata_buffer.allocation_offset
-                    ),
-                )
+                            for position, spec in enumerate(specs)
+                        ],
+                        data_buffer_offset=(
+                            self._candidate_arena._data_buffer.allocation_offset
+                        ),
+                        metadata_buffer_offset=(
+                            self._candidate_arena._metadata_buffer.allocation_offset
+                        ),
+                    )
+                else:
+                    logger.critical(
+                        "DT ring publish wave %s destination slot reused "
+                        "(seq %s); skipping ring write, Coordinator copies "
+                        "carry the destinations",
+                        wave.wave_seq,
+                        slot_seq,
+                    )
             published = pool.publish_reserved(
                 slot_id=wave.slot_id,
                 generation=wave.generation,
@@ -7175,6 +7235,12 @@ class DTTargetController:
                     publication_bytes=wave.row_count * self.pivot_width * 2,
                 )
         self._ring_publish_pending = retained
+        # Publication backpressure: while any wave is arena-retained its ring
+        # slots (record and destination region) must not be reused, or the
+        # retried cleanup would read/overwrite a newer lap.  Both publish
+        # entry points (launch staging and park staging) fall back to their
+        # non-ring paths for a backpressured session.
+        self._ring_publish_backpressure = {wave.session_id for wave in retained}
 
     def _direct_ring_writer(self, draft_session_id: str):
         """Return the serving ring to one owner Draft session, or None."""
