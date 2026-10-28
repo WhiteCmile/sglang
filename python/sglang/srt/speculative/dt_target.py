@@ -388,6 +388,7 @@ class DTTargetController:
                 TargetCoordinatorClient,
                 TargetRoundLedger,
             )
+            from dt_launcher.topology import default_candidate_slots
             from dt_profile import emit as profile_emit
             from dt_profile import flush as profile_flush
         except ImportError as exc:
@@ -729,6 +730,19 @@ class DTTargetController:
                     configured_slots = int(
                         self.server_args.draft_target_candidate_slots
                     )
+                    # A whole ring-published wave must fit in an empty arena,
+                    # so an explicit count below the largest wave the ring can
+                    # publish would hold every wave forever.  Zero takes the
+                    # launcher default, derived only in dt_launcher.topology.
+                    from sglang.srt.speculative.dt_direct_ring import V2_MAX_REQ
+
+                    if 0 < configured_slots < V2_MAX_REQ:
+                        raise ValueError(
+                            "draft-target-candidate-slots must be at least "
+                            f"{V2_MAX_REQ} (dt_direct_ring.V2_MAX_REQ, the "
+                            "largest wave the direct ring can publish); got "
+                            f"{configured_slots}"
+                        )
                     self._candidate_arena = TargetCandidateArena(
                         target_instance_id=self.instance_id,
                         target_session_id=self._client.instance_session_id,
@@ -736,7 +750,9 @@ class DTTargetController:
                         slot_count=(
                             configured_slots
                             if configured_slots > 0
-                            else max(2, int(scheduler.max_running_requests) * 2)
+                            else default_candidate_slots(
+                                int(scheduler.max_running_requests)
+                            )
                         ),
                         row_width=self.block_size,
                         profile_timing=self._profile_active,
@@ -4416,7 +4432,14 @@ class DTTargetController:
                 # own ownership atomically before dropping its last reference.
                 active_leases, quarantined_slots = source_pool.close()
                 source_pool_fenced = True
-                if active_leases or quarantined_slots:
+                if quarantined_slots:
+                    logger.info(
+                        "DT Target shutdown quarantined %d direct-GPU source "
+                        "slot(s) with possibly ring-published records; slots "
+                        "stay fenced from reuse until process teardown",
+                        quarantined_slots,
+                    )
+                if active_leases:
                     raise RuntimeError(
                         "DT Target shutdown found unresolved direct-GPU source "
                         "pool ownership after controller drain: "
@@ -4480,6 +4503,21 @@ class DTTargetController:
         # assembling cancellation for Coordinator-owned transfers.
         for transfer_id in tuple(self._staged_flashmtp_source_leases):
             self._release_source_slot(transfer_id)
+
+        # Every wave in _ring_publish_pending had its publish kernel launched
+        # (a wave enters the deque only after publisher.publish() succeeds),
+        # so its record may already be on the ring even though no
+        # confirmation task was ever queued: the Draft can pull such a
+        # source before any Coordinator confirmation.  Release would let the
+        # slot recycle under a potential reader, so quarantine each pending
+        # wave instead; quarantine is always safe at shutdown.
+        pending_waves = getattr(self, "_ring_publish_pending", None)
+        if pending_waves:
+            for wave in tuple(pending_waves):
+                self._feature_source_pool.quarantine_reserved(
+                    wave.slot_id, wave.generation
+                )
+            pending_waves.clear()
 
         unsent_transfer_ids = {
             task.transfer_id for batch in self._pending_send for task in batch.entries
