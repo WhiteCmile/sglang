@@ -57,13 +57,24 @@ from sglang.srt.speculative.dt_cuda_ipc import (
     CudaIpcRuntime,
     register_buffers,
 )
+from sglang.srt.speculative.dt_completion_source import (
+    COMPLETION_RECORD_BYTES,
+    GENERATION_WORD,
+    NONCE_HIGH_WORD,
+    NONCE_LOW_WORD,
+    PRODUCER_TAG_WORD,
+    READY_RECORD_BYTES,
+    ROOT_TOKEN_WORD,
+    VALID_LENGTH_WORD,
+    CandidateTransportError,
+    CompletionSource,
+    ShmSeqRecordSource,
+    _ReadyRecordFile,
+    completion_records_path,
+    ready_records_path,
+)
 
 METADATA_WORDS = 5
-GENERATION_WORD = 0
-NONCE_LOW_WORD = 1
-NONCE_HIGH_WORD = 2
-VALID_LENGTH_WORD = 3
-ROOT_TOKEN_WORD = 4
 COMPLETION_RETRY_NS = 100_000_000
 COMPLETION_MAX_ATTEMPTS = 100
 # Queue bursts instead of silently dropping them: at the measured standalone
@@ -83,22 +94,7 @@ RETIRED_TRANSFER_LIMIT = 65536
 RING_DEBUG = os.environ.get("DT_RING_DEBUG", "0") == "1"
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
-# One 32-byte host READY record per slot: the metadata words plus the
-# producer tag.  The generation word is written last.
-READY_RECORD_WORDS = 8
-READY_RECORD_BYTES = READY_RECORD_WORDS * 4
-PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
-# One 64-byte host completion record per slot: eight u64 words, the seq word
-# published last with a system-scope release store.
-COMPLETION_RECORD_WORDS = 8
-COMPLETION_RECORD_BYTES = COMPLETION_RECORD_WORDS * 8
-COMPLETION_SEQ_WORD = 0
-COMPLETION_META_WORD = 1  # generation (low u32), valid length (high u32)
-COMPLETION_HASH_WORD = 2  # transfer id hash
-COMPLETION_TOKEN_WORD = 3  # root token (low u32), producer tag (high u32)
-COMPLETION_PRODUCED_WORD = 4  # %globaltimer publication timestamp
-COMPLETION_OFFSET_WORD = 5  # producer's globaltimer->realtime offset (0 = none)
 GLOBALTIMER_CALIBRATION_SAMPLES = 64
 # A best-sample round trip above this cannot bound the offset usefully.
 GLOBALTIMER_CALIBRATION_MAX_UNCERTAINTY_NS = 1_000_000
@@ -118,55 +114,6 @@ def transfer_id_hash(transfer_id: str) -> int:
     return int.from_bytes(
         hashlib.blake2b(transfer_id.encode(), digest_size=8).digest(), "little"
     )
-
-
-class _ReadyRecordFile:
-    """A /dev/shm mapping of per-slot records shared by Target and Draft."""
-
-    def __init__(
-        self,
-        path: str,
-        *,
-        record_bytes: int = READY_RECORD_BYTES,
-        slot_count: int = 0,
-        create: bool,
-    ) -> None:
-        if create and slot_count <= 0:
-            raise ValueError("record file needs a positive slot count")
-        page = mmap.PAGESIZE
-        flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
-        fd = os.open(path, flags, 0o600)
-        try:
-            if create:
-                nbytes = -(-slot_count * record_bytes // page) * page
-                os.ftruncate(fd, nbytes)
-            else:
-                nbytes = os.fstat(fd).st_size
-            if nbytes <= 0 or nbytes % record_bytes:
-                raise CandidateTransportError("record file has an invalid size")
-            self._mm = mmap.mmap(fd, nbytes)
-        finally:
-            os.close(fd)
-        self.path = path
-        self.nbytes = nbytes
-        self.slot_capacity = nbytes // record_bytes
-        self.words = np.frombuffer(self._mm, dtype=np.uint32).reshape(
-            self.slot_capacity, record_bytes // 4
-        )
-        self.host_address = int(self.words.ctypes.data)
-
-    def close(self, *, unlink: bool) -> None:
-        self.words = None
-        try:
-            self._mm.close()
-        except BufferError:
-            # A caller still holds a view; the mapping dies with the process.
-            pass
-        if unlink:
-            try:
-                os.unlink(self.path)
-            except FileNotFoundError:
-                pass
 
 
 def _build_push_completion_library() -> Path:
@@ -323,10 +270,6 @@ def _calibrate_globaltimer_offset(
             view = None
     finally:
         sample_map.close()
-
-
-class CandidateTransportError(RuntimeError):
-    pass
 
 
 class _RingDebugLog:
@@ -536,8 +479,11 @@ class TargetCandidateArena:
         )
         self._ready_records: _ReadyRecordFile | None = None
         self.ready_record_path = ""
+        self._ready_source: CompletionSource | None = None
         self._completion_records: _ReadyRecordFile | None = None
         self.completion_record_path = ""
+        self._completion_source: ShmSeqRecordSource | None = None
+        self._completion_words = None
         if GPU_READY_RECORD or PUSH_COMPLETION_RECORD:
             # Generation/tag a slot's record must carry to become READY; 0 means
             # the slot is not waiting for a record (unassigned, done, cancelled).
@@ -545,14 +491,19 @@ class TargetCandidateArena:
             self._record_tag = np.zeros(self.slot_count, dtype=np.uint32)
         if GPU_READY_RECORD:
             self._ready_records = _ReadyRecordFile(
-                f"/dev/shm/dt-ready-{self.transport_session}",
+                ready_records_path(self.transport_session),
                 slot_count=self.slot_count,
                 create=True,
             )
             self.ready_record_path = self._ready_records.path
+            self._ready_source = ShmSeqRecordSource.ready_records(
+                records=self._ready_records,
+                slot_count=self.slot_count,
+                expected=self._record_generation,
+            )
         if PUSH_COMPLETION_RECORD:
             self._completion_records = _ReadyRecordFile(
-                f"/dev/shm/dt-completion-{self.transport_session}",
+                completion_records_path(self.transport_session),
                 record_bytes=COMPLETION_RECORD_BYTES,
                 slot_count=self.slot_count,
                 create=True,
@@ -566,20 +517,21 @@ class TargetCandidateArena:
                     self._completion_records.nbytes,
                 )
             except Exception:
-                self._completion_words = None
                 self.completion_record_path = ""
                 self._completion_records.close(unlink=True)
                 self._completion_records = None
                 raise
-            self._completion_words = self._completion_records.words.view(
-                np.uint64
-            ).reshape(
-                self._completion_records.slot_capacity, COMPLETION_RECORD_WORDS
-            )
             # Reservation nonce a slot's completion record must carry; 0 means
             # the slot is not waiting for a record (unassigned, done,
             # cancelled).
             self._record_seq_expected = np.zeros(self.slot_count, dtype=np.uint64)
+            self._completion_source = ShmSeqRecordSource.completion_records(
+                records=self._completion_records,
+                slot_count=self.slot_count,
+                expected=self._record_generation,
+                expected_seq=self._record_seq_expected,
+            )
+            self._completion_words = self._completion_source.words
 
     @property
     def free_slot_count(self) -> int:
@@ -602,8 +554,16 @@ class TargetCandidateArena:
     def registration(self):
         """Return the incarnation-scoped allocation material sent once."""
 
-        from dt_protocol import CandidateArenaRegistration
+        from dt_protocol import (
+            TRANSPORT_API_VERSION,
+            TRANSPORT_BACKEND_CUDA_IPC,
+            TRANSPORT_BACKENDS,
+            CandidateArenaRegistration,
+            RegionRegistration,
+            TransportEndpoint,
+        )
 
+        backend = TRANSPORT_BACKENDS[TRANSPORT_BACKEND_CUDA_IPC]
         data_allocation = self._allocations[self._data_buffer.allocation_index]
         metadata_allocation = self._allocations[
             self._metadata_buffer.allocation_index
@@ -623,6 +583,35 @@ class TargetCandidateArena:
             completion_endpoint=self.completion_endpoint,
             ready_record_path=self.ready_record_path,
             completion_record_path=self.completion_record_path,
+            # The transport-neutral view of the same CUDA-IPC material above;
+            # both stay filled so a legacy peer keeps working (#22 step 1).
+            transport_api_version=TRANSPORT_API_VERSION,
+            capabilities=backend.capabilities,
+            transport_endpoint=TransportEndpoint(
+                backend=backend.name,
+                api_version=backend.api_version,
+                endpoint_id=self.transport_session,
+                instance_session_id=self.target_session_id,
+                uri=self.completion_endpoint,
+            ),
+            regions=(
+                RegionRegistration(
+                    region_id=f"{self.transport_session}:data",
+                    region_generation=self.pool_generation,
+                    length=data_allocation.length,
+                    memory_kind="cuda",
+                    access=("write",),
+                    opaque_handle=data_allocation.ipc_handle,
+                ),
+                RegionRegistration(
+                    region_id=f"{self.transport_session}:metadata",
+                    region_generation=self.pool_generation,
+                    length=metadata_allocation.length,
+                    memory_kind="cuda",
+                    access=("write",),
+                    opaque_handle=metadata_allocation.ipc_handle,
+                ),
+            ),
         )
 
     def reserve(self, transfer_id: str):
@@ -1322,20 +1311,22 @@ class TargetCandidateArena:
         The Draft push stream writes payload, metadata, and record words in
         order, generation last, so a matching generation proves the payload is
         in this arena.  The identity is the assignment's; the producer tag and
-        nonce reject records from any other writer.
+        nonce reject records from any other writer.  The shm record source
+        only decodes events; arming, consume-once clearing, authentication,
+        and the slot watermark live here.
         """
 
-        records = getattr(self, "_ready_records", None)
-        if records is None:
+        source = self._ready_source
+        if source is None:
+            return 0
+        events = source.poll()
+        if not events:
             return 0
         expected = self._record_generation
-        hits = np.flatnonzero((expected != 0) & (records.words[: self.slot_count, 0] == expected))
-        if hits.size == 0:
-            return 0
         observed_ns = time.monotonic_ns()
         accepted = 0
-        for slot_id in hits.tolist():
-            values = [int(value) for value in records.words[slot_id]]
+        for event in events:
+            slot_id = event.slot_id
             with self._lock:
                 generation = int(expected[slot_id])
                 slot = self._slots[slot_id]
@@ -1354,17 +1345,16 @@ class TargetCandidateArena:
                     or not slot.draft_instance_id
                 ):
                     continue
-                nonce = values[NONCE_LOW_WORD] | (values[NONCE_HIGH_WORD] << 32)
                 if (
-                    nonce != slot.authorization_nonce
-                    or values[PRODUCER_TAG_WORD] != int(self._record_tag[slot_id])
-                    or values[VALID_LENGTH_WORD] != self.row_width
+                    event.seq != slot.authorization_nonce
+                    or event.producer_tag != int(self._record_tag[slot_id])
+                    or event.valid_length != self.row_width
                 ):
                     slot.state = CandidateSlotState.QUARANTINED
                     raise CandidateTransportError(
                         "candidate READY record failed generation/authentication"
                     )
-                root = values[ROOT_TOKEN_WORD]
+                root = event.root_token
                 if root & 0x80000000:
                     root -= 1 << 32
                 slot.completion_draft_instance_id = slot.draft_instance_id
@@ -1374,7 +1364,7 @@ class TargetCandidateArena:
                     slot_id=slot_id,
                     generation=slot.generation,
                     authorization_nonce=slot.authorization_nonce,
-                    valid_length=values[VALID_LENGTH_WORD],
+                    valid_length=event.valid_length,
                     root_token=root,
                     draft_instance_id=slot.draft_instance_id,
                     draft_session_id=slot.draft_session_id,
@@ -1398,6 +1388,7 @@ class TargetCandidateArena:
             # The direct notice still follows; ACK it as a duplicate.
             self._remember_notice(key)
             accepted += 1
+        source.make_gpu_visible()
         return accepted
 
     def poll_completion_records(self) -> int:
@@ -1418,36 +1409,26 @@ class TargetCandidateArena:
         carry the record's %globaltimer stamp and, when the producer stamped
         a nonzero globaltimer offset, the publication-to-discovery
         delivery_ns derived from both; the monotonic observed-chain fields
-        are unaffected.
+        are unaffected.  The shm record source only decodes events; arming,
+        consume-once clearing, authentication, and the slot watermark live
+        here.
         """
 
-        records = getattr(self, "_completion_records", None)
-        if records is None:
+        source = self._completion_source
+        if source is None:
+            return 0
+        events = source.poll()
+        if not events:
             return 0
         expected = self._record_generation
         expected_seq = self._record_seq_expected
-        words = self._completion_words
-        hits = np.flatnonzero(
-            (expected_seq != 0)
-            & (words[: self.slot_count, COMPLETION_SEQ_WORD] == expected_seq)
-            & (
-                (words[: self.slot_count, COMPLETION_META_WORD] & 0xFFFFFFFF)
-                == expected
-            )
-        )
-        if hits.size == 0:
-            return 0
         observed_ns = time.monotonic_ns()
         accepted = 0
-        for slot_id in hits.tolist():
+        for event in events:
+            slot_id = event.slot_id
             # The nonce was released last; the payload words cannot be
             # reordered before it on this CPU, and the GPU released them
             # beforehand.
-            meta = int(words[slot_id, COMPLETION_META_WORD])
-            record_hash = int(words[slot_id, COMPLETION_HASH_WORD])
-            token = int(words[slot_id, COMPLETION_TOKEN_WORD])
-            produced = int(words[slot_id, COMPLETION_PRODUCED_WORD])
-            record_offset = int(words[slot_id, COMPLETION_OFFSET_WORD])
             with self._lock:
                 # A record is consumable exactly once: a failed authentication
                 # must not re-raise on every poll.
@@ -1457,10 +1438,10 @@ class TargetCandidateArena:
                 if slot.generation != generation:
                     continue
                 if (
-                    meta & 0xFFFFFFFF != generation
-                    or meta >> 32 != self.row_width
-                    or record_hash != transfer_id_hash(slot.transfer_id)
-                    or token >> 32 != int(self._record_tag[slot_id])
+                    event.slot_generation != generation
+                    or event.valid_length != self.row_width
+                    or event.transfer_digest != transfer_id_hash(slot.transfer_id)
+                    or event.producer_tag != int(self._record_tag[slot_id])
                 ):
                     if slot.cancel_pending:
                         slot.cancel_pending = False
@@ -1485,7 +1466,7 @@ class TargetCandidateArena:
                     or not slot.draft_instance_id
                 ):
                     continue
-                root = token & 0xFFFFFFFF
+                root = event.root_token
                 if root & 0x80000000:
                     root -= 1 << 32
                 slot.completion_draft_instance_id = slot.draft_instance_id
@@ -1495,7 +1476,7 @@ class TargetCandidateArena:
                     slot_id=slot_id,
                     generation=slot.generation,
                     authorization_nonce=slot.authorization_nonce,
-                    valid_length=meta >> 32,
+                    valid_length=event.valid_length,
                     root_token=root,
                     draft_instance_id=slot.draft_instance_id,
                     draft_session_id=slot.draft_session_id,
@@ -1506,10 +1487,11 @@ class TargetCandidateArena:
                     notice_received_ns=observed_ns,
                     metadata_submitted_ns=observed_ns,
                     ready_source="completion_record",
-                    producer_globaltimer_ns=produced,
+                    producer_globaltimer_ns=event.producer_globaltimer_ns,
                     delivery_ns=(
-                        time.time_ns() - (produced + record_offset)
-                        if record_offset
+                        time.time_ns()
+                        - (event.producer_globaltimer_ns + event.globaltimer_offset_ns)
+                        if event.globaltimer_offset_ns
                         else 0
                     ),
                 )
@@ -1526,6 +1508,7 @@ class TargetCandidateArena:
             # A straggler notice from a mixed-mode producer ACKs as a duplicate.
             self._remember_notice(key)
             accepted += 1
+        source.make_gpu_visible()
         return accepted
 
     def begin_read(self, completions: list[CandidateCompletion]) -> torch.Tensor:
@@ -1697,14 +1680,20 @@ class TargetCandidateArena:
         self.poll_cancelled()
         self._completion_socket.close(linger=0)
         if getattr(self, "_ready_records", None) is not None:
+            if self._ready_source is not None:
+                self._ready_source.close()
+                self._ready_source = None
             # Draft mappings keep the inode alive; only the name goes away.
             self._ready_records.close(unlink=True)
             self._ready_records = None
         if getattr(self, "_completion_records", None) is not None:
             self._runtime.host_unregister(self._completion_records.host_address)
-            # Release the numpy view first: a live view fails the mmap close
+            # Release the numpy views first: a live view fails the mmap close
             # with BufferError and leaks the mapping.
             self._completion_words = None
+            if self._completion_source is not None:
+                self._completion_source.close()
+                self._completion_source = None
             self.completion_record_path = ""
             # Draft mappings keep the inode alive; only the name goes away.
             self._completion_records.close(unlink=True)
