@@ -1909,6 +1909,12 @@ class Scheduler(
                 ):
                     ready_wave = self.dt_target_controller.build_ready_batch()
                     if ready_wave is not None:
+                        # build_ready_batch freezes membership only; the
+                        # top-of-loop path then runs the wave through
+                        # update_running_batch (retract-on-OOM with DT
+                        # cleanup, then prepare_for_decode) before launch.
+                        ready_wave = self.update_running_batch(ready_wave)
+                    if ready_wave is not None and not ready_wave.is_empty():
                         asap_wave = ready_wave
                         ready_wave_result = launch_dt_wave_batch(
                             ready_wave,
