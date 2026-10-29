@@ -1842,8 +1842,10 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
+            dt_result_freed_slot = False
             if disable_overlap_for_batch:
                 pop_and_process()
+                dt_result_freed_slot = True
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1874,6 +1876,7 @@ class Scheduler(
             if self.last_batch:
                 if not disable_overlap_for_batch and not defer_dt_result:
                     pop_and_process()
+                    dt_result_freed_slot = True
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -1881,16 +1884,18 @@ class Scheduler(
             # Draft-Target: a proposal that turns READY while this iteration is
             # busy (previous result processing, sampling) otherwise waits for
             # the next iteration's receive + poll before it can freeze. When
-            # the top selection launched nothing and the late-freeze hold has
-            # cleared, re-poll and freeze/launch the next wave in this same
-            # iteration. The re-poll is the regular poll, so its broadcast
-            # packet keeps the freeze decision TP-consistent exactly like the
-            # top-of-loop poll. Iterations that already launched keep the
-            # one-executing-plus-one-submitted cadence untouched.
+            # the top selection launched nothing, a result was just consumed
+            # (a compute slot freed), and the late-freeze hold has cleared,
+            # re-poll and freeze/launch the next wave in this same iteration.
+            # The slot-freed gate keeps quiet iterations (warmup lulls, drained
+            # pipelines) on the plain one-poll path. The re-poll is the regular
+            # poll, so its broadcast packet keeps the freeze decision
+            # TP-consistent exactly like the top-of-loop poll.
             asap_wave = None
             if (
                 self.dt_target_controller is not None
                 and batch is None
+                and dt_result_freed_slot
                 and not self._engine_paused
                 and not self.gracefully_exit
             ):
