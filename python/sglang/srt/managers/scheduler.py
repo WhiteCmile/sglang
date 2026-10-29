@@ -3664,15 +3664,15 @@ class Scheduler(
 
         # WAIT_DRAFT rows are outside ``batch`` but still own Target KV.  Under
         # pressure reclaim those owners too; synchronize overlap snapshots
-        # before their KV can be released.
-        if (
-            self.dt_target_controller is not None
-            and not batch.check_decode_mem()
-        ):
+        # before their KV can be released.  The common no-pressure case costs
+        # one check_decode_mem; the DT reclaim re-checks after freeing.
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and self.dt_target_controller is not None:
             self._retract_dt_owned_for_oom()
+            kv_full_retract_flag = not batch.check_decode_mem()
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
