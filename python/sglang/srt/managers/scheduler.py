@@ -1879,16 +1879,18 @@ class Scheduler(
                 self.on_idle()
 
             # Draft-Target: a proposal that turns READY while this iteration is
-            # busy launching, processing the previous result, or sampling
-            # otherwise waits for the next iteration's receive + poll before it
-            # can freeze. Re-poll here; when the late-freeze hold has cleared
-            # and a verify slot is free, freeze and launch the next wave in
-            # this same iteration. This is the regular poll, so its broadcast
+            # busy (previous result processing, sampling) otherwise waits for
+            # the next iteration's receive + poll before it can freeze. When
+            # the top selection launched nothing and the late-freeze hold has
+            # cleared, re-poll and freeze/launch the next wave in this same
+            # iteration. The re-poll is the regular poll, so its broadcast
             # packet keeps the freeze decision TP-consistent exactly like the
-            # top-of-loop poll.
+            # top-of-loop poll. Iterations that already launched keep the
+            # one-executing-plus-one-submitted cadence untouched.
             asap_wave = None
             if (
                 self.dt_target_controller is not None
+                and batch is None
                 and not self._engine_paused
                 and not self.gracefully_exit
             ):
