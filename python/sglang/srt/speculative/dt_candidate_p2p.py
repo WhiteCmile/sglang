@@ -468,6 +468,10 @@ class TargetCandidateArena:
         self.transport_session = uuid.uuid4().hex
         self.slot_count = int(slot_count)
         self.row_width = int(row_width)
+        # Set whenever a completion parks in READY or an assignment lands;
+        # poll()'s parked-completion pickup scan runs only while this is set,
+        # because nothing else can newly expose a parked completion.
+        self._ready_pickup_pending = False
         self._profile_timing = bool(profile_timing)
         self._row_nbytes = self.row_width * 4
         self._metadata_row_nbytes = METADATA_WORDS * 4
@@ -757,6 +761,7 @@ class TargetCandidateArena:
                 )
             slot.draft_instance_id = assignment.draft_instance_id
             slot.draft_session_id = assignment.draft_session_id
+            self._ready_pickup_pending = True
             if (
                 getattr(self, "_record_generation", None) is not None
                 and (
@@ -865,6 +870,7 @@ class TargetCandidateArena:
                 # Same parked-before-ACK semantics as the readback path: poll()
                 # exposes it only once the assignment identity matches.
                 slot.state = CandidateSlotState.READY
+                self._ready_pickup_pending = True
                 return
 
         timing_enabled = bool(getattr(self, "_profile_timing", False))
@@ -1283,6 +1289,7 @@ class TargetCandidateArena:
                 # Completion may beat the assignment ACK.  Retain it in READY
                 # but do not expose it to the scheduler until both identities match.
                 slot.state = CandidateSlotState.READY
+                self._ready_pickup_pending = True
                 if (
                     slot.draft_instance_id
                     and (
@@ -1297,7 +1304,13 @@ class TargetCandidateArena:
                     completed.append(slot.completion)
         self._poll_cursor = (self._poll_cursor + queries) % self.slot_count
         # Pick up completions that were parked before their assignment arrived.
+        # Only an authorize() or a fresh READY entry (both flagged above, under
+        # this same lock) can newly expose a parked completion, so an idle flag
+        # makes the full-slot scan provably fruitless.
         with self._lock:
+            if not self._ready_pickup_pending:
+                return tuple(completed)
+            self._ready_pickup_pending = False
             for slot in self._slots:
                 if (
                     slot.state is CandidateSlotState.READY
@@ -1387,6 +1400,7 @@ class TargetCandidateArena:
                     ready_source="gpu_record",
                 )
                 slot.state = CandidateSlotState.READY
+                self._ready_pickup_pending = True
                 key = (
                     slot.transfer_id,
                     slot_id,
@@ -1515,6 +1529,7 @@ class TargetCandidateArena:
                 )
                 expected[slot_id] = 0
                 slot.state = CandidateSlotState.READY
+                self._ready_pickup_pending = True
                 key = (
                     slot.transfer_id,
                     slot_id,
