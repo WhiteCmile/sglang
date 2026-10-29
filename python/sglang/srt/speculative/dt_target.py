@@ -522,6 +522,11 @@ class DTTargetController:
         self._parked: dict[str, ParkedTargetRound] = {}
         self._feature_control_rounds: dict[str, ParkedTargetRound] = {}
         self._draft_admitted_attempts: dict[str, int] = {}
+        # Latest observed progress per Draft. The round timeout is a failure
+        # detector: a round expires only after the Draft that owns it has been
+        # silent for the whole timeout window, never merely because it queued
+        # behind load while its Draft kept completing other rounds.
+        self._draft_progress_ns: dict[str, int] = {}
         # Overlap scheduling can have more than one chunked-prefill forward for
         # the same request in ``result_queue``.  Track the number of launched
         # Target forwards whose results have not been consumed yet.  A request
@@ -5234,6 +5239,7 @@ class DTTargetController:
                 if active_retries:
                     self._queue_task_batch(tuple(active_retries))
             elif isinstance(message, TargetResultBatch):
+                self._note_draft_progress(message.draft_instance_id)
                 if self._profile_active:
                     consume_started_ns = time.monotonic_ns()
                     result_events = self._consume_result_batch(message)
@@ -5279,8 +5285,10 @@ class DTTargetController:
                     result_events = self._consume_result_batch(message)
                 events.extend(result_events)
             elif isinstance(message, SourceReadDone):
+                self._note_draft_progress(message.draft_instance_id)
                 self._consume_source_read_done(message)
             elif isinstance(message, SourceReadDoneBatch):
+                self._note_draft_progress(message.draft_instance_id)
                 self._consume_source_read_done_batch(message)
             elif isinstance(message, ControlAck):
                 self._delivery_outbox.ack(message.operation, message.message_id)
@@ -5328,6 +5336,7 @@ class DTTargetController:
                     completion.transfer_id,
                     draft_instance_id=completion.draft_instance_id,
                 )
+                self._note_draft_progress(completion.draft_instance_id)
                 parked.result_received_ns = completion.observed_ns
                 if self._profile_active:
                     export_ledger_ready_ns = time.monotonic_ns()
@@ -5610,6 +5619,26 @@ class DTTargetController:
         timeout_ns = getattr(self, "round_timeout_ns", 0)
         return time.monotonic_ns() + timeout_ns if timeout_ns else 0
 
+    def _note_draft_progress(self, draft_instance_id: str) -> None:
+        if draft_instance_id:
+            self._draft_progress_ns[draft_instance_id] = time.monotonic_ns()
+
+    def _draft_progress_is_fresh(
+        self, draft_instance_id: str | None, now_ns: int
+    ) -> bool:
+        """True while the owning Draft (or any Draft when no owner is known)
+        progressed within the round-timeout window. Queueing behind a live
+        Draft is not a failure, so expiry must not fire on it."""
+
+        timeout_ns = self.round_timeout_ns
+        if not timeout_ns:
+            return False
+        if draft_instance_id:
+            stamp = self._draft_progress_ns.get(draft_instance_id, 0)
+        else:
+            stamp = max(self._draft_progress_ns.values(), default=0)
+        return bool(stamp) and now_ns - stamp < timeout_ns
+
     def _expire_local_rounds(self) -> list[tuple[str, str, object]]:
         from dt_protocol import (
             CANCEL_TRANSFERS,
@@ -5622,9 +5651,15 @@ class DTTargetController:
         if now_ns < getattr(self, "_next_local_expiry_ns", 0):
             # No live round can be due yet: deadlines are creation time plus a
             # fixed timeout, so nothing added after the last scan expires
-            # earlier than the cached minimum.
+            # earlier than the cached minimum.  A round past its deadline but
+            # kept alive by fresh Draft progress stays in the ledger, so the
+            # cached minimum remains in the past and the scan keeps running.
             return []
-        expired = self._ledger.expired(now_ns=now_ns)
+        expired = tuple(
+            state
+            for state in self._ledger.expired(now_ns=now_ns)
+            if not self._draft_progress_is_fresh(state.draft_instance_id or None, now_ns)
+        )
         # A round whose Coordinator copy is still queued locally (or, for a
         # kernel-published wave, not even built yet) never entered the ledger,
         # so the ledger cannot time it out.  Its request-visible round started
@@ -5640,6 +5675,7 @@ class DTTargetController:
             and state.deadline_ns
             and state.deadline_ns <= now_ns
             and self._ledger.get(state.transfer_id) is None
+            and not self._draft_progress_is_fresh(None, now_ns)
         ]
         if not expired and not stranded:
             pending = [
