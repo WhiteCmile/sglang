@@ -155,33 +155,37 @@ class DFlashDraftInputV2(SpecInput):
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
-        committed_seq_lens_sum = 0
-        reserved_seq_lens_sum = 0
-        num_needed_tokens = 0
-        max_top_k = 1
-        uniform_top_k_value = None
-        uniform_top_k = True
-        for i, req in enumerate(batch.reqs):
+        committed_list = []
+        cur_alloc_list = []
+        reserved_list = []
+        top_ks = []
+        for req in batch.reqs:
             committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv.kv_allocated_len)
-            reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
-            top_k = int(req.sampling_params.top_k)
+            committed_list.append(committed_len)
+            cur_alloc_list.append(cur_alloc_len)
+            reserved_list.append(max(cur_alloc_len, committed_len + 2 * block_size))
+            top_ks.append(int(req.sampling_params.top_k))
 
-            batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur_alloc_len
-            nxt_kv_lens_cpu_t[i] = reserved_len
+        # Bulk-fill the pinned staging buffers: one as_tensor + copy_ per
+        # buffer instead of three per-request scalar setitem calls.
+        batch_seq_lens_cpu_t.copy_(
+            torch.as_tensor(committed_list, dtype=batch_seq_lens_cpu_t.dtype)
+        )
+        cur_kv_lens_cpu_t.copy_(
+            torch.as_tensor(cur_alloc_list, dtype=cur_kv_lens_cpu_t.dtype)
+        )
+        nxt_kv_lens_cpu_t.copy_(
+            torch.as_tensor(reserved_list, dtype=nxt_kv_lens_cpu_t.dtype)
+        )
 
-            committed_seq_lens_sum += committed_len
-            reserved_seq_lens_sum += reserved_len
-            num_needed_tokens += reserved_len - cur_alloc_len
-
-            if top_k > max_top_k:
-                max_top_k = top_k
-            if i == 0:
-                uniform_top_k_value = top_k
-            elif uniform_top_k and top_k != uniform_top_k_value:
-                uniform_top_k = False
+        committed_seq_lens_sum = sum(committed_list)
+        reserved_seq_lens_sum = sum(reserved_list)
+        num_needed_tokens = reserved_seq_lens_sum - sum(cur_alloc_list)
+        max_top_k = max(top_ks)
+        uniform_top_k_value = top_ks[0]
+        uniform_top_k = all(top_k == uniform_top_k_value for top_k in top_ks)
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
