@@ -5549,6 +5549,11 @@ class DTTargetController:
         )
 
         now_ns = time.monotonic_ns()
+        if now_ns < getattr(self, "_next_local_expiry_ns", 0):
+            # No live round can be due yet: deadlines are creation time plus a
+            # fixed timeout, so nothing added after the last scan expires
+            # earlier than the cached minimum.
+            return []
         expired = self._ledger.expired(now_ns=now_ns)
         # A round whose Coordinator copy is still queued locally (or, for a
         # kernel-published wave, not even built yet) never entered the ledger,
@@ -5567,7 +5572,23 @@ class DTTargetController:
             and self._ledger.get(state.transfer_id) is None
         ]
         if not expired and not stranded:
+            pending = [
+                state.deadline_ns
+                for state in (
+                    *self._parked.values(),
+                    *self._feature_control_rounds.values(),
+                )
+                if not state.failure and state.deadline_ns
+            ]
+            ledger_next = (
+                self._ledger.next_deadline_ns() if self._ledger is not None else None
+            )
+            if ledger_next is not None:
+                pending.append(ledger_next)
+            self._next_local_expiry_ns = min(pending) if pending else 0
             return []
+        # Expiries found: rescan on the next poll; neighbours may be near due.
+        self._next_local_expiry_ns = 0
         transfer_ids = tuple(state.task.transfer_id for state in expired)
         for state in expired:
             transfer_id = state.task.transfer_id
