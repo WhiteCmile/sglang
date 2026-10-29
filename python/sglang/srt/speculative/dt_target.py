@@ -3570,9 +3570,8 @@ class DTTargetController:
 
     def has_compute_slot(self) -> bool:
         """Whether one more compute batch may be admitted. One executing plus
-        one submitted batch is the overlap bound; the ASAP re-poll can fill
-        the second slot within one iteration, so the next selection waits for
-        a result to be consumed before any new batch is built."""
+        one submitted batch is the overlap bound; the next selection waits
+        for a result to be consumed before any new batch is built."""
         return self._target_compute_batches_inflight < 2
 
     def register_overlap_inflight_batch(self, launched_batch: ScheduleBatch) -> None:
@@ -3953,8 +3952,7 @@ class DTTargetController:
         build_entry_ns = time.monotonic_ns() if (observe_build or trace_build) else 0
         build_cpu_start_ns = time.thread_time_ns() if observe_build else 0
         if not self.has_compute_slot():
-            # The one-executing-plus-one-submitted bound is full (the ASAP
-            # re-poll fills the second slot within one iteration); the next
+            # The one-executing-plus-one-submitted bound is full; the next
             # freeze waits for a result to be consumed before a slot is free
             # again.
             return None

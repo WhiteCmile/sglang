@@ -1842,10 +1842,8 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            dt_result_freed_slot = False
             if disable_overlap_for_batch:
                 pop_and_process()
-                dt_result_freed_slot = True
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1876,69 +1874,9 @@ class Scheduler(
             if self.last_batch:
                 if not disable_overlap_for_batch and not defer_dt_result:
                     pop_and_process()
-                    dt_result_freed_slot = True
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
-
-            # Draft-Target: a proposal that turns READY while this iteration is
-            # busy (previous result processing, sampling) otherwise waits for
-            # the next iteration's receive + poll before it can freeze. When
-            # the top selection launched nothing, a result was just consumed
-            # (a compute slot freed), and the late-freeze hold has cleared,
-            # re-poll and freeze/launch the next wave in this same iteration.
-            # The slot-freed gate keeps quiet iterations (warmup lulls, drained
-            # pipelines) on the plain one-poll path. The re-poll is the regular
-            # poll, so its broadcast packet keeps the freeze decision
-            # TP-consistent exactly like the top-of-loop poll.
-            asap_wave = None
-            if (
-                self.dt_target_controller is not None
-                and batch is None
-                and dt_result_freed_slot
-                and not self._engine_paused
-                and not self.gracefully_exit
-            ):
-                asap_poll_started_ns = (
-                    time.monotonic_ns() if target_phase_profile_enabled else 0
-                )
-                self.dt_target_controller.poll(
-                    overlap_result=(
-                        self.result_queue[0][1] if self.result_queue else None
-                    )
-                )
-                asap_poll_finished_ns = (
-                    time.monotonic_ns() if target_phase_profile_enabled else 0
-                )
-                if (
-                    not self.dt_target_controller.hold_next_batch
-                    and self.dt_target_controller.has_feature_source_capacity()
-                ):
-                    ready_wave = self.dt_target_controller.build_ready_batch()
-                    if ready_wave is not None:
-                        # build_ready_batch freezes membership only; the
-                        # top-of-loop path then runs the wave through
-                        # update_running_batch (retract-on-OOM with DT
-                        # cleanup, then prepare_for_decode) before launch.
-                        ready_wave = self.update_running_batch(ready_wave)
-                    if ready_wave is not None and not ready_wave.is_empty():
-                        asap_wave = ready_wave
-                        ready_wave_result = launch_dt_wave_batch(
-                            ready_wave,
-                            # The re-poll has no separate selection phase: the
-                            # build below starts as soon as the poll returns.
-                            selection_started_ns=asap_poll_finished_ns,
-                            selection_finished_ns=asap_poll_finished_ns,
-                            submission_started_ns=0,
-                            iteration_started_ns=iteration_started_ns,
-                            receive_started_ns=receive_started_ns,
-                            receive_finished_ns=receive_finished_ns,
-                            poll_started_ns=asap_poll_started_ns,
-                            poll_finished_ns=asap_poll_finished_ns,
-                        )
-                        self.launch_batch_sample_if_needed(
-                            ready_wave_result, ready_wave
-                        )
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1951,12 +1889,8 @@ class Scheduler(
                     launched_batch=batch,
                 )
 
-            # Update last_batch. An ASAP re-poll wave is the most recent launch,
-            # so it owns last_batch; otherwise a queued result could sit
-            # unpopped behind a None last_batch while the in-flight bound
-            # blocks every new freeze.
             if not defer_dt_result:
-                self.last_batch = asap_wave if asap_wave is not None else batch
+                self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -3229,10 +3163,10 @@ class Scheduler(
             and not self.dt_target_controller.has_compute_slot()
         ):
             # One executing plus one submitted compute batch is the overlap
-            # bound. The ASAP re-poll fills the second slot within one
-            # iteration, so a busy next iteration must not select any batch
-            # (a prefill would not pass the launch admission check either);
-            # the pending results are consumed below and free a slot.
+            # bound. A busy iteration must not select any batch while both
+            # slots are taken (a prefill would not pass the launch admission
+            # check either); the pending results are consumed below and free
+            # a slot.
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         # Preserve ordinary prefill admission before freezing a DT verify wave.
