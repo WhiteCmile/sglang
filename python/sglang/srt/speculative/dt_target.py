@@ -3820,7 +3820,8 @@ class DTTargetController:
             self._freeze_lead_ema_ns[key[0]] = (
                 lead if previous is None else 0.8 * previous + 0.2 * lead
             )
-        self._freeze_inflight.append([result, launch_ns, key, 0])
+        # Element 4 (hold engagement info) is allocated by _late_freeze_hold.
+        self._freeze_inflight.append([result, launch_ns, key, 0, None])
         while len(self._freeze_inflight) > 4:
             self._freeze_inflight.popleft()
 
@@ -3830,6 +3831,26 @@ class DTTargetController:
                 return record
         return None
 
+    def _late_freeze_release(self, record, now_ns, reason, planned_release_ns):
+        """Trace one hold release: the plan vs the actual next-launch timing."""
+        info = record[4]
+        if info is None or info.get("emitted") or not info.get("held_polls"):
+            return
+        info["emitted"] = True
+        self._profile_emit(
+            "target_late_freeze_release",
+            wave_id=getattr(record[0], "dt_full_wave_id", None),
+            release_ns=now_ns,
+            release_reason=reason,
+            planned_release_ns=planned_release_ns,
+            start_ns=info.get("start_ns"),
+            busy_ema_ns=info.get("busy_ema_ns"),
+            lead_ema_ns=info.get("lead_ema_ns"),
+            margin_ns=self._freeze_margin_ns,
+            held_polls=info.get("held_polls", 0),
+            held_ns=now_ns - info["first_hold_ns"] if "first_hold_ns" in info else 0,
+        )
+
     def _late_freeze_hold(self, overlap_result, result_ready) -> bool:
         """Return whether the next batch should stay unfrozen (TP0 decision)."""
         if not self._late_freeze or overlap_result is None:
@@ -3838,22 +3859,41 @@ class DTTargetController:
         if record is None:
             return False
         now_ns = time.monotonic_ns()
+        if record[4] is None:
+            record[4] = {"held_polls": 0}
+        info = record[4]
         if result_ready:
             if not record[3]:
                 record[3] = now_ns
+            self._late_freeze_release(record, now_ns, "result_ready", None)
             return False
         busy_ns = self._freeze_busy_ema_ns.get(record[2])
         if busy_ns is None:
+            self._late_freeze_release(record, now_ns, "no_busy_estimate", None)
             return False
         start_ns = max(record[1], self._freeze_last_done_ns)
         if now_ns - start_ns > 2 * busy_ns:
+            self._late_freeze_release(record, now_ns, "guard", None)
             return False
         # The next batch is normally another decode wave.
         lead_ns = self._freeze_lead_ema_ns.get(False)
         if lead_ns is None:
+            self._late_freeze_release(record, now_ns, "no_lead_estimate", None)
             return False
-        lead_ns += self._freeze_margin_ns
-        return now_ns < start_ns + busy_ns - lead_ns
+        info["start_ns"] = start_ns
+        info["busy_ema_ns"] = float(busy_ns)
+        info["lead_ema_ns"] = float(lead_ns)
+        planned_release_ns = (
+            start_ns + busy_ns - lead_ns - self._freeze_margin_ns
+        )
+        info["planned_release_ns"] = planned_release_ns
+        if "first_hold_ns" not in info:
+            info["first_hold_ns"] = now_ns
+        info["held_polls"] += 1
+        if now_ns < planned_release_ns:
+            return True
+        self._late_freeze_release(record, now_ns, "threshold", planned_release_ns)
+        return False
 
     def note_overlap_result_done(self, result) -> None:
         """Learn a batch's GPU busy time when its result is consumed (TP0)."""
