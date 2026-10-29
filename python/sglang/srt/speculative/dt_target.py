@@ -3568,6 +3568,13 @@ class DTTargetController:
             # before it examines the waiting queue.
             batch.batch_is_full = False
 
+    def has_compute_slot(self) -> bool:
+        """Whether one more compute batch may be admitted. One executing plus
+        one submitted batch is the overlap bound; the ASAP re-poll can fill
+        the second slot within one iteration, so the next selection waits for
+        a result to be consumed before any new batch is built."""
+        return self._target_compute_batches_inflight < 2
+
     def register_overlap_inflight_batch(self, launched_batch: ScheduleBatch) -> None:
         """Register Target ownership immediately after an overlap launch.
 
@@ -3579,13 +3586,12 @@ class DTTargetController:
         Keep registration next to ``result_queue.append`` so every launched
         forward is visible before any older result can be processed.
         """
-        inflight_batches = getattr(self, "_target_compute_batches_inflight", 0)
-        if inflight_batches >= 2:
+        if not self.has_compute_slot():
             raise RuntimeError(
                 "Target compute invariant violated: more than one executing plus "
                 "one submitted batch"
             )
-        self._target_compute_batches_inflight = inflight_batches + 1
+        self._target_compute_batches_inflight += 1
         if self.is_export_rank:
             self._overlap_launch_ns = time.monotonic_ns()
             self._record_freeze_launch(launched_batch)
@@ -3662,7 +3668,7 @@ class DTTargetController:
                 self._target_inflight_counts[req.rid] = count - 1
 
     def assert_overlap_compute_admission(self) -> None:
-        if getattr(self, "_target_compute_batches_inflight", 0) >= 2:
+        if not self.has_compute_slot():
             raise RuntimeError(
                 "Target compute admission exceeded the one-executing plus "
                 "one-submitted bound"
@@ -3946,12 +3952,11 @@ class DTTargetController:
         trace_build = bool(self.is_export_rank and self._profile_active)
         build_entry_ns = time.monotonic_ns() if (observe_build or trace_build) else 0
         build_cpu_start_ns = time.thread_time_ns() if observe_build else 0
-        if self._target_compute_batches_inflight >= 2:
-            # One executing plus one submitted compute batch is the overlap
-            # bound, the same invariant assert_overlap_compute_admission
-            # enforces at launch. The ASAP re-poll in the overlap loop fills
-            # the second slot within one iteration, so the next freeze waits
-            # for a result to be consumed before a slot is free again.
+        if not self.has_compute_slot():
+            # The one-executing-plus-one-submitted bound is full (the ASAP
+            # re-poll fills the second slot within one iteration); the next
+            # freeze waits for a result to be consumed before a slot is free
+            # again.
             return None
         ready = [
             state

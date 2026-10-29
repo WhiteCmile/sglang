@@ -3217,6 +3217,17 @@ class Scheduler(
                 )
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
+        if (
+            self.dt_target_controller is not None
+            and not self.dt_target_controller.has_compute_slot()
+        ):
+            # One executing plus one submitted compute batch is the overlap
+            # bound. The ASAP re-poll fills the second slot within one
+            # iteration, so a busy next iteration must not select any batch
+            # (a prefill would not pass the launch admission check either);
+            # the pending results are consumed below and free a slot.
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+
         # Preserve ordinary prefill admission before freezing a DT verify wave.
         # A ready wave is still unsubmitted work at this point.  Building it
         # first makes should_defer_prefill() choose it on every busy turn and
