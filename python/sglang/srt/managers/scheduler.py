@@ -1886,6 +1886,7 @@ class Scheduler(
             # this same iteration. This is the regular poll, so its broadcast
             # packet keeps the freeze decision TP-consistent exactly like the
             # top-of-loop poll.
+            asap_wave = None
             if (
                 self.dt_target_controller is not None
                 and not self._engine_paused
@@ -1908,6 +1909,7 @@ class Scheduler(
                 ):
                     ready_wave = self.dt_target_controller.build_ready_batch()
                     if ready_wave is not None:
+                        asap_wave = ready_wave
                         ready_wave_result = launch_dt_wave_batch(
                             ready_wave,
                             # The re-poll has no separate selection phase: the
@@ -1936,9 +1938,12 @@ class Scheduler(
                     launched_batch=batch,
                 )
 
-            # Update last_batch
+            # Update last_batch. An ASAP re-poll wave is the most recent launch,
+            # so it owns last_batch; otherwise a queued result could sit
+            # unpopped behind a None last_batch while the in-flight bound
+            # blocks every new freeze.
             if not defer_dt_result:
-                self.last_batch = batch
+                self.last_batch = asap_wave if asap_wave is not None else batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
