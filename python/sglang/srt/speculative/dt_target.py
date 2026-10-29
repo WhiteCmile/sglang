@@ -36,6 +36,11 @@ DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
 DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
 DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
+# Late-freeze lead estimation: p90 over the last N poll -> launch samples per
+# wave class (extend/decode). A mean-tracking estimator systematically
+# underestimates the tail and lands the next launch after the in-flight
+# wave's GPU end; see issue #108.
+_FREEZE_LEAD_WINDOW = 64
 
 
 class _PendingTaskPayloadMismatch(ValueError):
@@ -597,7 +602,13 @@ class DTTargetController:
         )
         self._freeze_inflight: deque[list] = deque()
         self._freeze_busy_ema_ns: dict[tuple[bool, int], float] = {}
-        self._freeze_lead_ema_ns: dict[bool, float] = {}
+        # Poll -> launch samples per wave class; the hold releases on the p90
+        # tail, not the mean, so a slow freeze+build+submit path cannot land
+        # the next launch after the in-flight wave's GPU end.
+        self._freeze_lead_samples_ns: dict[bool, deque] = {
+            False: deque(maxlen=_FREEZE_LEAD_WINDOW),
+            True: deque(maxlen=_FREEZE_LEAD_WINDOW),
+        }
         self._freeze_last_done_ns = 0
         self.hold_next_batch = False
         # Two-threshold READY batching (design rev 39): launch once READY rows
@@ -3815,10 +3826,8 @@ class DTTargetController:
             # Poll packet -> launch covers selection, build and submission:
             # the time the next batch needs once its members are frozen.
             # Prefill and decode differ by several milliseconds.
-            lead = launch_ns - self._last_poll_ns
-            previous = self._freeze_lead_ema_ns.get(key[0])
-            self._freeze_lead_ema_ns[key[0]] = (
-                lead if previous is None else 0.8 * previous + 0.2 * lead
+            self._freeze_lead_samples_ns[key[0]].append(
+                launch_ns - self._last_poll_ns
             )
         # Element 4 (hold engagement info) is allocated by _late_freeze_hold.
         self._freeze_inflight.append([result, launch_ns, key, 0, None])
@@ -3830,6 +3839,14 @@ class DTTargetController:
             if record[0] is result:
                 return record
         return None
+
+    def _freeze_lead_estimate_ns(self, is_extend: bool) -> float | None:
+        """p90 of the recent poll -> launch samples for one wave class."""
+        samples = self._freeze_lead_samples_ns.get(is_extend)
+        if not samples:
+            return None
+        ordered = sorted(samples)
+        return float(ordered[(9 * (len(ordered) - 1)) // 10])
 
     def _late_freeze_release(self, record, now_ns, reason, planned_release_ns):
         """Trace one hold release: the plan vs the actual next-launch timing."""
@@ -3845,7 +3862,7 @@ class DTTargetController:
             planned_release_ns=planned_release_ns,
             start_ns=info.get("start_ns"),
             busy_ema_ns=info.get("busy_ema_ns"),
-            lead_ema_ns=info.get("lead_ema_ns"),
+            lead_est_ns=info.get("lead_est_ns", info.get("lead_ema_ns")),
             margin_ns=self._freeze_margin_ns,
             held_polls=info.get("held_polls", 0),
             held_ns=now_ns - info["first_hold_ns"] if "first_hold_ns" in info else 0,
@@ -3865,7 +3882,9 @@ class DTTargetController:
         if result_ready:
             if not record[3]:
                 record[3] = now_ns
-            self._late_freeze_release(record, now_ns, "result_ready", None)
+            self._late_freeze_release(
+                record, now_ns, "result_ready", info.get("planned_release_ns")
+            )
             return False
         busy_ns = self._freeze_busy_ema_ns.get(record[2])
         if busy_ns is None:
@@ -3873,16 +3892,18 @@ class DTTargetController:
             return False
         start_ns = max(record[1], self._freeze_last_done_ns)
         if now_ns - start_ns > 2 * busy_ns:
-            self._late_freeze_release(record, now_ns, "guard", None)
+            self._late_freeze_release(
+                record, now_ns, "guard", info.get("planned_release_ns")
+            )
             return False
         # The next batch is normally another decode wave.
-        lead_ns = self._freeze_lead_ema_ns.get(False)
+        lead_ns = self._freeze_lead_estimate_ns(False)
         if lead_ns is None:
             self._late_freeze_release(record, now_ns, "no_lead_estimate", None)
             return False
         info["start_ns"] = start_ns
         info["busy_ema_ns"] = float(busy_ns)
-        info["lead_ema_ns"] = float(lead_ns)
+        info["lead_est_ns"] = float(lead_ns)
         planned_release_ns = (
             start_ns + busy_ns - lead_ns - self._freeze_margin_ns
         )
@@ -3890,7 +3911,16 @@ class DTTargetController:
         if "first_hold_ns" not in info:
             info["first_hold_ns"] = now_ns
         info["held_polls"] += 1
-        if now_ns < planned_release_ns:
+        # Decisions happen only at polls, so decide against the next decision
+        # instant (one held-poll gap ahead): releasing at the first poll past
+        # the plan would quantize the launch up to one gap late and idle the
+        # GPU; releasing one gap early never does.
+        previous_decision_ns = info.get("previous_decision_ns")
+        info["previous_decision_ns"] = now_ns
+        if previous_decision_ns is not None:
+            if now_ns + (now_ns - previous_decision_ns) < planned_release_ns:
+                return True
+        elif now_ns < planned_release_ns:
             return True
         self._late_freeze_release(record, now_ns, "threshold", planned_release_ns)
         return False
