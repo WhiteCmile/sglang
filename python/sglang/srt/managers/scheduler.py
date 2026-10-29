@@ -1713,6 +1713,64 @@ class Scheduler(
                     result_queue_depth_before=result_queue_depth_before,
                 )
 
+        def launch_dt_wave_batch(
+            wave_batch,
+            *,
+            selection_started_ns,
+            selection_finished_ns,
+            submission_started_ns,
+            iteration_started_ns,
+            receive_started_ns,
+            receive_finished_ns,
+            poll_started_ns,
+            poll_finished_ns,
+        ):
+            # Launch one frozen DT verify wave with the overlap bookkeeping the
+            # result queue relies on: admission check, WAR barrier, snapshot
+            # append, and immediate Target ownership registration. The helper
+            # also serves non-DT batches (controller None): the overlap queue
+            # bookkeeping is common, the DT admission/registration is not.
+            dt_controller = self.dt_target_controller
+            if dt_controller is not None:
+                dt_controller.assert_overlap_compute_admission()
+            result_queue_depth_before = (
+                len(self.result_queue) if target_phase_profile_enabled else 0
+            )
+            if target_phase_profile_enabled:
+                submission_started_ns = time.monotonic_ns()
+            wave_result = self.run_batch(wave_batch)
+            if target_phase_profile_enabled:
+                submission_returned_ns = time.monotonic_ns()
+                dt_controller.record_target_batch_submission(
+                    wave_batch,
+                    wave_result,
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=submission_started_ns,
+                    submission_returned_ns=submission_returned_ns,
+                    result_queue_depth_before=result_queue_depth_before,
+                    iteration_started_ns=iteration_started_ns,
+                    receive_started_ns=receive_started_ns,
+                    receive_finished_ns=receive_finished_ns,
+                    poll_started_ns=poll_started_ns,
+                    poll_finished_ns=poll_finished_ns,
+                )
+            # Fence result processing behind this forward's shared reads.
+            self._apply_war_barrier()
+            self.result_queue.append((wave_batch.copy(), wave_result))
+            if len(self.result_queue) > 2:
+                raise RuntimeError(
+                    "overlap result queue exceeded one executing plus one "
+                    "submitted compute batch"
+                )
+            if dt_controller is not None:
+                # A previous chunk result can be processed below before this
+                # batch reaches the post-sample detach point. Publish the new
+                # Target ownership now so that older results cannot start a
+                # remote Draft round for the same request early.
+                dt_controller.register_overlap_inflight_batch(wave_batch)
+            return wave_result
+
         while True:
             if self.gracefully_exit:
                 break
@@ -1796,47 +1854,19 @@ class Scheduler(
                         pass
             # Launch the current batch
             if batch:
-                if self.dt_target_controller is not None:
-                    self.dt_target_controller.assert_overlap_compute_admission()
-                result_queue_depth_before = (
-                    len(self.result_queue) if target_phase_profile_enabled else 0
+                # submission_started_ns is re-timed inside the launch helper
+                # when phase profiling is active.
+                batch_result = launch_dt_wave_batch(
+                    batch,
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=0,
+                    iteration_started_ns=iteration_started_ns,
+                    receive_started_ns=receive_started_ns,
+                    receive_finished_ns=receive_finished_ns,
+                    poll_started_ns=poll_started_ns,
+                    poll_finished_ns=poll_finished_ns,
                 )
-                submission_started_ns = (
-                    time.monotonic_ns()
-                    if target_phase_profile_enabled
-                    else 0
-                )
-                batch_result = self.run_batch(batch)
-                if target_phase_profile_enabled:
-                    submission_returned_ns = time.monotonic_ns()
-                    self.dt_target_controller.record_target_batch_submission(
-                        batch,
-                        batch_result,
-                        selection_started_ns=selection_started_ns,
-                        selection_finished_ns=selection_finished_ns,
-                        submission_started_ns=submission_started_ns,
-                        submission_returned_ns=submission_returned_ns,
-                        result_queue_depth_before=result_queue_depth_before,
-                        iteration_started_ns=iteration_started_ns,
-                        receive_started_ns=receive_started_ns,
-                        receive_finished_ns=receive_finished_ns,
-                        poll_started_ns=poll_started_ns,
-                        poll_finished_ns=poll_finished_ns,
-                    )
-                # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
-                if len(self.result_queue) > 2:
-                    raise RuntimeError(
-                        "overlap result queue exceeded one executing plus one "
-                        "submitted compute batch"
-                    )
-                if self.dt_target_controller is not None:
-                    # A previous chunk result can be processed below before
-                    # this batch reaches the post-sample detach point. Publish
-                    # the new Target ownership now so that older results cannot
-                    # start a remote Draft round for the same request early.
-                    self.dt_target_controller.register_overlap_inflight_batch(batch)
             else:
                 batch_result = None
 
@@ -1847,6 +1877,53 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # Draft-Target: a proposal that turns READY while this iteration is
+            # busy launching, processing the previous result, or sampling
+            # otherwise waits for the next iteration's receive + poll before it
+            # can freeze. Re-poll here; when the late-freeze hold has cleared
+            # and a verify slot is free, freeze and launch the next wave in
+            # this same iteration. This is the regular poll, so its broadcast
+            # packet keeps the freeze decision TP-consistent exactly like the
+            # top-of-loop poll.
+            if (
+                self.dt_target_controller is not None
+                and not self._engine_paused
+                and not self.gracefully_exit
+            ):
+                asap_poll_started_ns = (
+                    time.monotonic_ns() if target_phase_profile_enabled else 0
+                )
+                self.dt_target_controller.poll(
+                    overlap_result=(
+                        self.result_queue[0][1] if self.result_queue else None
+                    )
+                )
+                asap_poll_finished_ns = (
+                    time.monotonic_ns() if target_phase_profile_enabled else 0
+                )
+                if (
+                    not self.dt_target_controller.hold_next_batch
+                    and self.dt_target_controller.has_feature_source_capacity()
+                ):
+                    ready_wave = self.dt_target_controller.build_ready_batch()
+                    if ready_wave is not None:
+                        ready_wave_result = launch_dt_wave_batch(
+                            ready_wave,
+                            # The re-poll has no separate selection phase: the
+                            # build below starts as soon as the poll returns.
+                            selection_started_ns=asap_poll_finished_ns,
+                            selection_finished_ns=asap_poll_finished_ns,
+                            submission_started_ns=0,
+                            iteration_started_ns=iteration_started_ns,
+                            receive_started_ns=receive_started_ns,
+                            receive_finished_ns=receive_finished_ns,
+                            poll_started_ns=asap_poll_started_ns,
+                            poll_finished_ns=asap_poll_finished_ns,
+                        )
+                        self.launch_batch_sample_if_needed(
+                            ready_wave_result, ready_wave
+                        )
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

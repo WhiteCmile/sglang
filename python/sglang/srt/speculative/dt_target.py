@@ -3946,6 +3946,13 @@ class DTTargetController:
         trace_build = bool(self.is_export_rank and self._profile_active)
         build_entry_ns = time.monotonic_ns() if (observe_build or trace_build) else 0
         build_cpu_start_ns = time.thread_time_ns() if observe_build else 0
+        if self._target_compute_batches_inflight >= 2:
+            # One executing plus one submitted compute batch is the overlap
+            # bound, the same invariant assert_overlap_compute_admission
+            # enforces at launch. The ASAP re-poll in the overlap loop fills
+            # the second slot within one iteration, so the next freeze waits
+            # for a result to be consumed before a slot is free again.
+            return None
         ready = [
             state
             for state in self._parked.values()
