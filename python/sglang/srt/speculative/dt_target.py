@@ -5620,8 +5620,9 @@ class DTTargetController:
         return time.monotonic_ns() + timeout_ns if timeout_ns else 0
 
     def _note_draft_progress(self, draft_instance_id: str) -> None:
-        if draft_instance_id:
-            self._draft_progress_ns[draft_instance_id] = time.monotonic_ns()
+        progress_ns = getattr(self, "_draft_progress_ns", None)
+        if draft_instance_id and progress_ns is not None:
+            progress_ns[draft_instance_id] = time.monotonic_ns()
 
     def _draft_progress_is_fresh(
         self, draft_instance_id: str | None, now_ns: int
@@ -5630,13 +5631,14 @@ class DTTargetController:
         progressed within the round-timeout window. Queueing behind a live
         Draft is not a failure, so expiry must not fire on it."""
 
-        timeout_ns = self.round_timeout_ns
+        timeout_ns = getattr(self, "round_timeout_ns", 0)
         if not timeout_ns:
             return False
+        progress_ns = getattr(self, "_draft_progress_ns", {})
         if draft_instance_id:
-            stamp = self._draft_progress_ns.get(draft_instance_id, 0)
+            stamp = progress_ns.get(draft_instance_id, 0)
         else:
-            stamp = max(self._draft_progress_ns.values(), default=0)
+            stamp = max(progress_ns.values(), default=0)
         return bool(stamp) and now_ns - stamp < timeout_ns
 
     def _expire_local_rounds(self) -> list[tuple[str, str, object]]:
@@ -5658,7 +5660,9 @@ class DTTargetController:
         expired = tuple(
             state
             for state in self._ledger.expired(now_ns=now_ns)
-            if not self._draft_progress_is_fresh(state.draft_instance_id or None, now_ns)
+            if not self._draft_progress_is_fresh(
+                getattr(state, "draft_instance_id", "") or None, now_ns
+            )
         )
         # A round whose Coordinator copy is still queued locally (or, for a
         # kernel-published wave, not even built yet) never entered the ledger,
