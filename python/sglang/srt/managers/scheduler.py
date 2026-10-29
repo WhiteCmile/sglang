@@ -1889,8 +1889,14 @@ class Scheduler(
                     launched_batch=batch,
                 )
 
+            # Update last_batch. An idle iteration that clears last_batch while
+            # a result is still queued orphans the queued result: the pop gate
+            # (`if self.last_batch`) never opens again, and the defer cannot
+            # re-engage because it is itself gated on last_batch (issue #104).
+            # Clear last_batch only once the queue has drained.
             if not defer_dt_result:
-                self.last_batch = batch
+                if batch is not None or not self.result_queue:
+                    self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
