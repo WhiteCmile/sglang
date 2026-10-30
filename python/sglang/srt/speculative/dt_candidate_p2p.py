@@ -656,10 +656,20 @@ class TargetCandidateArena:
             if generation > 0x7FFFFFFF:
                 raise CandidateTransportError("candidate slot generation exhausted")
             nonce = secrets.randbits(63) or 1
-            wait_stream = torch.cuda.Stream(device=self.device)
-            metadata_host = torch.empty(
-                (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
-            )
+            # The per-slot readback stream and pinned metadata buffer are
+            # retained across generations (_free_locked carries them over):
+            # consecutive uses of one slot are serialized by the stream's
+            # in-order execution and fenced by the per-arm completion event,
+            # so recreating them per reservation only spends CUDA driver
+            # calls on the hot path.
+            wait_stream = slot.wait_stream
+            if wait_stream is None:
+                wait_stream = torch.cuda.Stream(device=self.device)
+            metadata_host = slot.metadata_host
+            if metadata_host is None:
+                metadata_host = torch.empty(
+                    (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
+                )
             slot.generation = generation
             slot.state = CandidateSlotState.ARMED
             slot.transfer_id = transfer_id
@@ -1737,7 +1747,11 @@ class TargetCandidateArena:
             if len(retired) > RETIRED_TRANSFER_LIMIT:
                 retired.popitem(last=False)
         generation = slot.generation
-        self._slots[slot_id] = _CandidateSlot(generation=generation)
+        self._slots[slot_id] = _CandidateSlot(
+            generation=generation,
+            wait_stream=slot.wait_stream,
+            metadata_host=slot.metadata_host,
+        )
         if getattr(self, "_record_generation", None) is not None:
             self._record_generation[slot_id] = 0
         if getattr(self, "_record_seq_expected", None) is not None:
