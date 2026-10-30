@@ -1653,7 +1653,6 @@ class DTTargetController:
                         tuple[torch.Tensor, torch.Tensor | None]
                     ] = []
                     scalar_copy_done = self.scheduler.device_module.Event()
-                    scalar_copy_done.record()
                     staged_scalar_copies = (
                         bonus_cpu,
                         seq_lens_cpu,
@@ -1799,6 +1798,12 @@ class DTTargetController:
                     hidden_rows.append(hidden.contiguous())
                     transfers.append((transfer_id, row_offset, token_count))
                     row_offset += token_count
+                if staged_scalar_copies is not None:
+                    # Every staged D2H copy (scalars above plus per-row token
+                    # copies in the loop) is enqueued by now; record the
+                    # completion event before feature publication so it fences
+                    # them all ahead of the .tolist() reads below.
+                    staged_scalar_copies[3].record()
                 batch_result.dt_dflash_feature_metadata_ns = (
                     time.monotonic_ns() - phase_started_ns
                 )
