@@ -2480,6 +2480,13 @@ def test_feature_publication_fences_graph_buffer_reuse(feature_path: str) -> Non
     trace = []
     producer_event = object()
 
+    class ScalarCopyDone:
+        def record(self) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
     class ForwardStream:
         def wait_event(self, event) -> None:
             trace.append(("forward_wait", event))
@@ -2513,7 +2520,9 @@ def test_feature_publication_fences_graph_buffer_reuse(feature_path: str) -> Non
 
     controller = object.__new__(DTTargetController)
     controller.scheduler = SimpleNamespace(
-        forward_stream=ForwardStream(), ps=SimpleNamespace(tp_size=1)
+        forward_stream=ForwardStream(),
+        ps=SimpleNamespace(tp_size=1),
+        device_module=SimpleNamespace(Event=ScalarCopyDone),
     )
     controller.is_export_rank = True
     controller.is_feature_backed = True

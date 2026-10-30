@@ -1547,6 +1547,12 @@ class DTTargetController:
                 packet = (specs_local, None, True)
                 export_block = False
         if export_block and packet is None and self.is_export_rank:
+            # Non-deferred waves stage their control-scalar D2H copies up
+            # front (async on the copy stream) and read them only after the
+            # publication below, so the scheduler does not block on the
+            # just-launched verify forward the way a synchronous
+            # .to("cpu") would.
+            staged_scalar_copies = None
             try:
                 if deferred:
                     error = getattr(batch_result, "dt_deferred_feature_error", None)
@@ -1639,10 +1645,22 @@ class DTTargetController:
                     bonus_values = batch_result.dt_dflash_bonus_tokens_cpu.tolist()
                     seq_len_values = batch_result.dt_dflash_seq_lens_cpu.tolist()
                 else:
-                    bonus_values = draft_input.bonus_tokens.detach().to("cpu").tolist()
-                    seq_len_values = (
-                        draft_input.new_seq_lens.detach().to("cpu").tolist()
+                    from sglang.srt.managers.utils import _async_d2h
+
+                    bonus_cpu = _async_d2h(draft_input.bonus_tokens)
+                    seq_lens_cpu = _async_d2h(draft_input.new_seq_lens)
+                    staged_rows: list[
+                        tuple[torch.Tensor, torch.Tensor | None]
+                    ] = []
+                    scalar_copy_done = self.scheduler.device_module.Event()
+                    scalar_copy_done.record()
+                    staged_scalar_copies = (
+                        bonus_cpu,
+                        seq_lens_cpu,
+                        staged_rows,
+                        scalar_copy_done,
                     )
+                    bonus_values = seq_len_values = None
                 eagle_tokens_by_index = {}
                 eagle_committed_by_index = {}
                 if self.is_eagle3:
@@ -1729,6 +1747,17 @@ class DTTargetController:
                     if self.is_eagle3:
                         token_ids = eagle_tokens_by_index[index]
                         committed_token_ids = eagle_committed_by_index[index]
+                        if staged_scalar_copies is not None:
+                            staged_scalar_copies[2].append((None, None))
+                    elif staged_scalar_copies is not None:
+                        token_cpu = _async_d2h(tokens)
+                        committed_cpu = (
+                            None
+                            if committed_tokens is tokens
+                            else _async_d2h(committed_tokens)
+                        )
+                        staged_scalar_copies[2].append((token_cpu, committed_cpu))
+                        token_ids = committed_token_ids = None
                     else:
                         token_ids = tuple(
                             int(value)
@@ -1739,7 +1768,7 @@ class DTTargetController:
                             for value in committed_tokens.detach().to("cpu").tolist()
                         )
                     specs.append(
-                        (
+                        [
                             req.rid,
                             transfer_id,
                             round_id,
@@ -1751,9 +1780,17 @@ class DTTargetController:
                             committed_token_ids,
                             (snapshot.previous_transfer_id if snapshot is not None
                              else self._verify_transfer_by_request.get(req.rid)),
-                            int(bonus_values[index]),
-                            int(seq_len_values[index]),
-                        )
+                            (
+                                int(bonus_values[index])
+                                if bonus_values is not None
+                                else None
+                            ),
+                            (
+                                int(seq_len_values[index])
+                                if seq_len_values is not None
+                                else None
+                            ),
+                        ]
                     )
                     if deferred:
                         # Clones were allocated on forward_stream; publication
@@ -2013,6 +2050,36 @@ class DTTargetController:
                     batch_result.dt_dflash_feature_profile_ns = (
                         time.monotonic_ns() - phase_started_ns
                     )
+                if staged_scalar_copies is not None:
+                    # The copies were enqueued before the publication work
+                    # above; by this point the verify forward has drained, so
+                    # the wait is short and no longer gates the launch path.
+                    (
+                        bonus_cpu,
+                        seq_lens_cpu,
+                        staged_rows,
+                        scalar_copy_done,
+                    ) = staged_scalar_copies
+                    scalar_copy_done.synchronize()
+                    bonus_list = bonus_cpu.tolist()
+                    seq_len_list = seq_lens_cpu.tolist()
+                    for position, spec in enumerate(specs):
+                        index = active[position]
+                        token_cpu, committed_cpu = staged_rows[position]
+                        if token_cpu is not None:
+                            spec[7] = tuple(
+                                int(value) for value in token_cpu.tolist()
+                            )
+                            spec[8] = tuple(
+                                int(value)
+                                for value in (
+                                    committed_cpu
+                                    if committed_cpu is not None
+                                    else token_cpu
+                                ).tolist()
+                            )
+                        spec[10] = int(bonus_list[index])
+                        spec[11] = int(seq_len_list[index])
                 packet = (specs, None, False)
             except Exception as exc:
                 if published is not None:

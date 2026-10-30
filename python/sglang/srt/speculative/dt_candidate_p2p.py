@@ -504,6 +504,11 @@ class TargetCandidateArena:
         self._active: dict[str, int] = {}
         self._poll_cursor = 0
         self._retired_transfers: OrderedDict[str, None] = OrderedDict()
+        # Completion events are released here at slot free and reused by the
+        # next reservation, instead of creating/destroying one CUDA event per
+        # task.  An event is only ever owned by one slot at a time; a freed
+        # slot's callers never query it again without a generation check.
+        self._event_pool: list[torch.cuda.Event] = []
         self._lock = Lock()
         self._closed = False
         self.device_uuid = str(torch.cuda.get_device_properties(self.device).uuid)
@@ -628,6 +633,22 @@ class TargetCandidateArena:
             ready_record_path=self.ready_record_path,
             completion_record_path=self.completion_record_path,
         )
+
+    def _acquire_completion_event(self) -> torch.cuda.Event:
+        """Reuse a pooled CUDA event instead of creating one per completion.
+
+        Pool events carry the arena's timing flag; a timing arena therefore
+        hands out timed events for both the completion record and the
+        optional metadata start record.
+        """
+
+        if self._event_pool:
+            return self._event_pool.pop()
+        return torch.cuda.Event(enable_timing=self._profile_timing)
+
+    def _release_completion_event(self, event: torch.cuda.Event | None) -> None:
+        if event is not None:
+            self._event_pool.append(event)
 
     def reserve(self, transfer_id: str):
         """Reserve and arm one entry, returning a protocol descriptor."""
@@ -884,12 +905,11 @@ class TargetCandidateArena:
                 return
 
         timing_enabled = bool(getattr(self, "_profile_timing", False))
-        event = torch.cuda.Event(enable_timing=timing_enabled)
-        start_event = (
-            torch.cuda.Event(enable_timing=True)
-            if timing_enabled
-            else None
-        )
+        with self._lock:
+            event = self._acquire_completion_event()
+            start_event = (
+                self._acquire_completion_event() if timing_enabled else None
+            )
         metadata_submitted_ns = time.monotonic_ns()
         try:
             with torch.cuda.stream(wait_stream):
@@ -1237,6 +1257,7 @@ class TargetCandidateArena:
         self.poll_ready_records()
         self.poll_completion_records()
         completed: list[CandidateCompletion] = []
+        completed_ids: set[int] = set()
         queries = min(max_queries, self.slot_count)
         for offset in range(queries):
             slot_id = (self._poll_cursor + offset) % self.slot_count
@@ -1312,11 +1333,14 @@ class TargetCandidateArena:
                     )
                 ):
                     completed.append(slot.completion)
+                    completed_ids.add(id(slot.completion))
         self._poll_cursor = (self._poll_cursor + queries) % self.slot_count
         # Pick up completions that were parked before their assignment arrived.
         # Only an authorize() or a fresh READY entry (both flagged above, under
         # this same lock) can newly expose a parked completion, so an idle flag
-        # makes the full-slot scan provably fruitless.
+        # makes the full-slot scan provably fruitless.  Membership is by object
+        # identity: one completion object exists per slot generation, so
+        # identity dedups exactly like dataclass equality would, at O(1).
         with self._lock:
             if not self._ready_pickup_pending:
                 return tuple(completed)
@@ -1334,9 +1358,10 @@ class TargetCandidateArena:
                         slot.completion_draft_instance_id,
                         slot.completion_draft_session_id,
                     )
-                    and slot.completion not in completed
+                    and id(slot.completion) not in completed_ids
                 ):
                     completed.append(slot.completion)
+                    completed_ids.add(id(slot.completion))
         return tuple(completed)
 
     def poll_ready_records(self) -> int:
@@ -1747,6 +1772,8 @@ class TargetCandidateArena:
             if len(retired) > RETIRED_TRANSFER_LIMIT:
                 retired.popitem(last=False)
         generation = slot.generation
+        self._release_completion_event(slot.completion_event)
+        self._release_completion_event(slot.metadata_start_event)
         self._slots[slot_id] = _CandidateSlot(
             generation=generation,
             wait_stream=slot.wait_stream,
