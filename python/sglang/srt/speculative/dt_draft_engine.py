@@ -3617,12 +3617,12 @@ class FlashMTPDraftEngine:
         if direct is not None and direct != task:
             if not (
                 direct.direct_ring_seq
-                and direct.candidate_destination is None
                 and self._ring_record_task_matches(direct, task)
             ):
                 raise ValueError("Coordinator task differs from its direct dispatch")
-            # A §7.1 ring-record task was reconstructed without destination or
-            # scheduling metadata; adopt the Coordinator copy for both.
+            # A §7.1 ring-record task lacks its scheduling metadata, and with
+            # DT_RING_PUBLISH_AT_LAUNCH=1 its destination was already latched
+            # at ring take; adopt the Coordinator copy for both.
             self._direct_tasks_by_transfer[task.transfer_id] = task
         self._unconfirmed_direct.pop(task.transfer_id, None)
         self._ring_record_positions.pop(task.transfer_id, None)
