@@ -1,6 +1,6 @@
 // DT V2 Target-side completion-record observer.
 //
-// One native thread per Target candidate arena busy-polls the /dev/shm
+// One native thread per Target candidate arena scans the /dev/shm
 // completion-record mapping (and the legacy READY-record mapping when one
 // exists), applying the same cheap prefilter the Python poll used to run on
 // the scheduler thread: the slot's armed reservation nonce (seq word) and
@@ -11,15 +11,13 @@
 // a wave's last member is observed while the scheduler is still busy, not at
 // the next poll.  No GIL, no CUDA: the library links only pthread.
 //
-// Word layout constants (kSeqWord/kMetaWord, the READY generation word) are
-// the C++ mirror of COMPLETION_SEQ_WORD/COMPLETION_META_WORD/GENERATION_WORD
-// in dt_candidate_p2p.py; strides are passed in by the Python owner.  The
+// Record word indices (completion seq/meta, READY generation) are passed in
+// by the Python owner, which single-sources the layout constants.  The
 // expectation arrays (_record_seq_expected/_record_generation) are numpy
 // memory owned by the arena, written under its lock; aligned u32/u64 loads
 // cannot tear, a stale mismatch self-heals on the next pass, and the Python
 // drain revalidates every entry under the lock before consuming it.
 
-#include <sched.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -28,11 +26,6 @@
 #include <thread>
 
 namespace {
-
-// Word indices inside one 64-byte completion record (u64 words).  Keep in
-// sync with dt_candidate_p2p.py's COMPLETION_*_WORD constants.
-constexpr int kSeqWord = 0;   // reservation nonce, released last by the GPU
-constexpr int kMetaWord = 1;  // generation (low u32), valid length (high u32)
 
 // Ring entry, one per observed record.  `value` is the matched seq (kind 1)
 // or generation (kind 2).
@@ -51,6 +44,9 @@ constexpr uint64_t kKindReady = 2;
 // below this; overflow only sets `dropped` and the Python side re-runs its
 // legacy full scan for that poll.
 constexpr uint64_t kRingCapacityFactor = 4;
+// Idle/backoff pause range for the scan loop (see run()).
+constexpr uint64_t kBackoffMinNs = 20000;     // 20 us
+constexpr uint64_t kBackoffMaxNs = 1000000;   // 1 ms
 
 uint64_t now_ns() {
   timespec ts;
@@ -60,6 +56,11 @@ uint64_t now_ns() {
 
 struct Observer {
   uint32_t slot_count = 0;
+  // Word indices inside one completion record (u64 words) and one READY
+  // record (u32 words), owned by the Python caller's layout constants.
+  uint32_t completion_seq_word = 0;   // reservation nonce, released last
+  uint32_t completion_meta_word = 0;  // generation (low u32), length (high)
+  uint32_t ready_generation_word = 0;
   // Completion records: slot s lives at completion + s * completion_stride.
   volatile const uint64_t* completion = nullptr;
   uint64_t completion_stride = 0;
@@ -97,6 +98,12 @@ bool push(Observer* o, int kind, uint32_t slot, uint64_t value) {
 }
 
 void run(Observer* o) {
+  // Idle backoff: a pass that observed nothing doubles the pause up to the
+  // cap, so an idle arena sleeps instead of pinning a core; one new arrival
+  // resets the pause to the floor.  The floor also caps the scan rate while
+  // records stream in, at a fraction of a millisecond of added observation
+  // latency.
+  uint64_t backoff_ns = kBackoffMinNs;
   while (!o->stop.load(std::memory_order_relaxed)) {
     bool progressed = false;
     for (uint32_t s = 0; s < o->slot_count; ++s) {
@@ -105,9 +112,14 @@ void run(Observer* o) {
       volatile const uint64_t* rec = reinterpret_cast<volatile const uint64_t*>(
           reinterpret_cast<volatile const uint8_t*>(o->completion) +
           (uint64_t)s * o->completion_stride);
-      uint64_t seq = rec[kSeqWord];
+      uint64_t seq = rec[o->completion_seq_word];
       if (seq != expected || o->reported_seq[s] == seq) continue;
-      if ((uint32_t)rec[kMetaWord] != o->generation[s]) continue;
+      // The GPU publishes the seq word with a system-scope release, so
+      // acquire before reading the rest of the record or publishing the
+      // arrival (the same fence dt_ring_worker.cpp places after its
+      // publication-word load).
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if ((uint32_t)rec[o->completion_meta_word] != o->generation[s]) continue;
       if (push(o, 0, s, seq)) {
         o->reported_seq[s] = seq;
         progressed = true;
@@ -122,7 +134,8 @@ void run(Observer* o) {
         volatile const uint32_t* rec = reinterpret_cast<volatile const uint32_t*>(
             reinterpret_cast<volatile const uint8_t*>(o->ready) +
             (uint64_t)s * o->ready_stride);
-        if (rec[0] != gen) continue;
+        if (rec[o->ready_generation_word] != gen) continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (push(o, 1, s, gen)) {
           o->reported_gen[s] = gen;
           progressed = true;
@@ -131,7 +144,14 @@ void run(Observer* o) {
         }
       }
     }
-    if (!progressed) sched_yield();
+    if (progressed)
+      backoff_ns = kBackoffMinNs;
+    else if (backoff_ns < kBackoffMaxNs)
+      backoff_ns = backoff_ns * 2 > kBackoffMaxNs ? kBackoffMaxNs : backoff_ns * 2;
+    timespec ts;
+    ts.tv_sec = (time_t)(backoff_ns / 1000000000ull);
+    ts.tv_nsec = (long)(backoff_ns % 1000000000ull);
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
   }
 }
 
@@ -146,13 +166,18 @@ extern "C" {
 void* dt_record_observer_create(uint32_t slot_count, uint64_t completion_base,
                                 uint64_t completion_stride, uint64_t ready_base,
                                 uint64_t ready_stride, uint64_t seq_expected_base,
-                                uint64_t generation_base) {
+                                uint64_t generation_base, uint32_t completion_seq_word,
+                                uint32_t completion_meta_word,
+                                uint32_t ready_generation_word) {
   if (!slot_count || !completion_base || !completion_stride || !seq_expected_base ||
       !generation_base)
     return nullptr;
   Observer* o = new (std::nothrow) Observer();
   if (!o) return nullptr;
   o->slot_count = slot_count;
+  o->completion_seq_word = completion_seq_word;
+  o->completion_meta_word = completion_meta_word;
+  o->ready_generation_word = ready_generation_word;
   o->completion = reinterpret_cast<volatile const uint64_t*>(completion_base);
   o->completion_stride = completion_stride;
   o->ready = ready_base

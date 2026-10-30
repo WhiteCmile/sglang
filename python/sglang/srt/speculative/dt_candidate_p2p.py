@@ -301,8 +301,9 @@ def _build_record_observer_library() -> Path:
 class _RecordObserver:
     """ctypes owner of the native completion-record observer thread.
 
-    The thread busy-polls the record mappings against the arena's armed
-    expectations and appends each first-seen match, with the observation
+    The thread scans the record mappings against the arena's armed
+    expectations, with a pause that backs off while no record matches, and
+    appends each first-seen match, with the observation
     timestamp, to a lock-free SPSC ring per record kind; the scheduler
     thread only drains.  This object pins the numpy arrays and mappings the
     thread reads so they outlive it (destroy before unmapping).
@@ -323,7 +324,18 @@ class _RecordObserver:
     ) -> None:
         lib = ctypes.CDLL(str(_build_record_observer_library()))
         u64, u32, vp = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_void_p
-        lib.dt_record_observer_create.argtypes = [u32, u64, u64, u64, u64, u64, u64]
+        lib.dt_record_observer_create.argtypes = [
+            u32,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u32,
+            u32,
+            u32,
+        ]
         lib.dt_record_observer_create.restype = vp
         lib.dt_record_observer_start.argtypes = [vp]
         lib.dt_record_observer_start.restype = ctypes.c_int
@@ -353,6 +365,11 @@ class _RecordObserver:
             ready_stride,
             int(record_seq_expected.ctypes.data),
             int(record_generation.ctypes.data),
+            # Record-layout word indices stay single-sourced here; the C++
+            # observer receives them rather than mirroring the constants.
+            COMPLETION_SEQ_WORD,
+            COMPLETION_META_WORD,
+            GENERATION_WORD,
         )
         if not self._handle:
             raise CandidateTransportError("native record observer could not be created")
