@@ -4071,7 +4071,7 @@ class DTTargetController:
         """
         wait_ns = getattr(self, "_ready_batch_wait_ns", 0)
         if wait_ns <= 0 or ready_count >= getattr(self, "_ready_batch_min_size", 1):
-            self._ready_hold_started_ns = 0
+            self._end_ready_hold("size", ready_count)
             return False
         outstanding = any(
             state.candidate_bytes is None
@@ -4082,15 +4082,38 @@ class DTTargetController:
             for state in self._parked.values()
         )
         if not outstanding:
-            self._ready_hold_started_ns = 0
+            self._end_ready_hold("drained", ready_count)
             return False
         now_ns = self._last_poll_ns
         if not self._ready_hold_started_ns:
             self._ready_hold_started_ns = now_ns
+            if getattr(self, "_profile_active", False) and self.is_export_rank:
+                self._profile_emit(
+                    "target_ready_hold",
+                    phase="start",
+                    start_ns=now_ns,
+                    ready_count=ready_count,
+                    wait_ns=wait_ns,
+                )
         if now_ns - self._ready_hold_started_ns < wait_ns:
             return True
-        self._ready_hold_started_ns = 0
+        self._end_ready_hold("budget", ready_count)
         return False
+
+    def _end_ready_hold(self, reason: str, ready_count: int) -> None:
+        """Trace the end of a READY hold so its GPU-idle cost is measurable."""
+        started_ns = self._ready_hold_started_ns
+        self._ready_hold_started_ns = 0
+        if started_ns and getattr(self, "_profile_active", False) and self.is_export_rank:
+            self._profile_emit(
+                "target_ready_hold",
+                phase="release",
+                reason=reason,
+                start_ns=started_ns,
+                release_ns=self._last_poll_ns,
+                held_ns=self._last_poll_ns - started_ns,
+                ready_count=ready_count,
+            )
 
     def build_ready_batch(self) -> ScheduleBatch | None:
         observer = getattr(self, "_overlap_fix_observer", None)
