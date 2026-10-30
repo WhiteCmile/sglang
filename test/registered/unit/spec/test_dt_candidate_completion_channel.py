@@ -12,6 +12,9 @@ exposed and the review pinned down:
 - ROUTER_MANDATORY makes the two ROUTER failure modes explicit: EAGAIN for
   a backlogged peer, EHOSTUNREACH for a departed one.
 - poll_completion_notices honors its wall-clock cap even under a flood.
+- The native record observer records each first-matching completion or
+  legacy READY record exactly once and the drain path consumes it exactly
+  once, including across disarm/rearm and destroy.
 
 The arena/transport constructors need CUDA, so objects are built with
 object.__new__ plus only the attributes the methods under test touch.
@@ -19,6 +22,7 @@ object.__new__ plus only the attributes the methods under test touch.
 
 import ctypes
 import os
+import shutil
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -44,6 +48,7 @@ from sglang.srt.speculative.dt_candidate_p2p import (
     COMPLETION_SEQ_WORD,
     COMPLETION_TOKEN_WORD,
     GLOBALTIMER_CALIBRATION_SAMPLES,
+    READY_RECORD_WORDS,
     CandidateSlotState,
     CandidateTransportError,
     DraftCandidatePushTransport,
@@ -52,6 +57,7 @@ from sglang.srt.speculative.dt_candidate_p2p import (
     _CandidateSlot,
     _PendingCompletionNotice,
     _ReadyRecordFile,
+    _RecordObserver,
     producer_tag,
     transfer_id_hash,
 )
@@ -302,9 +308,7 @@ def make_completion_arena(slot_count=1):
     arena._active = {}
     arena._retired_transfers = OrderedDict()
     arena._completion_records = SimpleNamespace()  # sentinel: feature enabled
-    arena._completion_words = np.zeros(
-        (slot_count, COMPLETION_RECORD_WORDS), dtype=np.uint64
-    )
+    arena._completion_words = np.zeros((slot_count, COMPLETION_RECORD_WORDS), dtype=np.uint64)
     arena._record_generation = np.zeros(slot_count, dtype=np.uint32)
     arena._record_seq_expected = np.zeros(slot_count, dtype=np.uint64)
     arena._record_tag = np.zeros(slot_count, dtype=np.uint32)
@@ -755,3 +759,111 @@ class TestCompletionRecords:
                 records._mm.close()
             if os.path.exists(path):
                 os.unlink(path)
+
+
+OBSERVER_CXX_AVAILABLE = shutil.which(os.environ.get("CXX", "g++")) is not None
+
+
+def make_observed_arena(slot_count=2):
+    """Bare completion arena wired to a real native observer over numpy."""
+
+    arena = make_completion_arena(slot_count)
+    completion_words = np.zeros((slot_count, COMPLETION_RECORD_WORDS), dtype=np.uint64)
+    ready_words = np.zeros((slot_count, READY_RECORD_WORDS), dtype=np.uint32)
+    arena._completion_words = completion_words
+    arena._ready_records = SimpleNamespace(words=ready_words)
+    observer = _RecordObserver(
+        slot_count=slot_count,
+        completion_words=completion_words,
+        ready_words=ready_words,
+        record_seq_expected=arena._record_seq_expected,
+        record_generation=arena._record_generation,
+    )
+    arena._observer = observer
+    arena._observer_dropped_seen = 0
+    return arena, observer
+
+
+def poll_observed(arena, observer, method, deadline_s=10.0):
+    """Drains until the observer-recorded arrival lands (the native thread
+    needs a scheduling quantum to see the record)."""
+
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if method() == 1:
+            return True
+        assert observer.dropped == arena._observer_dropped_seen
+        time.sleep(0.001)
+    return False
+
+
+@pytest.mark.skipif(
+    not OBSERVER_CXX_AVAILABLE, reason="needs a C++ compiler for the observer"
+)
+class TestRecordObserver:
+    def test_observer_records_completion_once(self):
+        arena, observer = make_observed_arena()
+        try:
+            arm_completion_slot(arena, 0, transfer_id="t", generation=2, nonce=111)
+            write_completion_record(arena, 0, nonce=111, generation=2, transfer_id="t")
+            assert poll_observed(arena, observer, arena.poll_completion_records)
+            # The record keeps matching, but is consumed exactly once.
+            assert arena.poll_completion_records() == 0
+            assert arena._record_seq_expected[0] == 0
+            slot = arena._slots[0]
+            assert slot.state is CandidateSlotState.READY
+            assert slot.completion.ready_source == "completion_record"
+            assert slot.completion.observed_ns > 0
+        finally:
+            observer.destroy()
+
+    def test_observer_gen_mismatch_then_rearm(self):
+        arena, observer = make_observed_arena()
+        try:
+            arm_completion_slot(arena, 0, transfer_id="t", generation=2, nonce=111)
+            # Wrong generation in the record: no arrival, expectation kept.
+            write_completion_record(arena, 0, nonce=111, generation=3, transfer_id="t")
+            time.sleep(0.02)
+            assert arena.poll_completion_records() == 0
+            assert arena._record_seq_expected[0] == 111
+            # Disarm and rearm with a fresh reservation: the new record is
+            # observed even though the slot reported the stale one already.
+            arena._record_seq_expected[0] = 0
+            arena._record_generation[0] = 0
+            arm_completion_slot(arena, 0, transfer_id="u", generation=4, nonce=222)
+            write_completion_record(arena, 0, nonce=222, generation=4, transfer_id="u")
+            assert poll_observed(arena, observer, arena.poll_completion_records)
+            assert arena._slots[0].completion.transfer_id == "u"
+        finally:
+            observer.destroy()
+
+    def test_observer_records_legacy_ready_record(self):
+        arena, observer = make_observed_arena()
+        try:
+            arm_completion_slot(arena, 0, transfer_id="t", generation=2, nonce=111)
+            values = arena._ready_records.words[0]
+            values[1] = 111 & 0xFFFFFFFF
+            values[2] = 111 >> 32
+            values[3] = ROW_WIDTH
+            values[4] = 77
+            values[5] = producer_tag("draft")
+            values[0] = 2  # generation published last
+            assert poll_observed(arena, observer, arena.poll_ready_records)
+            assert arena.poll_ready_records() == 0
+            completion = arena._slots[0].completion
+            assert completion.ready_source == "gpu_record"
+            assert completion.root_token == 77
+        finally:
+            observer.destroy()
+
+    def test_observer_destroy_stops_draining(self):
+        arena, observer = make_observed_arena()
+        # close() destroys the observer and drops it; polls then fall back
+        # to the legacy scan and stay consistent.
+        observer.destroy()
+        arena._observer = None
+        assert observer.drain(_RecordObserver.KIND_COMPLETION) == []
+        arm_completion_slot(arena, 0, transfer_id="t", generation=2, nonce=111)
+        write_completion_record(arena, 0, nonce=111, generation=2, transfer_id="t")
+        assert arena.poll_completion_records() == 1
+        observer.destroy()  # idempotent
