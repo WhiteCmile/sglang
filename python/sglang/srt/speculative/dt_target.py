@@ -5620,26 +5620,24 @@ class DTTargetController:
         return time.monotonic_ns() + timeout_ns if timeout_ns else 0
 
     def _note_draft_progress(self, draft_instance_id: str) -> None:
-        progress_ns = getattr(self, "_draft_progress_ns", None)
-        if draft_instance_id and progress_ns is not None:
-            progress_ns[draft_instance_id] = time.monotonic_ns()
-
-    def _draft_progress_is_fresh(
-        self, draft_instance_id: str | None, now_ns: int
-    ) -> bool:
-        """True while the owning Draft (or any Draft when no owner is known)
-        progressed within the round-timeout window. Queueing behind a live
-        Draft is not a failure, so expiry must not fire on it."""
-
-        timeout_ns = getattr(self, "round_timeout_ns", 0)
-        if not timeout_ns:
-            return False
-        progress_ns = getattr(self, "_draft_progress_ns", {})
         if draft_instance_id:
-            stamp = progress_ns.get(draft_instance_id, 0)
-        else:
-            stamp = max(progress_ns.values(), default=0)
-        return bool(stamp) and now_ns - stamp < timeout_ns
+            self._draft_progress_ns[draft_instance_id] = time.monotonic_ns()
+
+    def _round_effective_expiry_ns(
+        self, deadline_ns: int, draft_instance_id: str | None
+    ) -> int:
+        """When a live round can next expire: its deadline, or — when fresh
+        Draft progress keeps it alive past that deadline — the moment the
+        owning Draft's last recorded progress goes stale (stamp plus the
+        round timeout)."""
+
+        from dt_protocol import draft_progress_stamp
+
+        timeout_ns = self.round_timeout_ns
+        if not timeout_ns:
+            return deadline_ns
+        stamp = draft_progress_stamp(self._draft_progress_ns, draft_instance_id)
+        return max(deadline_ns, stamp + timeout_ns) if stamp else deadline_ns
 
     def _expire_local_rounds(self) -> list[tuple[str, str, object]]:
         from dt_protocol import (
@@ -5647,21 +5645,26 @@ class DTTargetController:
             PROTOCOL_VERSION,
             CancelTransfers,
             cancel_transfers_id,
+            draft_progress_is_fresh,
         )
 
         now_ns = time.monotonic_ns()
         if now_ns < getattr(self, "_next_local_expiry_ns", 0):
-            # No live round can be due yet: deadlines are creation time plus a
-            # fixed timeout, so nothing added after the last scan expires
-            # earlier than the cached minimum.  A round past its deadline but
-            # kept alive by fresh Draft progress stays in the ledger, so the
-            # cached minimum remains in the past and the scan keeps running.
+            # No live round can be due yet: a round expires no earlier than
+            # its deadline, and one kept alive past its deadline by fresh
+            # Draft progress expires no earlier than that progress goes
+            # stale; both bounds are in the cached minimum.  New rounds and
+            # new progress only move them later, so a rescan before then
+            # cannot find anything.
             return []
         expired = tuple(
             state
             for state in self._ledger.expired(now_ns=now_ns)
-            if not self._draft_progress_is_fresh(
-                getattr(state, "draft_instance_id", "") or None, now_ns
+            if not draft_progress_is_fresh(
+                self._draft_progress_ns,
+                state.draft_instance_id or None,
+                self.round_timeout_ns,
+                now_ns,
             )
         )
         # A round whose Coordinator copy is still queued locally (or, for a
@@ -5679,11 +5682,13 @@ class DTTargetController:
             and state.deadline_ns
             and state.deadline_ns <= now_ns
             and self._ledger.get(state.transfer_id) is None
-            and not self._draft_progress_is_fresh(None, now_ns)
+            and not draft_progress_is_fresh(
+                self._draft_progress_ns, None, self.round_timeout_ns, now_ns
+            )
         ]
         if not expired and not stranded:
             pending = [
-                state.deadline_ns
+                self._round_effective_expiry_ns(state.deadline_ns, None)
                 for state in (
                     *self._parked.values(),
                     *self._feature_control_rounds.values(),
@@ -5691,7 +5696,15 @@ class DTTargetController:
                 if not state.failure and state.deadline_ns
             ]
             ledger_next = (
-                self._ledger.next_deadline_ns() if self._ledger is not None else None
+                self._ledger.next_deadline_ns(
+                    effective_deadline_ns=lambda state: (
+                        self._round_effective_expiry_ns(
+                            state.task.deadline_ns, state.draft_instance_id or None
+                        )
+                    )
+                )
+                if self._ledger is not None
+                else None
             )
             if ledger_next is not None:
                 pending.append(ledger_next)
