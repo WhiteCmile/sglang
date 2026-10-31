@@ -10,9 +10,24 @@ from dataclasses import dataclass
 import torch
 from dt_profile import event_enabled as profile_event_enabled
 from dt_profile import explicit_event_enabled as profile_event_explicitly_enabled
+from dt_protocol import (
+    PROTOCOL_VERSION,
+    ControlAck,
+    DraftTask,
+    DraftTaskKind,
+    ErrorMessage,
+    SourceReadDone,
+    SourceReadDoneBatch,
+    SourceRef,
+    TargetResultBatch,
+    TargetTaskBatch,
+    TaskBatchAck,
+)
+from msgspec.structs import replace
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.model_executor.model_runner import (
     DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
 )
@@ -867,8 +882,6 @@ class DTTargetController:
                 batch_result.dt_dflash_feature_stage_credit = True
                 self._deferred_dflash_feature_stages += 1
                 if self.is_export_rank:
-                    from sglang.srt.managers.utils import _async_d2h
-
                     try:
                         error = getattr(batch_result, "dt_deferred_feature_error", None)
                         if error is not None:
@@ -948,8 +961,6 @@ class DTTargetController:
             return
         if not _flashmtp_pivot_preservation_indices(batch):
             return
-
-        from sglang.srt.managers.utils import _async_d2h
 
         started_ns = time.monotonic_ns() if self._profile_active else 0
         batch_result.dt_flashmtp_bonus_tokens_cpu = _async_d2h(
@@ -1636,19 +1647,39 @@ class DTTargetController:
                     )
                 ):
                     raise RuntimeError("DFLASH Target result is missing feature chunks")
+                # Every deferred chunk is a dim-0 slice of the same packed
+                # tensors, so the ndim/dtype/width invariants hold for all rows
+                # once checked on the packed base; the per-row loop then only
+                # reads row lengths.  The GPU rows also share one storage, so a
+                # single record_stream on the base covers them all.
+                packed_contiguous = False
+                if deferred:
+                    if (
+                        packed_hidden.ndim != 2
+                        or int(packed_hidden.shape[1]) != self.pivot_width
+                        or packed_hidden.dtype != torch.bfloat16
+                        or (
+                            not self.is_eagle3 and candidate_tokens.ndim != 2
+                        )
+                    ):
+                        raise RuntimeError(
+                            "DFLASH Target feature/token chunk shape mismatch"
+                        )
+                    packed_contiguous = bool(packed_hidden.is_contiguous())
+                    packed_hidden.record_stream(
+                        torch.cuda.current_stream(packed_hidden.device)
+                    )
                 active = [
                     index
                     for index, req in enumerate(batch.reqs)
                     if not req.finished()
                     and not req.is_retracted
-                    and int(feature_chunks[index].shape[0]) > 0
+                    and feature_chunks[index].shape[0] > 0
                 ]
                 if deferred:
                     bonus_values = batch_result.dt_dflash_bonus_tokens_cpu.tolist()
                     seq_len_values = batch_result.dt_dflash_seq_lens_cpu.tolist()
                 else:
-                    from sglang.srt.managers.utils import _async_d2h
-
                     bonus_cpu = _async_d2h(draft_input.bonus_tokens)
                     seq_lens_cpu = _async_d2h(draft_input.new_seq_lens)
                     staged_rows: list[
@@ -1678,6 +1709,12 @@ class DTTargetController:
                 transfers = []
                 hidden_rows = []
                 row_offset = 0
+                next_round_get = self._next_round.get
+                committed_len_get = self._draft_committed_len.get
+                kv_handle_get = self._draft_kv_handle_by_request.get
+                verify_transfer_get = self._verify_transfer_by_request.get
+                instance_id = self.instance_id
+                deferred_dflash = deferred and not self.is_eagle3
                 for index in active:
                     req = batch.reqs[index]
                     snapshot = None
@@ -1688,11 +1725,11 @@ class DTTargetController:
                         snapshot = snapshots[index]
                         current = DeferredFeatureRound(
                             req.rid,
-                            self._next_round.get(req.rid, 0),
+                            next_round_get(req.rid, 0),
                             self._lifecycle_attempt_by_request.get(req.rid),
-                            self._draft_kv_handle_by_request.get(req.rid),
-                            self._draft_committed_len.get(req.rid),
-                            self._verify_transfer_by_request.get(req.rid),
+                            kv_handle_get(req.rid),
+                            committed_len_get(req.rid),
+                            verify_transfer_get(req.rid),
                         )
                         if current != snapshot:
                             raise RuntimeError("deferred feature round fencing changed")
@@ -1705,46 +1742,52 @@ class DTTargetController:
                     committed_tokens = (
                         committed_chunks[index] if self.is_eagle3 else tokens
                     )
-                    if (
-                        hidden.ndim != 2
-                        or int(hidden.shape[1]) != self.pivot_width
-                        or hidden.dtype != torch.bfloat16
-                        or tokens.ndim != 1
-                        or int(tokens.numel()) != int(hidden.shape[0])
-                        or committed_tokens.ndim != 1
-                        or int(committed_tokens.numel()) != int(hidden.shape[0])
-                    ):
-                        raise RuntimeError(
-                            "DFLASH Target feature/token chunk shape mismatch"
-                        )
+                    if deferred_dflash:
+                        # Row shape invariants were validated once on the
+                        # packed base above; the split construction already
+                        # cross-checks each row's token/hidden lengths.
+                        token_count = hidden.shape[0]
+                    else:
+                        if (
+                            hidden.ndim != 2
+                            or int(hidden.shape[1]) != self.pivot_width
+                            or hidden.dtype != torch.bfloat16
+                            or tokens.ndim != 1
+                            or int(tokens.numel()) != int(hidden.shape[0])
+                            or committed_tokens.ndim != 1
+                            or int(committed_tokens.numel()) != int(hidden.shape[0])
+                        ):
+                            raise RuntimeError(
+                                "DFLASH Target feature/token chunk shape mismatch"
+                            )
+                        token_count = int(hidden.shape[0])
                     offset = int(feature_offsets[index])
-                    token_count = int(hidden.shape[0])
                     round_id = (
                         snapshot.round_id if snapshot is not None
-                        else self._next_round.get(req.rid, 0)
+                        else next_round_get(req.rid, 0)
                     )
                     previous_committed = (
                         snapshot.committed_len if snapshot is not None
-                        else self._draft_committed_len.get(req.rid)
+                        else committed_len_get(req.rid)
                     )
                     if round_id == 0:
                         if offset != 0 or previous_committed is not None:
                             raise RuntimeError(
                                 "DFLASH bootstrap must begin at offset zero"
                             )
-                        draft_kv_handle = f"{self.instance_id}:{req.rid}:" + str(
+                        draft_kv_handle = f"{instance_id}:{req.rid}:" + str(
                             attempt
                         )
                     else:
                         draft_kv_handle = (
                             snapshot.draft_kv_handle if snapshot is not None
-                            else self._draft_kv_handle_by_request.get(req.rid)
+                            else kv_handle_get(req.rid)
                         )
                         if draft_kv_handle is None or previous_committed != offset:
                             raise RuntimeError(
                                 "DFLASH feature range has a committed-prefix gap"
                             )
-                    transfer_id = f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
+                    transfer_id = f"{instance_id}:{req.rid}:{round_id}:{attempt}"
                     if self.is_eagle3:
                         token_ids = eagle_tokens_by_index[index]
                         committed_token_ids = eagle_committed_by_index[index]
@@ -1764,9 +1807,13 @@ class DTTargetController:
                             int(value)
                             for value in tokens.detach().to("cpu").tolist()
                         )
-                        committed_token_ids = tuple(
-                            int(value)
-                            for value in committed_tokens.detach().to("cpu").tolist()
+                        committed_token_ids = (
+                            token_ids
+                            if committed_tokens is tokens
+                            else tuple(
+                                int(value)
+                                for value in committed_tokens.detach().to("cpu").tolist()
+                            )
                         )
                     specs.append(
                         [
@@ -1780,7 +1827,7 @@ class DTTargetController:
                             token_ids,
                             committed_token_ids,
                             (snapshot.previous_transfer_id if snapshot is not None
-                             else self._verify_transfer_by_request.get(req.rid)),
+                             else verify_transfer_get(req.rid)),
                             (
                                 int(bonus_values[index])
                                 if bonus_values is not None
@@ -1796,8 +1843,17 @@ class DTTargetController:
                     if deferred:
                         # Clones were allocated on forward_stream; publication
                         # reads them on schedule_stream after result completion.
-                        hidden.record_stream(torch.cuda.current_stream(hidden.device))
-                    hidden_rows.append(hidden.contiguous())
+                        # Contiguous deferred rows are views of the packed base
+                        # whose storage was recorded once before the loop; a
+                        # non-contiguous base yields per-row copies that need
+                        # their own record_stream.
+                        if not packed_contiguous:
+                            hidden.record_stream(
+                                torch.cuda.current_stream(hidden.device)
+                            )
+                    hidden_rows.append(
+                        hidden if packed_contiguous else hidden.contiguous()
+                    )
                     transfers.append((transfer_id, row_offset, token_count))
                     row_offset += token_count
                 if staged_scalar_copies is not None:
@@ -4840,8 +4896,6 @@ class DTTargetController:
         feature_token_offset: int = 0,
         requires_proposal: bool = True,
     ):
-        from dt_protocol import DraftTask, DraftTaskKind, SourceRef
-
         now_ns = time.monotonic_ns()
         if self.is_token_only:
             full_sequence = tuple(req.origin_input_ids) + tuple(req.output_ids)
@@ -4982,8 +5036,6 @@ class DTTargetController:
         )
 
     def _queue_task_batch(self, tasks: tuple) -> None:
-        from dt_protocol import PROTOCOL_VERSION, TargetTaskBatch
-
         self._batch_sequence += 1
         batch = TargetTaskBatch(
             protocol_version=PROTOCOL_VERSION,
@@ -5004,7 +5056,6 @@ class DTTargetController:
         """Retire exact local copies; remote leases and ledger owners stay intact."""
         if not getattr(self, "_pending_send", None):
             return
-        from msgspec.structs import replace
 
         obsolete = {task.transfer_id: task for task in tasks}
         if not obsolete:
@@ -5028,9 +5079,6 @@ class DTTargetController:
         self._pending_send = retained
 
     def _flush_pending_send(self) -> None:
-        from dt_protocol import TargetTaskBatch
-        from msgspec.structs import replace
-
         self._flush_reliable_outbox()
         while self._pending_send:
             dispatchable = []
@@ -5250,15 +5298,6 @@ class DTTargetController:
                 self._last_pending_send_block = None
 
     def _poll_export_rank(self) -> list[tuple[str, str, object]]:
-        from dt_protocol import (
-            ControlAck,
-            ErrorMessage,
-            SourceReadDone,
-            SourceReadDoneBatch,
-            TargetResultBatch,
-            TaskBatchAck,
-        )
-
         if getattr(self, "_ring_publish_pending", None):
             # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
             # kernel-published waves, off the park critical path.

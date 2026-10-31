@@ -636,6 +636,13 @@ class TargetCandidateArena:
         self._slots = [_CandidateSlot() for _ in range(self.slot_count)]
         self._active: dict[str, int] = {}
         self._poll_cursor = 0
+        # Scanned-state epoch: bumped whenever a slot enters a state that
+        # poll_releases / poll_cancelled scan for (READING, or QUARANTINED
+        # with cancel_pending; CANCELLED is never assigned).  The scans skip
+        # the O(slot_count) sweep entirely while no such slot can exist.
+        self._scanned_slot_epoch = 0
+        self._release_scan: tuple[int, bool] = (-1, True)
+        self._cancel_scan: tuple[int, bool] = (-1, True)
         self._retired_transfers: OrderedDict[str, None] = OrderedDict()
         # Completion events are released here at slot free and reused by the
         # next reservation, instead of creating/destroying one CUDA event per
@@ -1824,6 +1831,7 @@ class TargetCandidateArena:
                 ):
                     raise CandidateTransportError("candidate completion is stale")
                 slot.state = CandidateSlotState.READING
+                self._scanned_slot_epoch += 1
                 slot_ids.append(slot_id)
         # A pageable list upload would block the scheduler until the verify
         # already queued on this stream finishes; stage it in pinned memory.
@@ -1851,12 +1859,17 @@ class TargetCandidateArena:
 
     def poll_releases(self) -> int:
         released = 0
+        epoch = self._scanned_slot_epoch
+        last_epoch, had_candidates = self._release_scan
+        if not had_candidates and last_epoch == epoch:
+            return 0
         with self._lock:
             candidates = [
                 (index, slot.generation, slot.read_event)
                 for index, slot in enumerate(self._slots)
                 if slot.state is CandidateSlotState.READING
             ]
+        self._release_scan = (epoch, bool(candidates))
         for slot_id, generation, event in candidates:
             if event is None:
                 continue
@@ -1906,12 +1919,17 @@ class TargetCandidateArena:
                 # assignment can authenticate the producer and its tombstone.
                 slot.state = CandidateSlotState.QUARANTINED
                 slot.cancel_pending = True
+                self._scanned_slot_epoch += 1
                 return False
             self._free_locked(slot_id)
             return True
 
     def poll_cancelled(self) -> int:
         released = 0
+        epoch = self._scanned_slot_epoch
+        last_epoch, had_candidates = self._cancel_scan
+        if not had_candidates and last_epoch == epoch:
+            return 0
         with self._lock:
             candidates = [
                 (index, slot.generation, slot.completion_event, slot.cancel_pending)
@@ -1922,6 +1940,7 @@ class TargetCandidateArena:
                     and slot.cancel_pending
                 )
             ]
+        self._cancel_scan = (epoch, bool(candidates))
         for slot_id, generation, event, needs_remote_proof in candidates:
             if event is None:
                 continue
