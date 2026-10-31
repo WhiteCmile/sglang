@@ -91,6 +91,7 @@ def test_direct_cancel_before_assignment_ack_retains_authenticated_generation() 
     arena = TargetCandidateArena.__new__(TargetCandidateArena)
     arena._lock = Lock()
     arena._active = {"transfer": 0}
+    arena._scanned_slot_epoch = 0
     arena._slots = [
         _CandidateSlot(
             generation=7,

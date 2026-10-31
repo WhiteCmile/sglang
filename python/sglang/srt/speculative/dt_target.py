@@ -27,7 +27,6 @@ from msgspec.structs import replace
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.model_executor.model_runner import (
     DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
 )
@@ -882,6 +881,8 @@ class DTTargetController:
                 batch_result.dt_dflash_feature_stage_credit = True
                 self._deferred_dflash_feature_stages += 1
                 if self.is_export_rank:
+                    from sglang.srt.managers.utils import _async_d2h
+
                     try:
                         error = getattr(batch_result, "dt_deferred_feature_error", None)
                         if error is not None:
@@ -961,6 +962,8 @@ class DTTargetController:
             return
         if not _flashmtp_pivot_preservation_indices(batch):
             return
+
+        from sglang.srt.managers.utils import _async_d2h
 
         started_ns = time.monotonic_ns() if self._profile_active else 0
         batch_result.dt_flashmtp_bonus_tokens_cpu = _async_d2h(
@@ -1680,6 +1683,8 @@ class DTTargetController:
                     bonus_values = batch_result.dt_dflash_bonus_tokens_cpu.tolist()
                     seq_len_values = batch_result.dt_dflash_seq_lens_cpu.tolist()
                 else:
+                    from sglang.srt.managers.utils import _async_d2h
+
                     bonus_cpu = _async_d2h(draft_input.bonus_tokens)
                     seq_lens_cpu = _async_d2h(draft_input.new_seq_lens)
                     staged_rows: list[
