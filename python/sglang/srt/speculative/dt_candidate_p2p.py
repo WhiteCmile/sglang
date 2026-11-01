@@ -57,24 +57,13 @@ from sglang.srt.speculative.dt_cuda_ipc import (
     CudaIpcRuntime,
     register_buffers,
 )
-from sglang.srt.speculative.dt_completion_source import (
-    COMPLETION_RECORD_BYTES,
-    GENERATION_WORD,
-    NONCE_HIGH_WORD,
-    NONCE_LOW_WORD,
-    PRODUCER_TAG_WORD,
-    READY_RECORD_BYTES,
-    ROOT_TOKEN_WORD,
-    VALID_LENGTH_WORD,
-    CandidateTransportError,
-    CompletionSource,
-    ShmSeqRecordSource,
-    _ReadyRecordFile,
-    completion_records_path,
-    ready_records_path,
-)
 
 METADATA_WORDS = 5
+GENERATION_WORD = 0
+NONCE_LOW_WORD = 1
+NONCE_HIGH_WORD = 2
+VALID_LENGTH_WORD = 3
+ROOT_TOKEN_WORD = 4
 COMPLETION_RETRY_NS = 100_000_000
 COMPLETION_MAX_ATTEMPTS = 100
 # Queue bursts instead of silently dropping them: at the measured standalone
@@ -94,7 +83,22 @@ RETIRED_TRANSFER_LIMIT = 65536
 RING_DEBUG = os.environ.get("DT_RING_DEBUG", "0") == "1"
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
+# One 32-byte host READY record per slot: the metadata words plus the
+# producer tag.  The generation word is written last.
+READY_RECORD_WORDS = 8
+READY_RECORD_BYTES = READY_RECORD_WORDS * 4
+PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
+# One 64-byte host completion record per slot: eight u64 words, the seq word
+# published last with a system-scope release store.
+COMPLETION_RECORD_WORDS = 8
+COMPLETION_RECORD_BYTES = COMPLETION_RECORD_WORDS * 8
+COMPLETION_SEQ_WORD = 0
+COMPLETION_META_WORD = 1  # generation (low u32), valid length (high u32)
+COMPLETION_HASH_WORD = 2  # transfer id hash
+COMPLETION_TOKEN_WORD = 3  # root token (low u32), producer tag (high u32)
+COMPLETION_PRODUCED_WORD = 4  # %globaltimer publication timestamp
+COMPLETION_OFFSET_WORD = 5  # producer's globaltimer->realtime offset (0 = none)
 GLOBALTIMER_CALIBRATION_SAMPLES = 64
 # A best-sample round trip above this cannot bound the offset usefully.
 GLOBALTIMER_CALIBRATION_MAX_UNCERTAINTY_NS = 1_000_000
@@ -114,6 +118,55 @@ def transfer_id_hash(transfer_id: str) -> int:
     return int.from_bytes(
         hashlib.blake2b(transfer_id.encode(), digest_size=8).digest(), "little"
     )
+
+
+class _ReadyRecordFile:
+    """A /dev/shm mapping of per-slot records shared by Target and Draft."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        record_bytes: int = READY_RECORD_BYTES,
+        slot_count: int = 0,
+        create: bool,
+    ) -> None:
+        if create and slot_count <= 0:
+            raise ValueError("record file needs a positive slot count")
+        page = mmap.PAGESIZE
+        flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            if create:
+                nbytes = -(-slot_count * record_bytes // page) * page
+                os.ftruncate(fd, nbytes)
+            else:
+                nbytes = os.fstat(fd).st_size
+            if nbytes <= 0 or nbytes % record_bytes:
+                raise CandidateTransportError("record file has an invalid size")
+            self._mm = mmap.mmap(fd, nbytes)
+        finally:
+            os.close(fd)
+        self.path = path
+        self.nbytes = nbytes
+        self.slot_capacity = nbytes // record_bytes
+        self.words = np.frombuffer(self._mm, dtype=np.uint32).reshape(
+            self.slot_capacity, record_bytes // 4
+        )
+        self.host_address = int(self.words.ctypes.data)
+
+    def close(self, *, unlink: bool) -> None:
+        self.words = None
+        try:
+            self._mm.close()
+        except BufferError:
+            # A caller still holds a view; the mapping dies with the process.
+            pass
+        if unlink:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
 
 
 def _build_push_completion_library() -> Path:
@@ -225,6 +278,139 @@ class _PushCompletionKernel:
             )
 
 
+def _build_record_observer_library() -> Path:
+    from sglang.srt.speculative.dt_direct_ring import _build_native_library
+
+    source = Path(__file__).with_name("csrc") / "dt_record_observer.cpp"
+    return _build_native_library(
+        "dt_record_observer",
+        source,
+        [
+            os.environ.get("CXX", "g++"),
+            "-O2",
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            "-lpthread",
+        ],
+        ["--version"],
+        "DT_RECORD_OBSERVER_BUILD_DIR",
+    )
+
+
+class _RecordObserver:
+    """ctypes owner of the native completion-record observer thread.
+
+    The thread scans the record mappings against the arena's armed
+    expectations, with a pause that backs off while no record matches, and
+    appends each first-seen match, with the observation
+    timestamp, to a lock-free SPSC ring per record kind; the scheduler
+    thread only drains.  This object pins the numpy arrays and mappings the
+    thread reads so they outlive it (destroy before unmapping).
+    """
+
+    KIND_COMPLETION = 1
+    KIND_READY = 2
+    _ENTRY_WORDS = 4
+
+    def __init__(
+        self,
+        *,
+        slot_count: int,
+        completion_words: np.ndarray,
+        ready_words: np.ndarray | None,
+        record_seq_expected: np.ndarray,
+        record_generation: np.ndarray,
+    ) -> None:
+        lib = ctypes.CDLL(str(_build_record_observer_library()))
+        u64, u32, vp = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_void_p
+        lib.dt_record_observer_create.argtypes = [
+            u32,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u32,
+            u32,
+            u32,
+        ]
+        lib.dt_record_observer_create.restype = vp
+        lib.dt_record_observer_start.argtypes = [vp]
+        lib.dt_record_observer_start.restype = ctypes.c_int
+        lib.dt_record_observer_drain.argtypes = [vp, u64, vp, u64]
+        lib.dt_record_observer_drain.restype = u64
+        lib.dt_record_observer_dropped.argtypes = [vp]
+        lib.dt_record_observer_dropped.restype = u64
+        lib.dt_record_observer_destroy.argtypes = [vp]
+        lib.dt_record_observer_destroy.restype = ctypes.c_int
+        self._lib = lib
+        self._slot_count = int(slot_count)
+        # Drain buffer size; the C++ ring is sized independently
+        # (kRingCapacityFactor in dt_record_observer.cpp), and a smaller
+        # buffer only means arrivals survive across more drains.
+        self._capacity = 4 * self._slot_count
+        self._completion_words = completion_words
+        self._ready_words = ready_words
+        self._record_seq_expected = record_seq_expected
+        self._record_generation = record_generation
+        ready_base = int(ready_words.ctypes.data) if ready_words is not None else 0
+        ready_stride = int(ready_words.strides[0]) if ready_words is not None else 0
+        self._handle = lib.dt_record_observer_create(
+            self._slot_count,
+            int(completion_words.ctypes.data),
+            int(completion_words.strides[0]),
+            ready_base,
+            ready_stride,
+            int(record_seq_expected.ctypes.data),
+            int(record_generation.ctypes.data),
+            # Record-layout word indices stay single-sourced here; the C++
+            # observer receives them rather than mirroring the constants.
+            COMPLETION_SEQ_WORD,
+            COMPLETION_META_WORD,
+            GENERATION_WORD,
+        )
+        if not self._handle:
+            raise CandidateTransportError("native record observer could not be created")
+        if lib.dt_record_observer_start(self._handle) != 0:
+            lib.dt_record_observer_destroy(self._handle)
+            self._handle = None
+            raise CandidateTransportError("native record observer did not start")
+        self._drain_buffer = np.zeros(
+            (self._capacity, self._ENTRY_WORDS), dtype=np.uint64
+        )
+
+    def drain(self, kind: int) -> list[tuple[int, int, int, int]]:
+        """Pop up to ``_capacity`` arrivals of one kind as observer tuples."""
+
+        if not self._handle:
+            return []
+        count = self._lib.dt_record_observer_drain(
+            self._handle, kind, self._drain_buffer.ctypes.data, self._capacity
+        )
+        rows = self._drain_buffer[:count]
+        return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rows]
+
+    @property
+    def dropped(self) -> int:
+        if not self._handle:
+            return 0
+        return int(self._lib.dt_record_observer_dropped(self._handle))
+
+    def destroy(self) -> None:
+        if not self._handle:
+            return
+        self._lib.dt_record_observer_destroy(self._handle)
+        self._handle = None
+        # The thread is joined; release the pins so a later record-file
+        # close() finds no live numpy view of the mapping.
+        self._completion_words = None
+        self._ready_words = None
+        self._record_seq_expected = None
+        self._record_generation = None
+
+
 def _calibrate_globaltimer_offset(
     runtime: CudaIpcRuntime, kernel: _PushCompletionKernel, device_index: int
 ) -> int:
@@ -270,6 +456,10 @@ def _calibrate_globaltimer_offset(
             view = None
     finally:
         sample_map.close()
+
+
+class CandidateTransportError(RuntimeError):
+    pass
 
 
 class _RingDebugLog:
@@ -411,6 +601,10 @@ class TargetCandidateArena:
         self.transport_session = uuid.uuid4().hex
         self.slot_count = int(slot_count)
         self.row_width = int(row_width)
+        # Set whenever a completion parks in READY or an assignment lands;
+        # poll()'s parked-completion pickup scan runs only while this is set,
+        # because nothing else can newly expose a parked completion.
+        self._ready_pickup_pending = False
         self._profile_timing = bool(profile_timing)
         self._row_nbytes = self.row_width * 4
         self._metadata_row_nbytes = METADATA_WORDS * 4
@@ -442,7 +636,19 @@ class TargetCandidateArena:
         self._slots = [_CandidateSlot() for _ in range(self.slot_count)]
         self._active: dict[str, int] = {}
         self._poll_cursor = 0
+        # Scanned-state epoch: bumped whenever a slot enters a state that
+        # poll_releases / poll_cancelled scan for (READING, or QUARANTINED
+        # with cancel_pending; CANCELLED is never assigned).  The scans skip
+        # the O(slot_count) sweep entirely while no such slot can exist.
+        self._scanned_slot_epoch = 0
+        self._release_scan: tuple[int, bool] = (-1, True)
+        self._cancel_scan: tuple[int, bool] = (-1, True)
         self._retired_transfers: OrderedDict[str, None] = OrderedDict()
+        # Completion events are released here at slot free and reused by the
+        # next reservation, instead of creating/destroying one CUDA event per
+        # task.  An event is only ever owned by one slot at a time; a freed
+        # slot's callers never query it again without a generation check.
+        self._event_pool: list[torch.cuda.Event] = []
         self._lock = Lock()
         self._closed = False
         self.device_uuid = str(torch.cuda.get_device_properties(self.device).uuid)
@@ -479,11 +685,10 @@ class TargetCandidateArena:
         )
         self._ready_records: _ReadyRecordFile | None = None
         self.ready_record_path = ""
-        self._ready_source: CompletionSource | None = None
         self._completion_records: _ReadyRecordFile | None = None
         self.completion_record_path = ""
-        self._completion_source: ShmSeqRecordSource | None = None
-        self._completion_words = None
+        self._observer: _RecordObserver | None = None
+        self._observer_dropped_seen = 0
         if GPU_READY_RECORD or PUSH_COMPLETION_RECORD:
             # Generation/tag a slot's record must carry to become READY; 0 means
             # the slot is not waiting for a record (unassigned, done, cancelled).
@@ -491,19 +696,14 @@ class TargetCandidateArena:
             self._record_tag = np.zeros(self.slot_count, dtype=np.uint32)
         if GPU_READY_RECORD:
             self._ready_records = _ReadyRecordFile(
-                ready_records_path(self.transport_session),
+                f"/dev/shm/dt-ready-{self.transport_session}",
                 slot_count=self.slot_count,
                 create=True,
             )
             self.ready_record_path = self._ready_records.path
-            self._ready_source = ShmSeqRecordSource.ready_records(
-                records=self._ready_records,
-                slot_count=self.slot_count,
-                expected=self._record_generation,
-            )
         if PUSH_COMPLETION_RECORD:
             self._completion_records = _ReadyRecordFile(
-                completion_records_path(self.transport_session),
+                f"/dev/shm/dt-completion-{self.transport_session}",
                 record_bytes=COMPLETION_RECORD_BYTES,
                 slot_count=self.slot_count,
                 create=True,
@@ -517,21 +717,35 @@ class TargetCandidateArena:
                     self._completion_records.nbytes,
                 )
             except Exception:
+                self._completion_words = None
                 self.completion_record_path = ""
                 self._completion_records.close(unlink=True)
                 self._completion_records = None
                 raise
+            self._completion_words = self._completion_records.words.view(
+                np.uint64
+            ).reshape(
+                self._completion_records.slot_capacity, COMPLETION_RECORD_WORDS
+            )
             # Reservation nonce a slot's completion record must carry; 0 means
             # the slot is not waiting for a record (unassigned, done,
             # cancelled).
             self._record_seq_expected = np.zeros(self.slot_count, dtype=np.uint64)
-            self._completion_source = ShmSeqRecordSource.completion_records(
-                records=self._completion_records,
+            # The native observer watches both record mappings against these
+            # expectations, so the scheduler thread drains first-seen arrivals
+            # instead of scanning every slot twice per poll.  It is destroyed
+            # in close() before the mappings and arrays go away.
+            self._observer = _RecordObserver(
                 slot_count=self.slot_count,
-                expected=self._record_generation,
-                expected_seq=self._record_seq_expected,
+                completion_words=self._completion_words,
+                ready_words=(
+                    self._ready_records.words
+                    if self._ready_records is not None
+                    else None
+                ),
+                record_seq_expected=self._record_seq_expected,
+                record_generation=self._record_generation,
             )
-            self._completion_words = self._completion_source.words
 
     @property
     def free_slot_count(self) -> int:
@@ -614,6 +828,22 @@ class TargetCandidateArena:
             ),
         )
 
+    def _acquire_completion_event(self) -> torch.cuda.Event:
+        """Reuse a pooled CUDA event instead of creating one per completion.
+
+        Pool events carry the arena's timing flag; a timing arena therefore
+        hands out timed events for both the completion record and the
+        optional metadata start record.
+        """
+
+        if self._event_pool:
+            return self._event_pool.pop()
+        return torch.cuda.Event(enable_timing=self._profile_timing)
+
+    def _release_completion_event(self, event: torch.cuda.Event | None) -> None:
+        if event is not None:
+            self._event_pool.append(event)
+
     def reserve(self, transfer_id: str):
         """Reserve and arm one entry, returning a protocol descriptor."""
 
@@ -641,10 +871,20 @@ class TargetCandidateArena:
             if generation > 0x7FFFFFFF:
                 raise CandidateTransportError("candidate slot generation exhausted")
             nonce = secrets.randbits(63) or 1
-            wait_stream = torch.cuda.Stream(device=self.device)
-            metadata_host = torch.empty(
-                (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
-            )
+            # The per-slot readback stream and pinned metadata buffer are
+            # retained across generations (_free_locked carries them over):
+            # consecutive uses of one slot are serialized by the stream's
+            # in-order execution and fenced by the per-arm completion event,
+            # so recreating them per reservation only spends CUDA driver
+            # calls on the hot path.
+            wait_stream = slot.wait_stream
+            if wait_stream is None:
+                wait_stream = torch.cuda.Stream(device=self.device)
+            metadata_host = slot.metadata_host
+            if metadata_host is None:
+                metadata_host = torch.empty(
+                    (METADATA_WORDS,), dtype=torch.int32, device="cpu", pin_memory=True
+                )
             slot.generation = generation
             slot.state = CandidateSlotState.ARMED
             slot.transfer_id = transfer_id
@@ -746,6 +986,7 @@ class TargetCandidateArena:
                 )
             slot.draft_instance_id = assignment.draft_instance_id
             slot.draft_session_id = assignment.draft_session_id
+            self._ready_pickup_pending = True
             if (
                 getattr(self, "_record_generation", None) is not None
                 and (
@@ -854,15 +1095,15 @@ class TargetCandidateArena:
                 # Same parked-before-ACK semantics as the readback path: poll()
                 # exposes it only once the assignment identity matches.
                 slot.state = CandidateSlotState.READY
+                self._ready_pickup_pending = True
                 return
 
         timing_enabled = bool(getattr(self, "_profile_timing", False))
-        event = torch.cuda.Event(enable_timing=timing_enabled)
-        start_event = (
-            torch.cuda.Event(enable_timing=True)
-            if timing_enabled
-            else None
-        )
+        with self._lock:
+            event = self._acquire_completion_event()
+            start_event = (
+                self._acquire_completion_event() if timing_enabled else None
+            )
         metadata_submitted_ns = time.monotonic_ns()
         try:
             with torch.cuda.stream(wait_stream):
@@ -1210,6 +1451,7 @@ class TargetCandidateArena:
         self.poll_ready_records()
         self.poll_completion_records()
         completed: list[CandidateCompletion] = []
+        completed_ids: set[int] = set()
         queries = min(max_queries, self.slot_count)
         for offset in range(queries):
             slot_id = (self._poll_cursor + offset) % self.slot_count
@@ -1272,6 +1514,7 @@ class TargetCandidateArena:
                 # Completion may beat the assignment ACK.  Retain it in READY
                 # but do not expose it to the scheduler until both identities match.
                 slot.state = CandidateSlotState.READY
+                self._ready_pickup_pending = True
                 if (
                     slot.draft_instance_id
                     and (
@@ -1284,9 +1527,18 @@ class TargetCandidateArena:
                     )
                 ):
                     completed.append(slot.completion)
+                    completed_ids.add(id(slot.completion))
         self._poll_cursor = (self._poll_cursor + queries) % self.slot_count
         # Pick up completions that were parked before their assignment arrived.
+        # Only an authorize() or a fresh READY entry (both flagged above, under
+        # this same lock) can newly expose a parked completion, so an idle flag
+        # makes the full-slot scan provably fruitless.  Membership is by object
+        # identity: one completion object exists per slot generation, so
+        # identity dedups exactly like dataclass equality would, at O(1).
         with self._lock:
+            if not self._ready_pickup_pending:
+                return tuple(completed)
+            self._ready_pickup_pending = False
             for slot in self._slots:
                 if (
                     slot.state is CandidateSlotState.READY
@@ -1300,9 +1552,10 @@ class TargetCandidateArena:
                         slot.completion_draft_instance_id,
                         slot.completion_draft_session_id,
                     )
-                    and slot.completion not in completed
+                    and id(slot.completion) not in completed_ids
                 ):
                     completed.append(slot.completion)
+                    completed_ids.add(id(slot.completion))
         return tuple(completed)
 
     def poll_ready_records(self) -> int:
@@ -1311,85 +1564,116 @@ class TargetCandidateArena:
         The Draft push stream writes payload, metadata, and record words in
         order, generation last, so a matching generation proves the payload is
         in this arena.  The identity is the assignment's; the producer tag and
-        nonce reject records from any other writer.  The shm record source
-        only decodes events; arming, consume-once clearing, authentication,
-        and the slot watermark live here.
+        nonce reject records from any other writer.  With the native observer
+        running, arrivals were prefiltered there (armed generation word) and
+        this only drains them; without it (no observer, e.g. bare test
+        arenas) the full-slot scan runs here.
         """
 
-        source = self._ready_source
-        if source is None:
+        records = getattr(self, "_ready_records", None)
+        if records is None:
             return 0
-        events = source.poll()
-        if not events:
-            return 0
+        observer = getattr(self, "_observer", None)
+        if observer is None:
+            return self._scan_ready_records()
+        accepted = 0
+        for _, slot_id, generation, observed_ns in observer.drain(
+            _RecordObserver.KIND_READY
+        ):
+            accepted += self._consume_ready_record(slot_id, generation, observed_ns)
+        if self._observer_overflowed(observer):
+            accepted += self._scan_ready_records()
+        return accepted
+
+    def _scan_ready_records(self) -> int:
+        records = self._ready_records
         expected = self._record_generation
+        hits = np.flatnonzero(
+            (expected != 0) & (records.words[: self.slot_count, 0] == expected)
+        )
+        if hits.size == 0:
+            return 0
         observed_ns = time.monotonic_ns()
         accepted = 0
-        for event in events:
-            slot_id = event.slot_id
-            with self._lock:
-                generation = int(expected[slot_id])
-                slot = self._slots[slot_id]
-                if slot.cancel_pending and getattr(
-                    self, "_completion_records", None
-                ) is not None:
-                    # The cancelled push's completion record retires this
-                    # slot; keep the expectation for poll_completion_records.
-                    continue
-                expected[slot_id] = 0
-                if (
-                    slot.generation != generation
-                    or slot.state is not CandidateSlotState.ARMED
-                    or slot.cancel_pending
-                    or slot.completion_draft_instance_id
-                    or not slot.draft_instance_id
-                ):
-                    continue
-                if (
-                    event.seq != slot.authorization_nonce
-                    or event.producer_tag != int(self._record_tag[slot_id])
-                    or event.valid_length != self.row_width
-                ):
-                    slot.state = CandidateSlotState.QUARANTINED
-                    raise CandidateTransportError(
-                        "candidate READY record failed generation/authentication"
-                    )
-                root = event.root_token
-                if root & 0x80000000:
-                    root -= 1 << 32
-                slot.completion_draft_instance_id = slot.draft_instance_id
-                slot.completion_draft_session_id = slot.draft_session_id
-                slot.completion = CandidateCompletion(
-                    transfer_id=slot.transfer_id,
-                    slot_id=slot_id,
-                    generation=slot.generation,
-                    authorization_nonce=slot.authorization_nonce,
-                    valid_length=event.valid_length,
-                    root_token=root,
-                    draft_instance_id=slot.draft_instance_id,
-                    draft_session_id=slot.draft_session_id,
-                    observed_ns=observed_ns,
-                    # No notice or readback precedes a record; keep one
-                    # monotonic chain for traces.
-                    notice_queued_ns=observed_ns,
-                    notice_received_ns=observed_ns,
-                    metadata_submitted_ns=observed_ns,
-                    ready_source="gpu_record",
-                )
-                slot.state = CandidateSlotState.READY
-                key = (
-                    slot.transfer_id,
-                    slot_id,
-                    slot.generation,
-                    slot.authorization_nonce,
-                    slot.draft_instance_id,
-                    slot.draft_session_id,
-                )
-            # The direct notice still follows; ACK it as a duplicate.
-            self._remember_notice(key)
-            accepted += 1
-        source.make_gpu_visible()
+        for slot_id in hits.tolist():
+            accepted += self._consume_ready_record(
+                slot_id, int(expected[slot_id]), observed_ns
+            )
         return accepted
+
+    def _consume_ready_record(
+        self, slot_id: int, generation: int, observed_ns: int
+    ) -> int:
+        values = [int(value) for value in self._ready_records.words[slot_id]]
+        with self._lock:
+            expected = self._record_generation
+            # The generation matched when the hit was recorded; the slot may
+            # have been consumed, disarmed, or rearmed since (generations are
+            # monotonic per slot, so a stale hit can never match fresh state).
+            if int(expected[slot_id]) != generation:
+                return 0
+            slot = self._slots[slot_id]
+            if (
+                slot.cancel_pending
+                and getattr(self, "_completion_records", None) is not None
+            ):
+                # The cancelled push's completion record retires this
+                # slot; keep the expectation for poll_completion_records.
+                return 0
+            expected[slot_id] = 0
+            if (
+                slot.generation != generation
+                or slot.state is not CandidateSlotState.ARMED
+                or slot.cancel_pending
+                or slot.completion_draft_instance_id
+                or not slot.draft_instance_id
+            ):
+                return 0
+            nonce = values[NONCE_LOW_WORD] | (values[NONCE_HIGH_WORD] << 32)
+            if (
+                nonce != slot.authorization_nonce
+                or values[PRODUCER_TAG_WORD] != int(self._record_tag[slot_id])
+                or values[VALID_LENGTH_WORD] != self.row_width
+            ):
+                slot.state = CandidateSlotState.QUARANTINED
+                raise CandidateTransportError(
+                    "candidate READY record failed generation/authentication"
+                )
+            root = values[ROOT_TOKEN_WORD]
+            if root & 0x80000000:
+                root -= 1 << 32
+            slot.completion_draft_instance_id = slot.draft_instance_id
+            slot.completion_draft_session_id = slot.draft_session_id
+            slot.completion = CandidateCompletion(
+                transfer_id=slot.transfer_id,
+                slot_id=slot_id,
+                generation=slot.generation,
+                authorization_nonce=slot.authorization_nonce,
+                valid_length=values[VALID_LENGTH_WORD],
+                root_token=root,
+                draft_instance_id=slot.draft_instance_id,
+                draft_session_id=slot.draft_session_id,
+                observed_ns=observed_ns,
+                # No notice or readback precedes a record; keep one
+                # monotonic chain for traces.
+                notice_queued_ns=observed_ns,
+                notice_received_ns=observed_ns,
+                metadata_submitted_ns=observed_ns,
+                ready_source="gpu_record",
+            )
+            slot.state = CandidateSlotState.READY
+            self._ready_pickup_pending = True
+            key = (
+                slot.transfer_id,
+                slot_id,
+                slot.generation,
+                slot.authorization_nonce,
+                slot.draft_instance_id,
+                slot.draft_session_id,
+            )
+        # The direct notice still follows; ACK it as a duplicate.
+        self._remember_notice(key)
+        return 1
 
     def poll_completion_records(self) -> int:
         """Mark assigned ARMED slots READY from GPU-written completion records.
@@ -1409,107 +1693,161 @@ class TargetCandidateArena:
         carry the record's %globaltimer stamp and, when the producer stamped
         a nonzero globaltimer offset, the publication-to-discovery
         delivery_ns derived from both; the monotonic observed-chain fields
-        are unaffected.  The shm record source only decodes events; arming,
-        consume-once clearing, authentication, and the slot watermark live
-        here.
+        are unaffected.
+
+        With the native observer running, arrivals were prefiltered there
+        (armed seq word and generation) with the observation timestamp taken
+        at match time, and this only drains them; without it (no observer,
+        e.g. bare test arenas) the full-slot scan runs here.
         """
 
-        source = self._completion_source
-        if source is None:
+        records = getattr(self, "_completion_records", None)
+        if records is None:
             return 0
-        events = source.poll()
-        if not events:
-            return 0
+        observer = getattr(self, "_observer", None)
+        if observer is None:
+            return self._scan_completion_records()
+        accepted = 0
+        for _, slot_id, seq, observed_ns in observer.drain(
+            _RecordObserver.KIND_COMPLETION
+        ):
+            accepted += self._consume_completion_record(slot_id, seq, observed_ns)
+        if self._observer_overflowed(observer):
+            accepted += self._scan_completion_records()
+        return accepted
+
+    def _observer_overflowed(self, observer: _RecordObserver) -> bool:
+        """Report once whether the observer ring overflowed since last drain.
+
+        Overflow is not reachable while the per-slot dedup bounds pending
+        arrivals; if it ever happens the matching record is still in its
+        mapping, so one legacy full scan recovers it.
+        """
+
+        dropped = observer.dropped
+        if dropped == self._observer_dropped_seen:
+            return False
+        self._observer_dropped_seen = dropped
+        return True
+
+    def _scan_completion_records(self) -> int:
         expected = self._record_generation
         expected_seq = self._record_seq_expected
+        words = self._completion_words
+        hits = np.flatnonzero(
+            (expected_seq != 0)
+            & (words[: self.slot_count, COMPLETION_SEQ_WORD] == expected_seq)
+            & (
+                (words[: self.slot_count, COMPLETION_META_WORD] & 0xFFFFFFFF)
+                == expected
+            )
+        )
+        if hits.size == 0:
+            return 0
         observed_ns = time.monotonic_ns()
         accepted = 0
-        for event in events:
-            slot_id = event.slot_id
-            # The nonce was released last; the payload words cannot be
-            # reordered before it on this CPU, and the GPU released them
-            # beforehand.
-            with self._lock:
-                # A record is consumable exactly once: a failed authentication
-                # must not re-raise on every poll.
-                expected_seq[slot_id] = 0
-                generation = int(expected[slot_id])
-                slot = self._slots[slot_id]
-                if slot.generation != generation:
-                    continue
-                if (
-                    event.slot_generation != generation
-                    or event.valid_length != self.row_width
-                    or event.transfer_digest != transfer_id_hash(slot.transfer_id)
-                    or event.producer_tag != int(self._record_tag[slot_id])
-                ):
-                    if slot.cancel_pending:
-                        slot.cancel_pending = False
-                    slot.state = CandidateSlotState.QUARANTINED
-                    raise CandidateTransportError(
-                        "candidate completion record failed generation/authentication"
-                    )
-                if (
-                    slot.state is CandidateSlotState.QUARANTINED
-                    and slot.cancel_pending
-                ):
-                    # Stream-ordered after the candidate copy, the record is
-                    # the cancelled push's quiescence proof; no tombstone
-                    # readback is needed.
-                    self._free_locked(slot_id)
-                    accepted += 1
-                    continue
-                if (
-                    slot.state is not CandidateSlotState.ARMED
-                    or slot.cancel_pending
-                    or slot.completion_draft_instance_id
-                    or not slot.draft_instance_id
-                ):
-                    continue
-                root = event.root_token
-                if root & 0x80000000:
-                    root -= 1 << 32
-                slot.completion_draft_instance_id = slot.draft_instance_id
-                slot.completion_draft_session_id = slot.draft_session_id
-                slot.completion = CandidateCompletion(
-                    transfer_id=slot.transfer_id,
-                    slot_id=slot_id,
-                    generation=slot.generation,
-                    authorization_nonce=slot.authorization_nonce,
-                    valid_length=event.valid_length,
-                    root_token=root,
-                    draft_instance_id=slot.draft_instance_id,
-                    draft_session_id=slot.draft_session_id,
-                    observed_ns=observed_ns,
-                    # No notice or readback precedes a record; keep one
-                    # monotonic chain for traces.
-                    notice_queued_ns=observed_ns,
-                    notice_received_ns=observed_ns,
-                    metadata_submitted_ns=observed_ns,
-                    ready_source="completion_record",
-                    producer_globaltimer_ns=event.producer_globaltimer_ns,
-                    delivery_ns=(
-                        time.time_ns()
-                        - (event.producer_globaltimer_ns + event.globaltimer_offset_ns)
-                        if event.globaltimer_offset_ns
-                        else 0
-                    ),
-                )
-                expected[slot_id] = 0
-                slot.state = CandidateSlotState.READY
-                key = (
-                    slot.transfer_id,
-                    slot_id,
-                    slot.generation,
-                    slot.authorization_nonce,
-                    slot.draft_instance_id,
-                    slot.draft_session_id,
-                )
-            # A straggler notice from a mixed-mode producer ACKs as a duplicate.
-            self._remember_notice(key)
-            accepted += 1
-        source.make_gpu_visible()
+        for slot_id in hits.tolist():
+            accepted += self._consume_completion_record(
+                slot_id, int(words[slot_id, COMPLETION_SEQ_WORD]), observed_ns
+            )
         return accepted
+
+    def _consume_completion_record(
+        self, slot_id: int, seq: int, observed_ns: int
+    ) -> int:
+        words = self._completion_words
+        # The nonce was released last; the payload words cannot be
+        # reordered before it on this CPU, and the GPU released them
+        # beforehand.  A record can only be overwritten after the slot is
+        # freed and rearmed, which the seq recheck under the lock detects.
+        meta = int(words[slot_id, COMPLETION_META_WORD])
+        record_hash = int(words[slot_id, COMPLETION_HASH_WORD])
+        token = int(words[slot_id, COMPLETION_TOKEN_WORD])
+        produced = int(words[slot_id, COMPLETION_PRODUCED_WORD])
+        record_offset = int(words[slot_id, COMPLETION_OFFSET_WORD])
+        with self._lock:
+            # The seq matched the armed expectation when the hit was
+            # recorded; the slot may have been consumed, disarmed, or
+            # rearmed since (nonces are unique per reservation, so a stale
+            # hit can never match a fresh expectation).
+            expected_seq = self._record_seq_expected
+            if int(expected_seq[slot_id]) != seq:
+                return 0
+            # A record is consumable exactly once: a failed authentication
+            # must not re-raise on every poll.
+            expected_seq[slot_id] = 0
+            expected = self._record_generation
+            generation = int(expected[slot_id])
+            slot = self._slots[slot_id]
+            if slot.generation != generation:
+                return 0
+            if (
+                meta & 0xFFFFFFFF != generation
+                or meta >> 32 != self.row_width
+                or record_hash != transfer_id_hash(slot.transfer_id)
+                or token >> 32 != int(self._record_tag[slot_id])
+            ):
+                if slot.cancel_pending:
+                    slot.cancel_pending = False
+                slot.state = CandidateSlotState.QUARANTINED
+                raise CandidateTransportError(
+                    "candidate completion record failed generation/authentication"
+                )
+            if slot.state is CandidateSlotState.QUARANTINED and slot.cancel_pending:
+                # Stream-ordered after the candidate copy, the record is
+                # the cancelled push's quiescence proof; no tombstone
+                # readback is needed.
+                self._free_locked(slot_id)
+                return 1
+            if (
+                slot.state is not CandidateSlotState.ARMED
+                or slot.cancel_pending
+                or slot.completion_draft_instance_id
+                or not slot.draft_instance_id
+            ):
+                return 0
+            root = token & 0xFFFFFFFF
+            if root & 0x80000000:
+                root -= 1 << 32
+            slot.completion_draft_instance_id = slot.draft_instance_id
+            slot.completion_draft_session_id = slot.draft_session_id
+            slot.completion = CandidateCompletion(
+                transfer_id=slot.transfer_id,
+                slot_id=slot_id,
+                generation=slot.generation,
+                authorization_nonce=slot.authorization_nonce,
+                valid_length=meta >> 32,
+                root_token=root,
+                draft_instance_id=slot.draft_instance_id,
+                draft_session_id=slot.draft_session_id,
+                observed_ns=observed_ns,
+                # No notice or readback precedes a record; keep one
+                # monotonic chain for traces.
+                notice_queued_ns=observed_ns,
+                notice_received_ns=observed_ns,
+                metadata_submitted_ns=observed_ns,
+                ready_source="completion_record",
+                producer_globaltimer_ns=produced,
+                delivery_ns=(
+                    time.time_ns() - (produced + record_offset)
+                    if record_offset
+                    else 0
+                ),
+            )
+            expected[slot_id] = 0
+            slot.state = CandidateSlotState.READY
+            self._ready_pickup_pending = True
+            key = (
+                slot.transfer_id,
+                slot_id,
+                slot.generation,
+                slot.authorization_nonce,
+                slot.draft_instance_id,
+                slot.draft_session_id,
+            )
+        # A straggler notice from a mixed-mode producer ACKs as a duplicate.
+        self._remember_notice(key)
+        return 1
 
     def begin_read(self, completions: list[CandidateCompletion]) -> torch.Tensor:
         """Gather selected rows, fence their last read, and return device tokens."""
@@ -1530,6 +1868,7 @@ class TargetCandidateArena:
                 ):
                     raise CandidateTransportError("candidate completion is stale")
                 slot.state = CandidateSlotState.READING
+                self._scanned_slot_epoch += 1
                 slot_ids.append(slot_id)
         # A pageable list upload would block the scheduler until the verify
         # already queued on this stream finishes; stage it in pinned memory.
@@ -1557,12 +1896,17 @@ class TargetCandidateArena:
 
     def poll_releases(self) -> int:
         released = 0
+        epoch = self._scanned_slot_epoch
+        last_epoch, had_candidates = self._release_scan
+        if not had_candidates and last_epoch == epoch:
+            return 0
         with self._lock:
             candidates = [
                 (index, slot.generation, slot.read_event)
                 for index, slot in enumerate(self._slots)
                 if slot.state is CandidateSlotState.READING
             ]
+        self._release_scan = (epoch, bool(candidates))
         for slot_id, generation, event in candidates:
             if event is None:
                 continue
@@ -1612,12 +1956,17 @@ class TargetCandidateArena:
                 # assignment can authenticate the producer and its tombstone.
                 slot.state = CandidateSlotState.QUARANTINED
                 slot.cancel_pending = True
+                self._scanned_slot_epoch += 1
                 return False
             self._free_locked(slot_id)
             return True
 
     def poll_cancelled(self) -> int:
         released = 0
+        epoch = self._scanned_slot_epoch
+        last_epoch, had_candidates = self._cancel_scan
+        if not had_candidates and last_epoch == epoch:
+            return 0
         with self._lock:
             candidates = [
                 (index, slot.generation, slot.completion_event, slot.cancel_pending)
@@ -1628,6 +1977,7 @@ class TargetCandidateArena:
                     and slot.cancel_pending
                 )
             ]
+        self._cancel_scan = (epoch, bool(candidates))
         for slot_id, generation, event, needs_remote_proof in candidates:
             if event is None:
                 continue
@@ -1679,21 +2029,20 @@ class TargetCandidateArena:
         self.poll_releases()
         self.poll_cancelled()
         self._completion_socket.close(linger=0)
+        if getattr(self, "_observer", None) is not None:
+            # Stop and join the observer before the record mappings it
+            # polls and the expectation arrays it reads are released.
+            self._observer.destroy()
+            self._observer = None
         if getattr(self, "_ready_records", None) is not None:
-            if self._ready_source is not None:
-                self._ready_source.close()
-                self._ready_source = None
             # Draft mappings keep the inode alive; only the name goes away.
             self._ready_records.close(unlink=True)
             self._ready_records = None
         if getattr(self, "_completion_records", None) is not None:
             self._runtime.host_unregister(self._completion_records.host_address)
-            # Release the numpy views first: a live view fails the mmap close
+            # Release the numpy view first: a live view fails the mmap close
             # with BufferError and leaks the mapping.
             self._completion_words = None
-            if self._completion_source is not None:
-                self._completion_source.close()
-                self._completion_source = None
             self.completion_record_path = ""
             # Draft mappings keep the inode alive; only the name goes away.
             self._completion_records.close(unlink=True)
@@ -1711,7 +2060,13 @@ class TargetCandidateArena:
             if len(retired) > RETIRED_TRANSFER_LIMIT:
                 retired.popitem(last=False)
         generation = slot.generation
-        self._slots[slot_id] = _CandidateSlot(generation=generation)
+        self._release_completion_event(slot.completion_event)
+        self._release_completion_event(slot.metadata_start_event)
+        self._slots[slot_id] = _CandidateSlot(
+            generation=generation,
+            wait_stream=slot.wait_stream,
+            metadata_host=slot.metadata_host,
+        )
         if getattr(self, "_record_generation", None) is not None:
             self._record_generation[slot_id] = 0
         if getattr(self, "_record_seq_expected", None) is not None:
@@ -2244,6 +2599,20 @@ class DraftCandidatePushTransport:
         if start_event is not None:
             start_event.record(stream)
         self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
+        # Issue the per-row publication words directly on the bound driver
+        # call: this loop runs ~5 writes per task per wave and the wrapper
+        # method's per-call validation/keyword overhead dominated the push
+        # submit.  Identical driver calls in identical order, same per-call
+        # error check; the values are in range by construction (nonce words
+        # masked to uint32, row_width/generation validated above).
+        write_value32 = self._runtime._stream_write_value32
+        if write_value32 is None:
+            raise CandidateTransportError("cuStreamWriteValue32 is unavailable")
+        check_driver = self._runtime._check_driver
+        c_stream = ctypes.c_void_p(stream.cuda_stream)
+        c_uint64 = ctypes.c_uint64
+        c_uint32 = ctypes.c_uint32
+        c_zero = ctypes.c_uint(0)
         for task, address in zip(tasks, metadata_addresses, strict=True):
             destination = task.candidate_destination
             nonce = int(destination.authorization_nonce)
@@ -2256,11 +2625,11 @@ class DraftCandidatePushTransport:
                 (GENERATION_WORD, destination.generation),
             )
             for word, value in words:
-                self._runtime.stream_write_value32(
-                    address=address + word * 4,
-                    value=value,
-                    stream=stream.cuda_stream,
+                rc = write_value32(
+                    c_stream, c_uint64(address + word * 4), c_uint32(value), c_zero
                 )
+                if rc:
+                    check_driver(rc, "cuStreamWriteValue32")
             completion = getattr(self, "_completion_records", {}).get(
                 self._registration_key(destination)
             )
@@ -2283,11 +2652,14 @@ class DraftCandidatePushTransport:
                     (PRODUCER_TAG_WORD, self._producer_tag),
                     words[-1],
                 ):
-                    self._runtime.stream_write_value32(
-                        address=record_address + word * 4,
-                        value=value,
-                        stream=stream.cuda_stream,
+                    rc = write_value32(
+                        c_stream,
+                        c_uint64(record_address + word * 4),
+                        c_uint32(value),
+                        c_zero,
                     )
+                    if rc:
+                        check_driver(rc, "cuStreamWriteValue32")
             if completion is not None:
                 records, device_base = completion
                 if destination.slot_id >= records.slot_capacity:

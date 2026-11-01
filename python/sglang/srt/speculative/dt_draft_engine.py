@@ -51,6 +51,11 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.0005
+# Idle-loop poll interval while a DFlash/EAGLE3/FlashMTP completion or a
+# direct candidate push is still in flight on the GPU: long enough to keep
+# the CPU cost bounded, short enough not to delay the Draft done -> push ->
+# Target READY path (issue #149).
+INFLIGHT_POLL_S = 0.00005
 DIRECT_PUSH_SPIN_NS = 200_000
 # Token-count buckets for the CUDA-graphed DFlash KV materializer.
 DFLASH_MATERIALIZE_GRAPH_BUCKETS = (8, 16, 32, 64, 96, 128, 192, 256, 384, 512)
@@ -131,13 +136,32 @@ def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tens
     index_cpu = torch.tensor(indices, dtype=torch.int64, pin_memory=True)
     index = index_cpu.to(rows.device, non_blocking=True)
     return rows.index_select(0, index)
-COALESCING_POLL_S = 0.0001
 # Queue candidate pushes behind the proposal at launch and let the Target
 # observe READY from GPU-written host records (dt_candidate_p2p).
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
 DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
 RING_RETIRED_LIMIT = 65536
+# cuda-ipc proposal admission bound.  The direct path carries no result-slot
+# pool, so this explicit credit replaces the admission accounting the pool
+# used to provide (issue #42); 64 is the validated dev operating point.
+DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT = 64
+
+
+def _resolve_direct_proposal_admission_limit() -> int:
+    """Resolve the cuda-ipc proposal admission bound.
+
+    Unset reproduces the validated 64; DT_DIRECT_PROPOSAL_ADMISSION_LIMIT
+    overrides it for experiments without touching launch argv.
+    """
+
+    env_limit = os.environ.get("DT_DIRECT_PROPOSAL_ADMISSION_LIMIT")
+    limit = int(env_limit) if env_limit else DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT
+    if limit <= 0:
+        raise ValueError("direct_proposal_admission_limit must be positive")
+    return limit
+
+
 # Provisional deadline for a §7.1 ring-record task; its Coordinator
 # confirmation copy carries the authoritative one.
 _RING_RECORD_TIMEOUT_NS = (
@@ -410,6 +434,9 @@ class PendingEagle3Completion:
     candidates: torch.Tensor | None = None
     candidate_rows_cpu: torch.Tensor | None = None
     result_slot: int | None = None
+    # True while the completion owns one direct proposal-admission credit
+    # (cuda-ipc standalone path; acquired at batch submit).
+    admission_credit: bool = False
 
 
 @dataclass(slots=True)
@@ -448,6 +475,10 @@ class PendingCandidatePush:
     cancelled: bool = False
     # False for a dropped ring copy whose round was already reported.
     coordinator_result: bool = True
+    # True while the push owns one direct proposal-admission credit, returned
+    # when the GPU push completion retires it.  Launch-time early pushes and
+    # cancellation tombstones hold no credit.
+    admission_credit: bool = False
 
 
 STANDALONE_DRAFT_DECODE_GRAPH_BATCH_SIZES = (
@@ -795,8 +826,6 @@ class FlashMTPDraftEngine:
         nccl_port: int,
         max_pending_tasks: int,
         max_batch_size: int,
-        batch_ready_threshold: int,
-        batch_wait_ms: float,
         result_slot_count: int,
         data_dir: str,
         mem_fraction_static: float,
@@ -824,15 +853,8 @@ class FlashMTPDraftEngine:
 
         if max_pending_tasks <= 0 or max_batch_size <= 0:
             raise ValueError("queue and batch capacities must be positive")
-        if not 0 < batch_ready_threshold <= max_batch_size:
-            raise ValueError(
-                "batch_ready_threshold must be positive and no larger than "
-                "max_batch_size"
-            )
         if result_slot_count <= 0:
             raise ValueError("result_slot_count must be positive")
-        if batch_wait_ms < 0:
-            raise ValueError("batch_wait_ms must be non-negative")
         if migration_backend not in {"disabled", "cuda-ipc"}:
             raise ValueError("migration_backend must be 'disabled' or 'cuda-ipc'")
         if migration_backend == "cuda-ipc" and os.environ.get(
@@ -873,9 +895,7 @@ class FlashMTPDraftEngine:
         self.gpu_id = gpu_id
         self.max_pending_tasks = max_pending_tasks
         self.max_batch_size = max_batch_size
-        self.batch_ready_threshold = batch_ready_threshold
         self.continuous_batching = bool(continuous_batching)
-        self.batch_wait_s = batch_wait_ms / 1_000
         self.batch_source_read_done = batch_source_read_done
         self.pinned_pivot_staging = pinned_pivot_staging
         self.enable_deterministic_inference = bool(enable_deterministic_inference)
@@ -936,6 +956,14 @@ class FlashMTPDraftEngine:
         self._source_done_batch_remaining: dict[str, set[str]] = {}
         self._pull_done_applied_ids: set[str] = set()
         self._free_result_slots = deque(range(result_slot_count))
+        self.direct_proposal_admission_limit = (
+            _resolve_direct_proposal_admission_limit()
+        )
+        # Credits held by published-but-incomplete cuda-ipc waves.  This is an
+        # independent counter, not derived from any deque: every acquire must
+        # be balanced by exactly one release (push completion, held-push drop,
+        # or exception).
+        self._direct_proposal_admission_inflight = 0
         self._result_sequence = 0
         self._result_pool_generation = uuid.uuid4().hex
         self._source_done_sequence = 0
@@ -1070,6 +1098,9 @@ class FlashMTPDraftEngine:
         # after its Coordinator copy (even after retirement) must not re-run.
         self._seen_transfers: set[str] = set()
         self._seen_transfer_order: deque[str] = deque()
+        # Pure cache of rid -> FNV hash for the per-row ring-record
+        # cross-check; cleared when it grows past the seen-transfer window.
+        self._rid_hash_cache: dict[str, int] = {}
         self._capacity_sequence = 0
         self._client = None
         try:
@@ -1733,6 +1764,8 @@ class FlashMTPDraftEngine:
             capture_decode_cuda_graph=not disable_cuda_graph
         )
         self._draft_cuda_graph = self._draft_model_runner.decode_cuda_graph_runner
+        if not disable_cuda_graph and self._is_dflash and self._uses_direct_gpu_source:
+            self._capture_dflash_materializer_graphs()
         logger.info(
             "DT DFLASH Draft ready: instance=%s block=%d feature_width=%d "
             "feature_slots=%d feature_tokens=%d cuda_graph=%s submit_pipeline=%s",
@@ -1743,6 +1776,45 @@ class FlashMTPDraftEngine:
             self.feature_buffer_max_tokens,
             self._draft_cuda_graph is not None,
             self.dflash_submit_pipeline,
+        )
+
+    def _capture_dflash_materializer_graphs(self) -> None:
+        """Replay the target-hidden -> draft-KV writer as one CUDA graph per bucket.
+
+        The eager writer launches a projection, the fused norm/RoPE kernel and
+        one KV write per layer from Python on every Draft batch
+        (~0.5 ms of scheduler-thread launch overhead per batch).  The graphed
+        writer copies the three inputs into static buffers and replays a
+        captured graph instead; rows beyond the largest bucket (capped well
+        past the measured p99 materialization size) keep the eager writer.
+        """
+
+        materializer = self._dflash_materializer
+        helper = getattr(materializer, "_fused_kv_helper", None)
+        if not getattr(materializer, "_use_fused_kv_materialize", False) or (
+            helper is None
+        ):
+            logger.info("DT DFLASH materializer graphs skipped: fused writer off")
+            return
+        staging_dtype = self._feature_staging_buffers[0].dtype
+        # Captured graphs bake the helper's workspace addresses; grow it once
+        # to the largest possible materialization batch so a later eager
+        # fallback (rows beyond the top bucket) can never reallocate the
+        # workspace under the captured graphs.
+        helper._ensure_workspace(self.feature_buffer_max_tokens, staging_dtype)
+        top_bucket = min(self.feature_buffer_max_tokens, self.max_batch_size * 2)
+        self._dflash_materializer = _GraphedDFlashMaterializer(
+            materializer,
+            width=self._pivot_width,
+            dtype=staging_dtype,
+            device=self.device,
+            buckets=draft_cuda_graph_batch_sizes(top_bucket),
+        )
+        self._dflash_materializer.capture()
+        logger.info(
+            "DT DFLASH materializer graphs captured: buckets=%d top=%d",
+            len(self._dflash_materializer._graphs),
+            top_bucket,
         )
 
     def _initialize_standalone_model(
@@ -2122,9 +2194,18 @@ class FlashMTPDraftEngine:
                 and not self._pending_feature_batches
                 and not self._ring_admission
             ):
-                sleep_s = self._idle_sleep_s()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                if (
+                    self._pending_dflash_completions
+                    or self._pending_eagle3_completions
+                    or self._pending_flashmtp_completions
+                    or self._pending_candidate_pushes
+                ):
+                    # A completion or direct candidate push is still in flight
+                    # on the GPU; observe it soon instead of sleeping the full
+                    # idle poll (issue #149).
+                    time.sleep(INFLIGHT_POLL_S)
+                else:
+                    time.sleep(IDLE_POLL_S)
             self._maybe_emit_lifecycle_status()
 
     @contextlib.contextmanager
@@ -2557,7 +2638,15 @@ class FlashMTPDraftEngine:
             # The native worker resolved the rid into the mailbox before
             # sealing the record; cross-check it against the record's hash.
             rid = req.rid
-            if not rid or rid_hash(rid) != req.rid_hash:
+            if not rid:
+                raise ValueError("ring record references an unknown request")
+            if len(self._rid_hash_cache) > 65536:
+                self._rid_hash_cache.clear()
+            cached_hash = self._rid_hash_cache.get(rid)
+            if cached_hash is None:
+                cached_hash = rid_hash(rid)
+                self._rid_hash_cache[rid] = cached_hash
+            if cached_hash != req.rid_hash:
                 raise ValueError("ring record references an unknown request")
             transfer_id = (
                 f"{target_instance_id}:{rid}:{req.round_id}:{req.attempt}"
@@ -2791,7 +2880,7 @@ class FlashMTPDraftEngine:
             row_cost, kv_cost = self._persistent_task_allocation(task)
             if row_cost > available_rows or kv_cost > available_kv:
                 break
-            if task.requires_proposal and self._available_dflash_result_slots() <= 0:
+            if task.requires_proposal and self._proposal_admission_blocked():
                 break
             queue.popleft()
             available_rows -= row_cost
@@ -3566,12 +3655,16 @@ class FlashMTPDraftEngine:
         source, other = direct.source, task.source
         if source is None or other is None:
             return source is None and other is None
+        # A wave split across several records names each request's rows
+        # relative to its record's subrange (allocation_offset at the subrange
+        # start), while the Coordinator descriptor is slot-absolute; the
+        # absolute source range is the identity.
         return (
             source.source_slot_id == other.source_slot_id
             and source.slot_generation == other.slot_generation
             and source.nbytes == other.nbytes
-            and source.byte_offset == other.byte_offset
-            and source.allocation_offset == other.allocation_offset
+            and source.byte_offset + source.allocation_offset
+            == other.byte_offset + other.allocation_offset
             and source.source_session_id == other.source_session_id
             and source.pool_generation == other.pool_generation
         )
@@ -3582,12 +3675,12 @@ class FlashMTPDraftEngine:
         if direct is not None and direct != task:
             if not (
                 direct.direct_ring_seq
-                and direct.candidate_destination is None
                 and self._ring_record_task_matches(direct, task)
             ):
                 raise ValueError("Coordinator task differs from its direct dispatch")
-            # A §7.1 ring-record task was reconstructed without destination or
-            # scheduling metadata; adopt the Coordinator copy for both.
+            # A §7.1 ring-record task lacks its scheduling metadata, and with
+            # DT_RING_PUBLISH_AT_LAUNCH=1 its destination was already latched
+            # at ring take; adopt the Coordinator copy for both.
             self._direct_tasks_by_transfer[task.transfer_id] = task
         self._unconfirmed_direct.pop(task.transfer_id, None)
         self._ring_record_positions.pop(task.transfer_id, None)
@@ -3653,16 +3746,23 @@ class FlashMTPDraftEngine:
 
         if not self._unconfirmed_direct:
             return
+        now_ns = time.monotonic_ns()
+        if now_ns < getattr(self, "_next_unconfirmed_expiry_ns", 0):
+            # Deadlines are task creation time plus a fixed timeout, so
+            # nothing admitted after the last empty scan can expire earlier
+            # than the cached minimum; skip the walk until then (#150).
+            return
         held_push_ids = {
             task.transfer_id
             for tasks, _candidates, _slot in getattr(self, "_held_ring_pushes", ())
             for task in tasks
         }
         expired_held_push = False
-        now_ns = time.monotonic_ns()
+        expired_any = False
         for transfer_id, deadline_ns in tuple(self._unconfirmed_direct.items()):
             if now_ns < deadline_ns + UNCONFIRMED_DIRECT_GRACE_NS:
                 continue
+            expired_any = True
             if transfer_id in held_push_ids:
                 self._unconfirmed_direct.pop(transfer_id)
                 self._held_direct_source_done.pop(transfer_id, None)
@@ -3697,6 +3797,16 @@ class FlashMTPDraftEngine:
                 # The drop just reported this transfer; a later Coordinator
                 # copy must not publish a duplicate failure.
                 self._remember_ring_retired(transfer_id, failed=False)
+        if expired_any:
+            # An expiry fired (or an entry was skipped as not yet
+            # result-bearing): rescan on the next poll; neighbours may be
+            # near due.
+            self._next_unconfirmed_expiry_ns = 0
+        else:
+            pending = [deadline_ns for deadline_ns in self._unconfirmed_direct.values()]
+            self._next_unconfirmed_expiry_ns = (
+                min(pending) + UNCONFIRMED_DIRECT_GRACE_NS if pending else 0
+            )
         if expired_held_push:
             self._release_held_ring_pushes()
 
@@ -3719,6 +3829,26 @@ class FlashMTPDraftEngine:
         if unconfirmed is None:
             unconfirmed = self._unconfirmed_direct = {}
         seen = getattr(self, "_seen_transfers", None)
+        # Feature-side queue depth for the capacity check below.  None of the
+        # counted collections changes while this message is processed (only
+        # self._pending and unconfirmed do), so compute the sums once instead
+        # of per entry.
+        active_feature_tasks = sum(
+            len(batch.pending) for batch in self._pending_feature_batches
+        ) + len(getattr(self, "_input_ready_features", ())) + sum(
+            len(batch.pending)
+            for batch in getattr(self, "_pending_flashmtp_completions", ())
+        ) + sum(
+            len(batch.pending) for batch in self._pending_dflash_completions
+        ) + sum(
+            len(batch.pending) for batch in self._pending_eagle3_completions
+        )
+        # Unconfirmed ring rounds are bounded by owned KV, not by the
+        # Coordinator queue this check protects; Coordinator copies
+        # waiting for their ring copy are Coordinator-charged.
+        active_feature_tasks += len(getattr(self, "_ring_admission", ())) + len(
+            getattr(self, "_ring_waiting", ())
+        )
         for task in message.entries:
             if task.transfer_id in self._pending_ids:
                 if task.transfer_id in unconfirmed:
@@ -3752,22 +3882,6 @@ class FlashMTPDraftEngine:
                 waiting[task.transfer_id] = task
                 accepted = True
                 continue
-            active_feature_tasks = sum(
-                len(batch.pending) for batch in self._pending_feature_batches
-            ) + len(getattr(self, "_input_ready_features", ())) + sum(
-                len(batch.pending)
-                for batch in getattr(self, "_pending_flashmtp_completions", ())
-            ) + sum(
-                len(batch.pending) for batch in self._pending_dflash_completions
-            ) + sum(
-                len(batch.pending) for batch in self._pending_eagle3_completions
-            )
-            # Unconfirmed ring rounds are bounded by owned KV, not by the
-            # Coordinator queue this check protects; Coordinator copies
-            # waiting for their ring copy are Coordinator-charged.
-            active_feature_tasks += len(getattr(self, "_ring_admission", ())) + len(
-                getattr(self, "_ring_waiting", ())
-            )
             if (
                 len(self._pending) + active_feature_tasks - len(unconfirmed)
                 >= self.max_pending_tasks
@@ -3831,21 +3945,8 @@ class FlashMTPDraftEngine:
             return []
         if self._uses_direct_gpu_source and not self._free_feature_staging_slots:
             return []
-        if not self._is_feature_backed and not self._free_result_slots:
+        if not self._is_feature_backed and self._proposal_wave_buffer_exhausted():
             return []
-        if (
-            not getattr(self, "continuous_batching", False)
-            and len(self._pending) < self.batch_ready_threshold
-            and self.batch_wait_s > 0
-        ):
-            oldest = self._pending[0]
-            received_ns = self._received_ns_by_transfer.get(oldest.transfer_id)
-            if (
-                received_ns is not None
-                and (time.monotonic_ns() - received_ns) / 1_000_000_000
-                < self.batch_wait_s
-            ):
-                return []
 
         queued: list[PendingDraftTask] = []
         take_ns = time.monotonic_ns()
@@ -3859,7 +3960,24 @@ class FlashMTPDraftEngine:
         feature_token_count = 0
         persistent_prefill_token_count = 0
         reserves_result_slot = False
-        result_slot_available = self._available_dflash_result_slots() > 0
+        result_slot_available = not self._proposal_admission_blocked()
+        # The cuda-ipc credit is a hard per-request bound: each proposal task
+        # queued below claims one of the remaining units, so a pull wave stops
+        # at the limit instead of reserving one unit and then expanding past
+        # it when its feature batch promotes into INPUT_READY entries.
+        admission_units_left = (
+            self._available_direct_proposal_admission()
+            if self.candidate_transport == "cuda-ipc"
+            else 0
+        )
+
+        def proposal_blocked(task) -> bool:
+            if not task.requires_proposal:
+                return False
+            if self.candidate_transport == "cuda-ipc":
+                return admission_units_left <= 0
+            return not reserves_result_slot and not result_slot_available
+
         stop_reason = "queue_exhausted"
         # Examine each currently queued row once. Incompatible or temporarily
         # blocked rows retain their relative FIFO order for the next round.
@@ -3933,11 +4051,7 @@ class FlashMTPDraftEngine:
                         deferred.append(self._pending.popleft())
                         continue
                     break
-                if (
-                    next_task.requires_proposal
-                    and not reserves_result_slot
-                    and not result_slot_available
-                ):
+                if proposal_blocked(next_task):
                     if profile_eagle3_batch:
                         stop_reason = "result_slot_unavailable"
                     if getattr(self, "continuous_batching", False):
@@ -4001,7 +4115,9 @@ class FlashMTPDraftEngine:
             queued.append(
                 PendingDraftTask(task=task)
             )
-            reserves_result_slot = reserves_result_slot or bool(task.requires_proposal)
+            if task.requires_proposal:
+                reserves_result_slot = True
+                admission_units_left -= 1
             if self._persistent:
                 selected_handles.add(task.draft_kv_handle)
                 if getattr(self, "continuous_batching", False):
@@ -4023,10 +4139,7 @@ class FlashMTPDraftEngine:
                 != bool(queued[0].task.requires_proposal)
             )
             result_available = not (
-                self._uses_direct_gpu_source
-                and next_task.requires_proposal
-                and not reserves_result_slot
-                and not result_slot_available
+                self._uses_direct_gpu_source and proposal_blocked(next_task)
             )
             next_feature_tokens = (
                 int(next_task.feature_token_count)
@@ -4090,39 +4203,30 @@ class FlashMTPDraftEngine:
             return queued
         raise RuntimeError("nonpersistent Draft task lacks direct GPU source transport")
 
-    def _idle_sleep_s(self) -> float:
-        if (
-            getattr(self, "continuous_batching", False)
-            or not self._pending
-            or (
-                self._uses_direct_gpu_source
-                and self._pending[0].requires_proposal
-                and self._available_dflash_result_slots() <= 0
-            )
-            or (
-                self._uses_direct_gpu_source
-                and not self._free_feature_staging_slots
-            )
-            or (not self._is_feature_backed and not self._free_result_slots)
-            or len(self._pending) >= self.batch_ready_threshold
-            or self.batch_wait_s == 0
-        ):
-            return IDLE_POLL_S
-        received_ns = self._received_ns_by_transfer.get(self._pending[0].transfer_id)
-        if received_ns is None:
-            return 0
-        age_s = (time.monotonic_ns() - received_ns) / 1_000_000_000
-        remaining_s = max(0.0, self.batch_wait_s - age_s)
-        return min(COALESCING_POLL_S, remaining_s)
+    def _dflash_admission_reserved(self) -> int:
+        """Submitted-but-unpublished proposal work holding an admission unit.
 
-    def _available_dflash_result_slots(self) -> int:
-        """Count result slots after bounded reservations by submitted work."""
-        if not self._uses_direct_gpu_source:
-            return len(self._free_result_slots)
-        reserved = sum(
-            any(item.task.requires_proposal for item in batch.pending)
-            for batch in self._pending_feature_batches
-        ) + sum(
+        Ring admission, INPUT_READY proposal entries, and pending
+        feature/FlashMTP/DFlash/EAGLE3 completions each reserve one unit until
+        their wave publishes (the same terms the result-pool accounting used).
+        The cuda-ipc credit is a hard per-request bound, so its pending
+        feature batches reserve one unit per proposal task — promotion into
+        INPUT_READY then swaps units 1:1 and cannot expand past the limit.
+        The mmap pool keeps the per-batch reservation it always had.
+        """
+
+        if self.candidate_transport == "cuda-ipc":
+            pending_feature = sum(
+                bool(item.task.requires_proposal)
+                for batch in self._pending_feature_batches
+                for item in batch.pending
+            )
+        else:
+            pending_feature = sum(
+                any(item.task.requires_proposal for item in batch.pending)
+                for batch in self._pending_feature_batches
+            )
+        return pending_feature + sum(
             bool(entry.pending.task.requires_proposal)
             for entry in getattr(self, "_input_ready_features", ())
         ) + len(
@@ -4134,7 +4238,57 @@ class FlashMTPDraftEngine:
             getattr(completion, "candidates", None) is not None
             for completion in getattr(self, "_pending_eagle3_completions", ())
         )
-        return max(0, len(self._free_result_slots) - reserved)
+
+    def _available_dflash_result_slots(self) -> int:
+        """Count result slots after bounded reservations by submitted work."""
+        if not self._uses_direct_gpu_source:
+            return len(self._free_result_slots)
+        return max(
+            0, len(self._free_result_slots) - self._dflash_admission_reserved()
+        )
+
+    def _acquire_direct_proposal_admission(self) -> None:
+        """Hold one cuda-ipc proposal-admission credit for a published wave."""
+        self._direct_proposal_admission_inflight += 1
+
+    def _release_direct_proposal_admission(self) -> None:
+        """Return one wave's credit; every holder must release exactly once."""
+        if self._direct_proposal_admission_inflight <= 0:
+            raise RuntimeError("direct proposal admission credit underflow")
+        self._direct_proposal_admission_inflight -= 1
+
+    def _available_direct_proposal_admission(self) -> int:
+        """cuda-ipc proposal-admission credits left for scheduling decisions.
+
+        Independent replacement for the admission bound the result-slot pool
+        used to give the direct path (issue #42): the configured limit minus
+        credits held by published-but-incomplete waves minus the same
+        submitted-work reservations the pool accounting subtracted.  The base
+        is an explicit counter, never a deque length.
+        """
+
+        available = (
+            self.direct_proposal_admission_limit
+            - self._direct_proposal_admission_inflight
+        )
+        if self._uses_direct_gpu_source:
+            available -= self._dflash_admission_reserved()
+        return max(0, available)
+
+    def _proposal_admission_blocked(self) -> bool:
+        """Whether one more proposal wave is admission-blocked right now."""
+        if self.candidate_transport == "cuda-ipc":
+            return self._available_direct_proposal_admission() <= 0
+        return self._available_dflash_result_slots() <= 0
+
+    def _proposal_wave_buffer_exhausted(self) -> bool:
+        """Raw per-wave publish buffer exhaustion (no reservation accounting)."""
+        if self.candidate_transport == "cuda-ipc":
+            return (
+                self._direct_proposal_admission_inflight
+                >= self.direct_proposal_admission_limit
+            )
+        return not self._free_result_slots
 
     @torch.inference_mode()
     def _execute_batch(self, pending: list[PendingDraftTask]) -> None:
@@ -5632,11 +5786,13 @@ class FlashMTPDraftEngine:
         staging_slot_counts: tuple[int, ...] = (),
         candidates: torch.Tensor | None = None,
         result_slot: int | None = None,
+        admission_credit: bool = False,
     ) -> None:
         """Keep persistent KV and slot buffers owned until GPU/D2H completion.
 
         EAGLE3 retains its feature slots. AR has no feature staging and instead
-        reserves a result slot, using the same completion/release machinery.
+        reserves a result slot (mmap) or proposal-admission credit (cuda-ipc),
+        using the same completion/release machinery.
         """
         host_rows = None
         if candidates is not None and self.candidate_transport == "mmap":
@@ -5653,6 +5809,7 @@ class FlashMTPDraftEngine:
             candidates=candidates,
             candidate_rows_cpu=host_rows,
             result_slot=result_slot,
+            admission_credit=admission_credit,
         )
         try:
             if host_rows is not None:
@@ -5733,10 +5890,15 @@ class FlashMTPDraftEngine:
             ]
             candidate_rows_cpu = getattr(completion, "candidate_rows_cpu", None)
             result_slot = getattr(completion, "result_slot", None)
+            admission_credit = getattr(completion, "admission_credit", False)
             push_active = [task for task in active if task.transfer_id not in early]
             if active and not push_active and completion.candidates is not None:
                 if result_slot is not None:
                     self._free_result_slots.append(result_slot)
+                if admission_credit:
+                    # Every live task was early-pushed at launch; no publish
+                    # will claim the completion's credit.
+                    self._release_direct_proposal_admission()
             elif active:
                 if completion.candidates is None:
                     self._publish_materialization_successes(active)
@@ -5765,9 +5927,12 @@ class FlashMTPDraftEngine:
                                 else rows.numpy().tobytes()
                             ),
                             result_slot=result_slot,
+                            admission_credit=admission_credit,
                         )
             elif result_slot is not None:
                 self._free_result_slots.append(result_slot)
+            elif admission_credit:
+                self._release_direct_proposal_admission()
             for task in cancelled:
                 self._retire_cancelled_transfer_identity(task)
                 self._release_persistent_request(task.draft_kv_handle)
@@ -6886,9 +7051,18 @@ class FlashMTPDraftEngine:
         expected_extend_graph_replays = 1
         decode_graph_replays = 0
         result_slot = None
+        admission_credit = False
         try:
             if getattr(self, "continuous_batching", False):
-                result_slot = self._free_result_slots.popleft()
+                if self.candidate_transport == "mmap":
+                    # The mmap completion path indexes its pinned host result
+                    # buffer by this slot; the direct path carries no pooled id.
+                    result_slot = self._free_result_slots.popleft()
+                else:
+                    # The direct path holds a proposal-admission credit for the
+                    # whole submit→publish→push lifetime instead (issue #42).
+                    self._acquire_direct_proposal_admission()
+                    admission_credit = True
             states = [self._prepare_persistent_task(task) for task in tasks]
             oversized_bootstrap = (
                 len(tasks) == 1
@@ -7105,9 +7279,14 @@ class FlashMTPDraftEngine:
                 )
             if getattr(self, "continuous_batching", False):
                 self._enqueue_eagle3_materialization_completion(
-                    pending, None, candidates=candidates, result_slot=result_slot
+                    pending,
+                    None,
+                    candidates=candidates,
+                    result_slot=result_slot,
+                    admission_credit=admission_credit,
                 )
                 result_slot = None  # ownership moved to the completion
+                admission_credit = False
             else:
                 candidate_bytes = None
                 if self.candidate_transport == "mmap":
@@ -7125,6 +7304,8 @@ class FlashMTPDraftEngine:
                     self._release_persistent_request(task.draft_kv_handle)
                 if result_slot is not None:
                     self._free_result_slots.append(result_slot)
+                if admission_credit:
+                    self._release_direct_proposal_admission()
             else:
                 self._quarantined_feature_draft_handles.update(
                     task.draft_kv_handle for task in tasks
@@ -8806,7 +8987,12 @@ class FlashMTPDraftEngine:
         )
 
     def _submit_candidate_push(self, tasks, push_candidates, *, result_slot) -> None:
-        """Submit one direct candidate push and track it until completion."""
+        """Submit one direct candidate push and track it until completion.
+
+        The caller's proposal-admission credit moves to the recorded push.  A
+        failed submit transfers nothing: the pooled slot (if any) returns here
+        and the caller must release the credit.
+        """
 
         try:
             push = self._candidate_push_transport.submit(
@@ -8814,7 +9000,8 @@ class FlashMTPDraftEngine:
                 candidates=push_candidates,
             )
         except Exception:
-            self._free_result_slots.append(result_slot)
+            if result_slot is not None:
+                self._free_result_slots.append(result_slot)
             raise
         self._pending_candidate_pushes.append(
             PendingCandidatePush(
@@ -8822,6 +9009,7 @@ class FlashMTPDraftEngine:
                 tasks=list(tasks),
                 result_slot=result_slot,
                 candidates=push_candidates,
+                admission_credit=result_slot is None,
             )
         )
         if self._profile_active:
@@ -8905,9 +9093,13 @@ class FlashMTPDraftEngine:
                 if task.transfer_id in self._cancelled_ids:
                     self._retire_cancelled_transfer_identity(task)
             if not live_tasks:
-                # Every task cancelled: retire the result slot like a failed
-                # submit.  A live task keeps its slot and its push.
-                self._free_result_slots.append(result_slot)
+                # Every task cancelled: retire the result slot or admission
+                # credit like a failed submit.  A live task keeps its credit
+                # and its push.  Direct pushes carry no pooled slot (None).
+                if result_slot is not None:
+                    self._free_result_slots.append(result_slot)
+                else:
+                    self._release_direct_proposal_admission()
                 continue
             # Push the adopted Coordinator copies: they carry the candidate
             # destinations the provisional record tasks lacked.  Gather the
@@ -8923,9 +9115,16 @@ class FlashMTPDraftEngine:
                     self._direct_tasks_by_transfer.get(task.transfer_id, task)
                     for task in live_tasks
                 ]
-                self._submit_candidate_push(
-                    adopted, rows, result_slot=result_slot
-                )
+                try:
+                    self._submit_candidate_push(
+                        adopted, rows, result_slot=result_slot
+                    )
+                except Exception:
+                    # The held entry is already dropped; its credit leaves
+                    # with the push only on a successful submit.
+                    if result_slot is None:
+                        self._release_direct_proposal_admission()
+                    raise
         self._held_ring_pushes = remaining
 
     def _ring_destination_ref(self, task, resolved):
@@ -9002,6 +9201,7 @@ class FlashMTPDraftEngine:
         candidates: bytes | torch.Tensor,
         *,
         result_slot: int | None = None,
+        admission_credit: bool = False,
     ) -> None:
         from dt_protocol import (
             PROTOCOL_VERSION,
@@ -9014,53 +9214,79 @@ class FlashMTPDraftEngine:
         publish_started_ns = time.monotonic_ns() if profile else 0
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
-        slot_id = self._free_result_slots.popleft() if result_slot is None else result_slot
+        credit_held = False
+        if result_slot is not None:
+            slot_id = result_slot
+        elif self.candidate_transport == "cuda-ipc":
+            # The direct path publishes GPU→GPU into Target-owned candidate
+            # destinations; there is no Draft-side result buffer to lease, so
+            # the wave carries no pooled slot id.  It instead holds one
+            # proposal-admission credit from here until its push retires
+            # (unless the caller already holds the wave's credit).
+            slot_id = None
+            if not admission_credit:
+                self._acquire_direct_proposal_admission()
+            credit_held = True
+        else:
+            slot_id = self._free_result_slots.popleft()
         if self.candidate_transport == "cuda-ipc":
-            if self._candidate_push_transport is None:
-                raise RuntimeError("direct candidate push transport is unavailable")
-            if not isinstance(candidates, torch.Tensor):
-                raise TypeError("direct candidate return requires GPU tensor rows")
-            push_candidates = candidates.contiguous()
-            # §7.1 record tasks adopt their Coordinator copy (destination,
-            # scheduling metadata) at confirmation; hold the wave's whole push
-            # while any of its tasks is still unconfirmed.  The destination
-            # itself arrives earlier through the ring's destination region.
-            tasks = [
-                self._direct_tasks_by_transfer.get(task.transfer_id, task)
-                for task in tasks
-            ]
-            if any(
-                task.candidate_destination is None and task.direct_ring_seq
-                for task in tasks
-            ):
-                from msgspec.structs import replace
+            # The credit this call holds leaves only with a queued push or a
+            # held wave; a raise before either means it is still owned here.
+            try:
+                if self._candidate_push_transport is None:
+                    raise RuntimeError("direct candidate push transport is unavailable")
+                if not isinstance(candidates, torch.Tensor):
+                    raise TypeError("direct candidate return requires GPU tensor rows")
+                push_candidates = candidates.contiguous()
+                # §7.1 record tasks adopt their Coordinator copy (destination,
+                # scheduling metadata) at confirmation; hold the wave's whole
+                # push while any of its tasks is still unconfirmed.  The
+                # destination itself arrives earlier through the ring's
+                # destination region.
+                tasks = [
+                    self._direct_tasks_by_transfer.get(task.transfer_id, task)
+                    for task in tasks
+                ]
+                if any(
+                    task.candidate_destination is None and task.direct_ring_seq
+                    for task in tasks
+                ):
+                    from msgspec.structs import replace
 
-                resolved = []
-                missing = False
-                for task in tasks:
-                    if task.candidate_destination is None and task.direct_ring_seq:
-                        destination = self._resolve_ring_destination(task)
-                        if destination is None:
-                            missing = True
-                            break
-                        resolved.append(
-                            replace(task, candidate_destination=destination)
+                    resolved = []
+                    missing = False
+                    for task in tasks:
+                        if task.candidate_destination is None and task.direct_ring_seq:
+                            destination = self._resolve_ring_destination(task)
+                            if destination is None:
+                                missing = True
+                                break
+                            resolved.append(
+                                replace(task, candidate_destination=destination)
+                            )
+                        else:
+                            resolved.append(task)
+                    if missing:
+                        self._held_ring_pushes.append(
+                            (tasks, push_candidates, slot_id)
                         )
-                    else:
-                        resolved.append(task)
-                if missing:
+                        return
+                    tasks = resolved
+                if any(
+                    task.candidate_destination is None
+                    and task.direct_ring_seq
+                    and task.transfer_id in self._unconfirmed_direct
+                    for task in tasks
+                ):
                     self._held_ring_pushes.append((tasks, push_candidates, slot_id))
                     return
-                tasks = resolved
-            if any(
-                task.candidate_destination is None
-                and task.direct_ring_seq
-                and task.transfer_id in self._unconfirmed_direct
-                for task in tasks
-            ):
-                self._held_ring_pushes.append((tasks, push_candidates, slot_id))
-                return
-            self._submit_candidate_push(tasks, push_candidates, result_slot=slot_id)
+                self._submit_candidate_push(
+                    tasks, push_candidates, result_slot=slot_id
+                )
+            except Exception:
+                if credit_held:
+                    self._release_direct_proposal_admission()
+                raise
             return
         if not isinstance(candidates, bytes):
             raise TypeError("mmap candidate return requires serialized bytes")
@@ -9242,6 +9468,10 @@ class FlashMTPDraftEngine:
                 self._send_result(message)
             if pending.result_slot is not None:
                 self._free_result_slots.append(pending.result_slot)
+            elif getattr(pending, "admission_credit", False):
+                # The wave's admission credit returns only when its GPU push
+                # completion retires here.
+                self._release_direct_proposal_admission()
             early = getattr(self, "_early_pushed_ids", ())
             for task in pending.tasks:
                 # A push queued at launch can retire before its completion
@@ -9815,9 +10045,13 @@ class FlashMTPDraftEngine:
             capacity_sequence=self._capacity_sequence,
             max_pending_tasks=self.max_pending_tasks,
             free_result_rows=(
-                self._available_dflash_result_slots() * self.max_batch_size
-                if self._uses_direct_gpu_source
-                else len(self._free_result_slots) * self.max_batch_size
+                self._available_direct_proposal_admission() * self.max_batch_size
+                if self.candidate_transport == "cuda-ipc"
+                else (
+                    self._available_dflash_result_slots() * self.max_batch_size
+                    if self._uses_direct_gpu_source
+                    else len(self._free_result_slots) * self.max_batch_size
+                )
             ),
             healthy=not self._stop,
             observed_ns=time.monotonic_ns(),
@@ -10028,8 +10262,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nccl-port", type=int, default=29600)
     parser.add_argument("--max-pending-tasks", type=int, default=512)
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--batch-ready-threshold", type=int, default=16)
-    parser.add_argument("--batch-wait-ms", type=float, default=0.2)
     parser.add_argument("--disable-continuous-batching", action="store_true")
     parser.add_argument("--result-slot-count", type=int, default=16)
     parser.add_argument(
@@ -10074,8 +10306,6 @@ def main() -> None:
         nccl_port=args.nccl_port,
         max_pending_tasks=args.max_pending_tasks,
         max_batch_size=args.max_batch_size,
-        batch_ready_threshold=args.batch_ready_threshold,
-        batch_wait_ms=args.batch_wait_ms,
         result_slot_count=args.result_slot_count,
         data_dir=args.data_dir,
         mem_fraction_static=args.mem_fraction_static,

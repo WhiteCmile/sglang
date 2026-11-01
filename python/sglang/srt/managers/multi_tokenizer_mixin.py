@@ -24,14 +24,12 @@ import logging
 import multiprocessing as multiprocessing
 import os
 import pickle
-import signal
 import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
-import psutil
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -63,6 +61,7 @@ from sglang.srt.managers.load_snapshot import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    ParentSigquitGuard,
     configure_logger,
     kill_itself_when_parent_died,
     kill_process_tree,
@@ -608,7 +607,7 @@ def run_multi_detokenizer_router_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)
-    parent_process = psutil.Process().parent()
+    parent_guard = ParentSigquitGuard()
 
     router = None
     try:
@@ -619,7 +618,7 @@ def run_multi_detokenizer_router_process(
         logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
         if router is not None:
             router.socket_mapping.clear_all_sockets()
-        parent_process.send_signal(signal.SIGQUIT)
+        parent_guard.send_sigquit()
 
 
 class TokenizerWorker(TokenizerManager):

@@ -16,13 +16,11 @@
 import faulthandler
 import logging
 import multiprocessing as mp
-import signal
 import threading
 import time
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
-import psutil
 import setproctitle
 import zmq
 
@@ -55,6 +53,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
+    ParentSigquitGuard,
     configure_logger,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
@@ -813,7 +812,7 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
+    parent_guard = ParentSigquitGuard()
 
     configure_logger(server_args)
     if server_args.enable_trace:
@@ -855,4 +854,4 @@ def run_data_parallel_controller_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        parent_guard.send_sigquit()

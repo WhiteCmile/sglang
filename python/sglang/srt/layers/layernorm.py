@@ -422,6 +422,32 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
+            # The JIT fused add+rmsnorm is per-row, hence batch-invariant like
+            # rms_norm_batch_invariant; use it instead of the eager fallback
+            # when the calling semantics allow (issue #140: the eager fp32
+            # op sequence costs ~1 ms per small verify wave).
+            if (
+                residual is not None
+                and not self.cast_x_before_out_mul
+                and not self.fp32_residual
+                and post_residual_addition is None
+                and x.dim() == 2
+                and x.is_contiguous()
+                and residual.is_contiguous()
+                and x.dtype in (torch.float16, torch.bfloat16)
+                and x.dtype == residual.dtype
+                and x.dtype == self.weight.data.dtype
+                and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
+                and get_server_args().rl_on_policy_target != "fsdp"
+            ):
+                _jit_fused_add_rmsnorm(
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    cast_x_before_out_mul=False,
+                )
+                return x, residual
             if (
                 residual is not None
                 or self.cast_x_before_out_mul

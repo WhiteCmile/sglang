@@ -91,6 +91,7 @@ def test_direct_cancel_before_assignment_ack_retains_authenticated_generation() 
     arena = TargetCandidateArena.__new__(TargetCandidateArena)
     arena._lock = Lock()
     arena._active = {"transfer": 0}
+    arena._scanned_slot_epoch = 0
     arena._slots = [
         _CandidateSlot(
             generation=7,
@@ -2480,6 +2481,13 @@ def test_feature_publication_fences_graph_buffer_reuse(feature_path: str) -> Non
     trace = []
     producer_event = object()
 
+    class ScalarCopyDone:
+        def record(self) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
     class ForwardStream:
         def wait_event(self, event) -> None:
             trace.append(("forward_wait", event))
@@ -2513,7 +2521,9 @@ def test_feature_publication_fences_graph_buffer_reuse(feature_path: str) -> Non
 
     controller = object.__new__(DTTargetController)
     controller.scheduler = SimpleNamespace(
-        forward_stream=ForwardStream(), ps=SimpleNamespace(tp_size=1)
+        forward_stream=ForwardStream(),
+        ps=SimpleNamespace(tp_size=1),
+        device_module=SimpleNamespace(Event=ScalarCopyDone),
     )
     controller.is_export_rank = True
     controller.is_feature_backed = True
@@ -3096,6 +3106,7 @@ def test_source_read_done_batch_queues_one_reliable_ack() -> None:
     )
     controller = object.__new__(DTTargetController)
     controller._client = SimpleNamespace(recv_nowait=lambda: (batch,))
+    controller._draft_progress_ns = {}
     controller._flush_pending_send = lambda: None
     controller._expire_local_rounds = lambda: []
     controller._expire_source_leases = lambda **_kwargs: None
@@ -3602,12 +3613,15 @@ def test_stale_attempt_timeout_does_not_release_reused_draft_handle() -> None:
             transfer_id="stale-transfer",
             request_id="request-0",
             attempt=4,
-        )
+        ),
+        draft_instance_id="",
     )
     finished = []
     controller.instance_id = "target-0"
     controller.is_feature_backed = False
     controller.is_token_only = True
+    controller.round_timeout_ns = 120_000_000_000
+    controller._draft_progress_ns = {}
     controller._ledger = SimpleNamespace(
         expired=lambda **_kwargs: [expired],
         finish=finished.append,
@@ -3646,12 +3660,15 @@ def test_timeout_then_pop_preserves_pending_cancel_payload(is_token_only) -> Non
             transfer_id=parked.transfer_id,
             request_id=req.rid,
             attempt=parked.attempt,
-        )
+        ),
+        draft_instance_id="",
     )
     controller.instance_id = "target-0"
     controller.is_feature_backed = not is_token_only
     controller.is_token_only = is_token_only
     controller.is_export_rank = True
+    controller.round_timeout_ns = 120_000_000_000
+    controller._draft_progress_ns = {}
     controller._parked = {parked.transfer_id: parked}
     controller._feature_control_rounds = {}
     controller._lifecycle_attempt_by_request = {req.rid: parked.attempt}
@@ -3736,6 +3753,8 @@ def test_stranded_parked_round_times_out_without_ledger_entry() -> None:
     controller.is_feature_backed = True
     controller.is_token_only = False
     controller.is_export_rank = True
+    controller.round_timeout_ns = 120_000_000_000
+    controller._draft_progress_ns = {}
     controller._parked = {
         state.transfer_id: state for state in (stranded, waiting, unfenced)
     }
@@ -4199,8 +4218,6 @@ def test_dflash_pipeline_reserves_one_result_slot_per_submitted_batch() -> None:
     engine._pending_dflash_completions = deque(
         (SimpleNamespace(proposal_tasks=(object(),)),)
     )
-    engine.batch_ready_threshold = 1
-    engine.batch_wait_s = 0
     engine.max_batch_size = 8
     engine.feature_buffer_max_tokens = 8
     engine._cancelled_ids = set()

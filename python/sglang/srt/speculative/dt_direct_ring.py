@@ -88,11 +88,13 @@ STATE_CLOSED = 4
 RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "1") == "1"
 # Q15b (DT_RING_PUBLISH_AT_LAUNCH=1): eligible deferred verify waves enqueue
 # the publish kernel on the verify stream at launch, right behind the verify
-# forward, instead of from host park one result boundary later.  Launch-time
-# publishes need their own staging slots: the host stages wave k+1 while the
-# GPU may still hold wave k-1's kernel queued behind its forward, so a single
-# staging buffer could be overwritten before the queued kernel reads it.  The
-# launch slots rotate; slot 0 remains the park path's staging.
+# forward, instead of from host park one result boundary later.  The staging
+# slots rotate: the host stages wave k+1 while the GPU may still hold wave
+# k-1's kernel queued behind its forward, so a single staging buffer could be
+# overwritten before the queued kernel reads it.  Slot 0 remains the
+# single-record park path's staging; a multi-record park wave (one record per
+# owner Draft group) rotates the remaining slots so its later records never
+# overwrite an earlier record's staging before that kernel has run.
 RING_PUBLISH_AT_LAUNCH = os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "0") == "1"
 LAUNCH_STAGING_SLOTS = 8
 V2_VERSION = 2
@@ -476,21 +478,21 @@ class RingGpuPublisher:
         self._active_offset = self.max_batch_slots * V2_STAGING_ENTRY_BYTES
         self._counts_offset = self._active_offset + 4 * V2_MAX_REQ
         nbytes = self._counts_offset + 4 * self.max_batch_slots
-        if RING_PUBLISH_AT_LAUNCH:
-            # Launch slots 1..LAUNCH_STAGING_SLOTS (slot 0 is the park path):
-            # each carries its own compacted entries and active list.  The
-            # host can stage at most a handful of unpublished waves ahead of
-            # the GPU (every park syncs the previous wave's copy_done), so
-            # eight slots bound the rotation with margin.
-            self._launch_slot_stride = (
-                V2_MAX_REQ * V2_STAGING_ENTRY_BYTES + 4 * V2_MAX_REQ
-            )
-            self._launch_entries_base = nbytes
-            self._launch_active_base = self._launch_entries_base + (
-                LAUNCH_STAGING_SLOTS * self._launch_slot_stride
-            )
-            nbytes = self._launch_active_base + LAUNCH_STAGING_SLOTS * 4 * V2_MAX_REQ
-            self._launch_slot_cycle = -1
+        # Launch slots 1..LAUNCH_STAGING_SLOTS (slot 0 is the single-record
+        # park path): each carries its own compacted entries and active list.
+        # The host can stage at most a handful of unpublished waves ahead of
+        # the GPU (every park syncs the previous wave's copy_done), so eight
+        # slots bound the rotation with margin.  Both the launch-time path and
+        # multi-record park waves rotate these slots.
+        self._launch_slot_stride = (
+            V2_MAX_REQ * V2_STAGING_ENTRY_BYTES + 4 * V2_MAX_REQ
+        )
+        self._launch_entries_base = nbytes
+        self._launch_active_base = self._launch_entries_base + (
+            LAUNCH_STAGING_SLOTS * self._launch_slot_stride
+        )
+        nbytes = self._launch_active_base + LAUNCH_STAGING_SLOTS * 4 * V2_MAX_REQ
+        self._launch_slot_cycle = -1
         self._staging_host, self._staging_dev = self._ext.staging_alloc(nbytes)
         buf = (ctypes.c_uint8 * nbytes).from_address(self._staging_host)
         flat = np.frombuffer(buf, dtype=np.uint8)
@@ -524,10 +526,8 @@ class RingGpuPublisher:
         return value
 
     def next_launch_slot(self) -> int:
-        """Rotate the launch-time staging slots (1..LAUNCH_STAGING_SLOTS)."""
+        """Rotate the staging slots (1..LAUNCH_STAGING_SLOTS)."""
 
-        if not RING_PUBLISH_AT_LAUNCH:
-            raise DirectRingError("launch staging requires DT_RING_PUBLISH_AT_LAUNCH=1")
         self._launch_slot_cycle = (self._launch_slot_cycle + 1) % LAUNCH_STAGING_SLOTS
         return self._launch_slot_cycle + 1
 

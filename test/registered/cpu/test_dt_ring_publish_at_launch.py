@@ -214,7 +214,9 @@ def test_launch_publish_stages_record_and_finalize():
     assert c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
     assert len(c._ring_publish_pending) == 1
     wave = c._ring_publish_pending[0]
-    assert wave.wave_seq == 41 and wave.slot_id == 3 and wave.generation == 11
+    assert len(wave.records) == 1
+    assert wave.records[0].wave_seq == 41
+    assert wave.slot_id == 3 and wave.generation == 11
     assert result.dt_ring_publish_wave is wave
 
 
@@ -626,6 +628,7 @@ def _make_record_engine(destination, *, at_launch=True):
     engine._cancelled_ids = set()
     engine._seen_transfers = set()
     engine._seen_transfer_order = []
+    engine._rid_hash_cache = {}
     engine._received_ns_by_transfer = {}
     engine._direct_tasks_by_transfer = {}
     engine._unconfirmed_direct = {}

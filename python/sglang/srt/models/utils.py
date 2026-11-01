@@ -29,7 +29,6 @@ from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -487,7 +486,10 @@ def apply_qk_norm(
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
-        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        # Deterministic inference keeps this fused path: the JIT kernel is
+        # per-(token, head), so its numerics do not depend on the batch
+        # composition, and it is far cheaper than the eager fallback (~1.5 ms
+        # per small verify wave on Qwen3-14B; issue #140).
         and get_server_args().cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)

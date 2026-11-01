@@ -2969,6 +2969,63 @@ def kill_itself_when_parent_died():
         )
 
 
+class ParentSigquitGuard:
+    """Safe "crash, then SIGQUIT the parent" for sglang child processes.
+
+    Server child processes (scheduler, detokenizer, data-parallel controller,
+    ...) send SIGQUIT to their parent on crash so the whole server tears down.
+    If the parent died and the child was reparented to PID 1 (init/systemd)
+    — e.g. the server tree was started detached (setsid/nohup) and an
+    intermediate process exited — that SIGQUIT reaches PID 1; as root on a
+    systemd host it reboots the machine (issue #75).
+
+    This guard snapshots the parent (pid and create_time) at startup and
+    later only sends SIGQUIT if the parent is still that exact process; it
+    never signals PID 1. Otherwise it logs and the child exits through its
+    normal error path.
+    """
+
+    def __init__(self) -> None:
+        self._pid: Optional[int] = None
+        self._create_time: Optional[float] = None
+        parent = psutil.Process().parent()
+        if parent is not None:
+            try:
+                self._pid = parent.pid
+                self._create_time = parent.create_time()
+            except psutil.NoSuchProcess:
+                pass
+
+    def send_sigquit(self) -> None:
+        if self._pid is None or self._pid == 1:
+            logger.warning(
+                "Skipping SIGQUIT to parent: no parent recorded or parent is "
+                "PID 1; the process will exit through its normal error path."
+            )
+            return
+        try:
+            current_parent = psutil.Process().parent()
+            if current_parent is None or current_parent.pid != self._pid:
+                logger.warning(
+                    f"Skipping SIGQUIT to parent pid {self._pid}: the parent "
+                    "died and this process was reparented (possibly to PID 1); "
+                    "the process will exit through its normal error path."
+                )
+                return
+            if current_parent.create_time() != self._create_time:
+                logger.warning(
+                    f"Skipping SIGQUIT to parent pid {self._pid}: the pid now "
+                    "belongs to a different process (create_time mismatch)."
+                )
+                return
+            current_parent.send_signal(signal.SIGQUIT)
+        except psutil.NoSuchProcess:
+            logger.warning(
+                f"Skipping SIGQUIT to parent pid {self._pid}: it exited "
+                "before the signal was delivered."
+            )
+
+
 class UvicornAccessLogFilter(logging.Filter):
     """Filter uvicorn access logs by request path.
 

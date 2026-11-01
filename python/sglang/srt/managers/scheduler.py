@@ -31,7 +31,6 @@ from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
-import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -256,6 +255,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
+    ParentSigquitGuard,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -1713,6 +1713,64 @@ class Scheduler(
                     result_queue_depth_before=result_queue_depth_before,
                 )
 
+        def launch_dt_wave_batch(
+            wave_batch,
+            *,
+            selection_started_ns,
+            selection_finished_ns,
+            submission_started_ns,
+            iteration_started_ns,
+            receive_started_ns,
+            receive_finished_ns,
+            poll_started_ns,
+            poll_finished_ns,
+        ):
+            # Launch one frozen DT verify wave with the overlap bookkeeping the
+            # result queue relies on: admission check, WAR barrier, snapshot
+            # append, and immediate Target ownership registration. The helper
+            # also serves non-DT batches (controller None): the overlap queue
+            # bookkeeping is common, the DT admission/registration is not.
+            dt_controller = self.dt_target_controller
+            if dt_controller is not None:
+                dt_controller.assert_overlap_compute_admission()
+            result_queue_depth_before = (
+                len(self.result_queue) if target_phase_profile_enabled else 0
+            )
+            if target_phase_profile_enabled:
+                submission_started_ns = time.monotonic_ns()
+            wave_result = self.run_batch(wave_batch)
+            if target_phase_profile_enabled:
+                submission_returned_ns = time.monotonic_ns()
+                dt_controller.record_target_batch_submission(
+                    wave_batch,
+                    wave_result,
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=submission_started_ns,
+                    submission_returned_ns=submission_returned_ns,
+                    result_queue_depth_before=result_queue_depth_before,
+                    iteration_started_ns=iteration_started_ns,
+                    receive_started_ns=receive_started_ns,
+                    receive_finished_ns=receive_finished_ns,
+                    poll_started_ns=poll_started_ns,
+                    poll_finished_ns=poll_finished_ns,
+                )
+            # Fence result processing behind this forward's shared reads.
+            self._apply_war_barrier()
+            self.result_queue.append((wave_batch.copy(), wave_result))
+            if len(self.result_queue) > 2:
+                raise RuntimeError(
+                    "overlap result queue exceeded one executing plus one "
+                    "submitted compute batch"
+                )
+            if dt_controller is not None:
+                # A previous chunk result can be processed below before this
+                # batch reaches the post-sample detach point. Publish the new
+                # Target ownership now so that older results cannot start a
+                # remote Draft round for the same request early.
+                dt_controller.register_overlap_inflight_batch(wave_batch)
+            return wave_result
+
         while True:
             if self.gracefully_exit:
                 break
@@ -1796,47 +1854,19 @@ class Scheduler(
                         pass
             # Launch the current batch
             if batch:
-                if self.dt_target_controller is not None:
-                    self.dt_target_controller.assert_overlap_compute_admission()
-                result_queue_depth_before = (
-                    len(self.result_queue) if target_phase_profile_enabled else 0
+                # submission_started_ns is re-timed inside the launch helper
+                # when phase profiling is active.
+                batch_result = launch_dt_wave_batch(
+                    batch,
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=0,
+                    iteration_started_ns=iteration_started_ns,
+                    receive_started_ns=receive_started_ns,
+                    receive_finished_ns=receive_finished_ns,
+                    poll_started_ns=poll_started_ns,
+                    poll_finished_ns=poll_finished_ns,
                 )
-                submission_started_ns = (
-                    time.monotonic_ns()
-                    if target_phase_profile_enabled
-                    else 0
-                )
-                batch_result = self.run_batch(batch)
-                if target_phase_profile_enabled:
-                    submission_returned_ns = time.monotonic_ns()
-                    self.dt_target_controller.record_target_batch_submission(
-                        batch,
-                        batch_result,
-                        selection_started_ns=selection_started_ns,
-                        selection_finished_ns=selection_finished_ns,
-                        submission_started_ns=submission_started_ns,
-                        submission_returned_ns=submission_returned_ns,
-                        result_queue_depth_before=result_queue_depth_before,
-                        iteration_started_ns=iteration_started_ns,
-                        receive_started_ns=receive_started_ns,
-                        receive_finished_ns=receive_finished_ns,
-                        poll_started_ns=poll_started_ns,
-                        poll_finished_ns=poll_finished_ns,
-                    )
-                # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
-                if len(self.result_queue) > 2:
-                    raise RuntimeError(
-                        "overlap result queue exceeded one executing plus one "
-                        "submitted compute batch"
-                    )
-                if self.dt_target_controller is not None:
-                    # A previous chunk result can be processed below before
-                    # this batch reaches the post-sample detach point. Publish
-                    # the new Target ownership now so that older results cannot
-                    # start a remote Draft round for the same request early.
-                    self.dt_target_controller.register_overlap_inflight_batch(batch)
             else:
                 batch_result = None
 
@@ -1859,9 +1889,14 @@ class Scheduler(
                     launched_batch=batch,
                 )
 
-            # Update last_batch
+            # Update last_batch. An idle iteration that clears last_batch while
+            # a result is still queued orphans the queued result: the pop gate
+            # (`if self.last_batch`) never opens again, and the defer cannot
+            # re-engage because it is itself gated on last_batch (issue #104).
+            # Clear last_batch only once the queue has drained.
             if not defer_dt_result:
-                self.last_batch = batch
+                if batch is not None or not self.result_queue:
+                    self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -3129,6 +3164,17 @@ class Scheduler(
                 )
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
+        if (
+            self.dt_target_controller is not None
+            and not self.dt_target_controller.has_compute_slot()
+        ):
+            # One executing plus one submitted compute batch is the overlap
+            # bound. A busy iteration must not select any batch while both
+            # slots are taken (a prefill would not pass the launch admission
+            # check either); the pending results are consumed below and free
+            # a slot.
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+
         # Preserve ordinary prefill admission before freezing a DT verify wave.
         # A ready wave is still unsubmitted work at this point.  Building it
         # first makes should_defer_prefill() choose it on every busy turn and
@@ -3624,15 +3670,15 @@ class Scheduler(
 
         # WAIT_DRAFT rows are outside ``batch`` but still own Target KV.  Under
         # pressure reclaim those owners too; synchronize overlap snapshots
-        # before their KV can be released.
-        if (
-            self.dt_target_controller is not None
-            and not batch.check_decode_mem()
-        ):
+        # before their KV can be released.  The common no-pressure case costs
+        # one check_decode_mem; the DT reclaim re-checks after freeing.
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and self.dt_target_controller is not None:
             self._retract_dt_owned_for_oom()
+            kv_full_retract_flag = not batch.check_decode_mem()
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
@@ -5287,7 +5333,7 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
-    parent_process = psutil.Process().parent()
+    parent_guard = ParentSigquitGuard()
 
     # Set up tracing
     if server_args.enable_trace:
@@ -5327,7 +5373,7 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        parent_guard.send_sigquit()
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
         if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
