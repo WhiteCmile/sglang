@@ -3829,26 +3829,43 @@ class FlashMTPDraftEngine:
         if unconfirmed is None:
             unconfirmed = self._unconfirmed_direct = {}
         seen = getattr(self, "_seen_transfers", None)
-        # Feature-side queue depth for the capacity check below.  None of the
-        # counted collections changes while this message is processed (only
-        # self._pending and unconfirmed do), so compute the sums once instead
-        # of per entry.
-        active_feature_tasks = sum(
-            len(batch.pending) for batch in self._pending_feature_batches
-        ) + len(getattr(self, "_input_ready_features", ())) + sum(
-            len(batch.pending)
-            for batch in getattr(self, "_pending_flashmtp_completions", ())
-        ) + sum(
-            len(batch.pending) for batch in self._pending_dflash_completions
-        ) + sum(
-            len(batch.pending) for batch in self._pending_eagle3_completions
+        # Gated-queue depth for the capacity check below: only non-ring
+        # identities count.  Direct-ring rounds — copies waiting for their
+        # ring data, admitted or held rounds — are dispatched by the
+        # Coordinator without the capacity gate (the Target pipelines rounds
+        # per request, so a ring confirmation must be accepted in order and
+        # can never be back-pressured) and are bounded by owned KV and by
+        # execution admission, not by the Coordinator queue this check
+        # protects.  None of the counted collections changes while this
+        # message is processed (only self._pending does, one appended
+        # non-ring entry per accepted task below), so compute the count once
+        # instead of per entry.
+        ring_ids = getattr(self, "_ring_pending_ids", None) or frozenset()
+        held_gated = sum(
+            1 for pending in self._pending if pending.transfer_id not in ring_ids
         )
-        # Unconfirmed ring rounds are bounded by owned KV, not by the
-        # Coordinator queue this check protects; Coordinator copies
-        # waiting for their ring copy are Coordinator-charged.
-        active_feature_tasks += len(getattr(self, "_ring_admission", ())) + len(
-            getattr(self, "_ring_waiting", ())
+        for batch in self._pending_feature_batches:
+            held_gated += sum(
+                1
+                for item in batch.pending
+                if item.task.transfer_id not in ring_ids
+            )
+        held_gated += sum(
+            1
+            for entry in getattr(self, "_input_ready_features", ())
+            if entry.pending.task.transfer_id not in ring_ids
         )
+        for completion_queue in (
+            getattr(self, "_pending_flashmtp_completions", ()),
+            self._pending_dflash_completions,
+            self._pending_eagle3_completions,
+        ):
+            for batch in completion_queue:
+                held_gated += sum(
+                    1
+                    for item in batch.pending
+                    if item.task.transfer_id not in ring_ids
+                )
         for task in message.entries:
             if task.transfer_id in self._pending_ids:
                 if task.transfer_id in unconfirmed:
@@ -3882,10 +3899,7 @@ class FlashMTPDraftEngine:
                 waiting[task.transfer_id] = task
                 accepted = True
                 continue
-            if (
-                len(self._pending) + active_feature_tasks - len(unconfirmed)
-                >= self.max_pending_tasks
-            ):
+            if held_gated >= self.max_pending_tasks:
                 raise RuntimeError(
                     "Coordinator exceeded advertised Draft queue capacity"
                 )
@@ -3900,6 +3914,7 @@ class FlashMTPDraftEngine:
                     raise ValueError("migration feature lease changed before execution")
                 self._deferred_feature_source_tasks[deferred_key] = task
             self._pending.append(task)
+            held_gated += 1
             if task.candidate_destination is not None:
                 self._direct_tasks_by_transfer[task.transfer_id] = task
             self._received_tasks += 1
