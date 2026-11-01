@@ -2562,6 +2562,20 @@ class DraftCandidatePushTransport:
         if start_event is not None:
             start_event.record(stream)
         self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
+        # Issue the per-row publication words directly on the bound driver
+        # call: this loop runs ~5 writes per task per wave and the wrapper
+        # method's per-call validation/keyword overhead dominated the push
+        # submit.  Identical driver calls in identical order, same per-call
+        # error check; the values are in range by construction (nonce words
+        # masked to uint32, row_width/generation validated above).
+        write_value32 = self._runtime._stream_write_value32
+        if write_value32 is None:
+            raise CandidateTransportError("cuStreamWriteValue32 is unavailable")
+        check_driver = self._runtime._check_driver
+        c_stream = ctypes.c_void_p(stream.cuda_stream)
+        c_uint64 = ctypes.c_uint64
+        c_uint32 = ctypes.c_uint32
+        c_zero = ctypes.c_uint(0)
         for task, address in zip(tasks, metadata_addresses, strict=True):
             destination = task.candidate_destination
             nonce = int(destination.authorization_nonce)
@@ -2574,11 +2588,11 @@ class DraftCandidatePushTransport:
                 (GENERATION_WORD, destination.generation),
             )
             for word, value in words:
-                self._runtime.stream_write_value32(
-                    address=address + word * 4,
-                    value=value,
-                    stream=stream.cuda_stream,
+                rc = write_value32(
+                    c_stream, c_uint64(address + word * 4), c_uint32(value), c_zero
                 )
+                if rc:
+                    check_driver(rc, "cuStreamWriteValue32")
             completion = getattr(self, "_completion_records", {}).get(
                 self._registration_key(destination)
             )
@@ -2601,11 +2615,14 @@ class DraftCandidatePushTransport:
                     (PRODUCER_TAG_WORD, self._producer_tag),
                     words[-1],
                 ):
-                    self._runtime.stream_write_value32(
-                        address=record_address + word * 4,
-                        value=value,
-                        stream=stream.cuda_stream,
+                    rc = write_value32(
+                        c_stream,
+                        c_uint64(record_address + word * 4),
+                        c_uint32(value),
+                        c_zero,
                     )
+                    if rc:
+                        check_driver(rc, "cuStreamWriteValue32")
             if completion is not None:
                 records, device_base = completion
                 if destination.slot_id >= records.slot_capacity:
