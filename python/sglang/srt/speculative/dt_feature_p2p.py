@@ -16,6 +16,8 @@ cover feature and KV transfers consistently.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -25,6 +27,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from threading import Condition, Lock, local
 
+import numpy as np
 import torch
 
 from sglang.srt.speculative.dt_cuda_ipc import (
@@ -32,6 +35,10 @@ from sglang.srt.speculative.dt_cuda_ipc import (
     CudaIpcMappingCache,
     CudaIpcRuntime,
     register_buffers,
+)
+from sglang.srt.speculative.dt_host_tcp import (
+    MSG_HIDDEN_PULL_REQ,
+    HostTcpClient,
 )
 
 
@@ -257,6 +264,12 @@ class TargetFeatureSourcePool:
         self._completed_limit = max(4096, self.slot_count * 16)
         self._lock = Lock()
         self._closed = False
+        # Host-staged TCP fallback (issue #164): one pinned staging buffer and
+        # one side stream serve every remote hidden pull; the lock serializes
+        # buffer reuse across the server's per-connection handler threads.
+        self._remote_pull_lock = Lock()
+        self._remote_pull_pinned: torch.Tensor | None = None
+        self._remote_pull_stream: torch.cuda.Stream | None = None
 
         properties = torch.cuda.get_device_properties(self.device)
         self.device_uuid = str(properties.uuid)
@@ -666,6 +679,102 @@ class TargetFeatureSourcePool:
         )
         return active
 
+    def remote_pull(
+        self,
+        *,
+        transfer_id: str,
+        source_slot_id: int,
+        slot_generation: int,
+        source_session_id: str,
+        pool_generation: str,
+        byte_offset: int,
+        nbytes: int,
+        timeout_s: float = 30.0,
+    ) -> bytes:
+        """Serve one remote Draft's hidden-state read over the TCP fallback.
+
+        Validates the same identity fences as the cuda-ipc read path
+        (:meth:`_validate_fence` plus the lease lookup of
+        :meth:`_validate_read_done_locked`) but never retires the lease: the
+        Draft still reports ``SourceReadDone`` over the Coordinator, which is
+        the sole lease-retiring path.  The copy source is the pool allocation
+        viewed as bytes at ``slot_id * slot_nbytes + byte_offset`` — exactly
+        the range the cuda-ipc path copies from ``mapped_base +
+        allocation_offset + byte_offset``.
+        """
+
+        if self._closed:
+            raise FeatureTransportError("feature source pool is closed")
+        self._validate_fence(
+            source_session_id=source_session_id,
+            pool_generation=pool_generation,
+        )
+        if (
+            nbytes <= 0
+            or byte_offset < 0
+            or byte_offset + nbytes > self._slot_nbytes
+            or source_slot_id < 0
+            or source_slot_id >= self.slot_count
+        ):
+            raise FeatureTransportError("remote pull range exceeds the source slot")
+        with self._lock:
+            active = self._validate_read_done_locked(
+                transfer_id=transfer_id,
+                source_slot_id=source_slot_id,
+                slot_generation=slot_generation,
+            )
+            if active is None:
+                # The lease was already retired: a completed transfer repeats
+                # its read-done but must not re-read the slot.
+                raise FeatureTransportError("feature transfer lease is not active")
+        # The lease exists before the GPU pack finishes enqueueing; wait for
+        # the publication's producer event without holding the pool lock —
+        # the same discipline as the cuda-ipc read path, which blocks on the
+        # event on the Draft's own copy stream.
+        deadline = time.monotonic() + timeout_s
+        producer_event = None
+        while True:
+            with self._lock:
+                slot = self._slots[source_slot_id]
+                if slot.generation != slot_generation or slot.state not in {
+                    FeatureSlotState.PUBLISHED,
+                    FeatureSlotState.QUARANTINED,
+                }:
+                    raise FeatureTransportError("stale source slot generation")
+                if slot.producer_event is not None:
+                    producer_event = slot.producer_event
+            if producer_event is not None:
+                break
+            if time.monotonic() >= deadline:
+                raise FeatureTransportError(
+                    "remote pull timed out waiting for source publication"
+                )
+            time.sleep(0.001)
+        producer_event.synchronize()
+        with self._remote_pull_lock:
+            if (
+                self._remote_pull_pinned is None
+                or self._remote_pull_pinned.numel() < nbytes
+            ):
+                self._remote_pull_pinned = torch.empty(
+                    max(nbytes, self._slot_nbytes),
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+            pinned = self._remote_pull_pinned[:nbytes]
+            if self._remote_pull_stream is None:
+                self._remote_pull_stream = torch.cuda.Stream(device=self.device)
+            side = self._remote_pull_stream
+            flat = self._storage.view(torch.uint8).reshape(-1)
+            start = source_slot_id * self._slot_nbytes + byte_offset
+            source = flat[start : start + nbytes]
+            with torch.cuda.stream(side):
+                pinned.copy_(source, non_blocking=True)
+                copied = torch.cuda.Event()
+                copied.record(side)
+            copied.synchronize()
+            return pinned.numpy().tobytes()
+
     def cancel(
         self,
         *,
@@ -954,6 +1063,46 @@ class _InlinePullFuture:
         return self._exception
 
 
+class _RemotePullFuture:
+    """Future-compatible handle for one host-staged TCP hidden pull.
+
+    The single remote worker thread resolves the future once the response
+    bytes are H2D-copied into the staging slot; ``done()`` is a plain flag
+    read so the scheduler loop polls it exactly like the inline future.
+    """
+
+    __slots__ = ("_done", "_result", "_exception", "_resolved")
+
+    def __init__(self) -> None:
+        self._done = False
+        self._result: FeaturePullMetrics | None = None
+        self._exception: BaseException | None = None
+        self._resolved = threading.Event()
+
+    def done(self) -> bool:
+        return self._done
+
+    def result(self, timeout: float | None = None) -> FeaturePullMetrics:
+        self._resolved.wait(timeout)
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        self._resolved.wait(timeout)
+        return self._exception
+
+    def _resolve(self, result: FeaturePullMetrics) -> None:
+        self._result = result
+        self._done = True
+        self._resolved.set()
+
+    def _reject(self, exc: BaseException) -> None:
+        self._exception = exc
+        self._done = True
+        self._resolved.set()
+
+
 class DraftFeaturePullTransport:
     """Asynchronously pull one Target feature range into Draft-local VRAM."""
 
@@ -963,6 +1112,7 @@ class DraftFeaturePullTransport:
         device: torch.device,
         max_workers: int = 1,
         profile_timing: bool = False,
+        host_addr: str = "",
     ) -> None:
         if max_workers <= 0:
             raise ValueError("feature copy transport requires positive workers")
@@ -991,6 +1141,16 @@ class DraftFeaturePullTransport:
         self._admission = Condition(self._lock)
         self._admitted_pulls = 0
         self._lifecycle_fence = False
+        # Cross-host targets (issue #164): target_instance_id -> (host, port)
+        # learned from arena registrations whose host_addr differs from ours.
+        # Descriptors for these targets skip the cuda-ipc-only checks and are
+        # served by the single remote worker thread over framed TCP.
+        self._host_addr = host_addr
+        self._remote_targets: dict[str, tuple[str, int]] = {}
+        self._remote_worker: threading.Thread | None = None
+        self._remote_queue: queue.Queue | None = None
+        self._remote_stream: torch.cuda.Stream | None = None
+        self._remote_inflight: set[_RemotePullFuture] = set()
         # Inline mode enqueues the copy on the calling scheduler thread and
         # completes it by event query. No helper thread is on the hot path.
         self._inline_submit = os.environ.get("DT_FEATURE_PULL_INLINE", "1") == "1"
@@ -1012,6 +1172,8 @@ class DraftFeaturePullTransport:
         destination: torch.Tensor,
     ) -> Future[FeaturePullMetrics]:
         """Queue a direct source-to-destination pull and return immediately."""
+        if source.target_instance_id in getattr(self, "_remote_targets", {}):
+            return self._submit_remote(source, destination)
         self._validate_submission(source, destination)
         if getattr(self, "_inline_submit", False):
             return self._submit_inline(source, destination)
@@ -1181,6 +1343,19 @@ class DraftFeaturePullTransport:
             if self._closed:
                 return
             self._closed = True
+        remote_worker = getattr(self, "_remote_worker", None)
+        if remote_worker is not None:
+            self._remote_queue.put(None)
+            remote_worker.join(timeout=5.0)
+            self._remote_worker = None
+            try:
+                if self._remote_stream is not None:
+                    self._remote_stream.synchronize()
+            except Exception:
+                with self._lock:
+                    self._fatal_error = FeatureTransportQuiescenceError(
+                        "remote feature pull did not quiesce at close"
+                    )
         self._executor.shutdown(wait=True, cancel_futures=True)
         if getattr(self, "_inline_inflight", None):
             try:
@@ -1395,6 +1570,148 @@ class DraftFeaturePullTransport:
             self._inline_inflight.discard(handle)
             self._admitted_pulls -= 1
             self._admission.notify_all()
+
+    def set_remote_targets(self, mapping: dict[str, tuple[str, int]]) -> None:
+        """Update the cross-host target map learned from arena registrations."""
+
+        with self._lock:
+            self._remote_targets = dict(mapping)
+
+    def _submit_remote(
+        self, source: FeatureSourceDescriptor, destination: torch.Tensor
+    ) -> _RemotePullFuture:
+        self._validate_remote_submission(source, destination)
+        with self._admission:
+            if self._closed:
+                raise FeatureTransportError("feature pull transport is closed")
+            if self._fatal_error is not None:
+                raise FeatureTransportError(
+                    "feature pull transport is quarantined after an unquiesced GPU-copy failure"
+                ) from self._fatal_error
+            if self._lifecycle_fence:
+                raise FeatureTransportError(
+                    "feature pull admission is fenced by peer lifecycle work"
+                )
+            self._admitted_pulls += 1
+        self._ensure_remote_worker()
+        future = _RemotePullFuture()
+        with self._admission:
+            self._remote_inflight.add(future)
+        self._remote_queue.put((future, source, destination))
+        return future
+
+    def _validate_remote_submission(
+        self, source: FeatureSourceDescriptor, destination: torch.Tensor
+    ) -> None:
+        """Host-agnostic half of ``_validate_submission`` for cross-host pulls.
+
+        The cuda-ipc-only checks (``transport == "cuda-ipc"``, ``ipc_handle``,
+        ``producer_event_handle``) are skipped: the Target still publishes
+        them, but the remote leg never dereferences IPC material.
+        """
+
+        if not source.target_instance_id or not source.source_session_id:
+            raise ValueError("feature descriptor source identity is incomplete")
+        if not source.pool_generation or not source.transport_session:
+            raise ValueError("feature descriptor generation fence is incomplete")
+        if source.dtype != "bfloat16" or len(source.shape) != 2:
+            raise ValueError("DFlash feature descriptor must describe a BF16 matrix")
+        if source.shape[0] <= 0 or source.shape[1] <= 0:
+            raise ValueError("feature descriptor shape must be positive")
+        expected_nbytes = source.shape[0] * source.shape[1] * 2
+        if source.nbytes != expected_nbytes:
+            raise ValueError("feature descriptor byte length does not match BF16 shape")
+        if source.byte_offset < 0 or source.allocation_offset < 0:
+            raise ValueError("feature descriptor offsets must be non-negative")
+        if (
+            source.allocation_offset + source.byte_offset + source.nbytes
+            > source.allocation_length
+        ):
+            raise ValueError("feature descriptor range exceeds mapped allocation")
+        if destination.device != self.device or destination.dtype is not torch.bfloat16:
+            raise ValueError("feature destination must be BF16 on the Draft CUDA device")
+        if not destination.is_contiguous() or destination.numel() * 2 != source.nbytes:
+            raise ValueError("feature destination must be one contiguous BF16 source")
+
+    def _ensure_remote_worker(self) -> None:
+        if self._remote_worker is not None:
+            return
+        with self._lock:
+            if self._remote_worker is None:
+                self._remote_queue = queue.Queue()
+                self._remote_stream = torch.cuda.Stream(device=self.device)
+                self._remote_worker = threading.Thread(
+                    target=self._remote_worker_loop,
+                    name="dt-feature-remote-pull",
+                    daemon=True,
+                )
+                self._remote_worker.start()
+
+    def _remote_worker_loop(self) -> None:
+        while True:
+            item = self._remote_queue.get()
+            if item is None:
+                return
+            future, source, destination = item
+            submitted_ns = time.monotonic_ns()
+            result = None
+            error = None
+            try:
+                host, port = self._remote_targets[source.target_instance_id]
+                header = {
+                    "transfer_id": source.transfer_id,
+                    "slot_id": source.source_slot_id,
+                    "slot_generation": source.slot_generation,
+                    "source_session_id": source.source_session_id,
+                    "pool_generation": source.pool_generation,
+                    "transport_session": source.transport_session,
+                    "byte_offset": source.byte_offset,
+                    "nbytes": source.nbytes,
+                }
+                _resp, payload = HostTcpClient.request(
+                    host, port, MSG_HIDDEN_PULL_REQ, header, timeout_s=30.0
+                )
+                if len(payload) != source.nbytes:
+                    raise FeatureTransportError(
+                        f"remote hidden pull returned {len(payload)} bytes, "
+                        f"expected {source.nbytes}"
+                    )
+                cpu = (
+                    torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
+                    .view(torch.bfloat16)
+                    .reshape(tuple(source.shape))
+                )
+                torch.cuda.set_device(self.device)
+                with torch.cuda.stream(self._remote_stream):
+                    destination.copy_(cpu, non_blocking=False)
+                    copied = torch.cuda.Event()
+                    copied.record(self._remote_stream)
+                copied.synchronize()
+                result = FeaturePullMetrics(
+                    submitted_ns=submitted_ns,
+                    gpu_completed_ns=time.monotonic_ns(),
+                    mapping_ns=0,
+                    driver_submit_ns=0,
+                    gpu_copy_ns=0,
+                    feature_bytes=source.nbytes,
+                    cold_mapping_count=0,
+                    worker_started_ns=submitted_ns,
+                    mapping_done_ns=submitted_ns,
+                    driver_submit_started_ns=submitted_ns,
+                    driver_submit_done_ns=submitted_ns,
+                    cuda_pre_copy_ns=0,
+                    gpu_start_observed_ns=0,
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced through the future
+                error = exc
+            with self._admission:
+                self._remote_inflight.discard(future)
+                self._admitted_pulls -= 1
+                self._admission.notify_all()
+            if error is not None:
+                future._reject(error)
+            else:
+                future._resolve(result)
 
     def _worker_stream(self):
         """Return one bounded CUDA stream owned by the current copy worker."""

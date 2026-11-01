@@ -36,6 +36,7 @@ import logging
 import mmap
 import os
 import secrets
+import struct
 import subprocess
 import time
 import uuid
@@ -56,6 +57,10 @@ from sglang.srt.speculative.dt_cuda_ipc import (
     CudaIpcMappingCache,
     CudaIpcRuntime,
     register_buffers,
+)
+from sglang.srt.speculative.dt_host_tcp import (
+    MSG_CAND_PUSH,
+    HostTcpClient,
 )
 
 METADATA_WORDS = 5
@@ -580,6 +585,8 @@ class TargetCandidateArena:
         slot_count: int,
         row_width: int,
         profile_timing: bool = False,
+        host_addr: str = "",
+        data_port: int = 0,
     ) -> None:
         if not target_instance_id or not target_session_id:
             raise ValueError("Target candidate identity must not be empty")
@@ -597,6 +604,8 @@ class TargetCandidateArena:
         torch.cuda.set_device(self.device)
         self.target_instance_id = target_instance_id
         self.target_session_id = target_session_id
+        self.host_addr = host_addr
+        self.data_port = int(data_port)
         self.pool_generation = uuid.uuid4().hex
         self.transport_session = uuid.uuid4().hex
         self.slot_count = int(slot_count)
@@ -651,6 +660,11 @@ class TargetCandidateArena:
         self._event_pool: list[torch.cuda.Event] = []
         self._lock = Lock()
         self._closed = False
+        # Host-staged TCP fallback (issue #164): one side stream serves every
+        # remote push's H2D copy; the lock serializes copies and record writes
+        # across the server's per-connection handler threads.
+        self._remote_push_lock = Lock()
+        self._remote_push_stream: torch.cuda.Stream | None = None
         self.device_uuid = str(torch.cuda.get_device_properties(self.device).uuid)
         self._zmq_context = zmq.Context.instance()
         self._completion_socket = self._zmq_context.socket(zmq.ROUTER)
@@ -797,6 +811,8 @@ class TargetCandidateArena:
             completion_endpoint=self.completion_endpoint,
             ready_record_path=self.ready_record_path,
             completion_record_path=self.completion_record_path,
+            host_addr=self.host_addr,
+            data_port=self.data_port,
             # The transport-neutral view of the same CUDA-IPC material above;
             # both stay filled so a legacy peer keeps working (#22 step 1).
             transport_api_version=TRANSPORT_API_VERSION,
@@ -1003,6 +1019,118 @@ class TargetCandidateArena:
                 self._record_generation[slot_id] = slot.generation
                 if getattr(self, "_record_seq_expected", None) is not None:
                     self._record_seq_expected[slot_id] = slot.authorization_nonce
+
+    def remote_push(
+        self,
+        *,
+        slot_id: int,
+        generation: int,
+        nonce: int,
+        transfer_id: str,
+        draft_session_id: str,
+        root_token: int,
+        data_bytes: bytes,
+        metadata_bytes: bytes,
+        timeout_s: float = 5.0,
+    ) -> None:
+        """Serve one remote Draft's candidate push over the TCP fallback.
+
+        The Target copies the row and metadata words into its own arena on a
+        side stream, then writes this arena's 64-byte completion record into
+        its own /dev/shm record file (payload words first, the reservation
+        nonce released last) so the existing poll/authenticate path consumes
+        cross-host pushes exactly like GPU-written records.
+        """
+
+        if self._closed:
+            raise CandidateTransportError("candidate arena is closed")
+        if slot_id < 0 or slot_id >= self.slot_count:
+            raise CandidateTransportError("candidate slot id is out of range")
+        if len(data_bytes) != self._row_nbytes:
+            raise CandidateTransportError("candidate push row has an invalid length")
+        if len(metadata_bytes) != self._metadata_row_nbytes:
+            raise CandidateTransportError(
+                "candidate push metadata has an invalid length"
+            )
+        expected_seq = getattr(self, "_record_seq_expected", None)
+        if expected_seq is None:
+            raise CandidateTransportError(
+                "candidate arena has no completion-record expectations"
+            )
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                active = self._active.get(transfer_id)
+                if active != slot_id:
+                    raise CandidateTransportError(
+                        "candidate push names no active destination"
+                    )
+                slot = self._slots[slot_id]
+                if slot.generation != generation:
+                    raise CandidateTransportError("candidate push generation is stale")
+                if slot.authorization_nonce != nonce:
+                    slot.state = CandidateSlotState.QUARANTINED
+                    raise CandidateTransportError("candidate push nonce mismatch")
+                if slot.draft_session_id and slot.draft_session_id != draft_session_id:
+                    slot.state = CandidateSlotState.QUARANTINED
+                    raise CandidateTransportError(
+                        "candidate push producer is unauthorized"
+                    )
+                # authorize() arms the record expectations; dispatch ordering
+                # can race the push, so a missing arm waits instead of failing.
+                armed = (
+                    int(expected_seq[slot_id]) == nonce
+                    and int(self._record_generation[slot_id]) == generation
+                    and int(self._record_tag[slot_id])
+                    == producer_tag(draft_session_id)
+                )
+            if armed:
+                break
+            if time.monotonic() >= deadline:
+                raise CandidateTransportError(
+                    "candidate push timed out waiting for slot authorization"
+                )
+            time.sleep(0.001)
+        rows_host = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.int32).copy())
+        meta_host = torch.from_numpy(
+            np.frombuffer(metadata_bytes, dtype=np.int32).copy()
+        )
+        with self._remote_push_lock:
+            if self._remote_push_stream is None:
+                self._remote_push_stream = torch.cuda.Stream(device=self.device)
+            side = self._remote_push_stream
+            with torch.cuda.stream(side):
+                self.storage[slot_id].copy_(rows_host, non_blocking=False)
+                self._metadata[slot_id].copy_(meta_host, non_blocking=False)
+                copied = torch.cuda.Event()
+                copied.record(side)
+            copied.synchronize()
+            words = self._completion_words
+            if words is None:
+                raise CandidateTransportError(
+                    "candidate arena completion record mapping is unavailable"
+                )
+            with self._lock:
+                if int(expected_seq[slot_id]) != nonce:
+                    raise CandidateTransportError(
+                        "candidate slot was rearmed before the push landed"
+                    )
+            record = words[slot_id]
+            record[COMPLETION_META_WORD] = np.uint64(
+                (generation & 0xFFFFFFFF) | (self.row_width << 32)
+            )
+            record[COMPLETION_HASH_WORD] = np.uint64(transfer_id_hash(transfer_id))
+            record[COMPLETION_TOKEN_WORD] = np.uint64(
+                (root_token & 0xFFFFFFFF)
+                | (producer_tag(draft_session_id) << 32)
+            )
+            record[COMPLETION_PRODUCED_WORD] = np.uint64(0)
+            record[COMPLETION_OFFSET_WORD] = np.uint64(0)
+            record[6] = np.uint64(0)
+            record[7] = np.uint64(0)
+            # x86 TSO keeps the in-order host stores visible; publishing the
+            # nonce (seq) word last matches the GPU kernel's release ordering.
+            record[COMPLETION_SEQ_WORD] = np.uint64(nonce)
 
     def notify_host_completion(
         self,
@@ -2093,6 +2221,7 @@ class DraftCandidatePushTransport:
         draft_session_id: str,
         device: torch.device,
         profile_timing: bool = False,
+        host_addr: str = "",
     ) -> None:
         if not draft_instance_id or not draft_session_id:
             raise ValueError("Draft candidate identity must not be empty")
@@ -2109,6 +2238,12 @@ class DraftCandidatePushTransport:
         self.draft_instance_id = draft_instance_id
         self.draft_session_id = draft_session_id
         self._profile_timing = bool(profile_timing)
+        # This Draft's own host address (--dt-host-addr); a registration whose
+        # host_addr differs is cross-host and served over framed TCP instead
+        # of CUDA IPC (issue #164).
+        self._host_addr = host_addr
+        # target_instance_id -> (host_addr, data_port) for remote arenas.
+        self._remote: dict[str, tuple[str, int]] = {}
         self._runtime = CudaIpcRuntime()
         self._mapping_cache = CudaIpcMappingCache(self._runtime)
         self._registered = {}
@@ -2177,6 +2312,18 @@ class DraftCandidatePushTransport:
             raise CandidateTransportError(
                 "candidate Target incarnation changed; Draft restart is required"
             )
+        remote_addr = getattr(registration, "host_addr", "") or ""
+        if remote_addr and remote_addr != self._host_addr:
+            # Cross-host arena (issue #164): its IPC handles and /dev/shm
+            # record files are meaningless from this process.  Remember the
+            # host-staged endpoint and skip the mapping, the record files,
+            # and the completion DEALER entirely; pushes go over framed TCP
+            # and the Target writes the completion record locally.
+            self._remote[registration.target_instance_id] = (
+                remote_addr,
+                int(getattr(registration, "data_port", 0) or 0),
+            )
+            return
         data_base, _ = self._mapping_cache.map(
             peer_instance_id=registration.target_instance_id,
             peer_session_id=registration.target_session_id,
@@ -2362,6 +2509,10 @@ class DraftCandidatePushTransport:
         now_ns = time.monotonic_ns()
         for task in tasks:
             destination = task.candidate_destination
+            if destination.target_instance_id in self._remote:
+                # The host-staged push had the Target write the completion
+                # record locally; no direct notice exists cross-host.
+                continue
             mapped = self._registered.get(self._registration_key(destination))
             if mapped is None:
                 raise CandidateTransportError(
@@ -2570,13 +2721,24 @@ class DraftCandidatePushTransport:
             or not candidates.is_contiguous()
         ):
             raise ValueError("candidate source must be contiguous int32 CUDA")
+        row_bytes = int(candidates.shape[1]) * 4
+        for task in tasks:
+            self._validate_destination(
+                task, task.candidate_destination, row_bytes
+            )
+        # Cross-host pushes (issue #164) complete synchronously: one framed
+        # TCP request per task; the Target copies into its own arena and
+        # writes the completion record locally.
+        local_tasks = []
         segments = []
         metadata_addresses = []
         cold = 0
-        row_bytes = int(candidates.shape[1]) * 4
         for index, task in enumerate(tasks):
             destination = task.candidate_destination
-            self._validate_destination(task, destination, row_bytes)
+            if destination.target_instance_id in self._remote:
+                self._push_remote_task(task, candidates[index])
+                continue
+            local_tasks.append(task)
             data_base, metadata_base = self._mapping(destination)
             segments.append(
                 CopySegment(
@@ -2598,7 +2760,8 @@ class DraftCandidatePushTransport:
         )
         if start_event is not None:
             start_event.record(stream)
-        self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
+        if segments:
+            self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
         # Issue the per-row publication words directly on the bound driver
         # call: this loop runs ~5 writes per task per wave and the wrapper
         # method's per-call validation/keyword overhead dominated the push
@@ -2613,7 +2776,7 @@ class DraftCandidatePushTransport:
         c_uint64 = ctypes.c_uint64
         c_uint32 = ctypes.c_uint32
         c_zero = ctypes.c_uint(0)
-        for task, address in zip(tasks, metadata_addresses, strict=True):
+        for task, address in zip(local_tasks, metadata_addresses, strict=True):
             destination = task.candidate_destination
             nonce = int(destination.authorization_nonce)
             words = (
@@ -2693,6 +2856,56 @@ class DraftCandidatePushTransport:
             start_event=start_event,
         )
 
+    def _remote_metadata_words(
+        self, destination, *, valid_length: int, task
+    ) -> bytes:
+        """Pack the 5 in-memory int32 metadata words exactly as the cuda-ipc
+        path writes them via cuStreamWriteValue32: generation, nonce low,
+        nonce high, valid length, root token."""
+
+        nonce = int(destination.authorization_nonce)
+        return struct.pack(
+            "<5I",
+            int(destination.generation) & 0xFFFFFFFF,
+            nonce & 0xFFFFFFFF,
+            (nonce >> 32) & 0xFFFFFFFF,
+            int(valid_length) & 0xFFFFFFFF,
+            int(task.next_token_id) & 0xFFFFFFFF,
+        )
+
+    def _push_remote_task(self, task, candidate_row: torch.Tensor) -> None:
+        """Send one cross-host candidate row plus metadata over framed TCP."""
+
+        destination = task.candidate_destination
+        host, port = self._remote[destination.target_instance_id]
+        if not port:
+            raise CandidateTransportError("remote candidate Target has no data port")
+        rows_cpu = candidate_row.to("cpu", non_blocking=False)
+        metadata = self._remote_metadata_words(
+            destination, valid_length=destination.row_width, task=task
+        )
+        header = {
+            "slot_id": int(destination.slot_id),
+            "generation": int(destination.generation),
+            "nonce": int(destination.authorization_nonce),
+            "transfer_id": task.transfer_id,
+            "draft_session_id": self.draft_session_id,
+            "root_token": int(task.next_token_id) & 0xFFFFFFFF,
+        }
+        try:
+            HostTcpClient.request(
+                host,
+                port,
+                MSG_CAND_PUSH,
+                header,
+                payload=rows_cpu.numpy().tobytes() + metadata,
+                timeout_s=30.0,
+            )
+        except Exception as exc:
+            raise CandidateTransportError(
+                f"remote candidate push failed for {task.transfer_id}"
+            ) from exc
+
     def publish_cancelled(self, tasks: list[object]) -> CandidatePush:
         """Publish authenticated quiescence for tasks cancelled before a push."""
 
@@ -2711,6 +2924,42 @@ class DraftCandidatePushTransport:
         for task in tasks:
             destination = task.candidate_destination
             self._validate_destination(task, destination, destination.nbytes)
+            if destination.target_instance_id in self._remote:
+                # Cross-host tombstone (issue #164): send the same metadata
+                # words the local path writes (valid length 0) over framed
+                # TCP; the Target's locally written completion record is the
+                # cancelled push's quiescence proof, exactly as for the
+                # GPU-written record.
+                host, port = self._remote[destination.target_instance_id]
+                if not port:
+                    raise CandidateTransportError(
+                        "remote candidate Target has no data port"
+                    )
+                metadata = self._remote_metadata_words(
+                    destination, valid_length=0, task=task
+                )
+                header = {
+                    "slot_id": int(destination.slot_id),
+                    "generation": int(destination.generation),
+                    "nonce": int(destination.authorization_nonce),
+                    "transfer_id": task.transfer_id,
+                    "draft_session_id": self.draft_session_id,
+                    "root_token": int(task.next_token_id) & 0xFFFFFFFF,
+                }
+                try:
+                    HostTcpClient.request(
+                        host,
+                        port,
+                        MSG_CAND_PUSH,
+                        header,
+                        payload=b"\x00" * destination.nbytes + metadata,
+                        timeout_s=30.0,
+                    )
+                except Exception as exc:
+                    raise CandidateTransportError(
+                        f"remote candidate tombstone failed for {task.transfer_id}"
+                    ) from exc
+                continue
             _data_base, metadata_base = self._mapping(destination)
             address = metadata_base + destination.metadata_allocation_offset
             nonce = int(destination.authorization_nonce)

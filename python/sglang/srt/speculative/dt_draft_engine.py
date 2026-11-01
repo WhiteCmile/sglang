@@ -840,6 +840,7 @@ class FlashMTPDraftEngine:
         dflash_submit_pipeline: bool = False,
         continuous_batching: bool = True,
         candidate_transport: str = "mmap",
+        dt_host_addr: str = "",
     ) -> None:
         try:
             from dt_client import DraftCoordinatorClient
@@ -903,6 +904,12 @@ class FlashMTPDraftEngine:
         self.feature_buffer_max_tokens = int(feature_buffer_max_tokens)
         self.feature_buffer_slot_count = int(feature_buffer_slot_count)
         self.candidate_transport = candidate_transport
+        # This Draft's own host address (--dt-host-addr).  A Target arena
+        # registration whose host_addr is set and differs is cross-host: the
+        # direct ring is skipped (the Target falls back to the Coordinator
+        # relay) and the two data legs use the host-staged TCP fallback.
+        self._dt_host_addr = dt_host_addr
+        self._remote_targets: dict[str, tuple[str, int]] = {}
         self.dflash_submit_pipeline = bool(
             dflash_submit_pipeline or (getattr(self, "continuous_batching", False) and self._is_dflash)
         )
@@ -1130,6 +1137,7 @@ class FlashMTPDraftEngine:
                     draft_session_id=self._client.instance_session_id,
                     device=self.device,
                     profile_timing=self._profile_active,
+                    host_addr=self._dt_host_addr,
                 )
             if (
                 self.candidate_transport == "mmap"
@@ -1337,6 +1345,7 @@ class FlashMTPDraftEngine:
             device=self.device,
             max_workers=self.max_batch_size,
             profile_timing=self._profile_active,
+            host_addr=self._dt_host_addr,
         )
         # FlashMTP transfers exactly one pivot row per request. Unlike DFlash
         # feature ranges, its staging bound is the Draft batch size, not the
@@ -1683,6 +1692,7 @@ class FlashMTPDraftEngine:
             device=self.device,
             max_workers=self.max_batch_size,
             profile_timing=self._profile_active,
+            host_addr=self._dt_host_addr,
         )
         self._feature_staging_buffers = [
             torch.empty(
@@ -2056,6 +2066,7 @@ class FlashMTPDraftEngine:
             device=self.device,
             max_workers=self.max_batch_size,
             profile_timing=self._profile_active,
+            host_addr=self._dt_host_addr,
         )
         self._feature_staging_buffers = [
             torch.empty(
@@ -3823,8 +3834,21 @@ class FlashMTPDraftEngine:
                 raise RuntimeError("direct candidate push transport is unavailable")
             for registration in candidate_registrations:
                 self._candidate_push_transport.register(registration)
-                if DIRECT_RING:
+                reg_host = getattr(registration, "host_addr", "") or ""
+                if reg_host and reg_host != self._dt_host_addr:
+                    # Cross-host Target (issue #164): no direct ring (the
+                    # Target's ring attach falls back to the Coordinator
+                    # relay); the data legs use the host-staged TCP fallback.
+                    self._remote_targets[registration.target_instance_id] = (
+                        reg_host,
+                        int(getattr(registration, "data_port", 0) or 0),
+                    )
+                elif DIRECT_RING:
                     self._open_direct_ring(registration)
+            if self._remote_targets and self._feature_pull_transport is not None:
+                self._feature_pull_transport.set_remote_targets(
+                    self._remote_targets
+                )
         unconfirmed = getattr(self, "_unconfirmed_direct", None)
         if unconfirmed is None:
             unconfirmed = self._unconfirmed_direct = {}
@@ -10304,6 +10328,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="disabled",
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--dt-host-addr",
+        default="",
+        help="This Draft's own host address. A Target arena registration whose "
+        "host_addr differs is cross-host: the direct ring is skipped and the "
+        "hidden-pull/candidate-push legs use the host-staged TCP fallback.",
+    )
     return parser
 
 
@@ -10335,6 +10366,7 @@ def main() -> None:
         dflash_submit_pipeline=args.dflash_submit_pipeline,
         continuous_batching=not args.disable_continuous_batching,
         candidate_transport=args.candidate_transport,
+        dt_host_addr=args.dt_host_addr,
     )
 
     def stop(_signum, _frame) -> None:
