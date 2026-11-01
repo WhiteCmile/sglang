@@ -168,8 +168,6 @@ def test_take_batch_stops_at_the_admission_limit():
     engine._is_dflash = True
     engine._is_eagle3 = False
     engine._free_feature_staging_slots = deque((0, 1))
-    engine.batch_ready_threshold = 1
-    engine.batch_wait_s = 0
     engine.max_batch_size = 8
     engine.feature_buffer_max_tokens = 8
     engine._pending = deque(_take_task(f"t{i}") for i in range(4))

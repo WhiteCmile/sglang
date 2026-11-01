@@ -4218,8 +4218,6 @@ def test_dflash_pipeline_reserves_one_result_slot_per_submitted_batch() -> None:
     engine._pending_dflash_completions = deque(
         (SimpleNamespace(proposal_tasks=(object(),)),)
     )
-    engine.batch_ready_threshold = 1
-    engine.batch_wait_s = 0
     engine.max_batch_size = 8
     engine.feature_buffer_max_tokens = 8
     engine._cancelled_ids = set()

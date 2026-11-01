@@ -51,6 +51,11 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.0005
+# Idle-loop poll interval while a DFlash/EAGLE3/FlashMTP completion or a
+# direct candidate push is still in flight on the GPU: long enough to keep
+# the CPU cost bounded, short enough not to delay the Draft done -> push ->
+# Target READY path (issue #149).
+INFLIGHT_POLL_S = 0.00005
 DIRECT_PUSH_SPIN_NS = 200_000
 # Token-count buckets for the CUDA-graphed DFlash KV materializer.
 DFLASH_MATERIALIZE_GRAPH_BUCKETS = (8, 16, 32, 64, 96, 128, 192, 256, 384, 512)
@@ -131,7 +136,6 @@ def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tens
     index_cpu = torch.tensor(indices, dtype=torch.int64, pin_memory=True)
     index = index_cpu.to(rows.device, non_blocking=True)
     return rows.index_select(0, index)
-COALESCING_POLL_S = 0.0001
 # Queue candidate pushes behind the proposal at launch and let the Target
 # observe READY from GPU-written host records (dt_candidate_p2p).
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
@@ -822,8 +826,6 @@ class FlashMTPDraftEngine:
         nccl_port: int,
         max_pending_tasks: int,
         max_batch_size: int,
-        batch_ready_threshold: int,
-        batch_wait_ms: float,
         result_slot_count: int,
         data_dir: str,
         mem_fraction_static: float,
@@ -851,15 +853,8 @@ class FlashMTPDraftEngine:
 
         if max_pending_tasks <= 0 or max_batch_size <= 0:
             raise ValueError("queue and batch capacities must be positive")
-        if not 0 < batch_ready_threshold <= max_batch_size:
-            raise ValueError(
-                "batch_ready_threshold must be positive and no larger than "
-                "max_batch_size"
-            )
         if result_slot_count <= 0:
             raise ValueError("result_slot_count must be positive")
-        if batch_wait_ms < 0:
-            raise ValueError("batch_wait_ms must be non-negative")
         if migration_backend not in {"disabled", "cuda-ipc"}:
             raise ValueError("migration_backend must be 'disabled' or 'cuda-ipc'")
         if migration_backend == "cuda-ipc" and os.environ.get(
@@ -900,9 +895,7 @@ class FlashMTPDraftEngine:
         self.gpu_id = gpu_id
         self.max_pending_tasks = max_pending_tasks
         self.max_batch_size = max_batch_size
-        self.batch_ready_threshold = batch_ready_threshold
         self.continuous_batching = bool(continuous_batching)
-        self.batch_wait_s = batch_wait_ms / 1_000
         self.batch_source_read_done = batch_source_read_done
         self.pinned_pivot_staging = pinned_pivot_staging
         self.enable_deterministic_inference = bool(enable_deterministic_inference)
@@ -2157,9 +2150,18 @@ class FlashMTPDraftEngine:
                 and not self._pending_feature_batches
                 and not self._ring_admission
             ):
-                sleep_s = self._idle_sleep_s()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                if (
+                    self._pending_dflash_completions
+                    or self._pending_eagle3_completions
+                    or self._pending_flashmtp_completions
+                    or self._pending_candidate_pushes
+                ):
+                    # A completion or direct candidate push is still in flight
+                    # on the GPU; observe it soon instead of sleeping the full
+                    # idle poll (issue #149).
+                    time.sleep(INFLIGHT_POLL_S)
+                else:
+                    time.sleep(IDLE_POLL_S)
             self._maybe_emit_lifecycle_status()
 
     @contextlib.contextmanager
@@ -3872,19 +3874,6 @@ class FlashMTPDraftEngine:
             return []
         if not self._is_feature_backed and self._proposal_wave_buffer_exhausted():
             return []
-        if (
-            not getattr(self, "continuous_batching", False)
-            and len(self._pending) < self.batch_ready_threshold
-            and self.batch_wait_s > 0
-        ):
-            oldest = self._pending[0]
-            received_ns = self._received_ns_by_transfer.get(oldest.transfer_id)
-            if (
-                received_ns is not None
-                and (time.monotonic_ns() - received_ns) / 1_000_000_000
-                < self.batch_wait_s
-            ):
-                return []
 
         queued: list[PendingDraftTask] = []
         take_ns = time.monotonic_ns()
@@ -4140,34 +4129,6 @@ class FlashMTPDraftEngine:
         if self._persistent:
             return queued
         raise RuntimeError("nonpersistent Draft task lacks direct GPU source transport")
-
-    def _idle_sleep_s(self) -> float:
-        if (
-            getattr(self, "continuous_batching", False)
-            or not self._pending
-            or (
-                self._uses_direct_gpu_source
-                and self._pending[0].requires_proposal
-                and self._proposal_admission_blocked()
-            )
-            or (
-                self._uses_direct_gpu_source
-                and not self._free_feature_staging_slots
-            )
-            or (
-                not self._is_feature_backed
-                and self._proposal_wave_buffer_exhausted()
-            )
-            or len(self._pending) >= self.batch_ready_threshold
-            or self.batch_wait_s == 0
-        ):
-            return IDLE_POLL_S
-        received_ns = self._received_ns_by_transfer.get(self._pending[0].transfer_id)
-        if received_ns is None:
-            return 0
-        age_s = (time.monotonic_ns() - received_ns) / 1_000_000_000
-        remaining_s = max(0.0, self.batch_wait_s - age_s)
-        return min(COALESCING_POLL_S, remaining_s)
 
     def _dflash_admission_reserved(self) -> int:
         """Submitted-but-unpublished proposal work holding an admission unit.
@@ -10228,8 +10189,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nccl-port", type=int, default=29600)
     parser.add_argument("--max-pending-tasks", type=int, default=512)
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--batch-ready-threshold", type=int, default=16)
-    parser.add_argument("--batch-wait-ms", type=float, default=0.2)
     parser.add_argument("--disable-continuous-batching", action="store_true")
     parser.add_argument("--result-slot-count", type=int, default=16)
     parser.add_argument(
@@ -10274,8 +10233,6 @@ def main() -> None:
         nccl_port=args.nccl_port,
         max_pending_tasks=args.max_pending_tasks,
         max_batch_size=args.max_batch_size,
-        batch_ready_threshold=args.batch_ready_threshold,
-        batch_wait_ms=args.batch_wait_ms,
         result_slot_count=args.result_slot_count,
         data_dir=args.data_dir,
         mem_fraction_static=args.mem_fraction_static,
