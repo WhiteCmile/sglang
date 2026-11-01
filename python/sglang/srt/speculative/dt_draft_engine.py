@@ -1098,6 +1098,9 @@ class FlashMTPDraftEngine:
         # after its Coordinator copy (even after retirement) must not re-run.
         self._seen_transfers: set[str] = set()
         self._seen_transfer_order: deque[str] = deque()
+        # Pure cache of rid -> FNV hash for the per-row ring-record
+        # cross-check; cleared when it grows past the seen-transfer window.
+        self._rid_hash_cache: dict[str, int] = {}
         self._capacity_sequence = 0
         self._client = None
         try:
@@ -1761,6 +1764,8 @@ class FlashMTPDraftEngine:
             capture_decode_cuda_graph=not disable_cuda_graph
         )
         self._draft_cuda_graph = self._draft_model_runner.decode_cuda_graph_runner
+        if not disable_cuda_graph and self._is_dflash and self._uses_direct_gpu_source:
+            self._capture_dflash_materializer_graphs()
         logger.info(
             "DT DFLASH Draft ready: instance=%s block=%d feature_width=%d "
             "feature_slots=%d feature_tokens=%d cuda_graph=%s submit_pipeline=%s",
@@ -1771,6 +1776,45 @@ class FlashMTPDraftEngine:
             self.feature_buffer_max_tokens,
             self._draft_cuda_graph is not None,
             self.dflash_submit_pipeline,
+        )
+
+    def _capture_dflash_materializer_graphs(self) -> None:
+        """Replay the target-hidden -> draft-KV writer as one CUDA graph per bucket.
+
+        The eager writer launches a projection, the fused norm/RoPE kernel and
+        one KV write per layer from Python on every Draft batch
+        (~0.5 ms of scheduler-thread launch overhead per batch).  The graphed
+        writer copies the three inputs into static buffers and replays a
+        captured graph instead; rows beyond the largest bucket (capped well
+        past the measured p99 materialization size) keep the eager writer.
+        """
+
+        materializer = self._dflash_materializer
+        helper = getattr(materializer, "_fused_kv_helper", None)
+        if not getattr(materializer, "_use_fused_kv_materialize", False) or (
+            helper is None
+        ):
+            logger.info("DT DFLASH materializer graphs skipped: fused writer off")
+            return
+        staging_dtype = self._feature_staging_buffers[0].dtype
+        # Captured graphs bake the helper's workspace addresses; grow it once
+        # to the largest possible materialization batch so a later eager
+        # fallback (rows beyond the top bucket) can never reallocate the
+        # workspace under the captured graphs.
+        helper._ensure_workspace(self.feature_buffer_max_tokens, staging_dtype)
+        top_bucket = min(self.feature_buffer_max_tokens, self.max_batch_size * 2)
+        self._dflash_materializer = _GraphedDFlashMaterializer(
+            materializer,
+            width=self._pivot_width,
+            dtype=staging_dtype,
+            device=self.device,
+            buckets=draft_cuda_graph_batch_sizes(top_bucket),
+        )
+        self._dflash_materializer.capture()
+        logger.info(
+            "DT DFLASH materializer graphs captured: buckets=%d top=%d",
+            len(self._dflash_materializer._graphs),
+            top_bucket,
         )
 
     def _initialize_standalone_model(
@@ -2594,7 +2638,15 @@ class FlashMTPDraftEngine:
             # The native worker resolved the rid into the mailbox before
             # sealing the record; cross-check it against the record's hash.
             rid = req.rid
-            if not rid or rid_hash(rid) != req.rid_hash:
+            if not rid:
+                raise ValueError("ring record references an unknown request")
+            if len(self._rid_hash_cache) > 65536:
+                self._rid_hash_cache.clear()
+            cached_hash = self._rid_hash_cache.get(rid)
+            if cached_hash is None:
+                cached_hash = rid_hash(rid)
+                self._rid_hash_cache[rid] = cached_hash
+            if cached_hash != req.rid_hash:
                 raise ValueError("ring record references an unknown request")
             transfer_id = (
                 f"{target_instance_id}:{rid}:{req.round_id}:{req.attempt}"
@@ -3694,16 +3746,23 @@ class FlashMTPDraftEngine:
 
         if not self._unconfirmed_direct:
             return
+        now_ns = time.monotonic_ns()
+        if now_ns < getattr(self, "_next_unconfirmed_expiry_ns", 0):
+            # Deadlines are task creation time plus a fixed timeout, so
+            # nothing admitted after the last empty scan can expire earlier
+            # than the cached minimum; skip the walk until then (#150).
+            return
         held_push_ids = {
             task.transfer_id
             for tasks, _candidates, _slot in getattr(self, "_held_ring_pushes", ())
             for task in tasks
         }
         expired_held_push = False
-        now_ns = time.monotonic_ns()
+        expired_any = False
         for transfer_id, deadline_ns in tuple(self._unconfirmed_direct.items()):
             if now_ns < deadline_ns + UNCONFIRMED_DIRECT_GRACE_NS:
                 continue
+            expired_any = True
             if transfer_id in held_push_ids:
                 self._unconfirmed_direct.pop(transfer_id)
                 self._held_direct_source_done.pop(transfer_id, None)
@@ -3738,6 +3797,16 @@ class FlashMTPDraftEngine:
                 # The drop just reported this transfer; a later Coordinator
                 # copy must not publish a duplicate failure.
                 self._remember_ring_retired(transfer_id, failed=False)
+        if expired_any:
+            # An expiry fired (or an entry was skipped as not yet
+            # result-bearing): rescan on the next poll; neighbours may be
+            # near due.
+            self._next_unconfirmed_expiry_ns = 0
+        else:
+            pending = [deadline_ns for deadline_ns in self._unconfirmed_direct.values()]
+            self._next_unconfirmed_expiry_ns = (
+                min(pending) + UNCONFIRMED_DIRECT_GRACE_NS if pending else 0
+            )
         if expired_held_push:
             self._release_held_ring_pushes()
 
@@ -3760,6 +3829,26 @@ class FlashMTPDraftEngine:
         if unconfirmed is None:
             unconfirmed = self._unconfirmed_direct = {}
         seen = getattr(self, "_seen_transfers", None)
+        # Feature-side queue depth for the capacity check below.  None of the
+        # counted collections changes while this message is processed (only
+        # self._pending and unconfirmed do), so compute the sums once instead
+        # of per entry.
+        active_feature_tasks = sum(
+            len(batch.pending) for batch in self._pending_feature_batches
+        ) + len(getattr(self, "_input_ready_features", ())) + sum(
+            len(batch.pending)
+            for batch in getattr(self, "_pending_flashmtp_completions", ())
+        ) + sum(
+            len(batch.pending) for batch in self._pending_dflash_completions
+        ) + sum(
+            len(batch.pending) for batch in self._pending_eagle3_completions
+        )
+        # Unconfirmed ring rounds are bounded by owned KV, not by the
+        # Coordinator queue this check protects; Coordinator copies
+        # waiting for their ring copy are Coordinator-charged.
+        active_feature_tasks += len(getattr(self, "_ring_admission", ())) + len(
+            getattr(self, "_ring_waiting", ())
+        )
         for task in message.entries:
             if task.transfer_id in self._pending_ids:
                 if task.transfer_id in unconfirmed:
@@ -3793,22 +3882,6 @@ class FlashMTPDraftEngine:
                 waiting[task.transfer_id] = task
                 accepted = True
                 continue
-            active_feature_tasks = sum(
-                len(batch.pending) for batch in self._pending_feature_batches
-            ) + len(getattr(self, "_input_ready_features", ())) + sum(
-                len(batch.pending)
-                for batch in getattr(self, "_pending_flashmtp_completions", ())
-            ) + sum(
-                len(batch.pending) for batch in self._pending_dflash_completions
-            ) + sum(
-                len(batch.pending) for batch in self._pending_eagle3_completions
-            )
-            # Unconfirmed ring rounds are bounded by owned KV, not by the
-            # Coordinator queue this check protects; Coordinator copies
-            # waiting for their ring copy are Coordinator-charged.
-            active_feature_tasks += len(getattr(self, "_ring_admission", ())) + len(
-                getattr(self, "_ring_waiting", ())
-            )
             if (
                 len(self._pending) + active_feature_tasks - len(unconfirmed)
                 >= self.max_pending_tasks

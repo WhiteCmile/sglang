@@ -628,6 +628,7 @@ def _make_record_engine(destination, *, at_launch=True):
     engine._cancelled_ids = set()
     engine._seen_transfers = set()
     engine._seen_transfer_order = []
+    engine._rid_hash_cache = {}
     engine._received_ns_by_transfer = {}
     engine._direct_tasks_by_transfer = {}
     engine._unconfirmed_direct = {}
