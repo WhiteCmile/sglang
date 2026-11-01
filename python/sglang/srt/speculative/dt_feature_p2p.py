@@ -1147,9 +1147,11 @@ class DraftFeaturePullTransport:
         # served by the single remote worker thread over framed TCP.
         self._host_addr = host_addr
         self._remote_targets: dict[str, tuple[str, int]] = {}
-        self._remote_worker: threading.Thread | None = None
-        self._remote_queue: queue.Queue | None = None
-        self._remote_stream: torch.cuda.Stream | None = None
+        # One worker per remote Target: pulls to different Targets proceed in
+        # parallel, so a slow or busy peer cannot queue behind another.
+        self._remote_workers: dict[str, threading.Thread] = {}
+        self._remote_queues: dict[str, queue.Queue] = {}
+        self._remote_streams: dict[str, torch.cuda.Stream] = {}
         self._remote_inflight: set[_RemotePullFuture] = set()
         # Inline mode enqueues the copy on the calling scheduler thread and
         # completes it by event query. No helper thread is on the hot path.
@@ -1343,14 +1345,15 @@ class DraftFeaturePullTransport:
             if self._closed:
                 return
             self._closed = True
-        remote_worker = getattr(self, "_remote_worker", None)
-        if remote_worker is not None:
-            self._remote_queue.put(None)
-            remote_worker.join(timeout=5.0)
-            self._remote_worker = None
+        remote_workers = getattr(self, "_remote_workers", None)
+        if remote_workers:
+            for target_instance_id, worker in list(remote_workers.items()):
+                self._remote_queues[target_instance_id].put(None)
+                worker.join(timeout=5.0)
+            self._remote_workers = {}
             try:
-                if self._remote_stream is not None:
-                    self._remote_stream.synchronize()
+                for stream in self._remote_streams.values():
+                    stream.synchronize()
             except Exception:
                 with self._lock:
                     self._fatal_error = FeatureTransportQuiescenceError(
@@ -1593,11 +1596,11 @@ class DraftFeaturePullTransport:
                     "feature pull admission is fenced by peer lifecycle work"
                 )
             self._admitted_pulls += 1
-        self._ensure_remote_worker()
+        self._ensure_remote_worker(source.target_instance_id)
         future = _RemotePullFuture()
         with self._admission:
             self._remote_inflight.add(future)
-        self._remote_queue.put((future, source, destination))
+        self._remote_queues[source.target_instance_id].put((future, source, destination))
         return future
 
     def _validate_remote_submission(
@@ -1633,23 +1636,29 @@ class DraftFeaturePullTransport:
         if not destination.is_contiguous() or destination.numel() * 2 != source.nbytes:
             raise ValueError("feature destination must be one contiguous BF16 source")
 
-    def _ensure_remote_worker(self) -> None:
-        if self._remote_worker is not None:
+    def _ensure_remote_worker(self, target_instance_id: str) -> None:
+        if target_instance_id in self._remote_workers:
             return
         with self._lock:
-            if self._remote_worker is None:
-                self._remote_queue = queue.Queue()
-                self._remote_stream = torch.cuda.Stream(device=self.device)
-                self._remote_worker = threading.Thread(
+            if target_instance_id not in self._remote_workers:
+                self._remote_queues[target_instance_id] = queue.Queue()
+                self._remote_streams[target_instance_id] = torch.cuda.Stream(
+                    device=self.device
+                )
+                worker = threading.Thread(
                     target=self._remote_worker_loop,
-                    name="dt-feature-remote-pull",
+                    args=(target_instance_id,),
+                    name=f"dt-feature-remote-pull-{target_instance_id}",
                     daemon=True,
                 )
-                self._remote_worker.start()
+                self._remote_workers[target_instance_id] = worker
+                worker.start()
 
-    def _remote_worker_loop(self) -> None:
+    def _remote_worker_loop(self, target_instance_id: str) -> None:
+        work_queue = self._remote_queues[target_instance_id]
+        copy_stream = self._remote_streams[target_instance_id]
         while True:
-            item = self._remote_queue.get()
+            item = work_queue.get()
             if item is None:
                 return
             future, source, destination = item
@@ -1668,8 +1677,10 @@ class DraftFeaturePullTransport:
                     "byte_offset": source.byte_offset,
                     "nbytes": source.nbytes,
                 }
+                # Correctness-first: the wait budget covers deep queueing
+                # behind a busy peer; the bytes themselves are small.
                 _resp, payload = HostTcpClient.request(
-                    host, port, MSG_HIDDEN_PULL_REQ, header, timeout_s=30.0
+                    host, port, MSG_HIDDEN_PULL_REQ, header, timeout_s=120.0
                 )
                 if len(payload) != source.nbytes:
                     raise FeatureTransportError(
@@ -1682,10 +1693,10 @@ class DraftFeaturePullTransport:
                     .reshape(tuple(source.shape))
                 )
                 torch.cuda.set_device(self.device)
-                with torch.cuda.stream(self._remote_stream):
+                with torch.cuda.stream(copy_stream):
                     destination.copy_(cpu, non_blocking=False)
                     copied = torch.cuda.Event()
-                    copied.record(self._remote_stream)
+                    copied.record(copy_stream)
                 copied.synchronize()
                 result = FeaturePullMetrics(
                     submitted_ns=submitted_ns,
