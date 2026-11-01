@@ -332,33 +332,52 @@ class RingPublishLaunch:
 
 
 @dataclass(slots=True)
-class RingPublishWave:
-    """A kernel-published verify wave awaiting its deferred confirmation.
+class RingPublishRecord:
+    """One ring record of a kernel-published verify wave.
 
-    The ring record is authoritative for the Draft; the cleanup rebuilds the
-    Coordinator-bound copies from the record itself (no GPU sync) and keeps
-    the pool/ledger bookkeeping consistent with the Python publication path.
+    A wave that spans multiple owner Draft sessions — or more rows than one
+    record's geometry holds — publishes one record per (owner group, chunk);
+    each owner Draft consumes only the records on its own ring.  The deferred
+    cleanup confirms every record independently and publishes the wave's
+    source slot once all records are visible.
     """
 
     session_id: str
     wave_seq: int
-    slot_id: int
-    generation: int
-    row_count: int
-    ready_event: object
-    # 12-field StagedDFlashTask values with empty token-id tuples, in the
-    # record's request-table order; aligned with active_slots.
+    # 12-field StagedDFlashTask values with empty token-id tuples, in this
+    # record's request-table order.
     specs: tuple
-    reqs: dict  # rid -> req object at stage time
-    active_slots: tuple
-    # Filled by _park_dflash_completed_batch: transfer_id ->
-    # (requires_proposal, previous_transfer_id).
-    proposals: dict
+    # Feature-row offset of this record's packed range within the wave's
+    # source slot; the record's request-table token_offsets are relative to
+    # this range (0 for block-strided in-place records, which start at the
+    # slot base).
+    row_start: int
     # Record snapshot taken by _ring_publish_cleanup on the poll that first
-    # sees the wave's seq word in the ring.  A deferred wave (full arena)
+    # sees the record's seq word in its ring.  A deferred wave (full arena)
     # must not re-read the ring: the Draft consumes records and the producer
     # wraps, after which the old seq word can never reappear at its slot.
     record: object | None = None
+
+
+@dataclass(slots=True)
+class RingPublishWave:
+    """A kernel-published verify wave awaiting its deferred confirmation.
+
+    The ring records are authoritative for the Drafts; the cleanup rebuilds
+    the Coordinator-bound copies from the records themselves (no GPU sync) and
+    keeps the pool/ledger bookkeeping consistent with the Python publication
+    path.
+    """
+
+    slot_id: int
+    generation: int
+    row_count: int  # total feature rows published in the source slot
+    ready_event: object
+    reqs: dict  # rid -> req object at stage time
+    # Filled by _park_dflash_completed_batch: transfer_id ->
+    # (requires_proposal, previous_transfer_id).
+    proposals: dict
+    records: tuple  # RingPublishRecord, one per ring record
 
 
 @dataclass(frozen=True, slots=True)
@@ -6965,16 +6984,20 @@ class DTTargetController:
         """
 
         wave = RingPublishWave(
-            session_id=launch.session_id,
-            wave_seq=launch.wave_seq,
             slot_id=launch.slot_id,
             generation=launch.generation,
             row_count=launch.row_count,
             ready_event=launch.ready_event,
-            specs=tuple(commit_specs),
             reqs={req.rid: req for req in batch.reqs},
-            active_slots=tuple(index for index, *_ in launch.staged_meta),
             proposals={},
+            records=(
+                RingPublishRecord(
+                    session_id=launch.session_id,
+                    wave_seq=launch.wave_seq,
+                    specs=tuple(commit_specs),
+                    row_start=0,
+                ),
+            ),
         )
         self._ring_publish_pending.append(wave)
         batch_result.dt_ring_publish_wave = wave
@@ -7004,18 +7027,29 @@ class DTTargetController:
         seq_len_values,
         commit_specs,
     ):
-        """Publish one verify wave as a kernel-written ring record (§7.1).
+        """Publish one verify wave as kernel-written ring record(s) (§7.1).
 
-        Returns True when the wave went out on the ring, or None when the
-        wave is ineligible and the caller must fall back to the Python
-        publication path.  Scalars and fences are precomputed by the caller's
-        shared derivation (identical on every rank).  The heavy bookkeeping
-        (descriptors, Coordinator confirmation tasks, ledger updates) is
-        deferred to _ring_publish_cleanup, which rebuilds the per-request
-        token data from the ring record itself without a GPU sync.
+        Returns True when every record went out on its owner Draft's ring, or
+        None when the wave is ineligible and the caller must fall back to the
+        Python publication path.  Scalars and fences are precomputed by the
+        caller's shared derivation (identical on every rank).  The heavy
+        bookkeeping (descriptors, Coordinator confirmation tasks, ledger
+        updates) is deferred to _ring_publish_cleanup, which rebuilds the
+        per-request token data from the ring records themselves without a GPU
+        sync.
         """
 
         from sglang.srt.speculative.dt_direct_ring import V2_MAX_REQ, V2_MAX_TOK
+
+        def _skip(reason):
+            if self._profile_active:
+                self._profile_emit(
+                    "target_ring_publish_fallback",
+                    reason=reason,
+                    rows=len(staged_meta) if staged_meta else 0,
+                    wave_id=getattr(batch, "dt_full_wave_id", None),
+                )
+            return None
 
         pool = self._feature_source_pool
         if (
@@ -7026,10 +7060,8 @@ class DTTargetController:
             or not self._direct_ring
             or not getattr(self, "_ring_publish", False)
             or not staged_meta
-            or len(staged_meta) > V2_MAX_REQ
         ):
-            return None
-        active = [index for index, *_ in staged_meta]
+            return _skip("config")
         counts = accept_values
         publish_started_ns = time.monotonic_ns()
         _marks = []
@@ -7054,34 +7086,36 @@ class DTTargetController:
                 or not packed.is_cuda
                 or int(packed.shape[0]) != len(batch.reqs) * self.block_size
             ):
-                return None
+                return _skip("tensors")
         elif feature_chunks is None:
-            return None
+            return _skip("tensors")
         # Eligibility is evaluated at park time: the in-flight/binding state
         # it reads only settles once the previous wave's park has run, so it
         # cannot be precomputed at the deferred stage.  Eligibility and the
         # staging entries are built in ONE batch pass; ineligible waves
         # discard the half-built entries.
-        entries = []
-        session_id = None
-        publisher = None
+        #
+        # One ring record describes one wave to one owner Draft session and at
+        # most V2_MAX_REQ requests / V2_MAX_TOK committed rows.  The
+        # Coordinator assigns every request an owner Draft, so a 3T2D verify
+        # wave almost always mixes sessions; a wave that mixes owners or
+        # exceeds the record geometry is split into one record per (owner
+        # session, chunk), each naming its group's contiguous rows inside the
+        # wave's shared source slot.
         chunked_req = getattr(batch, "chunked_req", None)
         candidates_base = (
             int(candidates_gpu.data_ptr()) if deferred else 0
         )
-        for index, req, _offset, round_id, attempt, _handle in staged_meta:
+        groups: dict[str, list] = {}
+        group_order: list[str] = []
+        publishers = {}
+        for position, (index, req, _offset, round_id, attempt, _handle) in enumerate(
+            staged_meta
+        ):
             binding = self._draft_binding.get(req.rid)
             if binding is None:
                 # Round-0/bootstrap rounds have no owner lease yet; Python path.
-                return None
-            if session_id is None:
-                session_id = binding[1]
-                publisher = self._ring_publish_publisher(session_id)
-                if publisher is None:
-                    return None
-            elif binding[1] != session_id:
-                # One ring record describes one wave to one owner Draft session.
-                return None
+                return _skip("no_binding")
             if (
                 req is chunked_req
                 or getattr(req, "inflight_middle_chunks", 0) > 0
@@ -7089,65 +7123,221 @@ class DTTargetController:
             ):
                 # Only proposal-boundary waves are reconstructible Draft-side:
                 # the record carries no requires_proposal bit.
-                return None
+                return _skip("inflight")
             if not deferred and (
                 int(token_chunks[index].numel()) != counts[index]
                 or int(feature_chunks[index].shape[0]) != counts[index]
             ):
                 raise RuntimeError("DFLASH Target feature/token chunk shape mismatch")
+            session_id = binding[1]
+            publisher = publishers.get(session_id)
+            if publisher is None:
+                publisher = self._ring_publish_publisher(session_id)
+                if publisher is None:
+                    return _skip("no_publisher")
+                publishers[session_id] = publisher
             if deferred:
                 token_src = candidates_base + (
                     index * self.block_size * candidates_gpu.element_size()
                 )
             else:
                 token_src = int(token_chunks[index].data_ptr())
-            entries.append(
-                (
-                    publisher.rid_hash_for(req.rid),
-                    round_id,
-                    attempt,
-                    binding[2],
-                    token_src,
-                )
+            entry = (
+                publisher.rid_hash_for(req.rid),
+                round_id,
+                attempt,
+                binding[2],
+                token_src,
             )
+            if session_id not in groups:
+                groups[session_id] = []
+                group_order.append(session_id)
+            groups[session_id].append((position, index, entry))
 
-        if session_id in getattr(self, "_ring_publish_backpressure", ()):
-            # An earlier wave of this Draft session is arena-retained; its
-            # ring slots must not be reused until its cleanup lands.  Fall
-            # back to the Python publication path for this wave.
-            return None
+        # Split each owner group into record-sized chunks.
+        chunks = []
+        for session_id in group_order:
+            publisher = publishers[session_id]
+            rows = groups[session_id]
+            start = 0
+            while start < len(rows):
+                token_total = 0
+                end = start
+                while (
+                    end < len(rows)
+                    and end - start < V2_MAX_REQ
+                    and token_total + int(counts[rows[end][1]]) <= V2_MAX_TOK
+                ):
+                    token_total += int(counts[rows[end][1]])
+                    end += 1
+                chunks.append((session_id, publisher, rows[start:end], token_total))
+                start = end
 
-        row_count = int(counts[active].sum())
-        token_total = row_count
-        if row_count > V2_MAX_TOK or publisher.free_entries() <= 0:
-            return None
-        if (
-            deferred
-            and packed.data_ptr() in self._inplace_hidden
-            and int(packed.shape[0]) * self.pivot_width * 2
-            > publisher.writer.max_entry_bytes
-        ):
-            # The whole packed wave exceeds the Draft landing buffer.
-            return None
-        # Resolve the slot layout and make the wave's rows visible: either an
-        # in-place reservation from the forward (rows already in the slot,
-        # block-strided feature offsets) or a fresh reserve plus one pack
-        # copy (compacted layout).
-        _mark("eligibility")
-        offset_stride = 0
-        ready_event = None
-        if deferred:
-            reservation = self._inplace_hidden.pop(packed.data_ptr(), None)
+        for session_id, publisher, rows, token_total in chunks:
+            if session_id in getattr(self, "_ring_publish_backpressure", ()):
+                # An earlier wave of this Draft session is arena-retained; its
+                # ring slots must not be reused until its cleanup lands.  Fall
+                # back to the Python publication path for this wave.
+                return _skip("backpressure")
+            if publisher.free_entries() <= 0:
+                return _skip("ring_full")
+            if token_total * self.pivot_width * 2 > publisher.writer.max_entry_bytes:
+                # This chunk exceeds the Draft landing buffer.
+                return _skip("landing")
+            if (
+                len(chunks) == 1
+                and deferred
+                and packed.data_ptr() in self._inplace_hidden
+                and int(packed.shape[0]) * self.pivot_width * 2
+                > publisher.writer.max_entry_bytes
+            ):
+                # The whole strided in-place wave exceeds the Draft landing
+                # buffer (its record names the full block-strided range).
+                return _skip("landing")
+
+        if len(chunks) == 1:
+            session_id, publisher, group_rows, token_total = chunks[0]
+            entries = [entry for _p, _i, entry in group_rows]
+            row_count = token_total
+            # Resolve the slot layout and make the wave's rows visible: either
+            # an in-place reservation from the forward (rows already in the
+            # slot, block-strided feature offsets) or a fresh reserve plus one
+            # pack copy (compacted layout).
+            _mark("eligibility")
+            offset_stride = 0
+            ready_event = None
+            if deferred:
+                reservation = self._inplace_hidden.pop(packed.data_ptr(), None)
+            else:
+                reservation = None
+            if reservation is not None:
+                slot_id, generation, ready_event = reservation
+                offset_stride = self.block_size
+                row_count = int(packed.shape[0])
+            else:
+                fresh = pool.reserve(row_count)
+                if fresh is None:
+                    return _skip("pool_full")
+                slot_id, generation, rows = fresh
+                try:
+                    if deferred:
+                        block = self.block_size
+                        torch.cat(
+                            [
+                                packed[index * block : index * block + counts[index]]
+                                for _p, index, _e in group_rows
+                            ],
+                            dim=0,
+                            out=rows,
+                        )
+                    else:
+                        torch.cat(
+                            [feature_chunks[index] for _p, index, _e in group_rows],
+                            dim=0,
+                            out=rows,
+                        )
+                    events = getattr(self, "_slot_ready_events", None)
+                    if events is None:
+                        events = self._slot_ready_events = {}
+                    ready_event = events.get(slot_id)
+                    if ready_event is None:
+                        ready_event = events[slot_id] = torch.cuda.Event(interprocess=True)
+                    ready_event.record()
+                except Exception:
+                    pool.release_reserved(slot_id, generation)
+                    raise
+            _mark("reserve_pack")
+            published_wave = False
+            try:
+                event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
+                if event_handle is None:
+                    event_handle = ready_event.ipc_handle()
+                    self._slot_event_handles[slot_id] = event_handle
+                # Same WAR edge as the Python publication: a later graph replay on
+                # the forward stream may not overwrite the rows before the pull.
+                self.scheduler.forward_stream.wait_event(ready_event)
+                _mark("handle_war")
+                publisher.stage_requests(entries)
+                _mark("entries")
+                source_byte_offset = (
+                    pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
+                )
+                # The kernel reads the per-slot accept counts straight from the
+                # verify's GPU tensor (same int32 layout as the staged copy); the
+                # CPU-staged counts buffer is only a fallback for CPU-side
+                # accept_lens, and the kernel_done edge below covers the read.
+                accept_lens_gpu = getattr(batch_result, "accept_lens", None)
+                if accept_lens_gpu is not None and accept_lens_gpu.is_cuda:
+                    accept_dev = int(accept_lens_gpu.data_ptr())
+                else:
+                    publisher.stage_counts(counts)
+                    accept_dev = publisher.counts_dev
+                stream_ptr = getattr(self, "_ring_publish_stream_ptr", None)
+                if stream_ptr is None:
+                    stream_ptr = self._ring_publish_stream_ptr = (
+                        torch.cuda.current_stream().cuda_stream
+                    )
+                wave_seq = publisher.publish(
+                    stream=stream_ptr,
+                    active_slots=[index for _p, index, _e in group_rows],
+                    slot_id=slot_id,
+                    generation=generation,
+                    source_byte_offset=source_byte_offset,
+                    nbytes=row_count * self.pivot_width * 2,
+                    row_count=row_count,
+                    event_handle=event_handle,
+                    accept_dev=accept_dev,
+                    bonus_dev=int(draft_input.bonus_tokens.data_ptr()),
+                    seq_lens_dev=int(draft_input.new_seq_lens.data_ptr()),
+                    offset_stride=offset_stride,
+                    token_total=token_total,
+                )
+                published_wave = True
+                # The kernel also reads the verify's GPU scalars and candidate
+                # tokens; hold the next graph replay off those buffers until it
+                # has run (the ready_event edge above only covers the pack).  One
+                # event per controller: each park's record tightens the edge the
+                # next replay waits on, so reuse cannot weaken the ordering.
+                kernel_done = getattr(self, "_ring_publish_done_event", None)
+                if kernel_done is None:
+                    kernel_done = self._ring_publish_done_event = torch.cuda.Event()
+                kernel_done.record()
+                self.scheduler.forward_stream.wait_event(kernel_done)
+                _mark("stage_launch")
+            except Exception as exc:
+                if published_wave:
+                    # The record may already be on the ring: the slot must never
+                    # recycle, the producer event must stay alive for the Draft's
+                    # wait, and the wave must fail closed rather than re-publish.
+                    pool.quarantine_reserved(slot_id, generation)
+                    orphaned = getattr(self, "_ring_publish_orphaned_events", None)
+                    if orphaned is None:
+                        orphaned = self._ring_publish_orphaned_events = deque(maxlen=1024)
+                    orphaned.append(ready_event)
+                    raise RingPublishCommittedError(str(exc)) from exc
+                pool.release_reserved(slot_id, generation)
+                raise
+
+            records = (
+                RingPublishRecord(
+                    session_id=session_id,
+                    wave_seq=wave_seq,
+                    specs=tuple(commit_specs),
+                    row_start=0,
+                ),
+            )
         else:
-            reservation = None
-        if reservation is not None:
-            slot_id, generation, ready_event = reservation
-            offset_stride = self.block_size
-            row_count = int(packed.shape[0])
-        else:
+            # Multi-record path: pack every owner group contiguously (group
+            # order, staged order within a group) into one fresh slot, then
+            # publish one record per chunk naming its group's subrange.  An
+            # in-place reservation from the forward is not consumed here: the
+            # strided layout cannot name per-group ranges, and the deferred
+            # stage's cleanup releases the reservation either way.
+            ordered = [row for _s, _p, rows, _t in chunks for row in rows]
+            row_count = sum(token_total for _s, _p, _r, token_total in chunks)
             fresh = pool.reserve(row_count)
             if fresh is None:
-                return None
+                return _skip("pool_full")
             slot_id, generation, rows = fresh
             try:
                 if deferred:
@@ -7155,14 +7345,16 @@ class DTTargetController:
                     torch.cat(
                         [
                             packed[index * block : index * block + counts[index]]
-                            for index in active
+                            for _p, index, _e in ordered
                         ],
                         dim=0,
                         out=rows,
                     )
                 else:
                     torch.cat(
-                        [feature_chunks[index] for index in active], dim=0, out=rows
+                        [feature_chunks[index] for _p, index, _e in ordered],
+                        dim=0,
+                        out=rows,
                     )
                 events = getattr(self, "_slot_ready_events", None)
                 if events is None:
@@ -7174,90 +7366,117 @@ class DTTargetController:
             except Exception:
                 pool.release_reserved(slot_id, generation)
                 raise
-        _mark("reserve_pack")
-        published_wave = False
-        try:
-            event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
-            if event_handle is None:
-                event_handle = ready_event.ipc_handle()
-                self._slot_event_handles[slot_id] = event_handle
-            # Same WAR edge as the Python publication: a later graph replay on
-            # the forward stream may not overwrite the rows before the pull.
-            self.scheduler.forward_stream.wait_event(ready_event)
-            _mark("handle_war")
-            publisher.stage_requests(entries)
-            _mark("entries")
-            source_byte_offset = (
-                pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
-            )
-            # The kernel reads the per-slot accept counts straight from the
-            # verify's GPU tensor (same int32 layout as the staged copy); the
-            # CPU-staged counts buffer is only a fallback for CPU-side
-            # accept_lens, and the kernel_done edge below covers the read.
-            accept_lens_gpu = getattr(batch_result, "accept_lens", None)
-            if accept_lens_gpu is not None and accept_lens_gpu.is_cuda:
-                accept_dev = int(accept_lens_gpu.data_ptr())
-            else:
-                publisher.stage_counts(counts)
-                accept_dev = publisher.counts_dev
-            stream_ptr = getattr(self, "_ring_publish_stream_ptr", None)
-            if stream_ptr is None:
-                stream_ptr = self._ring_publish_stream_ptr = (
-                    torch.cuda.current_stream().cuda_stream
+            _mark("reserve_pack")
+            published_wave = False
+            try:
+                event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
+                if event_handle is None:
+                    event_handle = ready_event.ipc_handle()
+                    self._slot_event_handles[slot_id] = event_handle
+                self.scheduler.forward_stream.wait_event(ready_event)
+                _mark("handle_war")
+                # The kernels read the per-slot accept counts straight from the
+                # verify's GPU tensor (same int32 layout as the staged copy);
+                # the CPU-staged counts buffer is only a fallback for CPU-side
+                # accept_lens, and the kernel_done edge below covers the read.
+                # Each publisher reads its own staging buffer, so the fallback
+                # counts are staged per publisher.
+                accept_lens_gpu = getattr(batch_result, "accept_lens", None)
+                accept_dev_gpu = (
+                    int(accept_lens_gpu.data_ptr())
+                    if accept_lens_gpu is not None and accept_lens_gpu.is_cuda
+                    else None
                 )
-            wave_seq = publisher.publish(
-                stream=stream_ptr,
-                active_slots=[index for index, *_ in staged_meta],
-                slot_id=slot_id,
-                generation=generation,
-                source_byte_offset=source_byte_offset,
-                nbytes=row_count * self.pivot_width * 2,
-                row_count=row_count,
-                event_handle=event_handle,
-                accept_dev=accept_dev,
-                bonus_dev=int(draft_input.bonus_tokens.data_ptr()),
-                seq_lens_dev=int(draft_input.new_seq_lens.data_ptr()),
-                offset_stride=offset_stride,
-                token_total=token_total,
-            )
-            published_wave = True
-            # The kernel also reads the verify's GPU scalars and candidate
-            # tokens; hold the next graph replay off those buffers until it
-            # has run (the ready_event edge above only covers the pack).  One
-            # event per controller: each park's record tightens the edge the
-            # next replay waits on, so reuse cannot weaken the ordering.
-            kernel_done = getattr(self, "_ring_publish_done_event", None)
-            if kernel_done is None:
-                kernel_done = self._ring_publish_done_event = torch.cuda.Event()
-            kernel_done.record()
-            self.scheduler.forward_stream.wait_event(kernel_done)
-            _mark("stage_launch")
-        except Exception as exc:
-            if published_wave:
-                # The record may already be on the ring: the slot must never
-                # recycle, the producer event must stay alive for the Draft's
-                # wait, and the wave must fail closed rather than re-publish.
-                pool.quarantine_reserved(slot_id, generation)
-                orphaned = getattr(self, "_ring_publish_orphaned_events", None)
-                if orphaned is None:
-                    orphaned = self._ring_publish_orphaned_events = deque(maxlen=1024)
-                orphaned.append(ready_event)
-                raise RingPublishCommittedError(str(exc)) from exc
-            pool.release_reserved(slot_id, generation)
-            raise
+                stream_ptr = getattr(self, "_ring_publish_stream_ptr", None)
+                if stream_ptr is None:
+                    stream_ptr = self._ring_publish_stream_ptr = (
+                        torch.cuda.current_stream().cuda_stream
+                    )
+                row_cursor = 0
+                records = []
+                for session_id, publisher, group_rows, token_total in chunks:
+                    if accept_dev_gpu is not None:
+                        accept_dev = accept_dev_gpu
+                    else:
+                        publisher.stage_counts(counts)
+                        accept_dev = publisher.counts_dev
+                    # Each record stages into its own rotating slot: a later
+                    # chunk's host staging must not overwrite an earlier
+                    # chunk's entries before that kernel has read them.
+                    staging_slot = publisher.next_launch_slot()
+                    publisher.stage_requests(
+                        [entry for _p, _i, entry in group_rows],
+                        staging_slot=staging_slot,
+                    )
+                    source_byte_offset = (
+                        pool._buffer.allocation_offset
+                        + slot_id * pool._slot_nbytes
+                        + row_cursor * self.pivot_width * 2
+                    )
+                    wave_seq = publisher.publish(
+                        stream=stream_ptr,
+                        active_slots=[index for _p, index, _e in group_rows],
+                        slot_id=slot_id,
+                        generation=generation,
+                        source_byte_offset=source_byte_offset,
+                        nbytes=token_total * self.pivot_width * 2,
+                        row_count=token_total,
+                        event_handle=event_handle,
+                        accept_dev=accept_dev,
+                        bonus_dev=int(draft_input.bonus_tokens.data_ptr()),
+                        seq_lens_dev=int(draft_input.new_seq_lens.data_ptr()),
+                        offset_stride=0,
+                        token_total=token_total,
+                        staging_slot=staging_slot,
+                    )
+                    published_wave = True
+                    records.append(
+                        RingPublishRecord(
+                            session_id=session_id,
+                            wave_seq=wave_seq,
+                            specs=tuple(
+                                commit_specs[p] for p, _i, _e in group_rows
+                            ),
+                            row_start=row_cursor,
+                        )
+                    )
+                    row_cursor += token_total
+                # The kernels also read the verify's GPU scalars and candidate
+                # tokens; hold the next graph replay off those buffers until
+                # they have run (the ready_event edge above only covers the
+                # pack).  One event per controller: each park's record tightens
+                # the edge the next replay waits on, so reuse cannot weaken
+                # the ordering.
+                kernel_done = getattr(self, "_ring_publish_done_event", None)
+                if kernel_done is None:
+                    kernel_done = self._ring_publish_done_event = torch.cuda.Event()
+                kernel_done.record()
+                self.scheduler.forward_stream.wait_event(kernel_done)
+                _mark("stage_launch")
+            except Exception as exc:
+                if published_wave:
+                    # A record may already be on a ring: the slot must never
+                    # recycle, the producer event must stay alive for the
+                    # Drafts' wait, and the wave must fail closed rather than
+                    # re-publish.
+                    pool.quarantine_reserved(slot_id, generation)
+                    orphaned = getattr(self, "_ring_publish_orphaned_events", None)
+                    if orphaned is None:
+                        orphaned = self._ring_publish_orphaned_events = deque(maxlen=1024)
+                    orphaned.append(ready_event)
+                    raise RingPublishCommittedError(str(exc)) from exc
+                pool.release_reserved(slot_id, generation)
+                raise
+            records = tuple(records)
 
-        specs = tuple(commit_specs)
         wave = RingPublishWave(
-            session_id=session_id,
-            wave_seq=wave_seq,
             slot_id=slot_id,
             generation=generation,
             row_count=row_count,
             ready_event=ready_event,
-            specs=specs,
             reqs={req.rid: req for req in batch.reqs},
-            active_slots=tuple(index for index, *_ in staged_meta),
             proposals={},
+            records=records,
         )
         self._ring_publish_pending.append(wave)
         _mark("wave_build")
@@ -7268,7 +7487,9 @@ class DTTargetController:
         )
         batch_result.dt_dflash_feature_publish_strategy = "ring-publish"
         batch_result.dt_dflash_feature_publish_chunks = 0
-        batch_result.dt_dflash_published_descriptor_count = len(specs)
+        batch_result.dt_dflash_published_descriptor_count = sum(
+            len(record.specs) for record in records
+        )
         batch_result.dt_dflash_published_feature_rows = row_count
         batch_result.dt_dflash_published_feature_bytes = (
             row_count * self.pivot_width * 2
@@ -7301,112 +7522,149 @@ class DTTargetController:
         pool = self._feature_source_pool
         retained = deque()
         for wave in self._ring_publish_pending:
-            writer = self._ring_writers.get(wave.session_id)
-            if writer is None:
-                # The owner lease was revoked; the fence machinery retires the
-                # wave's rounds and the slot via the quarantine path.
-                self._feature_source_pool.quarantine_reserved(
-                    wave.slot_id, wave.generation
-                )
-                continue
-            record = wave.record
-            base = (
-                writer._ring.entries_offset
-                + (wave.wave_seq % writer.capacity) * ENTRY_BYTES
-            )
-            raw = writer._ring.raw
-            slot_seq = _struct.unpack_from("<Q", raw, base)[0]
-            if record is None:
-                if slot_seq < wave.wave_seq:
-                    # The kernel has not landed yet (the slot still shows the
-                    # previous lap); the next poll sees this wave again.
-                    retained.append(wave)
-                    continue
-                if slot_seq > wave.wave_seq:
-                    # The slot already holds a newer lap: the ring wrapped
-                    # before this wave's first cleanup sighting.  The record
-                    # is unrecoverable from the ring; retaining would poll a
-                    # seq word that can never reappear and strand the wave,
-                    # its source reservation and its parked requests forever.
-                    # Quarantine the slot (the record may still reference it)
-                    # and drop the wave; its parked rounds fail loudly at
-                    # their own deadlines.  With the publication backpressure
-                    # below, new records cannot publish while a wave is
-                    # retained, so this requires a full ring of cleanup lag.
-                    logger.critical(
-                        "DT ring publish wave %s lost to ring wrap before "
-                        "cleanup; quarantining slot %s",
-                        wave.wave_seq,
-                        wave.slot_id,
-                    )
+            # A revoked owner lease quarantines the whole wave: its records
+            # may already be consumable and the slot must never recycle.
+            writers = []
+            revoked = False
+            for record in wave.records:
+                writer = self._ring_writers.get(record.session_id)
+                if writer is None:
                     self._feature_source_pool.quarantine_reserved(
                         wave.slot_id, wave.generation
                     )
-                    continue
-                # Snapshot the record the first time its seq word is visible.
-                # The Draft consumes records independently and the producer
-                # wraps after `capacity` further publications, so a deferred
-                # wave (full arena below) can never rely on reading the ring
-                # again: its slot may already hold a newer sequence, and
-                # waiting for the old one would strand the wave, its source
-                # reservation and its parked requests forever.
-                row_count = _struct.unpack_from("<I", raw, base + 48)[0]
-                request_count = _struct.unpack_from("<I", raw, base + 56)[0]
-                record_reqs = [
-                    _struct.unpack_from(
-                        "<Q6I", raw, base + V2_HEADER_BYTES + i * V2_REQ_ENTRY_BYTES
+                    revoked = True
+                    break
+                writers.append(writer)
+            if revoked:
+                continue
+            # Snapshot every record the first time its seq word is visible.
+            # The Drafts consume records independently and the producers wrap
+            # after `capacity` further publications, so a deferred wave (full
+            # arena below) can never rely on reading a ring again: its slot
+            # may already hold a newer sequence, and waiting for the old one
+            # would strand the wave, its source reservation and its parked
+            # requests forever.  The wave is confirmed only once ALL its
+            # records are visible: the source slot is published once and
+            # every record must be a consistent view of it.
+            awaiting = False
+            lost = False
+            for record, writer in zip(wave.records, writers):
+                base = (
+                    writer._ring.entries_offset
+                    + (record.wave_seq % writer.capacity) * ENTRY_BYTES
+                )
+                raw = writer._ring.raw
+                slot_seq = _struct.unpack_from("<Q", raw, base)[0]
+                if record.record is None:
+                    if slot_seq < record.wave_seq:
+                        # The kernel has not landed yet (the slot still shows
+                        # the previous lap); the next poll sees this wave again.
+                        awaiting = True
+                        break
+                    if slot_seq > record.wave_seq:
+                        # The slot already holds a newer lap: the ring wrapped
+                        # before this wave's first cleanup sighting.  The
+                        # record is unrecoverable from the ring; retaining
+                        # would poll a seq word that can never reappear and
+                        # strand the wave, its source reservation and its
+                        # parked requests forever.  Quarantine the slot (a
+                        # record may still reference it) and drop the wave;
+                        # its parked rounds fail loudly at their own deadlines.
+                        # With the publication backpressure below, new records
+                        # cannot publish while a wave is retained, so this
+                        # requires a full ring of cleanup lag.
+                        logger.critical(
+                            "DT ring publish record %s lost to ring wrap before "
+                            "cleanup; quarantining slot %s",
+                            record.wave_seq,
+                            wave.slot_id,
+                        )
+                        self._feature_source_pool.quarantine_reserved(
+                            wave.slot_id, wave.generation
+                        )
+                        lost = True
+                        break
+                    # Snapshot the record the first time its seq word is
+                    # visible.
+                    row_count = _struct.unpack_from("<I", raw, base + 48)[0]
+                    request_count = _struct.unpack_from("<I", raw, base + 56)[0]
+                    record_reqs = [
+                        _struct.unpack_from(
+                            "<Q6I", raw, base + V2_HEADER_BYTES + i * V2_REQ_ENTRY_BYTES
+                        )
+                        for i in range(request_count)
+                    ]
+                    record_counts = [rec[4] for rec in record_reqs]
+                    token_total = sum(record_counts)
+                    # Feature row offsets are relative to this record's packed
+                    # range (block-strided for in-place single-record waves);
+                    # token ids sit at compacted prefix positions.
+                    row_offsets = [rec[3] for rec in record_reqs]
+                    tokens = _struct.unpack_from(
+                        f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
                     )
-                    for i in range(request_count)
-                ]
-                record_counts = [rec[4] for rec in record_reqs]
+                    hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+                    record.record = [
+                        row_count,
+                        request_count,
+                        record_counts,
+                        row_offsets,
+                        tokens,
+                        hidden_produced_ns,
+                        slot_seq,
+                    ]
+                else:
+                    # Snapshotted records proceed from the snapshot even if
+                    # the producer has wrapped (the Drafts consume records
+                    # independently); the fresh seq word only guards the
+                    # destination write below.
+                    record.record[6] = slot_seq
+            if lost:
+                continue
+            if awaiting:
+                retained.append(wave)
+                continue
+            # The record is authoritative for its requests: the request
+            # counts must match the commit specs exactly, and every request's
+            # rows must lie inside the record's pulled range.
+            for record in wave.records:
+                row_count, request_count, record_counts, row_offsets = (
+                    record.record[0],
+                    record.record[1],
+                    record.record[2],
+                    record.record[3],
+                )
                 token_total = sum(record_counts)
-                # Feature row offsets come from the record (block-strided for
-                # in-place waves); token ids sit at compacted prefix positions.
-                row_offsets = [rec[3] for rec in record_reqs]
-                tokens = _struct.unpack_from(
-                    f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
-                )
-                hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
-                record = wave.record = (
-                    row_count,
-                    request_count,
-                    record_counts,
-                    row_offsets,
-                    tokens,
-                    hidden_produced_ns,
-                )
-            row_count, request_count, record_counts, row_offsets, tokens, hidden_ns = (
-                record
-            )
-            token_total = sum(record_counts)
-            hidden_produced_ns = hidden_ns
-            specs = wave.specs
-            if (
-                request_count != len(specs)
-                or row_count != wave.row_count
-                or token_total > V2_MAX_TOK
-            ):
-                raise RuntimeError("ring publish record geometry diverged")
+                specs = record.specs
+                if (
+                    request_count != len(specs)
+                    or token_total > V2_MAX_TOK
+                    or any(
+                        offset + count > row_count
+                        for offset, count in zip(row_offsets, record_counts)
+                    )
+                ):
+                    raise RuntimeError("ring publish record geometry diverged")
             # Reserve each live request's arena destination now and publish
-            # it in the ring: the owning Draft's candidate push reads it from
-            # the destination region instead of waiting for this cleanup's
-            # Coordinator copy to arrive.  The cancel path below still
-            # retires rows that ended in the wave.
-            live_positions = [
-                position
-                for position, spec in enumerate(specs)
+            # it in the record's ring: the owning Draft's candidate push
+            # reads it from the destination region instead of waiting for
+            # this cleanup's Coordinator copy to arrive.  The cancel path
+            # below still retires rows that ended in the wave.
+            all_specs = [spec for record in wave.records for spec in record.specs]
+            live_transfer_ids = [
+                spec[1]
+                for spec in all_specs
                 if spec[1] not in self._cancelled_transfers
             ]
-            live_set = set(live_positions)
+            live_set = set(live_transfer_ids)
             destinations = {}
-            # The destination region is written for every wave — with zeros
-            # for cancelled rows — even when every row ended.  An all-cancelled
-            # wave otherwise leaves the region stale, and the Draft could not
-            # tell its held push that every row is retired.
+            # The destination region is written for every record — with
+            # zeros for cancelled rows — even when every row ended.  An
+            # all-cancelled record otherwise leaves the region stale, and the
+            # Draft could not tell its held push that every row is retired.
             if self._candidate_arena is not None:
                 try:
-                    for position in live_positions:
-                        transfer_id = specs[position][1]
+                    for transfer_id in live_transfer_ids:
                         destinations[transfer_id] = self._candidate_arena.reserve(
                             transfer_id
                         )
@@ -7417,28 +7675,40 @@ class DTTargetController:
                         )
                     if "slots are active" in str(exc):
                         # A full arena must apply backpressure, not kill the
-                        # scheduler: the record was snapshotted above, so the
-                        # reservation is retried from the snapshot at the next
-                        # poll no matter what happens to the ring slot (the
-                        # Draft consumes records and the producer wraps).  The
-                        # Draft falls back to the Coordinator copy meanwhile,
-                        # and the publication backpressure below stops new
-                        # records from reusing this wave's destination slot
-                        # while it is retained.
+                        # scheduler: the records were snapshotted above, so
+                        # the reservation is retried from the snapshots at
+                        # the next poll no matter what happens to the ring
+                        # slots (the Draft consumes records and the producers
+                        # wrap).  The Drafts fall back to the Coordinator copy
+                        # meanwhile, and the publication backpressure below
+                        # stops new records from reusing this wave's
+                        # destination slots while it is retained.
                         retained.append(wave)
                         continue
                     raise
-                # Generation ownership: the destination slot is modulo-reused
-                # after `capacity` further publications.  Publication is
-                # backpressured while this wave is retained, so the slot must
-                # still show this wave's seq; if it does not, writing the old
-                # seq would clobber a newer wave's destinations (its cancelled
-                # rows would lose their only terminal signal).  Skip the ring
-                # write: live rows still carry their destinations on the
-                # Coordinator copies built below.
-                if slot_seq == wave.wave_seq:
+                for record, writer in zip(wave.records, writers):
+                    slot_seq = record.record[6]
+                    specs = record.specs
+                    # Generation ownership: the destination slot is
+                    # modulo-reused after `capacity` further publications.
+                    # Publication is backpressured while this wave is
+                    # retained, so the slot must still show this record's seq;
+                    # if it does not, writing the old seq would clobber a
+                    # newer wave's destinations (its cancelled rows would lose
+                    # their only terminal signal).  Skip the ring write: live
+                    # rows still carry their destinations on the Coordinator
+                    # copies built below.
+                    if slot_seq != record.wave_seq:
+                        logger.critical(
+                            "DT ring publish record %s destination slot reused "
+                            "(seq %s); skipping ring write, Coordinator copies "
+                            "carry the destinations",
+                            record.wave_seq,
+                            slot_seq,
+                        )
+                        continue
                     writer.write_destinations(
-                        wave.wave_seq,
+                        record.wave_seq,
                         [
                             (
                                 (
@@ -7446,10 +7716,10 @@ class DTTargetController:
                                     destinations[spec[1]].generation,
                                     destinations[spec[1]].authorization_nonce,
                                 )
-                                if position in live_set
+                                if spec[1] in live_set
                                 else (0, 0, 0)
                             )
-                            for position, spec in enumerate(specs)
+                            for spec in specs
                         ],
                         data_buffer_offset=(
                             self._candidate_arena._data_buffer.allocation_offset
@@ -7458,14 +7728,9 @@ class DTTargetController:
                             self._candidate_arena._metadata_buffer.allocation_offset
                         ),
                     )
-                else:
-                    logger.critical(
-                        "DT ring publish wave %s destination slot reused "
-                        "(seq %s); skipping ring write, Coordinator copies "
-                        "carry the destinations",
-                        wave.wave_seq,
-                        slot_seq,
-                    )
+            # Publish the source slot exactly once, now that every record is
+            # visible: all records name disjoint ranges of its rows.
+            hidden_produced_ns = max(record.record[5] for record in wave.records)
             published = pool.publish_reserved(
                 slot_id=wave.slot_id,
                 generation=wave.generation,
@@ -7474,10 +7739,13 @@ class DTTargetController:
                 transfers=tuple(
                     FeatureTransferSlice(
                         transfer_id=spec[1],
-                        row_offset=row_offset,
+                        row_offset=record.row_start + row_offset,
                         row_count=spec[6],
                     )
-                    for spec, row_offset in zip(specs, row_offsets, strict=True)
+                    for record in wave.records
+                    for spec, row_offset in zip(
+                        record.specs, record.record[3], strict=True
+                    )
                 ),
                 producer_event=wave.ready_event,
                 hidden_produced_ns=hidden_produced_ns,
@@ -7486,94 +7754,103 @@ class DTTargetController:
                 descriptor.transfer_id: descriptor
                 for descriptor in published.descriptors
             }
-            for spec in specs:
+            for spec in all_specs:
                 self._source_slot_by_transfer[spec[1]] = (
                     wave.slot_id,
                     wave.generation,
                 )
             tasks = []
-            token_cursor = 0
-            for index, spec in enumerate(specs):
-                transfer_id = spec[1]
-                count = spec[6]
-                token_ids = tuple(tokens[token_cursor : token_cursor + count])
-                token_cursor += count
-                if int(record_counts[index]) != count:
-                    raise RuntimeError("ring publish record token counts diverged")
-                if transfer_id in self._cancelled_transfers:
-                    pool.cancel(
-                        transfer_id=transfer_id,
-                        source_slot_id=wave.slot_id,
-                        slot_generation=wave.generation,
-                        source_session_id=pool.source_session_id,
-                        pool_generation=pool.pool_generation,
-                    )
-                    self._source_slot_by_transfer.pop(transfer_id, None)
-                    destination = destinations.get(transfer_id)
-                    if destination is not None:
-                        self._candidate_arena.cancel(
-                            transfer_id, remote_quiescent=True
+            for record in wave.records:
+                specs = record.specs
+                record_counts = record.record[2]
+                tokens = record.record[4]
+                token_cursor = 0
+                for index, spec in enumerate(specs):
+                    transfer_id = spec[1]
+                    count = spec[6]
+                    token_ids = tuple(tokens[token_cursor : token_cursor + count])
+                    token_cursor += count
+                    if int(record_counts[index]) != count:
+                        raise RuntimeError(
+                            "ring publish record token counts diverged"
                         )
-                    # The cancellation is complete once its source share and
-                    # candidate destination are retired here; there is no
-                    # Coordinator task for this transfer, so nothing else
-                    # would ever remove the marker (quiescence leak).
-                    self._cancelled_transfers.discard(transfer_id)
-                    continue
-                requires_proposal, previous_transfer_id = wave.proposals.get(
-                    transfer_id, (True, spec[9])
-                )
-                task = self._make_task(
-                    transfer_id=transfer_id,
-                    req=wave.reqs[spec[0]],
-                    round_id=spec[2],
-                    attempt=spec[3],
-                    bonus_token=spec[10],
-                    previous_transfer_id=previous_transfer_id,
-                    feature_descriptor=descriptors_by_transfer[transfer_id],
-                    feature_token_ids=token_ids,
-                    committed_token_ids=token_ids,
-                    feature_token_offset=spec[5],
-                    requires_proposal=requires_proposal,
-                )
-                # Pre-stamped: the record is already on the ring, so the
-                # planner only authorizes the owner lease (no second write).
-                tasks.append(
-                    replace(
-                        task,
-                        direct_ring_seq=wave.wave_seq,
-                        candidate_destination=destinations.get(transfer_id),
+                    if transfer_id in self._cancelled_transfers:
+                        pool.cancel(
+                            transfer_id=transfer_id,
+                            source_slot_id=wave.slot_id,
+                            slot_generation=wave.generation,
+                            source_session_id=pool.source_session_id,
+                            pool_generation=pool.pool_generation,
+                        )
+                        self._source_slot_by_transfer.pop(transfer_id, None)
+                        destination = destinations.get(transfer_id)
+                        if destination is not None:
+                            self._candidate_arena.cancel(
+                                transfer_id, remote_quiescent=True
+                            )
+                        # The cancellation is complete once its source share
+                        # and candidate destination are retired here; there is
+                        # no Coordinator task for this transfer, so nothing
+                        # else would ever remove the marker (quiescence leak).
+                        self._cancelled_transfers.discard(transfer_id)
+                        continue
+                    requires_proposal, previous_transfer_id = wave.proposals.get(
+                        transfer_id, (True, spec[9])
                     )
-                )
-                self._ring_publish_transfers.add(transfer_id)
-                self._ring_unproven[transfer_id] = wave.session_id
-                binding = self._draft_binding.get(spec[0])
-                if binding is not None:
-                    self._lease_marks.append((transfer_id, binding[0]))
-                self._direct_sent.add(transfer_id)
-                self._ring_outstanding[wave.session_id].append(
-                    (wave.wave_seq, transfer_id, (wave.slot_id, wave.generation))
-                )
+                    task = self._make_task(
+                        transfer_id=transfer_id,
+                        req=wave.reqs[spec[0]],
+                        round_id=spec[2],
+                        attempt=spec[3],
+                        bonus_token=spec[10],
+                        previous_transfer_id=previous_transfer_id,
+                        feature_descriptor=descriptors_by_transfer[transfer_id],
+                        feature_token_ids=token_ids,
+                        committed_token_ids=token_ids,
+                        feature_token_offset=spec[5],
+                        requires_proposal=requires_proposal,
+                    )
+                    # Pre-stamped: the record is already on the ring, so the
+                    # planner only authorizes the owner lease (no second write).
+                    tasks.append(
+                        replace(
+                            task,
+                            direct_ring_seq=record.wave_seq,
+                            candidate_destination=destinations.get(transfer_id),
+                        )
+                    )
+                    self._ring_publish_transfers.add(transfer_id)
+                    self._ring_unproven[transfer_id] = record.session_id
+                    binding = self._draft_binding.get(spec[0])
+                    if binding is not None:
+                        self._lease_marks.append((transfer_id, binding[0]))
+                    self._direct_sent.add(transfer_id)
+                    self._ring_outstanding[record.session_id].append(
+                        (record.wave_seq, transfer_id, (wave.slot_id, wave.generation))
+                    )
             if tasks:
                 self._queue_task_batch(tuple(tasks))
                 self._flush_pending_send()
             if self._profile_active:
-                self._profile_emit(
-                    "target_ring_publish",
-                    ring_seq=wave.wave_seq,
-                    draft_session_id=wave.session_id,
-                    publication_strategy="ring-publish",
-                    publication_rows=wave.row_count,
-                    publication_requests=len(specs),
-                    publication_bytes=wave.row_count * self.pivot_width * 2,
-                )
+                for record in wave.records:
+                    self._profile_emit(
+                        "target_ring_publish",
+                        ring_seq=record.wave_seq,
+                        draft_session_id=record.session_id,
+                        publication_strategy="ring-publish",
+                        publication_rows=record.record[0],
+                        publication_requests=len(record.specs),
+                        publication_bytes=record.record[0] * self.pivot_width * 2,
+                    )
         self._ring_publish_pending = retained
         # Publication backpressure: while any wave is arena-retained its ring
         # slots (record and destination region) must not be reused, or the
         # retried cleanup would read/overwrite a newer lap.  Both publish
         # entry points (launch staging and park staging) fall back to their
         # non-ring paths for a backpressured session.
-        self._ring_publish_backpressure = {wave.session_id for wave in retained}
+        self._ring_publish_backpressure = {
+            record.session_id for wave in retained for record in wave.records
+        }
 
     def _direct_ring_writer(self, draft_session_id: str):
         """Return the serving ring to one owner Draft session, or None."""

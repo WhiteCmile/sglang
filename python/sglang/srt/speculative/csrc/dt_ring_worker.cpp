@@ -368,13 +368,15 @@ bool serve_entry_v2(Worker* w, Ring* r) {
     return false;
   }
   // Registered-source fences: the record must name the attached pool
-  // generation, the slot's current generation, and a slot-aligned range
-  // fully inside its registered slot.
+  // generation, the slot's current generation, and a row-aligned range fully
+  // inside its registered slot.  A wave split across several records (one per
+  // owner Draft group) names a subrange that starts past the slot base.
+  const uint64_t slot_base =
+      r->allocation_offset + (uint64_t)h.source_slot_id * r->slot_nbytes;
   bool geometry_ok =
       !r->slot_nbytes ||
-      (h.source_byte_offset >= r->allocation_offset &&
-       h.source_byte_offset - r->allocation_offset ==
-           (uint64_t)h.source_slot_id * r->slot_nbytes &&
+      (h.source_byte_offset >= slot_base &&
+       (h.source_byte_offset - slot_base) % h.row_bytes == 0 &&
        h.source_byte_offset + h.nbytes <=
            r->allocation_offset + (uint64_t)(h.source_slot_id + 1) * r->slot_nbytes);
   if (h.reserved[1] != r->pool_tag ||

@@ -3601,12 +3601,16 @@ class FlashMTPDraftEngine:
         source, other = direct.source, task.source
         if source is None or other is None:
             return source is None and other is None
+        # A wave split across several records names each request's rows
+        # relative to its record's subrange (allocation_offset at the subrange
+        # start), while the Coordinator descriptor is slot-absolute; the
+        # absolute source range is the identity.
         return (
             source.source_slot_id == other.source_slot_id
             and source.slot_generation == other.slot_generation
             and source.nbytes == other.nbytes
-            and source.byte_offset == other.byte_offset
-            and source.allocation_offset == other.allocation_offset
+            and source.byte_offset + source.allocation_offset
+            == other.byte_offset + other.allocation_offset
             and source.source_session_id == other.source_session_id
             and source.pool_generation == other.pool_generation
         )
