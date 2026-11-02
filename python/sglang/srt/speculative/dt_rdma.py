@@ -37,6 +37,7 @@ behalf.  Until that proof exists the affected slots stay quarantined.
 from __future__ import annotations
 
 import ctypes
+import itertools
 import logging
 import os
 import queue
@@ -49,6 +50,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS
 from sglang.srt.speculative.dt_direct_ring import (
     _build_native_library,
     pool_generation_tag,
@@ -71,11 +73,10 @@ READY_RECORD_BYTES = _READY_RECORD.size
 # Ready records a Draft can hold unconsumed; each is one posted receive, so
 # the Target's sends past this depth wait on RNR retry (backpressure).
 READY_RING_DEPTH = 1024
-# Candidate record header: transfer hash, producer tag, then the five int32
-# metadata words exactly as the arena stores them (generation, nonce low,
-# nonce high, valid length, root token).  The int32 row follows.
-_CANDIDATE_HEADER = struct.Struct("<QI5I")
-CANDIDATE_HEADER_BYTES = _CANDIDATE_HEADER.size
+# Candidate record header: transfer hash, producer tag, then the int32
+# metadata words exactly as the arena stores them.  The int32 row follows.
+_CANDIDATE_PREFIX = struct.Struct("<QI")
+CANDIDATE_HEADER_BYTES = _CANDIDATE_PREFIX.size + METADATA_WORDS * 4
 # Inline-data cap requested for every send queue; records must fit inline so
 # their send buffers need no registration and are reusable at post time.
 MAX_INLINE_BYTES = 256
@@ -147,10 +148,9 @@ def decode_ready_record(
 def encode_candidate_record(
     *, transfer_hash: int, producer_tag: int, metadata: bytes, row: bytes
 ) -> bytes:
-    return (
-        _CANDIDATE_HEADER.pack(transfer_hash, producer_tag, *struct.unpack("<5I", metadata))
-        + row
-    )
+    if len(metadata) != METADATA_WORDS * 4:
+        raise RdmaTransportError("candidate metadata has an invalid length")
+    return _CANDIDATE_PREFIX.pack(transfer_hash, producer_tag) + metadata + row
 
 
 def decode_candidate_record(
@@ -158,8 +158,8 @@ def decode_candidate_record(
 ) -> tuple[int, int, bytes, bytes]:
     """Return ``(transfer_hash, producer_tag, metadata_bytes, row_bytes)``."""
 
-    transfer_hash, tag = struct.unpack_from("<QI", record, 0)
-    metadata = record[12:CANDIDATE_HEADER_BYTES]
+    transfer_hash, tag = _CANDIDATE_PREFIX.unpack_from(record, 0)
+    metadata = record[_CANDIDATE_PREFIX.size : CANDIDATE_HEADER_BYTES]
     row = record[CANDIDATE_HEADER_BYTES : CANDIDATE_HEADER_BYTES + row_width * 4]
     return transfer_hash, tag, metadata, row
 
@@ -196,7 +196,6 @@ def _verbs_library() -> ctypes.CDLL:
         "dt_rdma_destroy_cq": ([vp], i32),
         "dt_rdma_create_qp": ([vp, vp, vp, i32, i32, i32, pu32, pu32], vp),
         "dt_rdma_connect_qp": ([vp, i32, u32, u32, u32, u32], i32),
-        "dt_rdma_qp_error": ([vp], i32),
         "dt_rdma_destroy_qp": ([vp], i32),
         "dt_rdma_post_recv": ([vp, u64, i32], i32),
         "dt_rdma_post_write_imm_inline": ([vp, u64, ctypes.c_char_p, u32, u64, u32, u32], i32),
@@ -348,7 +347,8 @@ class CompletionQueue:
         self._qpn = u32_array()
 
     def poll(self, timeout_ns: int = 0) -> list[tuple[int, int, int, int, int]]:
-        """Completions as ``(wr_id, status, opcode, imm, qp_num)``.
+        """Completions as ``(wr_id, status, opcode, imm, qp_num)``; ``wr_id``
+        is the posting queue pair's :attr:`QueuePair.tag`.
 
         Not thread-safe: each CQ has exactly one polling thread."""
 
@@ -367,6 +367,12 @@ class CompletionQueue:
         if self.handle:
             self._lib.dt_rdma_destroy_cq(self.handle)
             self.handle = None
+
+
+# Work-request ids: every queue pair gets a process-unique tag and posts all
+# its work requests with it, so a completion names its queue pair even after
+# that QP was destroyed and the provider reused its QP number.
+_QP_TAGS = itertools.count(1)
 
 
 class QueuePair:
@@ -391,6 +397,7 @@ class QueuePair:
         if not self.handle:
             raise RdmaTransportError("ibv_create_qp failed")
         self.qpn = qpn.value
+        self.tag = next(_QP_TAGS)
         self.max_inline = max_inline.value
         self.psn = secrets.randbits(24)
 
@@ -411,26 +418,23 @@ class QueuePair:
         return self.handle
 
     def post_recv(self, count: int = 1) -> None:
-        if self._lib.dt_rdma_post_recv(self._live(), 0, count) != 0:
+        if self._lib.dt_rdma_post_recv(self._live(), self.tag, count) != 0:
             raise RdmaTransportError("ibv_post_recv failed")
 
-    def post_write_imm(
-        self, wr_id: int, data: bytes, remote_addr: int, rkey: int, imm: int
-    ) -> None:
+    def post_write_imm(self, data: bytes, remote_addr: int, rkey: int, imm: int) -> None:
         if len(data) > self.max_inline:
             raise RdmaTransportError("record exceeds the queue pair's inline capacity")
         rc = self._lib.dt_rdma_post_write_imm_inline(
-            self._live(), wr_id, data, len(data), remote_addr, rkey, imm
+            self._live(), self.tag, data, len(data), remote_addr, rkey, imm
         )
         if rc != 0:
             raise RdmaTransportError(f"WRITE_WITH_IMM post failed ({rc})")
 
     def post_read(
-        self, wr_id: int, local: MemoryRegion, local_addr: int, nbytes: int,
-        remote_addr: int, rkey: int,
+        self, local: MemoryRegion, local_addr: int, nbytes: int, remote_addr: int, rkey: int
     ) -> None:
         rc = self._lib.dt_rdma_post_read(
-            self._live(), wr_id, local_addr, nbytes, local.lkey, remote_addr, rkey
+            self._live(), self.tag, local_addr, nbytes, local.lkey, remote_addr, rkey
         )
         if rc != 0:
             raise RdmaTransportError(f"RDMA READ post failed ({rc})")
@@ -470,6 +474,9 @@ class _TargetSession:
         self.ready_rkey = 0
         self.ready_seq = 0
         self.active = False
+        # Set once fence() destroyed the session's queue pairs; the session
+        # id can never connect again (a new Draft incarnation has a new one).
+        self.fenced = False
 
     def queue_pairs(self) -> tuple[QueuePair, ...]:
         return tuple(qp for qp in (self.pull_qp, self.push_qp) if qp is not None)
@@ -488,15 +495,15 @@ class TargetRdmaEndpoint:
         self.device = RdmaDevice(closest_ib_device(device_index))
         self._lock = threading.Lock()
         self._sessions: dict[tuple[str, str], _TargetSession] = {}
-        self._by_pull_qpn: dict[int, _TargetSession] = {}
-        self._by_push_qpn: dict[int, _TargetSession] = {}
+        # Live queue pairs by QueuePair.tag (= every completion's wr_id).
+        self._by_tag: dict[int, _TargetSession] = {}
         self._closed = False
         self._pool_mr: MemoryRegion | None = None
         self._ready_cq: CompletionQueue | None = None
         self._ready_generation: np.ndarray | None = None
         self._publications: queue.Queue = queue.Queue()
-        # Signaled ready-record sends not yet reaped, per pull QP number; a
-        # fenced QP's entry goes with it (a destroyed QP completes nothing).
+        # Signaled ready-record sends not yet reaped, per pull QP tag; a fenced
+        # QP's entry goes with it, so its late completions count for nothing.
         self._outstanding: dict[int, int] = {}
         self._staging: torch.Tensor | None = None
         self._staging_mr: MemoryRegion | None = None
@@ -561,6 +568,9 @@ class TargetRdmaEndpoint:
                 qp.close()
                 raise RdmaTransportError("RDMA endpoint is closed")
             session = self._sessions.setdefault(key, _TargetSession(*key))
+            if session.fenced:
+                qp.close()
+                raise RdmaTransportError("draft session was fenced")
             previous = session.pull_qp if leg == LEG_PULL else session.push_qp
             if previous is not None:
                 qp.close()
@@ -569,10 +579,9 @@ class TargetRdmaEndpoint:
                 session.pull_qp = qp
                 session.ready_addr = int(header["ready_addr"])
                 session.ready_rkey = int(header["ready_rkey"])
-                self._by_pull_qpn[qp.qpn] = session
             else:
                 session.push_qp = qp
-                self._by_push_qpn[qp.qpn] = session
+            self._by_tag[qp.tag] = session
         response = qp.endpoint(self.device.lid)
         if leg == LEG_PULL:
             pool = self._pool
@@ -646,15 +655,15 @@ class TargetRdmaEndpoint:
                 index = session.ready_seq % READY_RING_DEPTH
                 try:
                     session.pull_qp.post_write_imm(
-                        session.ready_seq, record,
+                        record,
                         session.ready_addr + index * READY_RECORD_BYTES,
                         session.ready_rkey, index,
                     )
                 except RdmaTransportError:
                     broken.append(session)
                 else:
-                    qpn = session.pull_qp.qpn
-                    self._outstanding[qpn] = self._outstanding.get(qpn, 0) + 1
+                    tag = session.pull_qp.tag
+                    self._outstanding[tag] = self._outstanding.get(tag, 0) + 1
         for session in broken:
             logger.error(
                 "ready record post failed for draft session %s; fencing it",
@@ -665,11 +674,11 @@ class TargetRdmaEndpoint:
     def _reap_ready_sends(self) -> None:
         if not any(self._outstanding.values()):
             return
-        for _wr_id, status, _opcode, _imm, qpn in self._ready_cq.poll(0):
+        for tag, status, _opcode, _imm, _qpn in self._ready_cq.poll(0):
             with self._lock:
-                if qpn in self._outstanding:
-                    self._outstanding[qpn] -= 1
-                session = self._by_pull_qpn.get(qpn)
+                if tag in self._outstanding:
+                    self._outstanding[tag] -= 1
+                session = self._by_tag.get(tag)
             if status == _IBV_WC_SUCCESS:
                 continue
             if session is not None:
@@ -688,10 +697,10 @@ class TargetRdmaEndpoint:
             # The poll returns at the first completion; its timeout only bounds
             # how often an idle thread takes the GIL (or retries a deferred push).
             timeout_ns = 1_000_000 if pending else int(_IDLE_WAIT_S * 1e9)
-            for _wr_id, status, _opcode, slot_id, qpn in self._push_cq.poll(timeout_ns):
+            for tag, status, _opcode, slot_id, _qpn in self._push_cq.poll(timeout_ns):
                 with self._lock:
                     # Under the lock: fence() may destroy the QP concurrently.
-                    session = self._by_push_qpn.get(qpn)
+                    session = self._by_tag.get(tag)
                     if session is not None and status == _IBV_WC_SUCCESS:
                         session.push_qp.post_recv()
                 if session is None:
@@ -732,40 +741,36 @@ class TargetRdmaEndpoint:
 
     # -- failure handling ---------------------------------------------------
 
-    def fence(self, draft_instance_id: str, draft_session_id: str = "") -> bool:
+    def fence(self, draft_instance_id: str, draft_session_id: str = "") -> dict[str, bool]:
         """Destroy the queue pairs of a lost Draft session (all sessions of
-        the instance when ``draft_session_id`` is empty).  Returns whether
-        quiescence is proven: no queue pair of those sessions remains."""
+        the instance when ``draft_session_id`` is empty).  Returns, per fenced
+        session id (including ones fenced earlier), whether quiescence is
+        proven: none of that session's queue pairs remains."""
 
+        fenced: dict[str, bool] = {}
         with self._lock:
-            sessions = [
-                session
-                for key, session in self._sessions.items()
-                if key[0] == draft_instance_id
-                and (not draft_session_id or key[1] == draft_session_id)
-            ]
-            proven = True
-            for session in sessions:
+            for key, session in self._sessions.items():
+                if key[0] != draft_instance_id or (
+                    draft_session_id and key[1] != draft_session_id
+                ):
+                    continue
                 session.active = False
+                session.fenced = True
                 for qp in session.queue_pairs():
+                    tag = qp.tag
                     try:
                         qp.close()
                     except RdmaTransportError:
-                        proven = False
                         continue
-                    self._by_pull_qpn.pop(qp.qpn, None)
-                    self._by_push_qpn.pop(qp.qpn, None)
-                    self._outstanding.pop(qp.qpn, None)
-                if all(qp.handle is None for qp in session.queue_pairs()):
-                    self._sessions.pop(
-                        (session.draft_instance_id, session.draft_session_id), None
-                    )
-        if sessions:
+                    self._by_tag.pop(tag, None)
+                    self._outstanding.pop(tag, None)
+                fenced[key[1]] = all(qp.handle is None for qp in session.queue_pairs())
+        if fenced:
             logger.warning(
-                "fenced RDMA queue pairs of draft %s session %s (proven=%s)",
-                draft_instance_id, draft_session_id or "<all>", proven,
+                "fenced RDMA queue pairs of draft %s sessions %s",
+                draft_instance_id, fenced,
             )
-        return proven
+        return fenced
 
     def close(self) -> None:
         with self._lock:
@@ -924,7 +929,7 @@ class DraftRdmaPuller:
         ready_ns = time.monotonic_ns()
         remote = self._pool_addr + slot_id * self._slot_nbytes + source.byte_offset
         self._conn.qp.post_read(
-            generation, self._landing_mr, self._landing_mr.address, source.nbytes,
+            self._landing_mr, self._landing_mr.address, source.nbytes,
             remote, self._pool_rkey,
         )
         posted_ns = time.monotonic_ns()
@@ -981,7 +986,7 @@ class DraftRdmaPusher:
         if slot_id >= self._slot_count or len(record) > self._stride:
             raise RdmaTransportError("candidate record does not fit the staging slot")
         self._conn.qp.post_write_imm(
-            slot_id, record, self._staging_addr + slot_id * self._stride,
+            record, self._staging_addr + slot_id * self._stride,
             self._staging_rkey, slot_id,
         )
         _wait_one(

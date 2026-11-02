@@ -200,15 +200,6 @@ int dt_rdma_connect_qp(void* qp_handle, int port, uint32_t remote_qpn,
   return 0;
 }
 
-// Moves the QP to ERR: the HCA stops executing requests for it and flushes
-// every outstanding work request with an error completion.
-int dt_rdma_qp_error(void* qp_handle) {
-  ibv_qp_attr attr;
-  memset(&attr, 0, sizeof(attr));
-  attr.qp_state = IBV_QPS_ERR;
-  return ibv_modify_qp((ibv_qp*)qp_handle, &attr, IBV_QP_STATE);
-}
-
 int dt_rdma_destroy_qp(void* qp_handle) {
   return ibv_destroy_qp((ibv_qp*)qp_handle);
 }

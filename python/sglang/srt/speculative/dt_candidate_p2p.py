@@ -1053,10 +1053,10 @@ class TargetCandidateArena:
             raise CandidateTransportError(
                 "candidate push metadata has an invalid length"
             )
-        generation, nonce_low, nonce_high, _valid, root_token = struct.unpack(
-            "<5I", metadata_bytes
-        )
-        nonce = nonce_low | (nonce_high << 32)
+        words = struct.unpack(f"<{METADATA_WORDS}I", metadata_bytes)
+        generation = words[GENERATION_WORD]
+        nonce = words[NONCE_LOW_WORD] | (words[NONCE_HIGH_WORD] << 32)
+        root_token = words[ROOT_TOKEN_WORD]
         expected_seq = getattr(self, "_record_seq_expected", None)
         if expected_seq is None:
             raise CandidateTransportError(

@@ -6272,9 +6272,17 @@ class DTTargetController:
         if rdma is not None and any(
             entry.error_code in RING_OWNER_LOSS_CODES for entry in batch.entries
         ):
-            rdma_unproven = not rdma.fence(
+            fenced = rdma.fence(
                 batch.draft_instance_id, getattr(batch, "draft_session_id", "")
             )
+            rdma_unproven = not all(fenced.values())
+            if self._candidate_arena is not None:
+                # As for a revoked ring owner: a destroyed push QP proves the
+                # session can no longer write its candidate destinations.
+                for draft_session_id, proven in fenced.items():
+                    self._candidate_arena.revoke_producer(
+                        draft_session_id, quiescent=proven
+                    )
         if self.uses_direct_gpu_source:
             for entry in batch.entries:
                 if entry.status == EntryStatus.OK:
