@@ -87,6 +87,13 @@ COMPLETION_RETRY_EAGAIN_LIMIT = 16
 # Bounded, deduplicated deferred-ACK queue (one queued ACK per transfer).
 COMPLETION_PENDING_ACK_LIMIT = 4096
 RETIRED_TRANSFER_LIMIT = 65536
+# Backpressure bound for one Target's staged remote-push queue.  Without it
+# the unpaced sender overflows the Target's serialized push handler (one
+# lock + one H2D stream) long before the 30 s request timeout, which showed
+# up at full load as mass push timeouts.  256 items are ~seconds of backlog
+# at the saturated handler's drain rate, so the common case never blocks the
+# scheduler thread while the backlog stays far under the timeout.
+REMOTE_PUSH_QUEUE_MAX = 256
 RING_DEBUG = os.environ.get("DT_RING_DEBUG", "0") == "1"
 METADATA_READBACK = os.environ.get("DT_CANDIDATE_METADATA_READBACK", "0") == "1"
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
@@ -2376,9 +2383,12 @@ class DraftCandidatePushTransport:
         self.push_stream = torch.cuda.Stream(device=self.device)
         # Cross-host staged pushes (issue #164): one sender thread per remote
         # Target owns the blocking framed-TCP request so the scheduler thread
-        # only enqueues an ordered D2H copy and never waits on the network.
-        # Done batches publish through a CUDA event recorded on the shared
-        # sender stream.  Tombstones use the same queues so a cancel can never
+        # only enqueues an ordered D2H copy and does not serialize network
+        # round trips.  Each queue is bounded (REMOTE_PUSH_QUEUE_MAX): the
+        # bound is the backpressure that keeps the unpaced sender from
+        # overflowing the Target's serialized push handler, and it only makes
+        # the scheduler thread wait when the Target has fallen seconds
+        # behind.  Tombstones use the same queues so a cancel can never
         # overtake a staged push for the same slot.
         self._remote_lock = Lock()
         self._remote_workers: dict[str, threading.Thread] = {}
@@ -3034,9 +3044,10 @@ class DraftCandidatePushTransport:
             raise CandidateTransportError("remote candidate Target has no data port")
         if batch is None:
             batch = _RemotePushBatch()
-        batch.item_added()
-        pinned = self._acquire_remote_pinned(candidate_row.numel())
+        pinned = None
         try:
+            batch.item_added()
+            pinned = self._acquire_remote_pinned(candidate_row.numel())
             pinned.copy_(candidate_row, non_blocking=True)
             ready = torch.cuda.Event(enable_timing=False)
             ready.record()
@@ -3045,7 +3056,8 @@ class DraftCandidatePushTransport:
             )
             header = self._remote_push_header(task, destination)
         except Exception:
-            self._release_remote_pinned(pinned)
+            if pinned is not None:
+                self._release_remote_pinned(pinned)
             batch.item_done()
             raise
         self._ensure_remote_sender(destination.target_instance_id)
@@ -3084,7 +3096,9 @@ class DraftCandidatePushTransport:
                 return
             if self._remote_send_stream is None:
                 self._remote_send_stream = torch.cuda.Stream(device=self.device)
-            self._remote_queues[target_instance_id] = queue.Queue()
+            self._remote_queues[target_instance_id] = queue.Queue(
+                maxsize=REMOTE_PUSH_QUEUE_MAX
+            )
             worker = threading.Thread(
                 target=self._remote_sender_loop,
                 args=(target_instance_id,),
@@ -3130,7 +3144,18 @@ class DraftCandidatePushTransport:
                 if pinned is not None:
                     self._release_remote_pinned(pinned)
             if finalize:
-                self._record_remote_batch(batch)
+                try:
+                    self._record_remote_batch(batch)
+                except Exception as exc:  # never kill the sender thread
+                    error = CandidateTransportError(
+                        f"remote candidate push completion failed for "
+                        f"{target_instance_id}"
+                    )
+                    error.__cause__ = exc
+                    with batch._lock:
+                        if batch.error is None:
+                            batch.error = error
+                    batch.event.mark_recorded()
 
     def _record_remote_batch(self, batch: _RemotePushBatch) -> None:
         """Record the batch event on the sender stream (exactly once)."""
@@ -3228,7 +3253,15 @@ class DraftCandidatePushTransport:
         # Quiesce the staged remote senders first: a live sender may hold a
         # pinned staging buffer and record CUDA events while teardown runs.
         for target_instance_id, worker in list(self._remote_workers.items()):
-            self._remote_queues[target_instance_id].put(None)
+            try:
+                # Bounded queue: the engine drained every push before close,
+                # so a brief blocking put only waits out in-flight items.
+                self._remote_queues[target_instance_id].put(None, timeout=30.0)
+            except queue.Full:
+                logger.warning(
+                    "remote candidate sender %s queue still full at close",
+                    target_instance_id,
+                )
             worker.join(timeout=30.0)
             if worker.is_alive():
                 logger.warning(
