@@ -6922,7 +6922,10 @@ class FlashMTPDraftEngine:
                 )
                 * 1_000_000
             )
-            self._last_step_ns = proposal_gpu_ns
+            # The step's GPU service time spans both timed phases: candidate
+            # feature materialization (materialize_start -> materialize_done)
+            # and proposal execution (materialize_done -> proposal_done).
+            self._last_step_ns = gpu_materialization_ns + proposal_gpu_ns
             profile_emit(
                 "draft_dflash_batch_complete",
                 draft_instance=self.instance_id,
