@@ -2217,9 +2217,13 @@ class _RemotePushEvent(torch.cuda.Event):
     """Completion event for one staged remote push batch.
 
     The batch's event is recorded on the sender stream once every staged TCP
-    push has landed; a sender-thread failure is stored on the event and
-    re-raised by ``query()``/``synchronize()`` so the engine's existing
-    quarantine paths treat a failed TCP push like a failed GPU push.
+    push has landed; a sender-thread failure is re-raised by
+    ``query()``/``synchronize()`` so the engine's existing quarantine paths
+    treat a failed TCP push like a failed GPU push.  The failure is read from
+    the batch at call time: senders keep working after the event is
+    published, so a snapshot taken at publication would swallow failures of
+    still in-flight items (the round would retire as OK although its
+    candidate never reached the Target).
     """
 
     def __new__(cls, *, enable_timing: bool = False):
@@ -2227,17 +2231,27 @@ class _RemotePushEvent(torch.cuda.Event):
 
     def __init__(self, *, enable_timing: bool = False) -> None:
         # torch.cuda.Event consumes its kwargs in __new__; __init__ only adds
-        # the deferred sender-thread failure and the record gate: a freshly
-        # created CUDA event queries as complete, so query()/synchronize()
-        # must wait for the sender to actually record this event.
-        self.error: BaseException | None = None
+        # the batch binding and the record gate: a freshly created CUDA event
+        # queries as complete, so query()/synchronize() must wait for the
+        # sender to actually record this event.
+        self._batch: _RemotePushBatch | None = None
         self._recorded = threading.Event()
+
+    def bind(self, batch: "_RemotePushBatch") -> None:
+        self._batch = batch
 
     def mark_recorded(self) -> None:
         self._recorded.set()
 
+    def _deferred_error(self) -> BaseException | None:
+        batch = self._batch
+        if batch is None:
+            return None
+        with batch._lock:
+            return batch.error
+
     def query(self) -> bool:
-        error = self.error
+        error = self._deferred_error()
         if error is not None:
             raise error
         if not self._recorded.is_set():
@@ -2245,7 +2259,7 @@ class _RemotePushEvent(torch.cuda.Event):
         return super().query()
 
     def synchronize(self) -> None:
-        error = self.error
+        error = self._deferred_error()
         if error is not None:
             raise error
         self._recorded.wait()
@@ -2292,7 +2306,7 @@ class _RemotePushBatch:
         with self._lock:
             self.local_gate = local_gate
             self.event = _RemotePushEvent(enable_timing=enable_timing)
-            self.event.error = self.error
+            self.event.bind(self)
             return self.event, self._finalize_locked()
 
     def _finalize_locked(self) -> bool:
