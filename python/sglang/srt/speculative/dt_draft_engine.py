@@ -176,6 +176,9 @@ DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
 DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
 DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 DT_DIRECT_GPU_REQUEST_EVIDENCE_IDLE_NS = 750_000_000
+# Draft-boundness stats line (issue #174): throttled so the production path
+# pays at most one log line per interval while the queue is busy.
+DT_DRAFT_STATS_INTERVAL_NS = 2_000_000_000
 
 
 def _prepare_eagle3_extend_batch(batch: ScheduleBatch) -> bool:
@@ -952,6 +955,10 @@ class FlashMTPDraftEngine:
         self._kv_pool = None
         self._last_batch_size = 0
         self._last_queue_delay_ns = 0
+        # Draft-boundness evidence (issue #174): GPU time of the last completed
+        # DFlash proposal batch, read by the throttled stats line below.
+        self._last_step_ns = 0
+        self._last_stats_log_ns = 0
         self._data_dir = Path(data_dir).absolute()
         self._published_by_batch: dict[str, PublishedResult] = {}
         self._published_by_range: dict[tuple[str, str, int, int, int, int], str] = {}
@@ -6915,6 +6922,7 @@ class FlashMTPDraftEngine:
                 )
                 * 1_000_000
             )
+            self._last_step_ns = proposal_gpu_ns
             profile_emit(
                 "draft_dflash_batch_complete",
                 draft_instance=self.instance_id,
@@ -10108,6 +10116,38 @@ class FlashMTPDraftEngine:
         )
         if not self._client.update_capacity(update):
             logger.warning("Draft capacity update was locally backpressured")
+        self._maybe_log_draft_stats(pending_tasks)
+
+    def _maybe_log_draft_stats(self, pending_tasks: int) -> None:
+        """Throttled draft-boundness sample for the capacity harness (#174).
+
+        Only logged while the queue holds work, so an idle Draft stays silent
+        and a measurement point's samples all reflect load.
+        """
+        if pending_tasks <= 0:
+            return
+        now_ns = time.monotonic_ns()
+        if now_ns - self._last_stats_log_ns < DT_DRAFT_STATS_INTERVAL_NS:
+            return
+        self._last_stats_log_ns = now_ns
+        from dt_protocol import DT_DRAFT_STATS_MARKER
+
+        logger.info(
+            "%s%s",
+            DT_DRAFT_STATS_MARKER,
+            json.dumps(
+                {
+                    "instance": self.instance_id,
+                    "pending": pending_tasks,
+                    "max_pending": self.max_pending_tasks,
+                    "queue_delay_ms": round(self._last_queue_delay_ns / 1e6, 3),
+                    "batch_size": self._last_batch_size,
+                    "step_ms": round(self._last_step_ns / 1e6, 3),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
 
     def _send_result(self, message) -> None:
         unconfirmed = getattr(self, "_unconfirmed_direct", None)
