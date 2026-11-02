@@ -15,6 +15,7 @@ cover feature and KV transfers consistently.
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import threading
@@ -41,6 +42,8 @@ from sglang.srt.speculative.dt_host_tcp import (
     HostTcpClient,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class FeatureTransportError(RuntimeError):
     """A feature descriptor or transport lifecycle invariant was violated."""
@@ -50,6 +53,12 @@ class FeatureTransportQuiescenceError(FeatureTransportError):
     """A failed copy stream may still reference a peer allocation."""
 
     resources_quiescent = False
+
+
+# One remote pull may wait on a busy peer for this long, so transport close
+# must be willing to wait at least as long before declaring the workers
+# unquiesced (SSOT for both the request timeout and the close budget).
+REMOTE_PULL_BUDGET_S = 120.0
 
 
 class FeatureSlotState(StrEnum):
@@ -1347,10 +1356,31 @@ class DraftFeaturePullTransport:
             self._closed = True
         remote_workers = getattr(self, "_remote_workers", None)
         if remote_workers:
+            # Sentinels sit behind queued work, so a worker only exits after
+            # every pull queued before close has finished; one pull may block
+            # for up to REMOTE_PULL_BUDGET_S.  Join for that full budget: a
+            # worker still alive afterwards may touch CUDA during teardown,
+            # which the quiescence error below records instead of returning
+            # silently and discarding the bookkeeping.
             for target_instance_id, worker in list(remote_workers.items()):
                 self._remote_queues[target_instance_id].put(None)
-                worker.join(timeout=5.0)
-            self._remote_workers = {}
+                worker.join(timeout=REMOTE_PULL_BUDGET_S + 10.0)
+            unquiesced = {
+                target_instance_id: worker
+                for target_instance_id, worker in remote_workers.items()
+                if worker.is_alive()
+            }
+            if unquiesced:
+                logger.error(
+                    "remote feature pull workers did not quiesce at close: %s",
+                    sorted(unquiesced),
+                )
+                with self._lock:
+                    self._fatal_error = FeatureTransportQuiescenceError(
+                        "remote feature pull did not quiesce at close"
+                    )
+            else:
+                self._remote_workers = {}
             try:
                 for stream in self._remote_streams.values():
                     stream.synchronize()
@@ -1680,7 +1710,7 @@ class DraftFeaturePullTransport:
                 # Correctness-first: the wait budget covers deep queueing
                 # behind a busy peer; the bytes themselves are small.
                 _resp, payload = HostTcpClient.request(
-                    host, port, MSG_HIDDEN_PULL_REQ, header, timeout_s=120.0
+                    host, port, MSG_HIDDEN_PULL_REQ, header, timeout_s=REMOTE_PULL_BUDGET_S
                 )
                 if len(payload) != source.nbytes:
                     raise FeatureTransportError(

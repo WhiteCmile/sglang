@@ -2157,11 +2157,11 @@ class ServerArgs:
         NS("spec"),
     ] = ""
     dt_tcp_port: A[
-        int,
+        Optional[int],
         "Target-side TCP port of the per-instance host-staged DT data "
-        "fallback server. Zero disables the fallback.",
+        "fallback server. Unset (None) disables the fallback.",
         NS("spec"),
-    ] = 0
+    ] = None
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

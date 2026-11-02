@@ -122,6 +122,12 @@ class HostTcpServer:
                 conn, _addr = self._listener.accept()
             except OSError:
                 break
+            # Reap finished threads before retaining the new one: fallback
+            # requests are one connection each, so the list must track live
+            # concurrency, not the whole connection history.
+            self._connection_threads = [
+                t for t in self._connection_threads if t.is_alive()
+            ]
             thread = threading.Thread(
                 target=self._handle_connection,
                 args=(conn,),

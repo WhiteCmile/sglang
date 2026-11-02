@@ -35,9 +35,11 @@ import hashlib
 import logging
 import mmap
 import os
+import queue
 import secrets
 import struct
 import subprocess
+import threading
 import time
 import uuid
 import zlib
@@ -2211,6 +2213,96 @@ class CandidatePush:
     start_event: torch.cuda.Event | None = None
 
 
+class _RemotePushEvent(torch.cuda.Event):
+    """Completion event for one staged remote push batch.
+
+    The batch's event is recorded on the sender stream once every staged TCP
+    push has landed; a sender-thread failure is stored on the event and
+    re-raised by ``query()``/``synchronize()`` so the engine's existing
+    quarantine paths treat a failed TCP push like a failed GPU push.
+    """
+
+    def __new__(cls, *, enable_timing: bool = False):
+        return super().__new__(cls, enable_timing=enable_timing)
+
+    def __init__(self, *, enable_timing: bool = False) -> None:
+        # torch.cuda.Event consumes its kwargs in __new__; __init__ only adds
+        # the deferred sender-thread failure and the record gate: a freshly
+        # created CUDA event queries as complete, so query()/synchronize()
+        # must wait for the sender to actually record this event.
+        self.error: BaseException | None = None
+        self._recorded = threading.Event()
+
+    def mark_recorded(self) -> None:
+        self._recorded.set()
+
+    def query(self) -> bool:
+        error = self.error
+        if error is not None:
+            raise error
+        if not self._recorded.is_set():
+            return False
+        return super().query()
+
+    def synchronize(self) -> None:
+        error = self.error
+        if error is not None:
+            raise error
+        self._recorded.wait()
+        super().synchronize()
+
+
+class _RemotePushBatch:
+    """Thread-shared completion state for the remote pushes of one submit().
+
+    Items may be decremented by several per-Target sender threads while the
+    submitting thread concurrently publishes the batch event; exactly one
+    caller observes ``True`` from the finalizing call and records the event.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._remaining = 0
+        self.event: _RemotePushEvent | None = None
+        self.local_gate: torch.cuda.Event | None = None
+        self.error: BaseException | None = None
+        self._finalized = False
+
+    def item_added(self) -> None:
+        with self._lock:
+            self._remaining += 1
+
+    def item_done(self) -> bool:
+        with self._lock:
+            self._remaining -= 1
+            return self._finalize_locked()
+
+    def item_failed(self, error: BaseException) -> bool:
+        with self._lock:
+            if self.error is None:
+                self.error = error
+            self._remaining -= 1
+            return self._finalize_locked()
+
+    def finish_local(
+        self, *, local_gate: "torch.cuda.Event | None", enable_timing: bool
+    ) -> tuple[_RemotePushEvent, bool]:
+        """Publish the batch event after the last remote item was enqueued."""
+
+        with self._lock:
+            self.local_gate = local_gate
+            self.event = _RemotePushEvent(enable_timing=enable_timing)
+            self.event.error = self.error
+            return self.event, self._finalize_locked()
+
+    def _finalize_locked(self) -> bool:
+        if self._finalized or self._remaining or self.event is None:
+            return False
+        self._finalized = True
+        return True
+
+
+
 class DraftCandidatePushTransport:
     """Map Target destinations and enqueue candidate copy+publication in place."""
 
@@ -2268,6 +2360,18 @@ class DraftCandidatePushTransport:
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
+        # Cross-host staged pushes (issue #164): one sender thread per remote
+        # Target owns the blocking framed-TCP request so the scheduler thread
+        # only enqueues an ordered D2H copy and never waits on the network.
+        # Done batches publish through a CUDA event recorded on the shared
+        # sender stream.  Tombstones use the same queues so a cancel can never
+        # overtake a staged push for the same slot.
+        self._remote_lock = Lock()
+        self._remote_workers: dict[str, threading.Thread] = {}
+        self._remote_queues: dict[str, "queue.Queue"] = {}
+        self._remote_send_stream: torch.cuda.Stream | None = None
+        self._remote_pinned: list[torch.Tensor] = []
+        self._remote_pinned_lock = Lock()
         self._closed = False
         self._ring_debug: _RingDebugLog | None = (
             _RingDebugLog(f"draft-push:{draft_instance_id}") if RING_DEBUG else None
@@ -2726,17 +2830,20 @@ class DraftCandidatePushTransport:
             self._validate_destination(
                 task, task.candidate_destination, row_bytes
             )
-        # Cross-host pushes (issue #164) complete synchronously: one framed
-        # TCP request per task; the Target copies into its own arena and
-        # writes the completion record locally.
+        # Cross-host pushes (issue #164) are staged on the host and sent by a
+        # per-Target sender thread: this thread only enqueues an ordered D2H
+        # copy, so a batch's remote legs no longer serialize network latency.
         local_tasks = []
         segments = []
         metadata_addresses = []
         cold = 0
+        remote_batch: _RemotePushBatch | None = None
         for index, task in enumerate(tasks):
             destination = task.candidate_destination
             if destination.target_instance_id in self._remote:
-                self._push_remote_task(task, candidates[index])
+                remote_batch = self._enqueue_remote_push(
+                    task, candidates[index], remote_batch
+                )
                 continue
             local_tasks.append(task)
             data_base, metadata_base = self._mapping(destination)
@@ -2845,8 +2952,22 @@ class DraftCandidatePushTransport:
                     ),
                     stream=stream.cuda_stream,
                 )
-        event = torch.cuda.Event(enable_timing=start_event is not None)
-        event.record(stream)
+        if remote_batch is None:
+            event = torch.cuda.Event(enable_timing=start_event is not None)
+            event.record(stream)
+        else:
+            # The batch event covers the local stream work (if any) and every
+            # staged remote push; it is recorded on the sender stream once
+            # the local gate passes and all remote pushes have landed.
+            local_gate = None
+            if local_tasks:
+                local_gate = torch.cuda.Event(enable_timing=False)
+                local_gate.record(stream)
+            event, finalize = remote_batch.finish_local(
+                local_gate=local_gate, enable_timing=start_event is not None
+            )
+            if finalize:
+                self._record_remote_batch(remote_batch)
         return CandidatePush(
             event=event,
             transfer_ids=tuple(task.transfer_id for task in tasks),
@@ -2873,18 +2994,8 @@ class DraftCandidatePushTransport:
             int(task.next_token_id) & 0xFFFFFFFF,
         )
 
-    def _push_remote_task(self, task, candidate_row: torch.Tensor) -> None:
-        """Send one cross-host candidate row plus metadata over framed TCP."""
-
-        destination = task.candidate_destination
-        host, port = self._remote[destination.target_instance_id]
-        if not port:
-            raise CandidateTransportError("remote candidate Target has no data port")
-        rows_cpu = candidate_row.to("cpu", non_blocking=False)
-        metadata = self._remote_metadata_words(
-            destination, valid_length=destination.row_width, task=task
-        )
-        header = {
+    def _remote_push_header(self, task, destination) -> dict:
+        return {
             "slot_id": int(destination.slot_id),
             "generation": int(destination.generation),
             "nonce": int(destination.authorization_nonce),
@@ -2892,19 +3003,141 @@ class DraftCandidatePushTransport:
             "draft_session_id": self.draft_session_id,
             "root_token": int(task.next_token_id) & 0xFFFFFFFF,
         }
+
+    def _enqueue_remote_push(
+        self, task, candidate_row: torch.Tensor, batch: "_RemotePushBatch | None"
+    ) -> _RemotePushBatch:
+        """Stage one cross-host candidate row for the per-Target sender.
+
+        The D2H copy is enqueued on the current stream (ordered after the
+        rows' producer and any later in-stream buffer reuse) and the sender
+        thread owns the blocking framed-TCP request.
+        """
+
+        destination = task.candidate_destination
+        host, port = self._remote[destination.target_instance_id]
+        if not port:
+            raise CandidateTransportError("remote candidate Target has no data port")
+        if batch is None:
+            batch = _RemotePushBatch()
+        batch.item_added()
+        pinned = self._acquire_remote_pinned(candidate_row.numel())
         try:
-            HostTcpClient.request(
-                host,
-                port,
-                MSG_CAND_PUSH,
-                header,
-                payload=rows_cpu.numpy().tobytes() + metadata,
-                timeout_s=30.0,
+            pinned.copy_(candidate_row, non_blocking=True)
+            ready = torch.cuda.Event(enable_timing=False)
+            ready.record()
+            metadata = self._remote_metadata_words(
+                destination, valid_length=destination.row_width, task=task
             )
-        except Exception as exc:
-            raise CandidateTransportError(
-                f"remote candidate push failed for {task.transfer_id}"
-            ) from exc
+            header = self._remote_push_header(task, destination)
+        except Exception:
+            self._release_remote_pinned(pinned)
+            batch.item_done()
+            raise
+        self._ensure_remote_sender(destination.target_instance_id)
+        self._remote_queues[destination.target_instance_id].put(
+            (ready, pinned, header, metadata, batch, candidate_row.numel() * 4)
+        )
+        return batch
+
+    def _enqueue_remote_tombstone(
+        self, task, batch: "_RemotePushBatch | None"
+    ) -> _RemotePushBatch:
+        """Stage one cross-host tombstone behind any queued pushes (FIFO)."""
+
+        destination = task.candidate_destination
+        host, port = self._remote[destination.target_instance_id]
+        if not port:
+            raise CandidateTransportError("remote candidate Target has no data port")
+        if batch is None:
+            batch = _RemotePushBatch()
+        batch.item_added()
+        metadata = self._remote_metadata_words(
+            destination, valid_length=0, task=task
+        )
+        header = self._remote_push_header(task, destination)
+        self._ensure_remote_sender(destination.target_instance_id)
+        self._remote_queues[destination.target_instance_id].put(
+            (None, None, header, metadata, batch, destination.nbytes)
+        )
+        return batch
+
+    def _ensure_remote_sender(self, target_instance_id: str) -> None:
+        if target_instance_id in self._remote_workers:
+            return
+        with self._remote_lock:
+            if target_instance_id in self._remote_workers:
+                return
+            if self._remote_send_stream is None:
+                self._remote_send_stream = torch.cuda.Stream(device=self.device)
+            self._remote_queues[target_instance_id] = queue.Queue()
+            worker = threading.Thread(
+                target=self._remote_sender_loop,
+                args=(target_instance_id,),
+                name=f"dt-candidate-remote-push-{target_instance_id}",
+                daemon=True,
+            )
+            self._remote_workers[target_instance_id] = worker
+            worker.start()
+
+    def _remote_sender_loop(self, target_instance_id: str) -> None:
+        work_queue = self._remote_queues[target_instance_id]
+        while True:
+            item = work_queue.get()
+            if item is None:
+                return
+            ready, pinned, header, metadata, batch, nbytes = item
+            try:
+                if ready is not None:
+                    ready.synchronize()
+                host, port = self._remote[target_instance_id]
+                HostTcpClient.request(
+                    host,
+                    port,
+                    MSG_CAND_PUSH,
+                    header,
+                    payload=(
+                        pinned.numpy().tobytes()
+                        if pinned is not None
+                        else b"\x00" * nbytes
+                    )
+                    + metadata,
+                    timeout_s=30.0,
+                )
+            except Exception as exc:  # surfaced through the batch event
+                error = CandidateTransportError(
+                    f"remote candidate push failed for {header['transfer_id']}"
+                )
+                error.__cause__ = exc
+                finalize = batch.item_failed(error)
+            else:
+                finalize = batch.item_done()
+            finally:
+                if pinned is not None:
+                    self._release_remote_pinned(pinned)
+            if finalize:
+                self._record_remote_batch(batch)
+
+    def _record_remote_batch(self, batch: _RemotePushBatch) -> None:
+        """Record the batch event on the sender stream (exactly once)."""
+
+        gate = batch.local_gate
+        if gate is not None:
+            gate.synchronize()
+        with torch.cuda.device(self.device):
+            batch.event.record(self._remote_send_stream)
+        batch.event.mark_recorded()
+
+    def _acquire_remote_pinned(self, numel: int) -> torch.Tensor:
+        with self._remote_pinned_lock:
+            for index, buffered in enumerate(self._remote_pinned):
+                if buffered.numel() >= numel:
+                    return self._remote_pinned.pop(index)
+        return torch.empty(numel, dtype=torch.int32, pin_memory=True)
+
+    def _release_remote_pinned(self, pinned: torch.Tensor) -> None:
+        with self._remote_pinned_lock:
+            self._remote_pinned.append(pinned)
 
     def publish_cancelled(self, tasks: list[object]) -> CandidatePush:
         """Publish authenticated quiescence for tasks cancelled before a push."""
@@ -2921,6 +3154,8 @@ class DraftCandidatePushTransport:
         )
         if start_event is not None:
             start_event.record(stream)
+        remote_batch: _RemotePushBatch | None = None
+        local_tasks = []
         for task in tasks:
             destination = task.candidate_destination
             self._validate_destination(task, destination, destination.nbytes)
@@ -2929,37 +3164,12 @@ class DraftCandidatePushTransport:
                 # words the local path writes (valid length 0) over framed
                 # TCP; the Target's locally written completion record is the
                 # cancelled push's quiescence proof, exactly as for the
-                # GPU-written record.
-                host, port = self._remote[destination.target_instance_id]
-                if not port:
-                    raise CandidateTransportError(
-                        "remote candidate Target has no data port"
-                    )
-                metadata = self._remote_metadata_words(
-                    destination, valid_length=0, task=task
-                )
-                header = {
-                    "slot_id": int(destination.slot_id),
-                    "generation": int(destination.generation),
-                    "nonce": int(destination.authorization_nonce),
-                    "transfer_id": task.transfer_id,
-                    "draft_session_id": self.draft_session_id,
-                    "root_token": int(task.next_token_id) & 0xFFFFFFFF,
-                }
-                try:
-                    HostTcpClient.request(
-                        host,
-                        port,
-                        MSG_CAND_PUSH,
-                        header,
-                        payload=b"\x00" * destination.nbytes + metadata,
-                        timeout_s=30.0,
-                    )
-                except Exception as exc:
-                    raise CandidateTransportError(
-                        f"remote candidate tombstone failed for {task.transfer_id}"
-                    ) from exc
+                # GPU-written record.  It is staged on the same per-Target
+                # queue so a cancel can never overtake a queued push for the
+                # same slot.
+                remote_batch = self._enqueue_remote_tombstone(task, remote_batch)
                 continue
+            local_tasks.append(task)
             _data_base, metadata_base = self._mapping(destination)
             address = metadata_base + destination.metadata_allocation_offset
             nonce = int(destination.authorization_nonce)
@@ -2975,8 +3185,19 @@ class DraftCandidatePushTransport:
                     value=value,
                     stream=stream.cuda_stream,
                 )
-        event = torch.cuda.Event(enable_timing=start_event is not None)
-        event.record(stream)
+        if remote_batch is None:
+            event = torch.cuda.Event(enable_timing=start_event is not None)
+            event.record(stream)
+        else:
+            local_gate = None
+            if local_tasks:
+                local_gate = torch.cuda.Event(enable_timing=False)
+                local_gate.record(stream)
+            event, finalize = remote_batch.finish_local(
+                local_gate=local_gate, enable_timing=start_event is not None
+            )
+            if finalize:
+                self._record_remote_batch(remote_batch)
         return CandidatePush(
             event=event,
             transfer_ids=tuple(task.transfer_id for task in tasks),
@@ -2990,6 +3211,18 @@ class DraftCandidatePushTransport:
         if self._closed:
             return
         self._closed = True
+        # Quiesce the staged remote senders first: a live sender may hold a
+        # pinned staging buffer and record CUDA events while teardown runs.
+        for target_instance_id, worker in list(self._remote_workers.items()):
+            self._remote_queues[target_instance_id].put(None)
+            worker.join(timeout=30.0)
+            if worker.is_alive():
+                logger.warning(
+                    "remote candidate sender %s did not quiesce at close",
+                    target_instance_id,
+                )
+        self._remote_workers = {}
+        self._remote_pinned = []
         torch.cuda.current_stream(self.device).synchronize()
         records_by_key = getattr(self, "_ready_records", {})
         # Pushes run on push_stream; their sources and mappings must outlive them.

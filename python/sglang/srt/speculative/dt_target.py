@@ -740,7 +740,7 @@ class DTTargetController:
                 )
                 # Host-staged TCP fallback (issue #164): one server per Target
                 # instance serves remote hidden pulls and candidate pushes.
-                dt_tcp_port = int(getattr(self.server_args, "dt_tcp_port", 0) or 0)
+                dt_tcp_port = int(getattr(self.server_args, "dt_tcp_port", None) or 0)
                 dt_host_addr = (
                     str(getattr(self.server_args, "dt_host_addr", "") or "")
                     if dt_tcp_port > 0
