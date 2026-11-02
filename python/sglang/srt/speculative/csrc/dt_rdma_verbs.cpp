@@ -204,6 +204,34 @@ int dt_rdma_destroy_qp(void* qp_handle) {
   return ibv_destroy_qp((ibv_qp*)qp_handle);
 }
 
+// RDMA WRITE from a registered local buffer, optionally with immediate data.
+// The task-record ring leg (issue #182) writes 4096-byte records this way:
+// payloads exceed the inline cap, so the send buffer must be registered and
+// stay untouched until the signaled completion returns.  `with_imm` selects
+// IBV_WR_RDMA_WRITE_WITH_IMM (one receive credit on the peer); `signaled`
+// selects who reaps the completion (the ring leg signals every record).
+int dt_rdma_post_write(void* qp_handle, uint64_t wr_id, uint64_t local_addr,
+                      uint32_t lkey, uint32_t length, uint64_t remote_addr,
+                      uint32_t rkey, int with_imm, uint32_t imm,
+                      int signaled) {
+  ibv_sge sge;
+  sge.addr = local_addr;
+  sge.length = length;
+  sge.lkey = lkey;
+  ibv_send_wr wr;
+  memset(&wr, 0, sizeof(wr));
+  wr.wr_id = wr_id;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = with_imm ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
+  wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+  if (with_imm) wr.imm_data = htonl(imm);
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = rkey;
+  ibv_send_wr* bad = nullptr;
+  return ibv_post_send((ibv_qp*)qp_handle, &wr, &bad);
+}
+
 // Zero-SGE receives: RDMA_WRITE_WITH_IMM lands its payload at the address
 // named by the writer and consumes one receive only for the immediate.
 int dt_rdma_post_recv(void* qp_handle, uint64_t wr_id, int count) {

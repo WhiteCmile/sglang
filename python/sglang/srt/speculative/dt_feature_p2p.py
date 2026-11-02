@@ -291,6 +291,14 @@ class TargetFeatureSourcePool:
         with self._lock:
             return sum(slot.state is FeatureSlotState.FREE for slot in self._slots)
 
+    def generation_snapshot(self) -> list[int]:
+        """Current per-slot generation table (issue #182's remote ring leg
+        mirrors it into the Draft's ring so records naming a recycled slot
+        are rejected before their hidden pull)."""
+
+        with self._lock:
+            return [slot.generation for slot in self._slots]
+
     @property
     def quarantined_slot_count(self) -> int:
         with self._lock:

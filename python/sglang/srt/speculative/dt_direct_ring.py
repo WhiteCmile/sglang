@@ -675,6 +675,10 @@ class RingGpuPublisher:
 class TargetRingWriter:
     """Target-side producer for one owner Draft session."""
 
+    # The RDMA producer (dt_rdma.TargetRemoteRingWriter) sets this True; the
+    # Target's ring planning branches on it for lease-retirement semantics.
+    is_remote = False
+
     def __init__(self, path: str) -> None:
         self._ring = _RingMapping(path, create=False)
         self.path = path
@@ -812,6 +816,10 @@ class TargetRingWriter:
 
 class DraftRingEndpoint:
     """Draft-side consumer state of one ring."""
+
+    # The RDMA consumer (dt_rdma.DraftRemoteRing) sets this True; the ring
+    # admission path branches on it for the hidden-pull placement.
+    is_remote = False
 
     def __init__(
         self,

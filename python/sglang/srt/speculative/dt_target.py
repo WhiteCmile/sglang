@@ -6794,7 +6794,10 @@ class DTTargetController:
             return publisher
         writer = self._direct_ring_writer(draft_session_id)
         pool = self._feature_source_pool
-        if writer is None or pool is None:
+        if writer is None or pool is None or writer.is_remote:
+            # Kernel-published waves write the ring's device memory directly;
+            # that stays a same-host path (#182 keeps v2 off the remote ring;
+            # remote waves fall back to per-round records on the remote ring).
             return None
         from sglang.srt.speculative.dt_direct_ring import RingGpuPublisher
 
@@ -8030,7 +8033,12 @@ class DTTargetController:
         }
 
     def _direct_ring_writer(self, draft_session_id: str):
-        """Return the serving ring to one owner Draft session, or None."""
+        """Return the serving ring to one owner Draft session, or None.
+
+        The transport is decided here, once per session: a Draft session that
+        connected the RDMA ring leg (it is cross-host) gets the remote ring
+        writer; otherwise the local /dev/shm ring, when the Draft created it.
+        """
 
         from sglang.srt.speculative.dt_direct_ring import (
             STATE_CREATED,
@@ -8046,15 +8054,31 @@ class DTTargetController:
             now_ns = time.monotonic_ns()
             if self._ring_missing_until_ns.get(draft_session_id, 0) > now_ns:
                 return None
-            path = ring_path(draft_session_id, self._client.instance_session_id)
-            try:
-                writer = TargetRingWriter(path)
-            except FileNotFoundError:
-                # Not on this host or not created yet: Coordinator path only.
-                self._ring_missing_until_ns[draft_session_id] = now_ns + 1_000_000_000
-                return None
+            rdma = getattr(self, "_rdma_endpoint", None)
+            if rdma is not None and rdma.has_session(draft_session_id):
+                # Cross-host session: wait for its ring leg without the
+                # missing-file cooldown (the ring file can never appear).
+                writer = rdma.ring_writer(draft_session_id)
+                if writer is None:
+                    return None
+            if writer is None:
+                path = ring_path(draft_session_id, self._client.instance_session_id)
+                try:
+                    writer = TargetRingWriter(path)
+                except FileNotFoundError:
+                    # Not on this host or not created yet: Coordinator path only.
+                    self._ring_missing_until_ns[draft_session_id] = now_ns + 1_000_000_000
+                    return None
             self._ring_writers[draft_session_id] = writer
             self._ring_outstanding[draft_session_id] = deque()
+        if writer.is_remote:
+            pool = self._feature_source_pool
+            if pool is not None:
+                allocation = pool._allocations[pool._buffer.allocation_index]
+                writer.source_ipc_handle = allocation.ipc_handle
+            else:
+                writer.source_ipc_handle = b""
+            return writer if writer.state == STATE_SERVING else None
         if writer.state == STATE_CREATED:
             pool = self._feature_source_pool
             if pool is not None:
@@ -8143,7 +8167,10 @@ class DTTargetController:
             source = task.source
             if writer is not None and source is not None and (
                 source.ipc_handle != writer.source_ipc_handle
-                or source.nbytes > writer.max_entry_bytes
+                or (
+                    writer.max_entry_bytes is not None
+                    and source.nbytes > writer.max_entry_bytes
+                )
                 or len(source.producer_event_handle) != 64
             ):
                 writer = None
@@ -8189,35 +8216,43 @@ class DTTargetController:
     def _write_direct_ring(self, plan) -> None:
         """Publish planned ring entries after the Coordinator submit succeeded."""
 
+        from sglang.srt.speculative.dt_rdma import RdmaTransportError
+
         for draft_session_id, writer, task, payload in plan:
             # Stamped before the seq store: the Draft may take it immediately.
             written_ns = time.monotonic_ns()
             source = task.source
-            if source is None:
-                seq = writer.write(payload=payload, has_pull=False)
-                pull = None
-            else:
-                seq = writer.write(
-                    payload=payload,
-                    has_pull=True,
-                    source_offset=source.allocation_offset + source.byte_offset,
-                    nbytes=source.nbytes,
-                    source_slot_id=source.source_slot_id,
-                    slot_generation=source.slot_generation,
-                    event_handle=source.producer_event_handle,
-                )
-                pull = (source.source_slot_id, source.slot_generation)
+            try:
+                if source is None:
+                    seq = writer.write(payload=payload, has_pull=False)
+                    pull = None
+                else:
+                    seq = writer.write(
+                        payload=payload,
+                        has_pull=True,
+                        source_offset=source.allocation_offset + source.byte_offset,
+                        nbytes=source.nbytes,
+                        source_slot_id=source.source_slot_id,
+                        slot_generation=source.slot_generation,
+                        event_handle=source.producer_event_handle,
+                    )
+                    pull = (source.source_slot_id, source.slot_generation)
+            except RdmaTransportError:
+                if not writer.is_remote:
+                    raise
+                # The ring leg died: fence the session's queue pairs (proves
+                # the NIC no longer touches the ring), revoke the owner so
+                # later rounds plan onto the Coordinator relay, and let the
+                # Coordinator copies of the already-planned rounds carry them.
+                self._revoke_ring_owner(draft_session_id, quiescent=True)
+                continue
             if seq != task.direct_ring_seq:
                 raise RuntimeError("direct ring sequence diverged from its plan")
-            self._ring_unproven[task.transfer_id] = draft_session_id
             # Applied after ledger.begin() registers the round.
             self._lease_marks.append(
                 (task.transfer_id, self._draft_binding[task.request_id][0])
             )
             self._direct_sent.add(task.transfer_id)
-            self._ring_outstanding[draft_session_id].append(
-                (seq, task.transfer_id, pull)
-            )
             if self._profile_active:
                 self._profile_emit(
                     "target_ring_write",
@@ -8226,7 +8261,17 @@ class DTTargetController:
                     round_id=task.round_id,
                     ring_seq=seq,
                     written_ns=written_ns,
+                    remote=writer.is_remote,
                 )
+            if writer.is_remote:
+                # No early read proof exists remotely: the source lease
+                # retires on the Coordinator's SourceReadDone, exactly like
+                # a relayed task's (see _consume_source_read_done).
+                continue
+            self._ring_unproven[task.transfer_id] = draft_session_id
+            self._ring_outstanding[draft_session_id].append(
+                (seq, task.transfer_id, pull)
+            )
 
     def _feature_source_pool_diagnostics(self) -> str:
         """Per-slot lease snapshot appended to park publication failures."""
@@ -8347,6 +8392,16 @@ class DTTargetController:
 
         self._ring_revoked_sessions.add(draft_session_id)
         writer = self._ring_writers.pop(draft_session_id, None)
+        if writer is not None and getattr(writer, "is_remote", False):
+            # A remote Draft's death does not stop its NIC: destroy the
+            # session's queue pairs first and let the destruction proof
+            # decide quiescence, exactly like the Coordinator loss path.
+            rdma = getattr(self, "_rdma_endpoint", None)
+            if rdma is not None:
+                fenced = rdma.fence(writer.draft_instance_id, draft_session_id)
+                quiescent = bool(fenced) and quiescent and all(fenced.values())
+            else:
+                quiescent = False
         outstanding = self._ring_outstanding.pop(draft_session_id, deque())
         for _seq, transfer_id, pull in outstanding:
             self._ring_unproven.pop(transfer_id, None)
