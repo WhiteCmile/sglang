@@ -2152,14 +2152,14 @@ class ServerArgs:
     ] = 10.0
     dt_host_addr: A[
         str,
-        "Host address this DT instance advertises to peers for the host-staged "
-        "TCP data fallback. Empty keeps same-host-only behavior.",
+        "Host address this DT instance advertises to peers for the cross-host "
+        "RDMA data plane. Empty keeps same-host-only behavior.",
         NS("spec"),
     ] = ""
     dt_tcp_port: A[
         Optional[int],
-        "Target-side TCP port of the per-instance host-staged DT data "
-        "fallback server. Unset (None) disables the fallback.",
+        "Target-side TCP port of the per-instance bootstrap server for the "
+        "cross-host RDMA data plane. Unset (None) disables it.",
         NS("spec"),
     ] = None
     speculative_dspark_block_size: A[

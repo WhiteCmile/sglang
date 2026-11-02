@@ -907,7 +907,7 @@ class FlashMTPDraftEngine:
         # This Draft's own host address (--dt-host-addr).  A Target arena
         # registration whose host_addr is set and differs is cross-host: the
         # direct ring is skipped (the Target falls back to the Coordinator
-        # relay) and the two data legs use the host-staged TCP fallback.
+        # relay) and the two data legs use the RDMA backend (dt_rdma).
         self._dt_host_addr = dt_host_addr
         self._remote_targets: dict[str, tuple[str, int]] = {}
         self.dflash_submit_pipeline = bool(
@@ -3838,7 +3838,7 @@ class FlashMTPDraftEngine:
                 if reg_host and reg_host != self._dt_host_addr:
                     # Cross-host Target (issue #164): no direct ring (the
                     # Target's ring attach falls back to the Coordinator
-                    # relay); the data legs use the host-staged TCP fallback.
+                    # relay); the data legs use the RDMA backend (#165).
                     self._remote_targets[registration.target_instance_id] = (
                         reg_host,
                         int(getattr(registration, "data_port", 0) or 0),
@@ -3847,7 +3847,9 @@ class FlashMTPDraftEngine:
                     self._open_direct_ring(registration)
             if self._remote_targets and self._feature_pull_transport is not None:
                 self._feature_pull_transport.set_remote_targets(
-                    self._remote_targets
+                    self._remote_targets,
+                    draft_instance_id=self.instance_id,
+                    draft_session_id=self._client.instance_session_id,
                 )
         unconfirmed = getattr(self, "_unconfirmed_direct", None)
         if unconfirmed is None:
@@ -10333,7 +10335,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="This Draft's own host address. A Target arena registration whose "
         "host_addr differs is cross-host: the direct ring is skipped and the "
-        "hidden-pull/candidate-push legs use the host-staged TCP fallback.",
+        "hidden-pull/candidate-push legs use the RDMA backend.",
     )
     return parser
 

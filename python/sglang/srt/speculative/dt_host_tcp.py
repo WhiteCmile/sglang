@@ -1,21 +1,21 @@
-"""Host-staged TCP fallback for cross-host DT data planes (issue #164).
+"""Framed TCP bootstrap channel for cross-host DT data planes (#164, #165).
 
 Same-host Draft-Target pairs keep the CUDA-IPC paths unchanged.  When a
 Target's arena registration carries a ``host_addr`` that differs from the
-Draft's own ``--dt-host-addr``, the Draft falls back to this framed TCP
-protocol for the two cross-host data legs:
+Draft's own ``--dt-host-addr``, the Draft serves the cross-host data legs
+over RDMA (``dt_rdma``).  This module is the out-of-band channel those queue
+pairs are bootstrapped over:
 
-- ``hidden_pull_req`` / ``hidden_pull_resp``: the Draft reads one published
-  Target feature range (raw little-endian BF16 rows exactly as laid out in
-  GPU memory).
-- ``cand_push`` / ``cand_push_resp``: the Draft sends one candidate row plus
-  its metadata words; the Target copies them into its own arena and then
-  writes the 64-byte completion record into its own /dev/shm record file, so
-  the existing poll/authenticate path consumes cross-host pushes unchanged.
+- ``rdma_connect`` / ``rdma_connect_resp``: the Draft sends one leg's queue
+  pair endpoint (and, for the hidden-pull leg, its ready-record ring); the
+  Target connects its queue pair and returns its endpoint plus the remote
+  memory regions the leg addresses.
+- ``rdma_ready`` / ``rdma_ready_resp``: the Draft's hidden-pull queue pair is
+  ready to receive; the Target starts ready records and returns the slots
+  already ready.
 
-One server runs per Target instance on its host (``--dt-tcp-port``); both
-legs share it and are dispatched by the request ``type``.  Wire format
-(single source of truth for the whole fallback):
+One server runs per Target instance on its host (``--dt-tcp-port``).  Wire
+format (single source of truth):
 
     u32le total frame length N
     N bytes:
@@ -24,12 +24,7 @@ legs share it and are dispatched by the request ``type``.  Wire format
         raw payload bytes
 
 The msgpack codec is ``msgspec.msgpack``, the same one every other DT
-module uses.  Long-lived workers (one hidden-pull worker and one
-candidate-push sender per Draft-Target pair) keep one persistent framed
-connection each: per-request connections churned a fresh TCP TIME_WAIT
-slot per request and, at the measured full-concurrency round rate,
-exhausted the ephemeral-port space of a (source, destination, port)
-five-tuple within a minute.  The wire protocol is unchanged and the
+module uses.  Each Draft-side leg keeps one persistent connection, and the
 server keeps a connection open for sequential request/response rounds.
 """
 
@@ -45,19 +40,16 @@ import msgspec
 logger = logging.getLogger(__name__)
 
 # Request types carried in the header "type" field.  The response type is
-# always the request base plus "_resp" (a trailing "_req" is stripped first):
-# "hidden_pull_req" -> "hidden_pull_resp", "cand_push" -> "cand_push_resp".
-MSG_HIDDEN_PULL_REQ = "hidden_pull_req"
-MSG_CAND_PUSH = "cand_push"
-MSG_HIDDEN_PULL_RESP = "hidden_pull_resp"
-MSG_CAND_PUSH_RESP = "cand_push_resp"
+# always the request base plus "_resp" (a trailing "_req" is stripped first).
+MSG_RDMA_CONNECT = "rdma_connect"
+MSG_RDMA_READY = "rdma_ready"
 
 _HEADER_LEN = struct.Struct("<I")
 _FRAME_LEN = struct.Struct("<I")
 
 
 class HostTcpError(RuntimeError):
-    """The host-staged TCP fallback failed at transport or application level."""
+    """The bootstrap channel failed at transport or application level."""
 
 
 def _read_exact(conn: socket.socket, nbytes: int) -> bytes:
@@ -126,9 +118,8 @@ class HostTcpServer:
                 conn, _addr = self._listener.accept()
             except OSError:
                 break
-            # Reap finished threads before retaining the new one: fallback
-            # requests are one connection each, so the list must track live
-            # concurrency, not the whole connection history.
+            # Reap finished threads before retaining the new one, so the list
+            # tracks live concurrency, not the whole connection history.
             self._connection_threads = [
                 t for t in self._connection_threads if t.is_alive()
             ]
@@ -197,13 +188,8 @@ class HostTcpConnection:
     """One persistent framed-TCP connection owned by a single thread.
 
     The server keeps a connection open for sequential request/response
-    rounds, so a long-lived worker (one per Draft-Target pair) reuses one
-    connection instead of churning a fresh TCP connection — and its TIME_WAIT
-    slot — per request.  At the measured full-concurrency round rate the
-    per-request connections exhausted the ephemeral-port space of a
-    (source, destination, port) five-tuple within a minute; a persistent
-    connection makes the rate irrelevant.  Not thread-safe: each owner is one
-    dedicated worker thread.
+    rounds; each Draft-side RDMA leg bootstraps over its own connection.
+    Not thread-safe: each owner is one dedicated worker thread.
     """
 
     def __init__(self, host: str, port: int, timeout_s: float) -> None:
@@ -211,60 +197,38 @@ class HostTcpConnection:
         self._timeout_s = timeout_s
         self._conn: socket.socket | None = None
 
-    def _ensure(self) -> socket.socket:
-        if self._conn is None:
-            self._conn = socket.create_connection(self._addr, timeout=self._timeout_s)
-        return self._conn
-
     def request(
-        self,
-        msg_type: str,
-        header: dict,
-        payload: bytes = b"",
-        *,
-        attempts: int = 2,
+        self, msg_type: str, header: dict, payload: bytes = b""
     ) -> tuple[dict, bytes]:
         """Send one framed request and read its response.
 
-        Retries once on a transport error with a fresh connection: a retry
-        can only race a lost response, and a replayed frame is idempotent on
-        the server (same transfer nonce/generation, same payload words).
-        Application-level rejections (``ok: false``) are never retried.
+        Never retried: a bootstrap request creates server-side queue pairs.
         """
 
-        last_error: HostTcpError | None = None
-        for attempt in range(max(1, attempts)):
-            frame = encode_frame(msg_type, header, payload)
-            try:
-                conn = self._ensure()
-                conn.settimeout(self._timeout_s)
-                conn.sendall(frame)
-                raw_len = _read_exact(conn, _FRAME_LEN.size)
-                frame_len = _FRAME_LEN.unpack(raw_len)[0]
-                if frame_len <= 0:
-                    raise HostTcpError("empty response frame")
-                resp_header, resp_payload = decode_frame(
-                    _read_exact(conn, frame_len)
+        try:
+            if self._conn is None:
+                self._conn = socket.create_connection(
+                    self._addr, timeout=self._timeout_s
                 )
-            except HostTcpError as exc:
-                last_error = exc
-            except OSError as exc:
-                last_error = HostTcpError(
-                    f"dt host tcp request to {self._addr[0]}:{self._addr[1]} "
-                    f"failed: {exc}"
-                )
-            else:
-                if not resp_header.get("ok"):
-                    # The server processed the request and rejected it; a
-                    # retry would hit the same rejection.
-                    raise HostTcpError(
-                        f"dt host tcp request {msg_type!r} rejected: "
-                        f"{resp_header.get('error', 'unknown error')}"
-                    )
-                return resp_header, resp_payload
+            self._conn.sendall(encode_frame(msg_type, header, payload))
+            frame_len = _FRAME_LEN.unpack(_read_exact(self._conn, _FRAME_LEN.size))[0]
+            if frame_len <= 0:
+                raise HostTcpError("empty response frame")
+            resp_header, resp_payload = decode_frame(
+                _read_exact(self._conn, frame_len)
+            )
+        except OSError as exc:
             self.close()
-        assert last_error is not None
-        raise last_error
+            raise HostTcpError(
+                f"dt host tcp request to {self._addr[0]}:{self._addr[1]} "
+                f"failed: {exc}"
+            ) from exc
+        if not resp_header.get("ok"):
+            raise HostTcpError(
+                f"dt host tcp request {msg_type!r} rejected: "
+                f"{resp_header.get('error', 'unknown error')}"
+            )
+        return resp_header, resp_payload
 
     def close(self) -> None:
         conn, self._conn = self._conn, None
@@ -273,9 +237,3 @@ class HostTcpConnection:
                 conn.close()
             except OSError:
                 pass
-
-    def __enter__(self) -> "HostTcpConnection":
-        return self
-
-    def __exit__(self, *_exc_info) -> None:
-        self.close()

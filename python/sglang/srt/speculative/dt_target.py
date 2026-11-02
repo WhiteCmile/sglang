@@ -716,8 +716,10 @@ class DTTargetController:
         self._ledger = None
         self._feature_source_pool = None
         self._candidate_arena = None
-        # Host-staged TCP fallback server (issue #164); None while disabled.
+        # Cross-host data plane (issues #164, #165): the framed-TCP bootstrap
+        # server and the RDMA endpoint it connects; None while disabled.
         self._host_tcp_server = None
+        self._rdma_endpoint = None
         # A failed direct-GPU-source shutdown is not an ordinary close.  Until
         # every remote read is acknowledged, the pool remains the owner of its
         # exported allocation, producer events, and active leases.  Latch the
@@ -738,8 +740,8 @@ class DTTargetController:
                     instance_id=self.instance_id,
                     data_endpoint="",
                 )
-                # Host-staged TCP fallback (issue #164): one server per Target
-                # instance serves remote hidden pulls and candidate pushes.
+                # Cross-host data plane (issues #164, #165): one bootstrap
+                # server per Target instance connects remote Drafts' RDMA legs.
                 dt_tcp_port = int(getattr(self.server_args, "dt_tcp_port", None) or 0)
                 dt_host_addr = (
                     str(getattr(self.server_args, "dt_host_addr", "") or "")
@@ -828,25 +830,31 @@ class DTTargetController:
                     or self._candidate_arena is not None
                 ):
                     from sglang.srt.speculative.dt_host_tcp import (
-                        MSG_CAND_PUSH,
-                        MSG_HIDDEN_PULL_REQ,
+                        MSG_RDMA_CONNECT,
+                        MSG_RDMA_READY,
                         HostTcpServer,
                     )
+                    from sglang.srt.speculative.dt_rdma import TargetRdmaEndpoint
 
+                    owner = self._feature_source_pool or self._candidate_arena
+                    self._rdma_endpoint = TargetRdmaEndpoint(
+                        pool=self._feature_source_pool,
+                        arena=self._candidate_arena,
+                        device_index=owner.device.index,
+                    )
                     self._host_tcp_server = HostTcpServer("0.0.0.0", dt_tcp_port)
-                    if self._feature_source_pool is not None:
-                        self._host_tcp_server.register_handler(
-                            MSG_HIDDEN_PULL_REQ, self._handle_remote_hidden_pull
-                        )
-                    if self._candidate_arena is not None:
-                        self._host_tcp_server.register_handler(
-                            MSG_CAND_PUSH, self._handle_remote_cand_push
-                        )
+                    self._host_tcp_server.register_handler(
+                        MSG_RDMA_CONNECT, self._rdma_endpoint.handle_connect
+                    )
+                    self._host_tcp_server.register_handler(
+                        MSG_RDMA_READY, self._rdma_endpoint.handle_ready
+                    )
                     logger.info(
-                        "DT host-staged TCP fallback listening on 0.0.0.0:%d "
-                        "(host_addr=%s)",
+                        "DT RDMA bootstrap listening on 0.0.0.0:%d "
+                        "(host_addr=%s, hca=%s)",
                         self._host_tcp_server.port,
                         dt_host_addr or "<unset>",
+                        self._rdma_endpoint.device.name,
                     )
                 self._client.register_target(
                     timeout_s=self.server_args.draft_target_registration_timeout_s
@@ -856,6 +864,9 @@ class DTTargetController:
                 if self._host_tcp_server is not None:
                     self._host_tcp_server.stop()
                     self._host_tcp_server = None
+                if self._rdma_endpoint is not None:
+                    self._rdma_endpoint.close()
+                    self._rdma_endpoint = None
                 if self._client is not None:
                     self._client.close()
                     self._client = None
@@ -872,52 +883,6 @@ class DTTargetController:
         """Whether proposal input is leased from registered Target VRAM."""
 
         return self.is_feature_backed or not self.is_token_only
-
-    def _handle_remote_hidden_pull(
-        self, header: dict, payload: bytes
-    ) -> tuple[dict, bytes]:
-        """hidden_pull_req handler: one leased feature range, bytes out."""
-
-        pool = self._feature_source_pool
-        if pool is None:
-            raise RuntimeError("feature source pool is unavailable")
-        data = pool.remote_pull(
-            transfer_id=str(header.get("transfer_id", "")),
-            source_slot_id=int(header.get("slot_id", -1)),
-            slot_generation=int(header.get("slot_generation", 0)),
-            source_session_id=str(header.get("source_session_id", "")),
-            pool_generation=str(header.get("pool_generation", "")),
-            byte_offset=int(header.get("byte_offset", 0)),
-            nbytes=int(header.get("nbytes", 0)),
-        )
-        return {"ok": True}, data
-
-    def _handle_remote_cand_push(
-        self, header: dict, payload: bytes
-    ) -> tuple[dict, bytes]:
-        """cand_push handler: one candidate row plus metadata words."""
-
-        arena = self._candidate_arena
-        if arena is None:
-            raise RuntimeError("candidate arena is unavailable")
-        row_nbytes = arena.row_width * 4
-        metadata_nbytes = 5 * 4
-        if len(payload) != row_nbytes + metadata_nbytes:
-            raise RuntimeError(
-                f"cand_push payload has {len(payload)} bytes, expected "
-                f"{row_nbytes + metadata_nbytes}"
-            )
-        arena.remote_push(
-            slot_id=int(header.get("slot_id", -1)),
-            generation=int(header.get("generation", 0)),
-            nonce=int(header.get("nonce", 0)),
-            transfer_id=str(header.get("transfer_id", "")),
-            draft_session_id=str(header.get("draft_session_id", "")),
-            root_token=int(header.get("root_token", 0)),
-            data_bytes=payload[:row_nbytes],
-            metadata_bytes=payload[row_nbytes:],
-        )
-        return {"ok": True}, b""
 
     def _emit_direct_gpu_measurement_evidence_once(
         self, payload: dict[str, object]
@@ -4827,9 +4792,12 @@ class DTTargetController:
         finally:
             if getattr(self, "_host_tcp_server", None) is not None:
                 # The shutdown drain above already waited for every remote
-                # read-done; refuse new fallback connections from here on.
+                # read-done; refuse new bootstrap connections from here on.
                 self._host_tcp_server.stop()
                 self._host_tcp_server = None
+            if getattr(self, "_rdma_endpoint", None) is not None:
+                self._rdma_endpoint.close()
+                self._rdma_endpoint = None
             for store in self._result_stores.values():
                 store.close()
             self._result_stores.clear()
@@ -6296,6 +6264,17 @@ class DTTargetController:
                 lost[session] = lost.get(session, True) and entry.source_read_quiescent
             for draft_session_id, quiescent in lost.items():
                 self._revoke_ring_owner(draft_session_id, quiescent=quiescent)
+        # A lost remote Draft's NIC may still touch the feature pool or the
+        # candidate staging: destroy its RDMA queue pairs before any of its
+        # leases is released (#165).  Without that proof, quarantine.
+        rdma_unproven = False
+        rdma = getattr(self, "_rdma_endpoint", None)
+        if rdma is not None and any(
+            entry.error_code in RING_OWNER_LOSS_CODES for entry in batch.entries
+        ):
+            rdma_unproven = not rdma.fence(
+                batch.draft_instance_id, getattr(batch, "draft_session_id", "")
+            )
         if self.uses_direct_gpu_source:
             for entry in batch.entries:
                 if entry.status == EntryStatus.OK:
@@ -6304,7 +6283,9 @@ class DTTargetController:
                     # The Coordinator speaks only for its own copy; the ring
                     # copy's read retires the lease (proof or revocation).
                     continue
-                if entry.source_read_quiescent:
+                if entry.source_read_quiescent and not (
+                    rdma_unproven and entry.error_code in RING_OWNER_LOSS_CODES
+                ):
                     self._release_source_slot(entry.transfer_id)
                 else:
                     self._quarantine_source_slot(entry.transfer_id)

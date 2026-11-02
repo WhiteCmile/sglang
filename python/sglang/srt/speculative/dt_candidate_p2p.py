@@ -60,10 +60,6 @@ from sglang.srt.speculative.dt_cuda_ipc import (
     CudaIpcRuntime,
     register_buffers,
 )
-from sglang.srt.speculative.dt_host_tcp import (
-    MSG_CAND_PUSH,
-    HostTcpConnection,
-)
 
 METADATA_WORDS = 5
 GENERATION_WORD = 0
@@ -669,10 +665,8 @@ class TargetCandidateArena:
         self._event_pool: list[torch.cuda.Event] = []
         self._lock = Lock()
         self._closed = False
-        # Host-staged TCP fallback (issue #164): one side stream serves every
-        # remote push's H2D copy; the lock serializes copies and record writes
-        # across the server's per-connection handler threads.
-        self._remote_push_lock = Lock()
+        # RDMA backend (issue #165): the endpoint's single push thread lands
+        # every remote candidate's H2D copy on this side stream.
         self._remote_push_stream: torch.cuda.Stream | None = None
         self.device_uuid = str(torch.cuda.get_device_properties(self.device).uuid)
         self._zmq_context = zmq.Context.instance()
@@ -1029,117 +1023,113 @@ class TargetCandidateArena:
                 if getattr(self, "_record_seq_expected", None) is not None:
                     self._record_seq_expected[slot_id] = slot.authorization_nonce
 
-    def remote_push(
+    def land_remote_push(
         self,
         *,
         slot_id: int,
-        generation: int,
-        nonce: int,
-        transfer_id: str,
-        draft_session_id: str,
-        root_token: int,
-        data_bytes: bytes,
+        transfer_hash: int,
+        producer_tag_value: int,
         metadata_bytes: bytes,
-        timeout_s: float = 5.0,
-    ) -> None:
-        """Serve one remote Draft's candidate push over the TCP fallback.
+        data_bytes: bytes,
+    ) -> bool:
+        """Land one remote Draft's candidate record (RDMA backend, #165).
 
-        The Target copies the row and metadata words into its own arena on a
-        side stream, then writes this arena's 64-byte completion record into
-        its own /dev/shm record file (payload words first, the reservation
-        nonce released last) so the existing poll/authenticate path consumes
-        cross-host pushes exactly like GPU-written records.
+        Returns ``False`` while the slot's record expectations are not armed
+        yet (dispatch ordering can race the push; the caller retries), and
+        ``True`` once landed.  A record naming a stale transfer, generation,
+        or session raises; a nonce or producer mismatch also quarantines the
+        slot.  Landing copies the row and metadata words into the arena on a
+        side stream and synchronizes that copy -- the GPU visibility barrier
+        -- before this arena's 64-byte completion record is written (payload
+        words first, the reservation nonce last), so the existing observer and
+        authenticate path consumes cross-host pushes like GPU-written records.
         """
 
         if self._closed:
             raise CandidateTransportError("candidate arena is closed")
-        if slot_id < 0 or slot_id >= self.slot_count:
-            raise CandidateTransportError("candidate slot id is out of range")
         if len(data_bytes) != self._row_nbytes:
             raise CandidateTransportError("candidate push row has an invalid length")
         if len(metadata_bytes) != self._metadata_row_nbytes:
             raise CandidateTransportError(
                 "candidate push metadata has an invalid length"
             )
+        generation, nonce_low, nonce_high, _valid, root_token = struct.unpack(
+            "<5I", metadata_bytes
+        )
+        nonce = nonce_low | (nonce_high << 32)
         expected_seq = getattr(self, "_record_seq_expected", None)
         if expected_seq is None:
             raise CandidateTransportError(
                 "candidate arena has no completion-record expectations"
             )
-        deadline = time.monotonic() + timeout_s
-        while True:
-            with self._lock:
-                active = self._active.get(transfer_id)
-                if active != slot_id:
-                    raise CandidateTransportError(
-                        "candidate push names no active destination"
-                    )
-                slot = self._slots[slot_id]
-                if slot.generation != generation:
-                    raise CandidateTransportError("candidate push generation is stale")
-                if slot.authorization_nonce != nonce:
-                    slot.state = CandidateSlotState.QUARANTINED
-                    raise CandidateTransportError("candidate push nonce mismatch")
-                if slot.draft_session_id and slot.draft_session_id != draft_session_id:
-                    slot.state = CandidateSlotState.QUARANTINED
-                    raise CandidateTransportError(
-                        "candidate push producer is unauthorized"
-                    )
-                # authorize() arms the record expectations; dispatch ordering
-                # can race the push, so a missing arm waits instead of failing.
-                armed = (
-                    int(expected_seq[slot_id]) == nonce
-                    and int(self._record_generation[slot_id]) == generation
-                    and int(self._record_tag[slot_id])
-                    == producer_tag(draft_session_id)
-                )
-            if armed:
-                break
-            if time.monotonic() >= deadline:
+        with self._lock:
+            slot = self._slots[slot_id]
+            if (
+                not slot.transfer_id
+                or self._active.get(slot.transfer_id) != slot_id
+                or transfer_id_hash(slot.transfer_id) != transfer_hash
+            ):
                 raise CandidateTransportError(
-                    "candidate push timed out waiting for slot authorization"
+                    "candidate push names no active destination"
                 )
-            time.sleep(0.001)
+            if slot.generation != generation:
+                raise CandidateTransportError("candidate push generation is stale")
+            if slot.authorization_nonce != nonce:
+                slot.state = CandidateSlotState.QUARANTINED
+                raise CandidateTransportError("candidate push nonce mismatch")
+            if (
+                slot.draft_session_id
+                and producer_tag(slot.draft_session_id) != producer_tag_value
+            ):
+                slot.state = CandidateSlotState.QUARANTINED
+                raise CandidateTransportError("candidate push producer is unauthorized")
+            # authorize() arms the record expectations.
+            if not (
+                int(expected_seq[slot_id]) == nonce
+                and int(self._record_generation[slot_id]) == generation
+                and int(self._record_tag[slot_id]) == producer_tag_value
+            ):
+                return False
+            transfer_id = slot.transfer_id
         rows_host = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.int32).copy())
         meta_host = torch.from_numpy(
             np.frombuffer(metadata_bytes, dtype=np.int32).copy()
         )
-        with self._remote_push_lock:
-            if self._remote_push_stream is None:
-                self._remote_push_stream = torch.cuda.Stream(device=self.device)
-            side = self._remote_push_stream
-            with torch.cuda.stream(side):
-                self.storage[slot_id].copy_(rows_host, non_blocking=False)
-                self._metadata[slot_id].copy_(meta_host, non_blocking=False)
-                copied = torch.cuda.Event()
-                copied.record(side)
-            copied.synchronize()
-            words = self._completion_words
-            if words is None:
+        if self._remote_push_stream is None:
+            self._remote_push_stream = torch.cuda.Stream(device=self.device)
+        side = self._remote_push_stream
+        with torch.cuda.stream(side):
+            self.storage[slot_id].copy_(rows_host, non_blocking=False)
+            self._metadata[slot_id].copy_(meta_host, non_blocking=False)
+            copied = torch.cuda.Event()
+            copied.record(side)
+        copied.synchronize()
+        words = self._completion_words
+        if words is None:
+            raise CandidateTransportError(
+                "candidate arena completion record mapping is unavailable"
+            )
+        with self._lock:
+            if int(expected_seq[slot_id]) != nonce:
                 raise CandidateTransportError(
-                    "candidate arena completion record mapping is unavailable"
+                    "candidate slot was rearmed before the push landed"
                 )
-            with self._lock:
-                if int(expected_seq[slot_id]) != nonce:
-                    raise CandidateTransportError(
-                        "candidate slot was rearmed before the push landed"
-                    )
-            record = words[slot_id]
-            record[COMPLETION_META_WORD] = np.uint64(
-                (generation & 0xFFFFFFFF) | (self.row_width << 32)
-            )
-            record[COMPLETION_HASH_WORD] = np.uint64(transfer_id_hash(transfer_id))
-            record[COMPLETION_TOKEN_WORD] = np.uint64(
-                (root_token & 0xFFFFFFFF)
-                | (producer_tag(draft_session_id) << 32)
-            )
-            record[COMPLETION_PRODUCED_WORD] = np.uint64(0)
-            record[COMPLETION_OFFSET_WORD] = np.uint64(0)
-            record[6] = np.uint64(0)
-            record[7] = np.uint64(0)
-            # x86 TSO keeps the in-order host stores visible; publishing the
-            # nonce (seq) word last matches the GPU kernel's release ordering.
-            record[COMPLETION_SEQ_WORD] = np.uint64(nonce)
+        record = words[slot_id]
+        record[COMPLETION_META_WORD] = np.uint64(
+            (generation & 0xFFFFFFFF) | (self.row_width << 32)
+        )
+        record[COMPLETION_HASH_WORD] = np.uint64(transfer_id_hash(transfer_id))
+        record[COMPLETION_TOKEN_WORD] = np.uint64(
+            (root_token & 0xFFFFFFFF) | (producer_tag_value << 32)
+        )
+        record[COMPLETION_PRODUCED_WORD] = np.uint64(0)
+        record[COMPLETION_OFFSET_WORD] = np.uint64(0)
+        record[6] = np.uint64(0)
+        record[7] = np.uint64(0)
+        # x86 TSO keeps the in-order host stores visible; publishing the
+        # nonce (seq) word last matches the GPU kernel's release ordering.
+        record[COMPLETION_SEQ_WORD] = np.uint64(nonce)
+        return True
 
     def notify_host_completion(
         self,
@@ -2223,10 +2213,10 @@ class CandidatePush:
 class _RemotePushEvent(torch.cuda.Event):
     """Completion event for one staged remote push batch.
 
-    The batch's event is recorded on the sender stream once every staged TCP
-    push has landed; a sender-thread failure is re-raised by
+    The batch's event is recorded on the sender stream once every staged
+    RDMA push has landed; a sender-thread failure is re-raised by
     ``query()``/``synchronize()`` so the engine's existing quarantine paths
-    treat a failed TCP push like a failed GPU push.  The failure is read from
+    treat a failed RDMA push like a failed GPU push.  The failure is read from
     the batch at call time: senders keep working after the event is
     published, so a snapshot taken at publication would swallow failures of
     still in-flight items (the round would retire as OK although its
@@ -2352,8 +2342,8 @@ class DraftCandidatePushTransport:
         self.draft_session_id = draft_session_id
         self._profile_timing = bool(profile_timing)
         # This Draft's own host address (--dt-host-addr); a registration whose
-        # host_addr differs is cross-host and served over framed TCP instead
-        # of CUDA IPC (issue #164).
+        # host_addr differs is cross-host and served over RDMA instead of
+        # CUDA IPC (issues #164, #165).
         self._host_addr = host_addr
         # target_instance_id -> (host_addr, data_port) for remote arenas.
         self._remote: dict[str, tuple[str, int]] = {}
@@ -2381,8 +2371,8 @@ class DraftCandidatePushTransport:
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
-        # Cross-host staged pushes (issue #164): one sender thread per remote
-        # Target owns the blocking framed-TCP request so the scheduler thread
+        # Cross-host staged pushes (issues #164, #165): one sender thread per
+        # remote Target owns the blocking RDMA write so the scheduler thread
         # only enqueues an ordered D2H copy and does not serialize network
         # round trips.  Each queue is bounded (REMOTE_PUSH_QUEUE_MAX): the
         # bound is the backpressure that keeps the unpaced sender from
@@ -2444,9 +2434,10 @@ class DraftCandidatePushTransport:
         if remote_addr and remote_addr != self._host_addr:
             # Cross-host arena (issue #164): its IPC handles and /dev/shm
             # record files are meaningless from this process.  Remember the
-            # host-staged endpoint and skip the mapping, the record files,
-            # and the completion DEALER entirely; pushes go over framed TCP
-            # and the Target writes the completion record locally.
+            # data endpoint and skip the mapping, the record files, and the
+            # completion DEALER entirely; pushes go over RDMA into the
+            # Target's host staging and the Target writes the completion
+            # record locally.
             self._remote[registration.target_instance_id] = (
                 remote_addr,
                 int(getattr(registration, "data_port", 0) or 0),
@@ -3035,7 +3026,7 @@ class DraftCandidatePushTransport:
 
         The D2H copy is enqueued on the current stream (ordered after the
         rows' producer and any later in-stream buffer reuse) and the sender
-        thread owns the blocking framed-TCP request.
+        thread owns the blocking RDMA write.
         """
 
         destination = task.candidate_destination
@@ -3109,11 +3100,27 @@ class DraftCandidatePushTransport:
             worker.start()
 
     def _remote_sender_loop(self, target_instance_id: str) -> None:
+        from sglang.srt.speculative.dt_rdma import (
+            DraftRdmaPusher,
+            encode_candidate_record,
+        )
+
         work_queue = self._remote_queues[target_instance_id]
         host, port = self._remote[target_instance_id]
-        # One persistent connection per Draft-Target pair: per-request
-        # connections exhausted the ephemeral-port space at full load.
-        connection = HostTcpConnection(host, port, 30.0)
+        pusher: DraftRdmaPusher | None = None
+        connect_error: BaseException | None = None
+        try:
+            pusher = DraftRdmaPusher(
+                host=host,
+                port=port,
+                device=self.device,
+                draft_instance_id=self.draft_instance_id,
+                draft_session_id=self.draft_session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - fails every queued push
+            logger.exception("RDMA push leg to %s failed to connect", target_instance_id)
+            connect_error = exc
+        tag = producer_tag(self.draft_session_id)
         try:
             while True:
                 item = work_queue.get()
@@ -3121,17 +3128,22 @@ class DraftCandidatePushTransport:
                     return
                 ready, pinned, header, metadata, batch, nbytes = item
                 try:
+                    if connect_error is not None:
+                        raise connect_error
                     if ready is not None:
                         ready.synchronize()
-                    connection.request(
-                        MSG_CAND_PUSH,
-                        header,
-                        payload=(
-                            pinned.numpy().tobytes()
-                            if pinned is not None
-                            else b"\x00" * nbytes
-                        )
-                        + metadata,
+                    pusher.push(
+                        header["slot_id"],
+                        encode_candidate_record(
+                            transfer_hash=transfer_id_hash(header["transfer_id"]),
+                            producer_tag=tag,
+                            metadata=metadata,
+                            row=(
+                                pinned.numpy().tobytes()
+                                if pinned is not None
+                                else b"\x00" * nbytes
+                            ),
+                        ),
                     )
                 except Exception as exc:  # surfaced through the batch event
                     error = CandidateTransportError(
@@ -3158,7 +3170,8 @@ class DraftCandidatePushTransport:
                                 batch.error = error
                         batch.event.mark_recorded()
         finally:
-            connection.close()
+            if pusher is not None:
+                pusher.close()
 
     def _record_remote_batch(self, batch: _RemotePushBatch) -> None:
         """Record the batch event on the sender stream (exactly once)."""
@@ -3203,8 +3216,8 @@ class DraftCandidatePushTransport:
             self._validate_destination(task, destination, destination.nbytes)
             if destination.target_instance_id in self._remote:
                 # Cross-host tombstone (issue #164): send the same metadata
-                # words the local path writes (valid length 0) over framed
-                # TCP; the Target's locally written completion record is the
+                # words the local path writes (valid length 0) over RDMA;
+                # the Target's locally written completion record is the
                 # cancelled push's quiescence proof, exactly as for the
                 # GPU-written record.  It is staged on the same per-Target
                 # queue so a cancel can never overtake a queued push for the
