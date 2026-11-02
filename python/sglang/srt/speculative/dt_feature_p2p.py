@@ -39,7 +39,7 @@ from sglang.srt.speculative.dt_cuda_ipc import (
 )
 from sglang.srt.speculative.dt_host_tcp import (
     MSG_HIDDEN_PULL_REQ,
-    HostTcpClient,
+    HostTcpConnection,
 )
 
 logger = logging.getLogger(__name__)
@@ -1687,72 +1687,83 @@ class DraftFeaturePullTransport:
     def _remote_worker_loop(self, target_instance_id: str) -> None:
         work_queue = self._remote_queues[target_instance_id]
         copy_stream = self._remote_streams[target_instance_id]
-        while True:
-            item = work_queue.get()
-            if item is None:
-                return
-            future, source, destination = item
-            submitted_ns = time.monotonic_ns()
-            result = None
-            error = None
-            try:
-                host, port = self._remote_targets[source.target_instance_id]
-                header = {
-                    "transfer_id": source.transfer_id,
-                    "slot_id": source.source_slot_id,
-                    "slot_generation": source.slot_generation,
-                    "source_session_id": source.source_session_id,
-                    "pool_generation": source.pool_generation,
-                    "transport_session": source.transport_session,
-                    "byte_offset": source.byte_offset,
-                    "nbytes": source.nbytes,
-                }
-                # Correctness-first: the wait budget covers deep queueing
-                # behind a busy peer; the bytes themselves are small.
-                _resp, payload = HostTcpClient.request(
-                    host, port, MSG_HIDDEN_PULL_REQ, header, timeout_s=REMOTE_PULL_BUDGET_S
-                )
-                if len(payload) != source.nbytes:
-                    raise FeatureTransportError(
-                        f"remote hidden pull returned {len(payload)} bytes, "
-                        f"expected {source.nbytes}"
+        connection: HostTcpConnection | None = None
+        try:
+            while True:
+                item = work_queue.get()
+                if item is None:
+                    return
+                future, source, destination = item
+                submitted_ns = time.monotonic_ns()
+                result = None
+                error = None
+                try:
+                    if connection is None:
+                        host, port = self._remote_targets[target_instance_id]
+                        connection = HostTcpConnection(
+                            host, port, REMOTE_PULL_BUDGET_S
+                        )
+                    header = {
+                        "transfer_id": source.transfer_id,
+                        "slot_id": source.source_slot_id,
+                        "slot_generation": source.slot_generation,
+                        "source_session_id": source.source_session_id,
+                        "pool_generation": source.pool_generation,
+                        "transport_session": source.transport_session,
+                        "byte_offset": source.byte_offset,
+                        "nbytes": source.nbytes,
+                    }
+                    # Correctness-first: the wait budget covers deep queueing
+                    # behind a busy peer; the bytes themselves are small.
+                    _resp, payload = connection.request(
+                        MSG_HIDDEN_PULL_REQ, header
                     )
-                cpu = (
-                    torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
-                    .view(torch.bfloat16)
-                    .reshape(tuple(source.shape))
-                )
-                torch.cuda.set_device(self.device)
-                with torch.cuda.stream(copy_stream):
-                    destination.copy_(cpu, non_blocking=False)
-                    copied = torch.cuda.Event()
-                    copied.record(copy_stream)
-                copied.synchronize()
-                result = FeaturePullMetrics(
-                    submitted_ns=submitted_ns,
-                    gpu_completed_ns=time.monotonic_ns(),
-                    mapping_ns=0,
-                    driver_submit_ns=0,
-                    gpu_copy_ns=0,
-                    feature_bytes=source.nbytes,
-                    cold_mapping_count=0,
-                    worker_started_ns=submitted_ns,
-                    mapping_done_ns=submitted_ns,
-                    driver_submit_started_ns=submitted_ns,
-                    driver_submit_done_ns=submitted_ns,
-                    cuda_pre_copy_ns=0,
-                    gpu_start_observed_ns=0,
-                )
-            except Exception as exc:  # noqa: BLE001 - surfaced through the future
-                error = exc
-            with self._admission:
-                self._remote_inflight.discard(future)
-                self._admitted_pulls -= 1
-                self._admission.notify_all()
-            if error is not None:
-                future._reject(error)
-            else:
-                future._resolve(result)
+                    if len(payload) != source.nbytes:
+                        raise FeatureTransportError(
+                            f"remote hidden pull returned {len(payload)} bytes, "
+                            f"expected {source.nbytes}"
+                        )
+                    cpu = (
+                        torch.from_numpy(
+                            np.frombuffer(payload, dtype=np.uint8).copy()
+                        )
+                        .view(torch.bfloat16)
+                        .reshape(tuple(source.shape))
+                    )
+                    torch.cuda.set_device(self.device)
+                    with torch.cuda.stream(copy_stream):
+                        destination.copy_(cpu, non_blocking=False)
+                        copied = torch.cuda.Event()
+                        copied.record(copy_stream)
+                    copied.synchronize()
+                    result = FeaturePullMetrics(
+                        submitted_ns=submitted_ns,
+                        gpu_completed_ns=time.monotonic_ns(),
+                        mapping_ns=0,
+                        driver_submit_ns=0,
+                        gpu_copy_ns=0,
+                        feature_bytes=source.nbytes,
+                        cold_mapping_count=0,
+                        worker_started_ns=submitted_ns,
+                        mapping_done_ns=submitted_ns,
+                        driver_submit_started_ns=submitted_ns,
+                        driver_submit_done_ns=submitted_ns,
+                        cuda_pre_copy_ns=0,
+                        gpu_start_observed_ns=0,
+                    )
+                except Exception as exc:  # noqa: BLE001 - surfaced through the future
+                    error = exc
+                with self._admission:
+                    self._remote_inflight.discard(future)
+                    self._admitted_pulls -= 1
+                    self._admission.notify_all()
+                if error is not None:
+                    future._reject(error)
+                else:
+                    future._resolve(result)
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _worker_stream(self):
         """Return one bounded CUDA stream owned by the current copy worker."""

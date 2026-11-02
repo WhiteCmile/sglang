@@ -24,8 +24,13 @@ legs share it and are dispatched by the request ``type``.  Wire format
         raw payload bytes
 
 The msgpack codec is ``msgspec.msgpack``, the same one every other DT
-module uses.  Every request opens one short-lived connection; correctness
-first, no pooling.
+module uses.  Long-lived workers (one hidden-pull worker and one
+candidate-push sender per Draft-Target pair) keep one persistent framed
+connection each: per-request connections churned a fresh TCP TIME_WAIT
+slot per request and, at the measured full-concurrency round rate,
+exhausted the ephemeral-port space of a (source, destination, port)
+five-tuple within a minute.  The wire protocol is unchanged and the
+server keeps a connection open for sequential request/response rounds.
 """
 
 from __future__ import annotations
@@ -49,7 +54,6 @@ MSG_CAND_PUSH_RESP = "cand_push_resp"
 
 _HEADER_LEN = struct.Struct("<I")
 _FRAME_LEN = struct.Struct("<I")
-_DEFAULT_TIMEOUT_S = 30.0
 
 
 class HostTcpError(RuntimeError):
@@ -189,36 +193,89 @@ class HostTcpServer:
             thread.join(timeout=5.0)
 
 
-class HostTcpClient:
-    """One short-lived connection per request; raises on any failure."""
+class HostTcpConnection:
+    """One persistent framed-TCP connection owned by a single thread.
 
-    @staticmethod
+    The server keeps a connection open for sequential request/response
+    rounds, so a long-lived worker (one per Draft-Target pair) reuses one
+    connection instead of churning a fresh TCP connection — and its TIME_WAIT
+    slot — per request.  At the measured full-concurrency round rate the
+    per-request connections exhausted the ephemeral-port space of a
+    (source, destination, port) five-tuple within a minute; a persistent
+    connection makes the rate irrelevant.  Not thread-safe: each owner is one
+    dedicated worker thread.
+    """
+
+    def __init__(self, host: str, port: int, timeout_s: float) -> None:
+        self._addr = (host, port)
+        self._timeout_s = timeout_s
+        self._conn: socket.socket | None = None
+
+    def _ensure(self) -> socket.socket:
+        if self._conn is None:
+            self._conn = socket.create_connection(self._addr, timeout=self._timeout_s)
+        return self._conn
+
     def request(
-        host: str,
-        port: int,
+        self,
         msg_type: str,
         header: dict,
         payload: bytes = b"",
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
+        *,
+        attempts: int = 2,
     ) -> tuple[dict, bytes]:
-        frame = encode_frame(msg_type, header, payload)
-        try:
-            with socket.create_connection((host, port), timeout=timeout_s) as conn:
-                conn.settimeout(timeout_s)
+        """Send one framed request and read its response.
+
+        Retries once on a transport error with a fresh connection: a retry
+        can only race a lost response, and a replayed frame is idempotent on
+        the server (same transfer nonce/generation, same payload words).
+        Application-level rejections (``ok: false``) are never retried.
+        """
+
+        last_error: HostTcpError | None = None
+        for attempt in range(max(1, attempts)):
+            frame = encode_frame(msg_type, header, payload)
+            try:
+                conn = self._ensure()
+                conn.settimeout(self._timeout_s)
                 conn.sendall(frame)
                 raw_len = _read_exact(conn, _FRAME_LEN.size)
                 frame_len = _FRAME_LEN.unpack(raw_len)[0]
                 if frame_len <= 0:
                     raise HostTcpError("empty response frame")
-                resp_header, resp_payload = decode_frame(_read_exact(conn, frame_len))
-        except HostTcpError:
-            raise
-        except OSError as exc:
-            raise HostTcpError(
-                f"dt host tcp request to {host}:{port} failed: {exc}"
-            ) from exc
-        if not resp_header.get("ok"):
-            raise HostTcpError(
-                f"dt host tcp request {msg_type!r} rejected: {resp_header.get('error', 'unknown error')}"
-            )
-        return resp_header, resp_payload
+                resp_header, resp_payload = decode_frame(
+                    _read_exact(conn, frame_len)
+                )
+            except HostTcpError as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = HostTcpError(
+                    f"dt host tcp request to {self._addr[0]}:{self._addr[1]} "
+                    f"failed: {exc}"
+                )
+            else:
+                if not resp_header.get("ok"):
+                    # The server processed the request and rejected it; a
+                    # retry would hit the same rejection.
+                    raise HostTcpError(
+                        f"dt host tcp request {msg_type!r} rejected: "
+                        f"{resp_header.get('error', 'unknown error')}"
+                    )
+                return resp_header, resp_payload
+            self.close()
+        assert last_error is not None
+        raise last_error
+
+    def close(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def __enter__(self) -> "HostTcpConnection":
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.close()

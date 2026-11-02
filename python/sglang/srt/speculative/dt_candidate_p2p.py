@@ -62,7 +62,7 @@ from sglang.srt.speculative.dt_cuda_ipc import (
 )
 from sglang.srt.speculative.dt_host_tcp import (
     MSG_CAND_PUSH,
-    HostTcpClient,
+    HostTcpConnection,
 )
 
 METADATA_WORDS = 5
@@ -3110,52 +3110,55 @@ class DraftCandidatePushTransport:
 
     def _remote_sender_loop(self, target_instance_id: str) -> None:
         work_queue = self._remote_queues[target_instance_id]
-        while True:
-            item = work_queue.get()
-            if item is None:
-                return
-            ready, pinned, header, metadata, batch, nbytes = item
-            try:
-                if ready is not None:
-                    ready.synchronize()
-                host, port = self._remote[target_instance_id]
-                HostTcpClient.request(
-                    host,
-                    port,
-                    MSG_CAND_PUSH,
-                    header,
-                    payload=(
-                        pinned.numpy().tobytes()
-                        if pinned is not None
-                        else b"\x00" * nbytes
-                    )
-                    + metadata,
-                    timeout_s=30.0,
-                )
-            except Exception as exc:  # surfaced through the batch event
-                error = CandidateTransportError(
-                    f"remote candidate push failed for {header['transfer_id']}"
-                )
-                error.__cause__ = exc
-                finalize = batch.item_failed(error)
-            else:
-                finalize = batch.item_done()
-            finally:
-                if pinned is not None:
-                    self._release_remote_pinned(pinned)
-            if finalize:
+        host, port = self._remote[target_instance_id]
+        # One persistent connection per Draft-Target pair: per-request
+        # connections exhausted the ephemeral-port space at full load.
+        connection = HostTcpConnection(host, port, 30.0)
+        try:
+            while True:
+                item = work_queue.get()
+                if item is None:
+                    return
+                ready, pinned, header, metadata, batch, nbytes = item
                 try:
-                    self._record_remote_batch(batch)
-                except Exception as exc:  # never kill the sender thread
+                    if ready is not None:
+                        ready.synchronize()
+                    connection.request(
+                        MSG_CAND_PUSH,
+                        header,
+                        payload=(
+                            pinned.numpy().tobytes()
+                            if pinned is not None
+                            else b"\x00" * nbytes
+                        )
+                        + metadata,
+                    )
+                except Exception as exc:  # surfaced through the batch event
                     error = CandidateTransportError(
-                        f"remote candidate push completion failed for "
-                        f"{target_instance_id}"
+                        f"remote candidate push failed for {header['transfer_id']}"
                     )
                     error.__cause__ = exc
-                    with batch._lock:
-                        if batch.error is None:
-                            batch.error = error
-                    batch.event.mark_recorded()
+                    finalize = batch.item_failed(error)
+                else:
+                    finalize = batch.item_done()
+                finally:
+                    if pinned is not None:
+                        self._release_remote_pinned(pinned)
+                if finalize:
+                    try:
+                        self._record_remote_batch(batch)
+                    except Exception as exc:  # never kill the sender thread
+                        error = CandidateTransportError(
+                            f"remote candidate push completion failed for "
+                            f"{target_instance_id}"
+                        )
+                        error.__cause__ = exc
+                        with batch._lock:
+                            if batch.error is None:
+                                batch.error = error
+                        batch.event.mark_recorded()
+        finally:
+            connection.close()
 
     def _record_remote_batch(self, batch: _RemotePushBatch) -> None:
         """Record the batch event on the sender stream (exactly once)."""
