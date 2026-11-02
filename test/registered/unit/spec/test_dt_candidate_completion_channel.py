@@ -761,6 +761,123 @@ class TestCompletionRecords:
                 os.unlink(path)
 
 
+class ReadyEvent:
+    """Completion event whose stream work is already done."""
+
+    def query(self):
+        return True
+
+
+def make_notice_arena(slot_count=1):
+    """Arena carrying only the state poll()'s readback path touches."""
+
+    arena = object.__new__(TargetCandidateArena)
+    arena.slot_count = slot_count
+    arena.row_width = ROW_WIDTH
+    arena._lock = Lock()
+    arena._slots = [_CandidateSlot() for _ in range(slot_count)]
+    arena._active = {}
+    arena._retired_transfers = OrderedDict()
+    arena._event_pool = []
+    arena._poll_cursor = 0
+    arena._ready_pickup_pending = False
+    return arena
+
+
+def arm_notice_slot(arena, slot_id, *, transfer_id, generation, nonce, valid_length):
+    """Arm one slot the way a cancelled-notice readback would leave it."""
+
+    slot = arena._slots[slot_id]
+    slot.generation = generation
+    slot.state = CandidateSlotState.ARMED
+    slot.transfer_id = transfer_id
+    slot.authorization_nonce = nonce
+    slot.draft_instance_id = "d"
+    slot.draft_session_id = "draft"
+    slot.completion_draft_instance_id = "d"
+    slot.completion_draft_session_id = "draft"
+    slot.completion_event = ReadyEvent()
+    slot.metadata_host = [
+        generation,
+        nonce & 0xFFFFFFFF,
+        (nonce >> 32) & 0xFFFFFFFF,
+        valid_length,
+        77,
+    ]
+    arena._active[transfer_id] = slot_id
+
+
+class TestProducerTombstoneOnArmedSlot:
+    """Issue #178: an authenticated producer tombstone (valid length 0) that
+    arrives while this side still holds the slot ARMED retires the slot. It
+    must not fail the arena with a generation/authentication error — the
+    overloaded point that races cancellations this way used to crash it."""
+
+    def test_notice_tombstone_on_armed_slot_retires_it(self):
+        arena = make_notice_arena()
+        arm_notice_slot(arena, 0, transfer_id="t1", generation=2, nonce=222,
+                        valid_length=0)
+        assert arena.poll() == ()
+        slot = arena._slots[0]
+        assert slot.state is CandidateSlotState.FREE
+        assert "t1" not in arena._active
+        assert "t1" in arena._retired_transfers
+
+    def test_notice_candidate_still_completes(self):
+        arena = make_notice_arena()
+        arm_notice_slot(arena, 0, transfer_id="t1", generation=2, nonce=222,
+                        valid_length=ROW_WIDTH)
+        (completion,) = arena.poll()
+        assert completion.transfer_id == "t1"
+        assert arena._slots[0].state is CandidateSlotState.READY
+
+    def test_notice_bad_nonce_still_quarantines(self):
+        arena = make_notice_arena()
+        arm_notice_slot(arena, 0, transfer_id="t1", generation=2, nonce=222,
+                        valid_length=ROW_WIDTH)
+        arena._slots[0].authorization_nonce = 999
+        with pytest.raises(CandidateTransportError, match="generation/authentication"):
+            arena.poll()
+        assert arena._slots[0].state is CandidateSlotState.QUARANTINED
+
+    def test_record_tombstone_on_armed_slot_retires_it(self):
+        arena = make_completion_arena()
+        arm_completion_slot(arena, 0, transfer_id="new", generation=2, nonce=222)
+        words = arena._completion_words[0]
+        # The producer's tombstone: authenticated words, valid length 0.
+        words[COMPLETION_META_WORD] = 2
+        words[COMPLETION_HASH_WORD] = transfer_id_hash("new")
+        words[COMPLETION_TOKEN_WORD] = 77 | (producer_tag("draft") << 32)
+        words[COMPLETION_SEQ_WORD] = 222
+        assert arena.poll_completion_records() == 1
+        slot = arena._slots[0]
+        assert slot.state is CandidateSlotState.FREE
+        assert "new" not in arena._active
+        assert "new" in arena._retired_transfers
+
+    def test_record_tombstone_on_cancel_pending_slot_retires_it(self):
+        arena = make_completion_arena()
+        arm_completion_slot(
+            arena,
+            0,
+            transfer_id="new",
+            generation=2,
+            nonce=222,
+            state=CandidateSlotState.QUARANTINED,
+            cancel_pending=True,
+        )
+        words = arena._completion_words[0]
+        words[COMPLETION_META_WORD] = 2
+        words[COMPLETION_HASH_WORD] = transfer_id_hash("new")
+        words[COMPLETION_TOKEN_WORD] = 77 | (producer_tag("draft") << 32)
+        words[COMPLETION_SEQ_WORD] = 222
+        assert arena.poll_completion_records() == 1
+        slot = arena._slots[0]
+        assert slot.state is CandidateSlotState.FREE
+        assert "new" not in arena._active
+        assert "new" in arena._retired_transfers
+
+
 OBSERVER_CXX_AVAILABLE = shutil.which(os.environ.get("CXX", "g++")) is not None
 
 

@@ -1407,7 +1407,12 @@ class TargetCandidateArena:
         return accepted
 
     def poll(self, *, max_queries: int = 64) -> tuple[CandidateCompletion, ...]:
-        """Observe ready events with bounded round-robin scanning."""
+        """Observe ready events with bounded round-robin scanning.
+
+        An authenticated readback whose valid length is 0 is the producer's
+        tombstone for a task cancelled before its push; it retires the slot
+        instead of completing it (issue #178).
+        """
 
         if max_queries <= 0:
             raise ValueError("max_queries must be positive")
@@ -1443,8 +1448,22 @@ class TargetCandidateArena:
                 if (
                     values[GENERATION_WORD] != slot.generation
                     or nonce != slot.authorization_nonce
-                    or values[VALID_LENGTH_WORD] != self.row_width
                 ):
+                    slot.state = CandidateSlotState.QUARANTINED
+                    raise CandidateTransportError(
+                        "candidate notification metadata failed generation/authentication"
+                    )
+                if values[VALID_LENGTH_WORD] == 0:
+                    # Authenticated producer tombstone on a slot this side
+                    # had not cancelled yet: the cancelled notice won the
+                    # race against this Target's own cancel (issue #178),
+                    # and the producer proved on its stream that no
+                    # candidate will land. Retire the slot, exactly like
+                    # the completion-record tombstone and poll_cancelled
+                    # paths, instead of failing the arena.
+                    self._free_locked(slot_id)
+                    continue
+                if values[VALID_LENGTH_WORD] != self.row_width:
                     slot.state = CandidateSlotState.QUARANTINED
                     raise CandidateTransportError(
                         "candidate notification metadata failed generation/authentication"
@@ -1652,7 +1671,10 @@ class TargetCandidateArena:
         other writer.  For a cancel-pending slot the authenticated record is
         the cancelled push's quiescence proof — its kernel still publishes
         the original nonce — and retires the slot directly, replacing the
-        suppressed notice's tombstone readback.  Accepted completions also
+        suppressed notice's tombstone readback.  An authenticated record
+        with valid length 0 is the producer's tombstone for a task cancelled
+        before its push (remote tombstones land here) and retires the slot
+        the same way, whether or not this side already cancelled it.  Accepted completions also
         carry the record's %globaltimer stamp and, when the producer stamped
         a nonzero globaltimer offset, the publication-to-discovery
         delivery_ns derived from both; the monotonic observed-chain fields
@@ -1746,12 +1768,29 @@ class TargetCandidateArena:
                 return 0
             if (
                 meta & 0xFFFFFFFF != generation
-                or meta >> 32 != self.row_width
                 or record_hash != transfer_id_hash(slot.transfer_id)
                 or token >> 32 != int(self._record_tag[slot_id])
             ):
                 if slot.cancel_pending:
                     slot.cancel_pending = False
+                slot.state = CandidateSlotState.QUARANTINED
+                raise CandidateTransportError(
+                    "candidate completion record failed generation/authentication"
+                )
+            if meta >> 32 == 0:
+                # Authenticated producer tombstone for a task cancelled
+                # before its push (a remote tombstone's record lands here):
+                # the record is the producer's quiescence proof, so retire
+                # the slot whether or not this side already cancelled it
+                # (issue #178).
+                if slot.state is CandidateSlotState.ARMED or (
+                    slot.state is CandidateSlotState.QUARANTINED
+                    and slot.cancel_pending
+                ):
+                    self._free_locked(slot_id)
+                    return 1
+                return 0
+            if meta >> 32 != self.row_width:
                 slot.state = CandidateSlotState.QUARANTINED
                 raise CandidateTransportError(
                     "candidate completion record failed generation/authentication"
