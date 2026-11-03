@@ -62,7 +62,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS, VALID_LENGTH_WORD
+from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS
 from sglang.srt.speculative.dt_direct_ring import (
     ENTRY_BYTES,
     ENTRY_HEADER_BYTES,
@@ -695,10 +695,10 @@ class TargetRdmaEndpoint:
     accepts Draft connections through the bootstrap server, publishes ready
     records, and lands candidate pushes into the arena."""
 
-    def __init__(self, *, pool, arena, device_index: int, on_cancelled_push=None) -> None:
+    def __init__(self, *, pool, arena, device_index: int, on_landed_push=None) -> None:
         self._pool = pool
         self._arena = arena
-        self._on_cancelled_push = on_cancelled_push
+        self._on_landed_push = on_landed_push
         self._device_index = device_index
         self.device = RdmaDevice(closest_ib_device(device_index))
         self._lock = threading.Lock()
@@ -1052,20 +1052,19 @@ class TargetRdmaEndpoint:
                 if landed_transfer is None:
                     continue
                 pending.pop(slot_id)
-                if self._on_cancelled_push is not None and not struct.unpack(
-                    f"<{METADATA_WORDS}I", metadata
-                )[VALID_LENGTH_WORD]:
-                    # A cancelled candidate record (valid length 0) is the
-                    # Draft's authenticated tombstone: the arena validated it
-                    # against the slot's generation, nonce, and producer tag
-                    # before landing it.  Let the controller retire what the
-                    # tombstone proves quiescent (a retired-unaccepted
-                    # round's source lease).
+                if self._on_landed_push is not None:
+                    # Every candidate push the arena authenticated and landed
+                    # — a cancelled tombstone (valid length 0) or a
+                    # successful row — proves that Draft's source read
+                    # complete or never started.  Let the controller retire
+                    # what the proof makes quiescent (a retired-unaccepted
+                    # round's source lease); the callback is a no-op for
+                    # rounds the Coordinator accepted.
                     try:
-                        self._on_cancelled_push(landed_transfer)
+                        self._on_landed_push(landed_transfer)
                     except Exception:  # noqa: BLE001 - the lease stays fenced
                         logger.exception(
-                            "cancelled-push callback failed for %s", landed_transfer
+                            "landed-push callback failed for %s", landed_transfer
                         )
 
     # -- failure handling ---------------------------------------------------
