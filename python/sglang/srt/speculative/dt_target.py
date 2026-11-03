@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -38,9 +37,6 @@ from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
-
-# Critical-section fallback for controller doubles that never ran __init__.
-_NULL_CONTEXT = contextlib.nullcontext()
 
 # Coordinator failure codes meaning the assigned Draft session is gone.
 RING_OWNER_LOSS_CODES = frozenset(
@@ -720,7 +716,7 @@ class DTTargetController:
         # recorded after the ACK cleanup that should have pruned it
         # (CI review, PR #210).
         self._remote_source_lock = threading.Lock()
-        self._ring_revoked_sessions: set[str] = set()
+        self._ring_revoked_sessions: dict[str, bool] = {}
         # Owner lease per request from Coordinator assignments:
         # request_id -> (draft_instance_id, draft_session_id, owner_epoch).
         self._draft_binding: dict[str, tuple[str, str, int]] = {}
@@ -5789,13 +5785,6 @@ class DTTargetController:
             "source_done_batches": len(self._source_done_batch_entries),
             "cancelled_transfers": len(self._cancelled_transfers),
             "request_lanes": len(self._lane_by_request),
-            "remote_source_retirements": len(
-                getattr(self, "_remote_source_retirement", {})
-            ),
-            "remote_source_proofs_landed": len(
-                getattr(self, "_remote_source_proof_landed", ())
-            ),
-            "remote_ring_sessions": len(getattr(self, "_remote_ring_sessions", {})),
             "early_staging_in_use": 0,
             "deferred_feature_stages": int(self._deferred_dflash_feature_stages),
             "feature_source_leases": (
@@ -6660,8 +6649,7 @@ class DTTargetController:
 
     def _remote_source_guard(self):
         """Critical-section guard for the remote proof/retirement handshake."""
-        lock = getattr(self, "_remote_source_lock", None)
-        return lock if lock is not None else _NULL_CONTEXT
+        return self._remote_source_lock
 
     def _ack_confirmed_remote_rounds(
         self, accepted_transfer_ids, duplicate_transfer_ids
@@ -6716,21 +6704,37 @@ class DTTargetController:
             ring_sessions = getattr(self, "_remote_ring_sessions", None)
             remote = ring_sessions is not None and transfer_id in ring_sessions
             replay = False
+            revoked_quiescent: bool | None = None
             # One critical section: discarding the unconfirmed marker,
             # registering the waiter (with the publish-time session id;
             # abort paths such as pop_aborted() drop the _draft_binding
-            # before this runs), and replaying a proof that landed before
-            # registration must be atomic with the completion thread's
-            # waiter/cache check, else the only proof is lost between the
-            # two checks (CI review, PR #210).
+            # before this runs), replaying a proof that landed before
+            # registration, and consuming a revocation that already ran must
+            # be atomic with the completion thread's waiter/cache check,
+            # else the only proof is lost between the two checks, or a
+            # waiter is registered for a producer that was already revoked
+            # and can never push or be revoked again (CI review, PR #210).
             with self._remote_source_guard():
                 direct_sent.discard(transfer_id)
                 if remote and retirement is not None:
-                    retirement[transfer_id] = ring_sessions.pop(transfer_id, None)
+                    session_id = ring_sessions.pop(transfer_id, None)
+                    if session_id is not None:
+                        # The Draft may have been revoked while this round's
+                        # Coordinator copy sat backpressured: its fence
+                        # already destroyed the ring leg, so a waiter
+                        # registered now would wait forever.  Consume the
+                        # cached quiescence result instead.
+                        revoked_quiescent = self._ring_revoked_sessions.get(
+                            session_id
+                        )
                     landed = getattr(self, "_remote_source_proof_landed", None)
-                    if landed is not None and transfer_id in landed:
+                    if revoked_quiescent is None:
+                        retirement[transfer_id] = session_id
+                        if landed is not None and transfer_id in landed:
+                            landed.discard(transfer_id)
+                            replay = True
+                    elif landed is not None:
                         landed.discard(transfer_id)
-                        replay = True
             self._release_candidate_destination(transfer_id, remote_quiescent=False)
             if remote:
                 # A remote record has no early read proof and the Coordinator
@@ -6743,6 +6747,15 @@ class DTTargetController:
                 # or, if the Draft dies first, on this session's revocation —
                 # never on Coordinator confirmation.
                 if retirement is None:
+                    return
+                if revoked_quiescent is not None:
+                    # The session's revocation already ran: retire the source
+                    # exactly as the revocation retired its registered
+                    # waiters.
+                    if revoked_quiescent:
+                        self._release_source_slot(transfer_id)
+                    else:
+                        self._quarantine_source_slot(transfer_id)
                     return
                 if replay:
                     # The Draft's push may also have landed before this
@@ -8456,6 +8469,14 @@ class DTTargetController:
                 # Coordinator relay.
                 written_ns = time.monotonic_ns()
                 source = task.source
+                # Install the unconfirmed-round bookkeeping BEFORE the write:
+                # the write releases the GIL, and the Draft can consume the
+                # record, abandon, and land its tombstone inside that window;
+                # a proof landing with neither waiter nor unconfirmed marker
+                # is dropped and the source lease leaks (CI review, PR #210).
+                with self._remote_source_guard():
+                    self._remote_ring_sessions[task.transfer_id] = session_id
+                    self._direct_sent.add(task.transfer_id)
                 try:
                     if source is None:
                         seq = writer.write(payload=payload, has_pull=False)
@@ -8470,6 +8491,20 @@ class DTTargetController:
                             event_handle=source.producer_event_handle,
                         )
                 except RdmaTransportError:
+                    seq = None
+                except BaseException:
+                    with self._remote_source_guard():
+                        self._direct_sent.discard(task.transfer_id)
+                        self._remote_ring_sessions.pop(task.transfer_id, None)
+                        self._remote_source_proof_landed.discard(task.transfer_id)
+                    raise
+                if seq is None:
+                    # The record never reached the ring: roll the bookkeeping
+                    # back so a later retirement classifies the round local.
+                    with self._remote_source_guard():
+                        self._direct_sent.discard(task.transfer_id)
+                        self._remote_ring_sessions.pop(task.transfer_id, None)
+                        self._remote_source_proof_landed.discard(task.transfer_id)
                     self._retire_failed_ring_writer(session_id, writer)
                     stamped.append(task)
                     continue
@@ -8482,14 +8517,8 @@ class DTTargetController:
                 destinations = getattr(self, "_remote_ring_destinations", None)
                 if destinations is not None:
                     destinations[task.transfer_id] = ring_task.candidate_destination
-                # The retirement registry reads this when the round retires:
-                # the _draft_binding may be gone by then (issue #209).
-                ring_sessions = getattr(self, "_remote_ring_sessions", None)
-                if ring_sessions is not None:
-                    ring_sessions[task.transfer_id] = session_id
                 # Applied after ledger.begin() registers the round.
                 self._lease_marks.append((task.transfer_id, instance_id))
-                self._direct_sent.add(task.transfer_id)
                 if self._profile_active:
                     self._profile_emit(
                         "target_ring_write",
@@ -8524,8 +8553,7 @@ class DTTargetController:
 
         if draft_session_id in self._ring_revoked_sessions:
             return
-        self._ring_revoked_sessions.add(draft_session_id)
-        self._ring_writers.pop(draft_session_id, None)
+        ring_quiescent = True
         if getattr(writer, "is_remote", False):
             rdma = getattr(self, "_rdma_endpoint", None)
             if rdma is not None:
@@ -8534,7 +8562,15 @@ class DTTargetController:
                 # Coordinator-relay fallback's features and candidates; a
                 # full fence() here would kill that fallback with them
                 # (CI review, PR #207 round 4).
-                rdma.fence_ring(writer.draft_instance_id, draft_session_id)
+                ring_quiescent = bool(
+                    rdma.fence_ring(writer.draft_instance_id, draft_session_id)
+                )
+        # Cache the ring-leg quiescence proof: a retired-unaccepted round of
+        # this session that is cancelled later consumes this result instead
+        # of registering a waiter no push or revocation can ever complete
+        # (CI review, PR #210).
+        self._ring_revoked_sessions[draft_session_id] = ring_quiescent
+        self._ring_writers.pop(draft_session_id, None)
         writer.close()
         logger.warning(
             "retired failed remote ring writer for draft session %s",
@@ -8701,7 +8737,6 @@ class DTTargetController:
     def _revoke_ring_owner(self, draft_session_id: str, *, quiescent: bool) -> None:
         """Revoke one Draft session's ring lease and retire its ring rounds."""
 
-        self._ring_revoked_sessions.add(draft_session_id)
         writer = self._ring_writers.pop(draft_session_id, None)
         if writer is not None and getattr(writer, "is_remote", False):
             # A remote Draft's death does not stop its NIC: destroy the
@@ -8713,6 +8748,11 @@ class DTTargetController:
                 quiescent = bool(fenced) and quiescent and all(fenced.values())
             else:
                 quiescent = False
+        # Cache the quiescence proof: a retired-unaccepted round of this
+        # session whose Coordinator copy is still backpressured consumes this
+        # result when it is cancelled, instead of registering a waiter no
+        # push or revocation can ever complete (CI review, PR #210).
+        self._ring_revoked_sessions[draft_session_id] = quiescent
         outstanding = self._ring_outstanding.pop(draft_session_id, deque())
         for _seq, transfer_id, pull in outstanding:
             self._ring_unproven.pop(transfer_id, None)
