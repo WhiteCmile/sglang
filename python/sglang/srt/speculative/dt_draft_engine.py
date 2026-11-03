@@ -2603,18 +2603,10 @@ class FlashMTPDraftEngine:
             # The worker's INPUT_READY write followed the copy on its stream.
             self._publish_source_done(task)
             self._ring_admission.append((task, slot, rows))
-        elif entry.has_pull and endpoint.is_remote and self._submit_remote_ring_pull(
-            task
-        ):
-            # The hidden rows are being pulled into a feature staging slot
-            # now, at ring admission — like the local worker's eager copy —
-            # so the round's pull is off its execution critical path.
-            pass
         else:
-            # No-pull entries, and remote entries that could not pre-pull:
-            # a remote round's hidden rows are then pulled lazily at
-            # execution over the RDMA pull leg (#165), exactly like a
-            # relayed task's.
+            # No-pull local entries, and remote entries: a remote ring's
+            # hidden rows are pulled lazily at execution over the RDMA pull
+            # leg (#165), exactly like a relayed task's.
             self._pending.append(task)
         profile_emit(
             "draft_ring_take",
@@ -2922,7 +2914,17 @@ class FlashMTPDraftEngine:
         queue = self._ring_admission
         if not queue:
             return
-        available_rows, available_kv = self._persistent_capacity_available()
+        available_rows = self._draft_model_runner.req_to_token_pool.available_size()
+        available_kv = self._draft_model_runner.token_to_kv_pool_allocator.available_size()
+        for owner in self._pending_feature_batches:
+            for item in owner.pending:
+                rows, tokens = self._persistent_task_allocation(item.task)
+                available_rows -= rows
+                available_kv -= max(tokens, 0)
+        for entry in self._input_ready_features:
+            rows, tokens = self._persistent_task_allocation(entry.pending.task)
+            available_rows -= rows
+            available_kv -= max(tokens, 0)
         now_ns = time.monotonic_ns()
         from dt_protocol import DraftTaskKind
 
@@ -4916,7 +4918,27 @@ class FlashMTPDraftEngine:
                 else int(source.shape[0])
             )
             row_end = row_offset + row_count
-            descriptor = self._feature_source_descriptor(task)
+            descriptor = FeatureSourceDescriptor(
+                target_instance_id=source.target_instance_id,
+                source_device_id=source.source_device_id,
+                source_slot_id=source.source_slot_id,
+                slot_generation=source.slot_generation,
+                transfer_id=source.transfer_id,
+                feature_schema_id=source.feature_schema_id,
+                nbytes=source.nbytes,
+                byte_offset=source.byte_offset,
+                transport=source.transport,
+                source_session_id=source.source_session_id,
+                pool_generation=source.pool_generation,
+                transport_session=source.transport_session,
+                device_uuid=source.device_uuid,
+                allocation_length=source.allocation_length,
+                allocation_offset=source.allocation_offset,
+                ipc_handle=source.ipc_handle,
+                dtype=source.dtype,
+                shape=tuple(source.shape),
+                producer_event_handle=source.producer_event_handle,
+            )
             sources.append(descriptor)
             destinations.append(staging[row_offset:row_end])
             if task.source_read_migration_id:
@@ -5046,63 +5068,6 @@ class FlashMTPDraftEngine:
             available_rows -= rows
             available_kv -= max(tokens, 0)
         return available_rows, available_kv
-
-    def _submit_remote_ring_pull(self, task) -> bool:
-        """Eagerly pull a remote ring task's hidden rows into a staging slot.
-
-        The local ring's native worker copies the hidden rows at ring
-        admission, so a same-host round's features are ready before it runs;
-        without this the remote round's pull would start only at batch take
-        and sit on its execution critical path.  The batch rides the normal
-        PendingFeatureBatch pipeline to INPUT_READY.  Returns False when the
-        task must take the lazy in-pending path instead (no staging slot, or
-        a persistent/proposal-admission gate would have deferred it).
-        """
-        if (
-            not self._uses_direct_gpu_source
-            or self._feature_pull_transport is None
-            or task.transfer_id in self._cancelled_ids
-            or time.monotonic_ns() >= task.deadline_ns
-        ):
-            return False
-        if not self._free_feature_staging_slots:
-            return False
-        if task.requires_proposal and self._proposal_admission_blocked():
-            return False
-        row_cost, kv_cost = self._persistent_task_allocation(task)
-        available_rows, available_kv = self._persistent_capacity_available()
-        if row_cost > available_rows or kv_cost > available_kv:
-            return False
-        row_count = (
-            int(task.feature_token_count)
-            if self._is_feature_backed
-            else int(task.source.shape[0])
-        )
-        staging_slot = self._free_feature_staging_slots.popleft()
-        staging = self._feature_staging_buffers[staging_slot]
-        try:
-            future = self._feature_pull_transport.submit(
-                source=self._feature_source_descriptor(task),
-                destination=staging[:row_count],
-            )
-        except Exception as exc:  # surfaced through the batch pipeline
-            future = Future()
-            future.set_exception(exc)
-        self._pending_feature_batches.append(
-            PendingFeatureBatch(
-                batch_id=f"remote-ring:{task.transfer_id}",
-                pending=[PendingDraftTask(task=task)],
-                staging_slot=staging_slot,
-                row_ranges=((0, row_count),),
-                futures=(future,),
-                submitted_ns=time.monotonic_ns(),
-            )
-        )
-        if staging_slot in self._feature_staging_refcounts:
-            raise RuntimeError("feature staging slot was admitted twice")
-        self._feature_staging_refcounts[staging_slot] = 1
-        self._publish_capacity()
-        return True
 
     def _release_feature_staging_entries(self, staging_slot: int, count: int) -> None:
         if count <= 0:
