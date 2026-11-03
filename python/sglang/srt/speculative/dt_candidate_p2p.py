@@ -99,6 +99,12 @@ READY_RECORD_WORDS = 8
 READY_RECORD_BYTES = READY_RECORD_WORDS * 4
 PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
+# One batched-publication descriptor per pushed row, matching
+# DtPushCompletionDesc in csrc/dt_push_completion.cu (five u64, five u32,
+# four pad bytes).
+_PUSH_BATCH_DESC = struct.Struct("<5Q5I4x")
+_PUSH_BATCH_COMPLETION = 1
+_PUSH_BATCH_READY = 2
 # One 64-byte host completion record per slot: eight u64 words, the seq word
 # published last with a system-scope release store.
 COMPLETION_RECORD_WORDS = 8
@@ -220,23 +226,17 @@ def _build_push_completion_library() -> Path:
 
 
 class _PushCompletionKernel:
-    """ctypes handle for the one-block completion record publication kernel."""
+    """ctypes handle for the batched completion record publication kernel."""
 
     def __init__(self) -> None:
         lib = ctypes.CDLL(str(_build_push_completion_library()))
-        lib.dt_push_completion_launch.argtypes = [
+        lib.dt_push_completion_batch_launch.argtypes = [
             ctypes.c_int,
             ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint64,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint64,
+            ctypes.c_int,
             ctypes.c_uint64,
         ]
-        lib.dt_push_completion_launch.restype = ctypes.c_int
+        lib.dt_push_completion_batch_launch.restype = ctypes.c_int
         lib.dt_push_completion_sample_globaltimer.argtypes = [
             ctypes.c_int,
             ctypes.c_void_p,
@@ -245,30 +245,18 @@ class _PushCompletionKernel:
         lib.dt_push_completion_sample_globaltimer.restype = ctypes.c_int
         self._lib = lib
 
-    def launch(
+    def launch_batch(
         self,
         *,
         device: int,
-        record_address: int,
-        seq: int,
-        generation: int,
-        valid_length: int,
-        record_hash: int,
-        root_token: int,
-        tag: int,
-        globaltimer_offset_ns: int,
+        descs_ptr: int,
+        count: int,
         stream: int,
     ) -> None:
-        rc = self._lib.dt_push_completion_launch(
+        rc = self._lib.dt_push_completion_batch_launch(
             device,
-            record_address,
-            seq,
-            generation,
-            valid_length,
-            record_hash,
-            root_token,
-            tag,
-            globaltimer_offset_ns,
+            descs_ptr,
+            count,
             stream,
         )
         if rc != 0:
@@ -2404,6 +2392,12 @@ class DraftCandidatePushTransport:
         # address), plus the publication kernel.
         self._completion_records: dict[tuple[str, str, str, str], tuple[_ReadyRecordFile, int]] = {}
         self._completion_kernel: _PushCompletionKernel | None = None
+        # Batched-publication descriptor staging: two pinned slots guarded by
+        # per-slot stream events so a repack never races the previous wave's
+        # kernel still reading its descriptors (issue #208).
+        self._batch_desc_slots: list = [None, None]
+        self._batch_desc_events: list = [None, None]
+        self._batch_desc_slot = 0
         # CLOCK_REALTIME minus this GPU's %globaltimer, calibrated once on
         # first use; None when uncalibrated (records then carry offset 0).
         self._globaltimer_offset_ns: int | None = None
@@ -2615,27 +2609,57 @@ class DraftCandidatePushTransport:
                 self.device_index,
             )
 
-    def _launch_completion_record(
+    def _batch_desc_for(
         self,
+        task,
         *,
         destination,
-        record_hash: int,
-        root_token: int,
+        metadata_address: int,
         record_address: int,
-        stream: int,
-    ) -> None:
-        self._completion_kernel.launch(
-            device=self.device_index,
-            record_address=record_address,
-            seq=int(destination.authorization_nonce),
-            generation=int(destination.generation),
-            valid_length=int(destination.row_width),
-            record_hash=record_hash,
-            root_token=root_token,
-            tag=self._producer_tag,
-            globaltimer_offset_ns=self._globaltimer_offset_ns or 0,
-            stream=stream,
+        kind: int,
+    ) -> bytes:
+        """Pack one batched-publication descriptor for a local push row."""
+        self._ensure_globaltimer_offset()
+        # The offset can be negative (GPU timebase ahead of host realtime);
+        # store the wrapped u64, exactly what the retired ctypes c_uint64
+        # argument carried.
+        offset_ns = int(self._globaltimer_offset_ns or 0) & 0xFFFFFFFFFFFFFFFF
+        return _PUSH_BATCH_DESC.pack(
+            record_address,
+            metadata_address,
+            int(destination.authorization_nonce),
+            transfer_id_hash(task.transfer_id),
+            offset_ns,
+            int(destination.generation),
+            int(destination.row_width),
+            int(task.next_token_id) & 0xFFFFFFFF,
+            self._producer_tag,
+            kind,
         )
+
+    def _batch_desc_slot_buffer(self, nbytes: int, stream) -> tuple:
+        """Return the next pinned descriptor slot plus its guard event.
+
+        Two slots alternate; a slot is repacked only after the stream event
+        recorded behind its previous kernel reports complete, so the host
+        never overwrites descriptors a queued wave still reads.
+        """
+        slot = self._batch_desc_slot
+        self._batch_desc_slot = slot ^ 1
+        old_event = self._batch_desc_events[slot]
+        if old_event is not None and not old_event.query():
+            # The previous wave's kernel may still read this slot's pinned
+            # descriptors (or the buffer about to be replaced); wait for it
+            # before repacking or freeing.
+            old_event.synchronize()
+        buffer = self._batch_desc_slots[slot]
+        if buffer is None or buffer.numel() < nbytes:
+            buffer = torch.empty(
+                max(nbytes, 4096), dtype=torch.uint8, pin_memory=True
+            )
+            self._batch_desc_slots[slot] = buffer
+            self._batch_desc_events[slot] = torch.cuda.Event()
+        return buffer, self._batch_desc_events[slot]
 
     def _mapping(self, destination):
         mapped = self._registered.get(self._registration_key(destination))
@@ -2890,9 +2914,10 @@ class DraftCandidatePushTransport:
         # copy, so a batch's remote legs no longer serialize network latency.
         local_tasks = []
         segments = []
-        metadata_addresses = []
+        publications = []
         cold = 0
         remote_batch: _RemotePushBatch | None = None
+        candidates_ptr = candidates.data_ptr()
         for index, task in enumerate(tasks):
             destination = task.candidate_destination
             if destination.target_instance_id in self._remote:
@@ -2904,15 +2929,47 @@ class DraftCandidatePushTransport:
             data_base, metadata_base = self._mapping(destination)
             segments.append(
                 CopySegment(
-                    source_address=candidates[index].data_ptr(),
+                    source_address=candidates_ptr + index * row_bytes,
                     destination_address=(
                         data_base + destination.data_allocation_offset
                     ),
                     length=row_bytes,
                 )
             )
-            metadata_addresses.append(
+            metadata_address = (
                 metadata_base + destination.metadata_allocation_offset
+            )
+            registration_key = self._registration_key(destination)
+            completion = self._completion_records.get(registration_key)
+            if completion is not None:
+                records, device_base = completion
+                if destination.slot_id >= records.slot_capacity:
+                    raise CandidateTransportError(
+                        "completion record slot is out of range"
+                    )
+                record_address = (
+                    device_base + destination.slot_id * COMPLETION_RECORD_BYTES
+                )
+                kind = _PUSH_BATCH_COMPLETION
+            else:
+                # The completion record carries a superset of the READY record
+                # words; only Targets without one take the READY record path.
+                record = self._ready_records.get(registration_key)
+                if record is None:
+                    record_address = 0
+                    kind = 0
+                else:
+                    records, device_base = record
+                    if destination.slot_id >= records.slot_capacity:
+                        raise CandidateTransportError(
+                            "READY record slot is out of range"
+                        )
+                    record_address = (
+                        device_base + destination.slot_id * READY_RECORD_BYTES
+                    )
+                    kind = _PUSH_BATCH_READY
+            publications.append(
+                (task, destination, metadata_address, record_address, kind)
             )
         stream = torch.cuda.current_stream(self.device)
         start_event = (
@@ -2924,89 +2981,42 @@ class DraftCandidatePushTransport:
             start_event.record(stream)
         if segments:
             self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
-        # Issue the per-row publication words directly on the bound driver
-        # call: this loop runs ~5 writes per task per wave and the wrapper
-        # method's per-call validation/keyword overhead dominated the push
-        # submit.  Identical driver calls in identical order, same per-call
-        # error check; the values are in range by construction (nonce words
-        # masked to uint32, row_width/generation validated above).
-        write_value32 = self._runtime._stream_write_value32
-        if write_value32 is None:
-            raise CandidateTransportError("cuStreamWriteValue32 is unavailable")
-        check_driver = self._runtime._check_driver
-        c_stream = ctypes.c_void_p(stream.cuda_stream)
-        c_uint64 = ctypes.c_uint64
-        c_uint32 = ctypes.c_uint32
-        c_zero = ctypes.c_uint(0)
-        for task, address in zip(local_tasks, metadata_addresses, strict=True):
-            destination = task.candidate_destination
-            nonce = int(destination.authorization_nonce)
-            words = (
-                (NONCE_LOW_WORD, nonce & 0xFFFFFFFF),
-                (NONCE_HIGH_WORD, (nonce >> 32) & 0xFFFFFFFF),
-                (VALID_LENGTH_WORD, destination.row_width),
-                (ROOT_TOKEN_WORD, int(task.next_token_id) & 0xFFFFFFFF),
-                # Publish generation last: the Target wait is the acquire edge.
-                (GENERATION_WORD, destination.generation),
-            )
-            for word, value in words:
-                rc = write_value32(
-                    c_stream, c_uint64(address + word * 4), c_uint32(value), c_zero
-                )
-                if rc:
-                    check_driver(rc, "cuStreamWriteValue32")
-            completion = getattr(self, "_completion_records", {}).get(
-                self._registration_key(destination)
-            )
-            record = (
-                None
-                if completion is not None
-                else getattr(self, "_ready_records", {}).get(
-                    self._registration_key(destination)
-                )
-            )
-            if record is not None:
-                records, device_base = record
-                if destination.slot_id >= records.slot_capacity:
-                    raise CandidateTransportError("READY record slot is out of range")
-                record_address = device_base + destination.slot_id * READY_RECORD_BYTES
-                # Default stream memops order after the copy and metadata
-                # above; the Target CPU treats a matching generation as READY.
-                for word, value in (
-                    *words[:-1],
-                    (PRODUCER_TAG_WORD, self._producer_tag),
-                    words[-1],
-                ):
-                    rc = write_value32(
-                        c_stream,
-                        c_uint64(record_address + word * 4),
-                        c_uint32(value),
-                        c_zero,
+        if publications:
+            # One batched kernel publishes every local row's metadata words
+            # and record; it replaces the per-task cuStreamWriteValue32 memops
+            # and per-task record kernel, which dominated this loop (issue
+            # #208). Stream order keeps the publication after the candidate
+            # copy above; the kernel's release stores are the same publish
+            # edges the memop sequence provided.
+            descs = []
+            for task, destination, metadata_address, record_address, kind in (
+                publications
+            ):
+                descs.append(
+                    self._batch_desc_for(
+                        task,
+                        destination=destination,
+                        metadata_address=metadata_address,
+                        record_address=record_address,
+                        kind=kind,
                     )
-                    if rc:
-                        check_driver(rc, "cuStreamWriteValue32")
-            if completion is not None:
-                records, device_base = completion
-                if destination.slot_id >= records.slot_capacity:
-                    raise CandidateTransportError(
-                        "completion record slot is out of range"
-                    )
-                # The completion record carries a superset of the READY
-                # record words, so the legacy writes above are skipped for
-                # this Target and READY comes only from the kernel.  The
-                # launch is stream-ordered after the copy and metadata: the
-                # kernel releases the reservation's authorization nonce last,
-                # so a Target CPU that observes it also observes the
-                # candidate payload.
-                self._launch_completion_record(
-                    destination=destination,
-                    record_hash=transfer_id_hash(task.transfer_id),
-                    root_token=int(task.next_token_id) & 0xFFFFFFFF,
-                    record_address=(
-                        device_base + destination.slot_id * COMPLETION_RECORD_BYTES
-                    ),
-                    stream=stream.cuda_stream,
                 )
+            buffer, event = self._batch_desc_slot_buffer(
+                len(descs) * _PUSH_BATCH_DESC.size, stream
+            )
+            ctypes.memmove(
+                buffer.data_ptr(), b"".join(descs), len(descs) * _PUSH_BATCH_DESC.size
+            )
+            kernel = self._completion_kernel
+            if kernel is None:
+                kernel = self._completion_kernel = _PushCompletionKernel()
+            kernel.launch_batch(
+                device=self.device_index,
+                descs_ptr=buffer.data_ptr(),
+                count=len(descs),
+                stream=stream.cuda_stream,
+            )
+            event.record(stream)
         if remote_batch is None:
             event = torch.cuda.Event(enable_timing=start_event is not None)
             event.record(stream)

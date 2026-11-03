@@ -72,6 +72,98 @@ extern "C" int dt_push_completion_launch(
   return static_cast<int>(cudaGetLastError());
 }
 
+// Batched publication for one push wave. One descriptor per local task; a
+// single launch replaces the per-task cuStreamWriteValue32 metadata memops
+// and the per-task record kernel, which were the dominant per-task host cost
+// of the retire path (issue #208).
+struct DtPushCompletionDesc {
+  std::uint64_t record;  // record base address (0 = no record writes)
+  std::uint64_t meta;  // reservation metadata base address (always written)
+  std::uint64_t seq;
+  std::uint64_t record_hash;
+  std::uint64_t globaltimer_offset_ns;
+  std::uint32_t generation;
+  std::uint32_t valid_length;
+  std::uint32_t root_token;
+  std::uint32_t producer_tag;
+  std::uint32_t kind;  // 1 = completion record, 2 = READY record
+  std::uint32_t pad0;
+};
+
+extern "C" __global__ void dt_push_completion_batch_k(
+    const DtPushCompletionDesc* descs,
+    int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const DtPushCompletionDesc d = descs[i];
+  // Reservation metadata words: nonce, valid length, root token first, then a
+  // system-scope release publishes the generation word last, matching the
+  // per-task cuStreamWriteValue32 sequence this replaces (the Target CPU
+  // treats that generation as its acquire edge).
+  {
+    unsigned* meta = reinterpret_cast<unsigned*>(d.meta);
+    meta[1] = static_cast<unsigned>(d.seq);
+    meta[2] = static_cast<unsigned>(d.seq >> 32);
+    meta[3] = d.valid_length;
+    meta[4] = d.root_token;
+    __threadfence_system();
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(meta),
+                 "r"(d.generation)
+                 : "memory");
+  }
+  if (d.kind == 1) {
+    std::uint64_t* record = reinterpret_cast<std::uint64_t*>(d.record);
+    std::uint64_t produced_ns;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(produced_ns));
+    record[1] = std::uint64_t(d.generation) |
+                (std::uint64_t(d.valid_length) << 32);
+    record[2] = d.record_hash;
+    record[3] = std::uint64_t(d.root_token) |
+                (std::uint64_t(d.producer_tag) << 32);
+    record[4] = produced_ns;
+    record[5] = d.globaltimer_offset_ns;
+    record[6] = 0;
+    record[7] = 0;
+    __threadfence_system();
+    asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(record),
+                 "l"(d.seq)
+                 : "memory");
+  } else if (d.kind == 2) {
+    unsigned* record = reinterpret_cast<unsigned*>(d.record);
+    record[1] = static_cast<unsigned>(d.seq);
+    record[2] = static_cast<unsigned>(d.seq >> 32);
+    record[3] = d.valid_length;
+    record[4] = d.root_token;
+    record[5] = d.producer_tag;
+    __threadfence_system();
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(record),
+                 "r"(d.generation)
+                 : "memory");
+  }
+}
+
+extern "C" int dt_push_completion_batch_launch(
+    int device,
+    const void* descs,
+    int n,
+    std::uint64_t stream) {
+  if (n <= 0) {
+    return 0;
+  }
+  cudaError_t err = cudaSetDevice(device);
+  if (err != cudaSuccess) {
+    return static_cast<int>(err);
+  }
+  constexpr int kThreads = 128;
+  int blocks = (n + kThreads - 1) / kThreads;
+  dt_push_completion_batch_k<<<blocks, kThreads, 0,
+                               reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const DtPushCompletionDesc*>(descs), n);
+  return static_cast<int>(cudaGetLastError());
+}
+
 // Calibration support: sample %globaltimer into one mapped u64 so the host
 // can estimate the CLOCK_REALTIME offset of the GPU timebase.
 extern "C" __global__ void dt_globaltimer_k(std::uint64_t* out) {

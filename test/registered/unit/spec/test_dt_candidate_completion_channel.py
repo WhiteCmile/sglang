@@ -58,6 +58,8 @@ from sglang.srt.speculative.dt_candidate_p2p import (
     _PendingCompletionNotice,
     _ReadyRecordFile,
     _RecordObserver,
+    _PUSH_BATCH_COMPLETION,
+    _PUSH_BATCH_DESC,
     producer_tag,
     transfer_id_hash,
 )
@@ -439,47 +441,87 @@ def make_push_transport():
 
 
 class TestProducerOffsetPublication:
-    def test_launch_stamps_calibrated_offset(self):
+    def test_batch_desc_stamps_calibrated_offset(self):
         transport = make_push_transport()
+        transport._globaltimer_calibrated = True
         transport._globaltimer_offset_ns = 1234
-        calls = []
-        transport._completion_kernel = SimpleNamespace(
-            launch=lambda **kwargs: calls.append(kwargs)
-        )
         destination = SimpleNamespace(
             authorization_nonce=222, generation=2, row_width=ROW_WIDTH
         )
-        transport._launch_completion_record(
-            destination=destination,
-            record_hash=99,
-            root_token=77,
-            record_address=4096,
-            stream=0,
+        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
+        desc = _PUSH_BATCH_DESC.unpack(
+            transport._batch_desc_for(
+                task,
+                destination=destination,
+                metadata_address=8192,
+                record_address=4096,
+                kind=_PUSH_BATCH_COMPLETION,
+            )
         )
-        (call,) = calls
-        assert call["globaltimer_offset_ns"] == 1234
-        assert call["seq"] == 222
-        assert call["generation"] == 2
-        assert call["valid_length"] == ROW_WIDTH
-        assert call["tag"] == producer_tag("draft")
+        (
+            record_address,
+            metadata_address,
+            seq,
+            record_hash,
+            offset_ns,
+            generation,
+            valid_length,
+            root_token,
+            tag,
+            kind,
+        ) = desc
+        assert record_address == 4096
+        assert metadata_address == 8192
+        assert seq == 222
+        assert record_hash == transfer_id_hash("tid-1")
+        assert offset_ns == 1234
+        assert generation == 2
+        assert valid_length == ROW_WIDTH
+        assert root_token == 77
+        assert tag == producer_tag("draft")
+        assert kind == _PUSH_BATCH_COMPLETION
 
-    def test_launch_stamps_zero_offset_when_uncalibrated(self):
+    def test_batch_desc_wraps_negative_offset_like_ctypes_u64(self):
+        # The calibrated offset can be negative (GPU timebase ahead of host
+        # realtime); the retired ctypes c_uint64 argument wrapped it modulo
+        # 2**64 and the packed descriptor must carry the same bits.
         transport = make_push_transport()
-        calls = []
-        transport._completion_kernel = SimpleNamespace(
-            launch=lambda **kwargs: calls.append(kwargs)
-        )
+        transport._globaltimer_calibrated = True
+        transport._globaltimer_offset_ns = -99
         destination = SimpleNamespace(
             authorization_nonce=222, generation=2, row_width=ROW_WIDTH
         )
-        transport._launch_completion_record(
-            destination=destination,
-            record_hash=99,
-            root_token=77,
-            record_address=4096,
-            stream=0,
+        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
+        desc = _PUSH_BATCH_DESC.unpack(
+            transport._batch_desc_for(
+                task,
+                destination=destination,
+                metadata_address=8192,
+                record_address=4096,
+                kind=_PUSH_BATCH_COMPLETION,
+            )
         )
-        assert calls[0]["globaltimer_offset_ns"] == 0
+        assert desc[4] == (1 << 64) - 99
+
+    def test_batch_desc_stamps_zero_offset_when_uncalibrated(self):
+        transport = make_push_transport()
+        transport._globaltimer_calibrated = True
+        destination = SimpleNamespace(
+            authorization_nonce=222, generation=2, row_width=ROW_WIDTH
+        )
+        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
+        desc = _PUSH_BATCH_DESC.unpack(
+            transport._batch_desc_for(
+                task,
+                destination=destination,
+                metadata_address=8192,
+                record_address=0,
+                kind=0,
+            )
+        )
+        assert desc[4] == 0
+        assert desc[0] == 0
+        assert desc[9] == 0
 
     def test_calibration_runs_exactly_once(self):
         transport = make_push_transport()
