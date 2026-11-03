@@ -88,6 +88,9 @@ _IDLE_WAIT_S = 0.05
 # Wait budget of one operation against a healthy peer: a bootstrap request,
 # a candidate write, or a hidden pull (its ready record and READ together).
 RDMA_OP_TIMEOUT_S = 30.0
+# Hidden-pull READs a Draft posts before polling completions; it is the pull
+# queue pair's send-queue depth, so a read_batch never overruns the QP.
+PULL_READ_WINDOW = 4
 
 _IBV_ACCESS_LOCAL_WRITE = 1
 _IBV_ACCESS_REMOTE_WRITE = 2
@@ -845,7 +848,7 @@ class DraftRdmaPuller:
             conn = self._conn
             conn.recv_cq = conn.device.completion_queue(2 * READY_RING_DEPTH)
             conn.qp = conn.device.queue_pair(
-                conn.send_cq, conn.recv_cq, max_send=4, max_recv=READY_RING_DEPTH
+                conn.send_cq, conn.recv_cq, max_send=PULL_READ_WINDOW, max_recv=READY_RING_DEPTH
             )
             self._ring = torch.zeros(
                 READY_RING_DEPTH * READY_RECORD_BYTES, dtype=torch.uint8, pin_memory=True
@@ -866,10 +869,9 @@ class DraftRdmaPuller:
             self._pool_rkey = int(remote["pool_rkey"])
             self._slot_nbytes = int(remote["slot_nbytes"])
             self._slot_count = int(remote["slot_count"])
-            self._landing = torch.empty(self._slot_nbytes, dtype=torch.uint8, device=device)
-            self._landing_mr = conn.device.register(
-                self._landing.data_ptr(), self._landing.nbytes, remote=0
-            )
+            self._device = device
+            self._landing: torch.Tensor | None = None
+            self._landing_mr = None
             self._expected_seq = 1
             snapshot = conn.ready()["ready_generation"]
             if len(snapshot) != self._slot_count:
@@ -900,13 +902,29 @@ class DraftRdmaPuller:
         if completions:
             self._conn.qp.post_recv(len(completions))
 
-    def read(
-        self, source, destination: torch.Tensor, stream: torch.cuda.Stream
-    ) -> tuple[int, int, int]:
-        """Pull one descriptor's range into ``destination``.
+    def _ensure_landing(self, nbytes: int) -> None:
+        """Grow the registered landing buffer until it holds ``nbytes``.
 
-        Returns the monotonic ns at which the ready record was in hand, the
-        READ was posted, and its completion was polled."""
+        A batch of rows of one (draft, target) pair shares the buffer at
+        disjoint offsets; growth is geometric so re-registration amortizes.
+        """
+
+        if self._landing is not None and self._landing.nbytes >= nbytes:
+            return
+        size = max(self._slot_nbytes, 1)
+        while size < nbytes:
+            size *= 2
+        landing = torch.empty(size, dtype=torch.uint8, device=self._device)
+        mr = self._conn.device.register(landing.data_ptr(), landing.nbytes, remote=0)
+        old_mr = self._landing_mr
+        self._landing = landing
+        self._landing_mr = mr
+        if old_mr is not None:
+            old_mr.close()
+
+    def _pull_plan(self, source) -> dict:
+        """Resolve one descriptor against the ready ring; raise for a stale
+        source, else return its read plan and ready timestamp."""
 
         if (
             source.pool_generation != self.pool_generation
@@ -926,29 +944,144 @@ class DraftRdmaPuller:
             self.drain(1_000_000)
         if self._ready[slot_id] != generation:
             raise StaleDescriptorError("feature source slot was republished before the read")
-        ready_ns = time.monotonic_ns()
-        remote = self._pool_addr + slot_id * self._slot_nbytes + source.byte_offset
-        self._conn.qp.post_read(
-            self._landing_mr, self._landing_mr.address, source.nbytes,
-            remote, self._pool_rkey,
-        )
-        posted_ns = time.monotonic_ns()
-        _wait_one(self._conn.send_cq, "hidden RDMA READ", deadline)
-        completed_ns = time.monotonic_ns()
+        return {
+            "slot_id": slot_id,
+            "generation": generation,
+            "remote": self._pool_addr + slot_id * self._slot_nbytes + source.byte_offset,
+            "nbytes": int(source.nbytes),
+            "ready_ns": time.monotonic_ns(),
+        }
+
+    @staticmethod
+    def _copy_runs(planned: list) -> list:
+        """Group consecutive pulls whose destinations are adjacent views of
+        one storage — the engine stages a same-Target batch into consecutive
+        rows — so their landing copies merge into one kernel per run."""
+
+        runs: list[list] = []
+        for plan in planned:
+            if runs:
+                previous = runs[-1][-1]
+                destination = plan["destination"]
+                if (
+                    destination.untyped_storage().data_ptr()
+                    == previous["destination"].untyped_storage().data_ptr()
+                    and previous["destination"].data_ptr() + previous["nbytes"]
+                    == destination.data_ptr()
+                ):
+                    runs[-1].append(plan)
+                    continue
+            runs.append([plan])
+        return runs
+
+    def read(
+        self, source, destination: torch.Tensor, stream: torch.cuda.Stream
+    ) -> tuple[int, int, int]:
+        """Pull one descriptor's range into ``destination``.
+
+        Returns the monotonic ns at which the ready record was in hand, the
+        READ was posted, and its completion was polled."""
+
+        timestamps, error = self.read_batch([(source, destination)], stream)[0]
+        if error is not None:
+            raise error
+        return timestamps
+
+    def read_batch(self, items, stream: torch.cuda.Stream) -> list:
+        """Pull a batch of same-Target descriptors into their destinations.
+
+        Every READ is posted into the landing buffer back to back (at most
+        :data:`PULL_READ_WINDOW` outstanding) and polled to completion; then
+        ONE ``cuFlushGPUDirectRDMAWrites`` covers the whole batch and the
+        landing copies are enqueued — merged into one copy per run of
+        adjacent destinations.  A row becomes visible to the consumer only
+        after that fence, exactly as a per-row fence guaranteed before.
+
+        Returns, aligned with ``items``, one ``((ready_ns, posted_ns,
+        read_done_ns), None)`` per pulled range, or ``(None, error)`` for a
+        descriptor that proved stale; its siblings still pull."""
+
+        planned = []
+        for source, destination in items:
+            try:
+                plan = self._pull_plan(source)
+            except StaleDescriptorError as exc:
+                plan = {"error": exc}
+            plan["source"] = source
+            plan["destination"] = destination
+            planned.append(plan)
+        live = [plan for plan in planned if "error" not in plan]
+        self._ensure_landing(sum(plan["nbytes"] for plan in live))
+        offset = 0
+        for plan in live:
+            plan["landing_offset"] = offset
+            offset += plan["nbytes"]
+        posted = 0
+        completed = 0
+        deadline = time.monotonic() + RDMA_OP_TIMEOUT_S
+        while completed < len(live):
+            while posted < len(live) and posted - completed < PULL_READ_WINDOW:
+                plan = live[posted]
+                self._conn.qp.post_read(
+                    self._landing_mr,
+                    self._landing_mr.address + plan["landing_offset"],
+                    plan["nbytes"],
+                    plan["remote"],
+                    self._pool_rkey,
+                )
+                plan["posted_ns"] = time.monotonic_ns()
+                posted += 1
+            # One RC queue pair completes sends in posting order, so the
+            # n-th completion belongs to the n-th posted READ.
+            for _wr_id, status, _opcode, _index, _qpn in self._conn.send_cq.poll(1_000_000):
+                if status != _IBV_WC_SUCCESS:
+                    raise RdmaTransportError(f"hidden RDMA READ completed with status {status}")
+                plan = live[completed]
+                plan["read_done_ns"] = time.monotonic_ns()
+                completed += 1
+            if time.monotonic() >= deadline:
+                raise RdmaTransportError("hidden RDMA READ did not complete")
         # A republication whose ready record arrived meanwhile may have
-        # overwritten the range under the READ.
+        # overwritten the range under a READ.
         self.drain()
-        if self._ready[slot_id] != generation:
-            raise StaleDescriptorError("feature source slot was republished during the read")
-        make_gpu_visible(self._driver)
-        with torch.cuda.stream(stream):
-            destination.view(torch.uint8).reshape(-1).copy_(
-                self._landing[: source.nbytes], non_blocking=True
-            )
-            copied = torch.cuda.Event()
-            copied.record(stream)
-        copied.synchronize()
-        return ready_ns, posted_ns, completed_ns
+        for plan in live:
+            if self._ready[plan["slot_id"]] != plan["generation"]:
+                plan["error"] = StaleDescriptorError(
+                    "feature source slot was republished during the read"
+                )
+        if any("error" not in plan for plan in live):
+            # One fence for the batch: every READ completion was polled
+            # above, so the flush orders all their landings before the
+            # copies below enqueue the GPU's reads of the landing buffer.
+            make_gpu_visible(self._driver)
+            with torch.cuda.stream(stream):
+                for run in self._copy_runs(
+                    [plan for plan in live if "error" not in plan]
+                ):
+                    first = run[0]
+                    total = sum(plan["nbytes"] for plan in run)
+                    source_span = self._landing[
+                        first["landing_offset"] : first["landing_offset"] + total
+                    ]
+                    destination = first["destination"].view(torch.uint8).reshape(-1)
+                    if total != first["nbytes"]:
+                        destination = destination.as_strided((total,), (1,))
+                    destination.copy_(source_span, non_blocking=True)
+                copied = torch.cuda.Event()
+                copied.record(stream)
+            copied.synchronize()
+        outcomes = []
+        for plan in planned:
+            if "error" in plan:
+                outcomes.append((None, plan["error"]))
+            else:
+                outcomes.append(
+                    (
+                        (plan["ready_ns"], plan["posted_ns"], plan["read_done_ns"]),
+                        None,
+                    )
+                )
+        return outcomes
 
     def close(self) -> None:
         self._conn.close()

@@ -4883,16 +4883,47 @@ class FlashMTPDraftEngine:
         # Completion/admission is request-granular. The transport may still
         # serialize these copies on its bounded stream, but one slow entry no
         # longer freezes compute membership chosen for the other entries.
-        for source, destination in zip(sources, destinations, strict=True):
+        # Consecutive rows of one cross-host Target go down as one batch so
+        # the pull worker covers their READs with a single GPU-visibility
+        # fence instead of a per-row fence + landing copy (#196).
+        futures: list = [None] * len(sources)
+        remote_run: list[int] = []
+        remote_run_target: str | None = None
+
+        def flush_remote_run() -> None:
+            nonlocal remote_run_target
+            if not remote_run:
+                return
+            run_futures = self._feature_pull_transport.submit_remote_batch(
+                sources=tuple(sources[index] for index in remote_run),
+                destinations=tuple(destinations[index] for index in remote_run),
+            )
+            for index, future in zip(remote_run, run_futures, strict=True):
+                futures[index] = future
+            remote_run.clear()
+            remote_run_target = None
+
+        transport = self._feature_pull_transport
+        for index, (source, destination) in enumerate(
+            zip(sources, destinations, strict=True)
+        ):
+            if transport.is_remote_target(source.target_instance_id):
+                if remote_run_target != source.target_instance_id:
+                    flush_remote_run()
+                    remote_run_target = source.target_instance_id
+                remote_run.append(index)
+                continue
+            flush_remote_run()
             try:
-                future = self._feature_pull_transport.submit(
+                futures[index] = transport.submit(
                     source=source,
                     destination=destination,
                 )
             except Exception as exc:
-                future = Future()
-                future.set_exception(exc)
-            futures.append(future)
+                failed = Future()
+                failed.set_exception(exc)
+                futures[index] = failed
+        flush_remote_run()
         profile_emit(
             "draft_feature_pull_batch_submit",
             draft_instance=self.instance_id,

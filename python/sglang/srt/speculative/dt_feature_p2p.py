@@ -39,7 +39,6 @@ from sglang.srt.speculative.dt_cuda_ipc import (
 from sglang.srt.speculative.dt_rdma import (
     RDMA_OP_TIMEOUT_S,
     DraftRdmaPuller,
-    StaleDescriptorError,
 )
 
 logger = logging.getLogger(__name__)
@@ -1567,7 +1566,41 @@ class DraftFeaturePullTransport:
     def _submit_remote(
         self, source: FeatureSourceDescriptor, destination: torch.Tensor
     ) -> _RemotePullFuture:
-        self._validate_remote_submission(source, destination)
+        return self.submit_remote_batch(
+            sources=(source,), destinations=(destination,)
+        )[0]
+
+    def is_remote_target(self, target_instance_id: str) -> bool:
+        return target_instance_id in self._remote_targets
+
+    def submit_remote_batch(
+        self,
+        *,
+        sources: Sequence[FeatureSourceDescriptor],
+        destinations: Sequence[torch.Tensor],
+    ) -> tuple[_RemotePullFuture, ...]:
+        """Queue one same-Target batch of pulls and return one future per row.
+
+        The batch keeps its engine order, so consecutive rows of one
+        (draft, target) pair reach the Target's pull worker together; the
+        worker issues their READs back to back and covers them with a single
+        GPU-visibility fence instead of a per-row fence + landing copy
+        (issue #196).
+        """
+
+        sources = tuple(sources)
+        destinations = tuple(destinations)
+        if not sources:
+            raise ValueError("remote pull batch must not be empty")
+        target_instance_id = sources[0].target_instance_id
+        if not target_instance_id or any(
+            source.target_instance_id != target_instance_id for source in sources
+        ):
+            raise ValueError("a remote pull batch must name exactly one Target")
+        if len(sources) != len(destinations):
+            raise ValueError("remote pull batch sources/destinations length mismatch")
+        for source, destination in zip(sources, destinations, strict=True):
+            self._validate_remote_submission(source, destination)
         with self._admission:
             if self._closed:
                 raise FeatureTransportError("feature pull transport is closed")
@@ -1579,13 +1612,15 @@ class DraftFeaturePullTransport:
                 raise FeatureTransportError(
                     "feature pull admission is fenced by peer lifecycle work"
                 )
-            self._admitted_pulls += 1
-        self._ensure_remote_worker(source.target_instance_id)
-        future = _RemotePullFuture(self._remote_completion_flag)
+            self._admitted_pulls += len(sources)
+        self._ensure_remote_worker(target_instance_id)
+        futures = tuple(
+            _RemotePullFuture(self._remote_completion_flag) for _ in sources
+        )
         with self._admission:
-            self._remote_inflight.add(future)
-        self._remote_queues[source.target_instance_id].put((future, source, destination))
-        return future
+            self._remote_inflight.update(futures)
+        self._remote_queues[target_instance_id].put((futures, sources, destinations))
+        return futures
 
     def _validate_remote_submission(
         self, source: FeatureSourceDescriptor, destination: torch.Tensor
@@ -1664,9 +1699,9 @@ class DraftFeaturePullTransport:
                     continue
                 if item is None:
                     return
-                future, source, destination = item
+                futures, sources, destinations = item
                 started_ns = time.monotonic_ns()
-                result = None
+                outcomes = None
                 error = None
                 try:
                     if failure is not None:
@@ -1684,44 +1719,52 @@ class DraftFeaturePullTransport:
                             draft_session_id=draft_session_id,
                         )
                     try:
-                        ready_ns, posted_ns, read_done_ns = puller.read(
-                            source, destination, copy_stream
+                        outcomes = puller.read_batch(
+                            list(zip(sources, destinations, strict=True)), copy_stream
                         )
-                    except StaleDescriptorError:
-                        raise
                     except Exception as exc:
                         failure = exc
                         raise
-                    # The pull legs in the existing metric fields: "mapping"
-                    # is the wait for the ready record, "driver submit" the
-                    # READ post -> completion, "gpu copy" the visibility
-                    # fence plus the landing -> destination copy.
-                    done_ns = time.monotonic_ns()
-                    result = FeaturePullMetrics(
-                        submitted_ns=started_ns,
-                        gpu_completed_ns=done_ns,
-                        mapping_ns=ready_ns - started_ns,
-                        driver_submit_ns=read_done_ns - posted_ns,
-                        gpu_copy_ns=done_ns - read_done_ns,
-                        feature_bytes=source.nbytes,
-                        cold_mapping_count=0,
-                        worker_started_ns=started_ns,
-                        mapping_done_ns=ready_ns,
-                        driver_submit_started_ns=posted_ns,
-                        driver_submit_done_ns=read_done_ns,
-                        cuda_pre_copy_ns=0,
-                        gpu_start_observed_ns=0,
-                    )
-                except Exception as exc:  # noqa: BLE001 - surfaced through the future
+                except Exception as exc:  # noqa: BLE001 - surfaced through the futures
                     error = exc
                 with self._admission:
-                    self._remote_inflight.discard(future)
-                    self._admitted_pulls -= 1
+                    for future in futures:
+                        self._remote_inflight.discard(future)
+                        self._admitted_pulls -= 1
                     self._admission.notify_all()
                 if error is not None:
-                    future._reject(error)
-                else:
-                    future._resolve(result)
+                    for future in futures:
+                        future._reject(error)
+                    continue
+                # The pull legs in the existing metric fields: "mapping"
+                # is the wait for the ready record, "driver submit" the
+                # READ post -> completion, "gpu copy" the visibility
+                # fence plus the landing -> destination copy.
+                done_ns = time.monotonic_ns()
+                for future, source, (timestamps, item_error) in zip(
+                    futures, sources, outcomes, strict=True
+                ):
+                    if item_error is not None:
+                        future._reject(item_error)
+                        continue
+                    ready_ns, posted_ns, read_done_ns = timestamps
+                    future._resolve(
+                        FeaturePullMetrics(
+                            submitted_ns=started_ns,
+                            gpu_completed_ns=done_ns,
+                            mapping_ns=ready_ns - started_ns,
+                            driver_submit_ns=read_done_ns - posted_ns,
+                            gpu_copy_ns=done_ns - read_done_ns,
+                            feature_bytes=source.nbytes,
+                            cold_mapping_count=0,
+                            worker_started_ns=started_ns,
+                            mapping_done_ns=ready_ns,
+                            driver_submit_started_ns=posted_ns,
+                            driver_submit_done_ns=read_done_ns,
+                            cuda_pre_copy_ns=0,
+                            gpu_start_observed_ns=0,
+                        )
+                    )
         finally:
             if puller is not None:
                 puller.close()
