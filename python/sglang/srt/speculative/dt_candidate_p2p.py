@@ -2637,7 +2637,7 @@ class DraftCandidatePushTransport:
             kind,
         )
 
-    def _batch_desc_slot_buffer(self, nbytes: int, stream) -> tuple:
+    def _batch_desc_slot_buffer(self, nbytes: int) -> tuple:
         """Return the next pinned descriptor slot plus its guard event.
 
         Two slots alternate; a slot is repacked only after the stream event
@@ -3002,7 +3002,7 @@ class DraftCandidatePushTransport:
                     )
                 )
             buffer, event = self._batch_desc_slot_buffer(
-                len(descs) * _PUSH_BATCH_DESC.size, stream
+                len(descs) * _PUSH_BATCH_DESC.size
             )
             ctypes.memmove(
                 buffer.data_ptr(), b"".join(descs), len(descs) * _PUSH_BATCH_DESC.size
