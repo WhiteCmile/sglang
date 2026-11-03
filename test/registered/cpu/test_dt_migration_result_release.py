@@ -73,6 +73,7 @@ from sglang.srt.speculative.dt_target import (
     _flashmtp_pivot_publish_view,
     _parse_pipeline_lane_weights,
     _ready_batch_h2d,
+    _ready_candidate_host_tensor,
 )
 from sglang.srt.speculative.eagle3_target_worker_v2 import (
     EAGLE3DisaggregatedTargetWorkerV2,
@@ -313,11 +314,12 @@ def test_ready_batch_h2d_is_nonblocking_only_for_pinned_source(pinned) -> None:
 
 def test_ready_candidate_host_tensor_preserves_rows_in_final_dtype() -> None:
     values = (11, 12, 13, 14, 21, 22, 23, 24)
-    wire_tokens = torch.frombuffer(
-        bytearray(struct.pack("<8i", *values)), dtype=torch.int32
-    ).reshape(2, 4)
-    staged = torch.empty((2, 4), dtype=torch.int64)
-    staged.copy_(wire_tokens)
+    staged = _ready_candidate_host_tensor(
+        struct.pack("<8i", *values),
+        batch_size=2,
+        block_size=4,
+        pin_memory=False,
+    )
 
     assert staged.device.type == "cpu"
     assert staged.dtype == torch.int64

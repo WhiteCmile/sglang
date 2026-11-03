@@ -3330,7 +3330,19 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
+                update_running_started_ns = (
+                    time.monotonic_ns()
+                    if (
+                        self.dt_target_controller is not None
+                        and self.dt_target_controller.target_phase_profile_enabled
+                    )
+                    else 0
+                )
                 running_batch = self.update_running_batch(running_batch)
+                if update_running_started_ns:
+                    running_batch.dt_update_running_ns = (
+                        time.monotonic_ns() - update_running_started_ns
+                    )
                 ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None

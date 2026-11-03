@@ -6,7 +6,6 @@ import os
 import time
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from dt_profile import event_enabled as profile_event_enabled
@@ -221,6 +220,27 @@ def _ready_batch_h2d(
         dtype=dtype,
         non_blocking=cpu_tensor.is_pinned(),
     )
+
+
+def _ready_candidate_host_tensor(
+    candidate_blob: bytes,
+    *,
+    batch_size: int,
+    block_size: int,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """Decode int32 wire candidates into the final int64 host staging dtype."""
+
+    wire_tokens = torch.frombuffer(
+        bytearray(candidate_blob), dtype=torch.int32
+    ).reshape(batch_size, block_size)
+    staged_tokens = torch.empty(
+        (batch_size, block_size),
+        dtype=torch.int64,
+        pin_memory=pin_memory,
+    )
+    staged_tokens.copy_(wire_tokens)
+    return staged_tokens
 
 
 @dataclass(slots=True)
@@ -642,12 +662,6 @@ class DTTargetController:
         )
         self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "32"))
         self._ready_hold_started_ns = 0
-        # Rotating pinned staging slots for READY-batch host tensors.  Each
-        # slot is rewritten only after the CUDA event recorded after its
-        # previous H2D copies completes, so the per-wave pinned allocations
-        # disappear from the freeze path without touching copy ordering.
-        self._ready_stage_slots: list[dict[str, Any]] = []
-        self._ready_stage_cursor = 0
         # Same-host Target -> owner-Draft descriptor rings (dt_direct_ring).
         # They replace the former ZMQ direct dispatch (DT_DIRECT_DISPATCH).
         self._direct_ring = os.environ.get("DT_DIRECT_RING", "1") == "1"
@@ -3443,6 +3457,7 @@ class DTTargetController:
             submission_started_ns=submission_started_ns,
             submission_returned_ns=submission_returned_ns,
             submission_wall_ns=submission_returned_ns - submission_started_ns,
+            update_running_ns=getattr(batch, "dt_update_running_ns", 0),
             result_queue_depth_before=result_queue_depth_before,
             target_compute_batches_inflight=self._target_compute_batches_inflight,
             iteration_started_ns=iteration_started_ns,
@@ -4249,49 +4264,6 @@ class DTTargetController:
         )
         return should_defer
 
-    def _ready_stage_slot(self, batch_size: int, device) -> dict[str, Any]:
-        """Return the next rotating pinned staging slot, fenced for reuse.
-
-        Rewriting a slot's host memory is unsafe only while a previous
-        non-blocking H2D copy from it may still read; the event recorded after
-        the previous wave's copies makes the wait exact instead of assumed.
-        """
-        slots = self._ready_stage_slots
-        if not slots:
-            slots.extend({} for _ in range(4))
-        slot = slots[self._ready_stage_cursor]
-        self._ready_stage_cursor = (self._ready_stage_cursor + 1) % len(slots)
-        pending = slot.get("copy_event")
-        if pending is not None:
-            pending.synchronize()
-            slot["copy_event"] = None
-
-        pin = is_pin_memory_available(device)
-
-        def grow(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-            buf = slot.get(name)
-            if buf is None or buf.shape[0] < shape[0]:
-                buf = torch.empty(shape, dtype=dtype, pin_memory=pin)
-                slot[name] = buf
-            return buf
-
-        slot["req_pool"] = grow("req_pool", (batch_size,), torch.int64)
-        slot["seq_lens"] = grow("seq_lens", (batch_size,), torch.int64)
-        slot["bonus_tokens"] = grow("bonus_tokens", (batch_size,), torch.int64)
-        slot["candidates"] = grow(
-            "candidates", (batch_size, self.block_size), torch.int64
-        )
-        return slot
-
-    def _ready_stage_slot_fenced_copy_done(self, slot: dict[str, Any], device) -> None:
-        if torch.device(device).type != "cuda":
-            return
-        event = slot.get("cuda_event")
-        if event is None:
-            event = slot["cuda_event"] = torch.cuda.Event()
-        event.record()
-        slot["copy_event"] = event
-
     def _hold_ready_batch(self, ready_count: int) -> bool:
         """Return whether to keep a small READY set open for returning rows.
 
@@ -4450,13 +4422,10 @@ class DTTargetController:
             self.is_export_rank and getattr(self, "_profile_active", False)
         )
         pin_ready_inputs = is_pin_memory_available(device)
-        stage_slot = self._ready_stage_slot(len(ready), device)
-        batch.req_pool_indices_cpu = stage_slot["req_pool"][: len(ready)]
-        batch.req_pool_indices_cpu.copy_(
-            torch.tensor(
-                [req.req_pool_idx for req in reqs],
-                dtype=torch.int64,
-            )
+        batch.req_pool_indices_cpu = torch.tensor(
+            [req.req_pool_idx for req in reqs],
+            dtype=torch.int64,
+            pin_memory=pin_ready_inputs,
         )
         req_pool_cpu_ns = (
             time.monotonic_ns() if breakdown_active else initialized_ns
@@ -4467,12 +4436,10 @@ class DTTargetController:
         req_pool_device_ns = (
             time.monotonic_ns() if breakdown_active else req_pool_cpu_ns
         )
-        batch.seq_lens_cpu = stage_slot["seq_lens"][: len(ready)]
-        batch.seq_lens_cpu.copy_(
-            torch.tensor(
-                [state.seq_len for state in ready],
-                dtype=torch.int64,
-            )
+        batch.seq_lens_cpu = torch.tensor(
+            [state.seq_len for state in ready],
+            dtype=torch.int64,
+            pin_memory=pin_ready_inputs,
         )
         seq_lens_cpu_ns = (
             time.monotonic_ns() if breakdown_active else req_pool_device_ns
@@ -4486,12 +4453,10 @@ class DTTargetController:
         seq_lens_derived_ns = (
             time.monotonic_ns() if breakdown_active else seq_lens_device_ns
         )
-        bonus_tokens_cpu = stage_slot["bonus_tokens"][: len(ready)]
-        bonus_tokens_cpu.copy_(
-            torch.tensor(
-                [state.bonus_token for state in ready],
-                dtype=torch.int64,
-            )
+        bonus_tokens_cpu = torch.tensor(
+            [state.bonus_token for state in ready],
+            dtype=torch.int64,
+            pin_memory=pin_ready_inputs,
         )
         bonus_tokens = _ready_batch_h2d(bonus_tokens_cpu, device=device)
         bonus_tokens_ns = (
@@ -4535,11 +4500,12 @@ class DTTargetController:
             expected_bytes = len(ready) * self.block_size * 4
             if len(candidate_blob) != expected_bytes:
                 raise ValueError("DT candidate payload width does not match block size")
-            wire_tokens = torch.frombuffer(
-                bytearray(candidate_blob), dtype=torch.int32
-            ).reshape(len(ready), self.block_size)
-            draft_tokens_cpu = stage_slot["candidates"][: len(ready)]
-            draft_tokens_cpu.copy_(wire_tokens)
+            draft_tokens_cpu = _ready_candidate_host_tensor(
+                candidate_blob,
+                batch_size=len(ready),
+                block_size=self.block_size,
+                pin_memory=pin_ready_inputs,
+            )
             candidate_cpu_ns = (
                 time.monotonic_ns() if breakdown_active else bonus_tokens_ns
             )
@@ -4551,7 +4517,6 @@ class DTTargetController:
         candidate_device_ns = (
             time.monotonic_ns() if breakdown_active else candidate_cpu_ns
         )
-        self._ready_stage_slot_fenced_copy_done(stage_slot, device)
         batch.spec_info = DFlashDraftInputV2(
             topk_p=torch.empty((len(ready), 0), dtype=torch.float32, device=device),
             topk_index=torch.empty((len(ready), 0), dtype=torch.int64, device=device),
@@ -5707,6 +5672,7 @@ class DTTargetController:
                         (completion, parked.bonus_token, parked.seq_len),
                     )
                 )
+        mark("arena_complete_ns")
         events.extend(self._expire_local_rounds())
         mark("expire_rounds_ns")
         self._expire_source_leases(now_ns=time.monotonic_ns())
