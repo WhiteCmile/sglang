@@ -17,7 +17,12 @@ import pytest
 
 from sglang.srt.speculative.dt_direct_ring import (
     ENTRY_BYTES,
+    ENTRY_V1_HEADER,
+    E_EPOCH,
+    E_PAYLOAD_LEN,
+    E_SOURCE_OFFSET_HI,
     PAYLOAD_OFFSET,
+    RING_CAPACITY,
     V2_VERSION,
     next_seq,
 )
@@ -26,10 +31,6 @@ from sglang.srt.speculative.dt_rdma import (
     decode_task_record,
     encode_task_record,
 )
-
-# The local ring worker parses v1 entries exactly like this (its mailbox
-# snapshot copies the 64-byte entry header verbatim); the remote image must.
-_LOCAL_V1_HEADER = struct.Struct("<IIQIIIII")
 
 _SLOT_COUNT = 4
 _GENERATIONS = np.array([3, 7, 1, 42], dtype=np.uint32)
@@ -68,7 +69,7 @@ def test_round_trip_matches_local_v1_layout():
         slot_generation,
         payload_len,
         epoch,
-    ) = _LOCAL_V1_HEADER.unpack_from(record, 0)
+    ) = ENTRY_V1_HEADER.unpack_from(record, 0)
     assert wire_seq == seq & 0xFFFFFFFF
     assert epoch == seq >> 32
     assert flags == 1
@@ -97,7 +98,7 @@ def test_epoch_lap_is_validated():
     assert _decode(record, lap_seq).seq == lap_seq
     # Same wire word with the wrong lap must not alias into this seq.
     stale = bytearray(record)
-    struct.pack_into("<I", stale, 4 * 8, 0)  # E_EPOCH back to lap 0
+    struct.pack_into("<I", stale, 4 * E_EPOCH, 0)  # back to lap 0
     with pytest.raises(RdmaTransportError, match="stale"):
         _decode(bytes(stale), lap_seq)
 
@@ -126,14 +127,14 @@ def test_stale_slot_generation_is_rejected():
 
 def test_kernel_published_record_cannot_arrive_remotely():
     record = bytearray(_encode(1, has_pull=True, slot_generation=int(_GENERATIONS[1])))
-    struct.pack_into("<I", record, 4 * 3, V2_VERSION)  # E_SOURCE_OFFSET_HI
+    struct.pack_into("<I", record, 4 * E_SOURCE_OFFSET_HI, V2_VERSION)
     with pytest.raises(RdmaTransportError, match="kernel-published"):
         _decode(bytes(record), 1)
 
 
 def test_geometry_faults_are_rejected():
     oversized = bytearray(_encode(1, has_pull=False, payload=b"x"))
-    struct.pack_into("<I", oversized, 4 * 7, ENTRY_BYTES)  # E_PAYLOAD_LEN
+    struct.pack_into("<I", oversized, 4 * E_PAYLOAD_LEN, ENTRY_BYTES)
     with pytest.raises(RdmaTransportError, match="payload length"):
         _decode(bytes(oversized), 1)
 
@@ -147,10 +148,13 @@ def test_geometry_faults_are_rejected():
 
 
 def test_sequence_advances_across_laps():
-    seq = 1
+    # Drive the ring past one full lap: the slot index wraps (seq %
+    # RING_CAPACITY aliases seq 1 onto slot 1 again) while the logical
+    # sequence must keep decoding in order, epoch word included.
     table = np.zeros(_SLOT_COUNT, dtype=np.uint32)
     table[0] = 5
-    for expected in range(1, 6):
+    seq = 1
+    for expected in range(1, RING_CAPACITY + 2):
         record = _encode(
             seq,
             has_pull=True,
@@ -163,7 +167,13 @@ def test_sequence_advances_across_laps():
         )
         assert entry.seq == expected
         seq = next_seq(seq)
-    # The sixth consume expects seq 6; a replay of the previous record fails.
-    replayed = _encode(5, has_pull=False)
+    # The lap boundary aliases slots, not sequences: the previous lap's
+    # record must not decode as the freshly written one.
+    stale = _encode(1, has_pull=False)
     with pytest.raises(RdmaTransportError, match="stale"):
-        decode_task_record(replayed, expected_seq=6, generation_table=table)
+        decode_task_record(
+            stale, expected_seq=RING_CAPACITY + 1, generation_table=table
+        )
+    fresh = _encode(RING_CAPACITY + 1, has_pull=False)
+    with pytest.raises(RdmaTransportError, match="stale"):
+        decode_task_record(fresh, expected_seq=1, generation_table=table)

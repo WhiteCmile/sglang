@@ -176,6 +176,11 @@ E_SOURCE_SLOT = 5
 E_SLOT_GENERATION = 6
 E_PAYLOAD_LEN = 7
 E_EPOCH = 8  # high 32 bits of the logical seq (written before E_SEQ)
+# Whole-header parse view of the word layout above: the two source-offset
+# words are one 64-bit field.  Consumers that decode an entire header at
+# once (the remote ring's RDMA decoder, contract tests) go through this
+# struct so a reordered E_* layout changes one schema, not two.
+ENTRY_V1_HEADER = struct.Struct("<IIQIIIII")
 
 
 class DirectRingError(RuntimeError):

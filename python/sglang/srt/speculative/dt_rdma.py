@@ -66,6 +66,7 @@ from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS
 from sglang.srt.speculative.dt_direct_ring import (
     ENTRY_BYTES,
     ENTRY_HEADER_BYTES,
+    ENTRY_V1_HEADER,
     E_EPOCH,
     E_FLAGS,
     E_NBYTES,
@@ -126,9 +127,6 @@ READY_SEND_DEPTH = 1024
 # this depth wait on RNR retry, exactly like the ready-record ring.
 REMOTE_RING_TABLE_BYTES = mmap.PAGESIZE
 REMOTE_RING_ENTRY_BYTES = ENTRY_BYTES
-# Header u32 word offsets of the record image (mirrors EntryHeader in the
-# native worker; the E_* indices are dt_direct_ring's).
-_REMOTE_ENTRY_HEADER = struct.Struct("<9I")
 # How long an idle proxy thread waits before re-checking for shutdown or
 # housekeeping; arrivals wake it at once, so this only bounds GIL wakeups.
 _IDLE_WAIT_S = 0.05
@@ -277,14 +275,15 @@ def decode_task_record(
     (
         wire_seq,
         flags,
-        offset_lo,
-        offset_hi,
+        source_offset,
         nbytes,
         source_slot_id,
         slot_generation,
         payload_len,
         epoch,
-    ) = _REMOTE_ENTRY_HEADER.unpack_from(record, 0)
+    ) = ENTRY_V1_HEADER.unpack_from(record, 0)
+    offset_lo = source_offset & SEQ_MASK
+    offset_hi = source_offset >> 32
     if wire_seq != expected_seq & SEQ_MASK or epoch != (expected_seq >> 32) & SEQ_MASK:
         raise RdmaTransportError(
             f"task record sequence is stale: wire {epoch << 32 | wire_seq}, "
@@ -660,7 +659,11 @@ class _TargetSession:
         self.push_qp: QueuePair | None = None
         # Task-record ring leg (issue #182): the Target writes 4096-byte
         # records into the Draft's pinned ring through this queue pair.
+        # Its completions reap into a per-session completion queue: several
+        # sessions share this endpoint, and each writer may only credit its
+        # own queue pair's completions.
         self.ring_qp: QueuePair | None = None
+        self.ring_cq: CompletionQueue | None = None
         self.ring_addr = 0
         self.ring_rkey = 0
         self.ring_capacity = 0
@@ -710,14 +713,8 @@ class TargetRdmaEndpoint:
         self._staging: torch.Tensor | None = None
         self._staging_mr: MemoryRegion | None = None
         self._push_cq: CompletionQueue | None = None
-        # Task-record ring leg (issue #182): signaled record writes reap here.
-        # Created for every endpoint: token-only Targets (no feature pool)
-        # still serve pull-free ring records to remote Drafts.
-        self._ring_send_cq: CompletionQueue | None = None
         self.rejected_pushes = 0
         self._threads: list[threading.Thread] = []
-        if pool is not None or arena is not None:
-            self._ring_send_cq = self.device.completion_queue(2 * RING_CAPACITY)
         if pool is not None:
             storage = pool._storage
             self._pool_mr = self.device.register(
@@ -770,28 +767,39 @@ class TargetRdmaEndpoint:
             )
             qp.post_recv(self._arena.slot_count)
         else:
-            if leg != LEG_RING or self._ring_send_cq is None:
+            if leg != LEG_RING or (self._pool is None and self._arena is None):
                 raise RdmaTransportError(f"unknown RDMA leg {leg!r}")
             if int(header["ring_capacity"]) != RING_CAPACITY:
                 raise RdmaTransportError("task-record ring capacity mismatch")
             if int(header["entry_bytes"]) != ENTRY_BYTES:
                 raise RdmaTransportError("task-record ring entry size mismatch")
-            qp = self.device.queue_pair(
-                self._ring_send_cq, self._ring_send_cq,
-                max_send=2 * RING_CAPACITY, max_recv=1,
-            )
+            ring_cq = self.device.completion_queue(2 * RING_CAPACITY)
+            try:
+                qp = self.device.queue_pair(
+                    ring_cq, ring_cq,
+                    max_send=2 * RING_CAPACITY, max_recv=1,
+                )
+            except Exception:
+                ring_cq.close()
+                raise
         try:
             qp.connect(header)
         except Exception:
             qp.close()
+            if leg == LEG_RING:
+                ring_cq.close()
             raise
         with self._lock:
             if self._closed:
                 qp.close()
+                if leg == LEG_RING:
+                    ring_cq.close()
                 raise RdmaTransportError("RDMA endpoint is closed")
             session = self._sessions.setdefault(key, _TargetSession(*key))
             if session.fenced:
                 qp.close()
+                if leg == LEG_RING:
+                    ring_cq.close()
                 raise RdmaTransportError("draft session was fenced")
             if leg == LEG_PULL:
                 previous = session.pull_qp
@@ -801,6 +809,8 @@ class TargetRdmaEndpoint:
                 previous = session.ring_qp
             if previous is not None:
                 qp.close()
+                if leg == LEG_RING:
+                    ring_cq.close()
                 raise RdmaTransportError(f"draft session already holds a {leg} leg")
             if leg == LEG_PULL:
                 session.pull_qp = qp
@@ -810,6 +820,7 @@ class TargetRdmaEndpoint:
                 session.push_qp = qp
             else:
                 session.ring_qp = qp
+                session.ring_cq = ring_cq
                 session.ring_addr = int(header["ring_addr"])
                 session.ring_rkey = int(header["ring_rkey"])
                 session.ring_capacity = int(header["ring_capacity"])
@@ -1058,6 +1069,9 @@ class TargetRdmaEndpoint:
                         continue
                     self._by_tag.pop(tag, None)
                     self._outstanding.pop(tag, None)
+                if session.ring_cq is not None:
+                    session.ring_cq.close()
+                    session.ring_cq = None
                 fenced[key[1]] = all(qp.handle is None for qp in session.queue_pairs())
         if fenced:
             logger.warning(
@@ -1082,6 +1096,9 @@ class TargetRdmaEndpoint:
             if session.ring_writer is not None:
                 session.ring_writer.close()
                 session.ring_writer = None
+            if session.ring_cq is not None:
+                session.ring_cq.close()
+                session.ring_cq = None
             if session.table_mr is not None:
                 session.table_mr.close()
                 session.table_mr = None
@@ -1092,7 +1109,6 @@ class TargetRdmaEndpoint:
             self._staging_mr,
             self._ready_cq,
             self._push_cq,
-            self._ring_send_cq,
         ):
             if resource is not None:
                 resource.close()
@@ -1454,9 +1470,9 @@ class TargetRemoteRingWriter:
     reuse; the Draft-side consumption credit is what actually protects the
     remote slot.  Unlike the local writer there is no early read proof (the
     hidden pull runs lazily at execution over the pull leg), so the Target's
-    ``_write_direct_ring`` skips the ring-outstanding bookkeeping and the
-    source lease retires on the Coordinator's SourceReadDone, exactly like a
-    relayed task's.
+    planner publishes the record before the Coordinator copy goes out and
+    skips the ring-outstanding bookkeeping; the source lease retires on the
+    Coordinator's SourceReadDone, exactly like a relayed task's.
     """
 
     is_remote = True
@@ -1504,11 +1520,11 @@ class TargetRemoteRingWriter:
         self._endpoint.fence(self.draft_instance_id, self.draft_session_id)
 
     def _reap(self) -> None:
-        """Reap signaled record completions in post order."""
+        """Reap this session's signaled record completions in post order."""
 
-        if self._session.ring_qp is None:
+        if self._session.ring_qp is None or self._session.ring_cq is None:
             return
-        for _tag, status, _opcode, _imm, _qpn in self._endpoint._ring_send_cq.poll(0):
+        for _tag, status, _opcode, _imm, _qpn in self._session.ring_cq.poll(0):
             if self._broken is not None:
                 continue  # a fenced session's late completions count for nothing
             if status != _IBV_WC_SUCCESS:
