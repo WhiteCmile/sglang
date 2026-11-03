@@ -5025,50 +5025,6 @@ class FlashMTPDraftEngine:
         self._feature_staging_refcounts[staging_slot] = len(pending)
         self._publish_capacity()
 
-    def _feature_source_descriptor(self, task):
-        """The pull transport's descriptor view of a task's source."""
-        from sglang.srt.speculative.dt_feature_p2p import FeatureSourceDescriptor
-
-        source = task.source
-        return FeatureSourceDescriptor(
-            target_instance_id=source.target_instance_id,
-            source_device_id=source.source_device_id,
-            source_slot_id=source.source_slot_id,
-            slot_generation=source.slot_generation,
-            transfer_id=source.transfer_id,
-            feature_schema_id=source.feature_schema_id,
-            nbytes=source.nbytes,
-            byte_offset=source.byte_offset,
-            transport=source.transport,
-            source_session_id=source.source_session_id,
-            pool_generation=source.pool_generation,
-            transport_session=source.transport_session,
-            device_uuid=source.device_uuid,
-            allocation_length=source.allocation_length,
-            allocation_offset=source.allocation_offset,
-            ipc_handle=source.ipc_handle,
-            dtype=source.dtype,
-            shape=tuple(source.shape),
-            producer_event_handle=source.producer_event_handle,
-        )
-
-    def _persistent_capacity_available(self) -> tuple[int, int]:
-        """Rows/KV left after the reservations owned by pulled/ready work."""
-        available_rows = self._draft_model_runner.req_to_token_pool.available_size()
-        available_kv = (
-            self._draft_model_runner.token_to_kv_pool_allocator.available_size()
-        )
-        for owner in self._pending_feature_batches:
-            for item in owner.pending:
-                rows, tokens = self._persistent_task_allocation(item.task)
-                available_rows -= rows
-                available_kv -= max(tokens, 0)
-        for entry in self._input_ready_features:
-            rows, tokens = self._persistent_task_allocation(entry.pending.task)
-            available_rows -= rows
-            available_kv -= max(tokens, 0)
-        return available_rows, available_kv
-
     def _release_feature_staging_entries(self, staging_slot: int, count: int) -> None:
         if count <= 0:
             raise ValueError("feature staging release count must be positive")
