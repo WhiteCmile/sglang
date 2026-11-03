@@ -3873,11 +3873,12 @@ class FlashMTPDraftEngine:
             getattr(self, "_ring_pending_ids", set()).discard(transfer_id)
             task = self._direct_tasks_by_transfer.pop(transfer_id, None)
             self._ring_record_positions.pop(transfer_id, None)
+            destination = getattr(task, "candidate_destination", None)
             if (
                 task is not None
-                and task.candidate_destination is not None
+                and destination is not None
                 and self._candidate_push_transport is not None
-                and task.candidate_destination.target_instance_id
+                and destination.target_instance_id
                 in getattr(self, "_remote_targets", ())
             ):
                 # The Coordinator never accepted this round, so neither a
@@ -3950,23 +3951,28 @@ class FlashMTPDraftEngine:
                 reg_host = getattr(registration, "host_addr", "") or ""
                 if reg_host and reg_host != self._dt_host_addr:
                     # Cross-host Target (issue #164): the data legs use the
-                    # RDMA backend (#165) and the 4096-byte task record rides
-                    # a remote direct ring (issue #182) instead of the
-                    # Coordinator relay; until the ring leg connects the
-                    # Target's planner falls back to the relay, as before.
+                    # RDMA backend (#165); under DT_DIRECT_RING the 4096-byte
+                    # task record rides a remote direct ring (issue #182)
+                    # instead of the Coordinator relay, and until the ring leg
+                    # connects the Target's planner falls back to the relay,
+                    # as before.
                     self._remote_targets[registration.target_instance_id] = (
                         reg_host,
                         int(getattr(registration, "data_port", 0) or 0),
                     )
-                    try:
-                        self._open_remote_ring(registration)
-                    except Exception:
-                        self._remote_ring_failed.add(registration.target_session_id)
-                        logger.exception(
-                            "remote task-record ring to Target %s unavailable; "
-                            "the Coordinator relay remains the path",
-                            registration.target_instance_id,
-                        )
+                    if DIRECT_RING:
+                        # The Target only plans ring records under
+                        # DT_DIRECT_RING; without it this ring would be
+                        # allocated but never written.
+                        try:
+                            self._open_remote_ring(registration)
+                        except Exception:
+                            self._remote_ring_failed.add(registration.target_session_id)
+                            logger.exception(
+                                "remote task-record ring to Target %s unavailable; "
+                                "the Coordinator relay remains the path",
+                                registration.target_instance_id,
+                            )
                 elif DIRECT_RING:
                     self._open_direct_ring(registration)
             if self._remote_targets and self._feature_pull_transport is not None:
@@ -10085,7 +10091,7 @@ class FlashMTPDraftEngine:
             getattr(self, "_ring_pending_ids", set()).discard(task.transfer_id)
         self._cancelled_ids.discard(task.transfer_id)
         self._received_ns_by_transfer.pop(task.transfer_id, None)
-        self._ring_record_positions.pop(task.transfer_id, None)
+        getattr(self, "_ring_record_positions", {}).pop(task.transfer_id, None)
         for book in (
             "_unconfirmed_direct",
             "_direct_tasks_by_transfer",

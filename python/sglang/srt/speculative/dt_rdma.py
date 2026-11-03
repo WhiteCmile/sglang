@@ -126,7 +126,6 @@ READY_SEND_DEPTH = 1024
 # ENTRY_BYTES.  Posted receives are entry credits: the Target's writes past
 # this depth wait on RNR retry, exactly like the ready-record ring.
 REMOTE_RING_TABLE_BYTES = mmap.PAGESIZE
-REMOTE_RING_ENTRY_BYTES = ENTRY_BYTES
 # How long an idle proxy thread waits before re-checking for shutdown or
 # housekeeping; arrivals wake it at once, so this only bounds GIL wakeups.
 _IDLE_WAIT_S = 0.05

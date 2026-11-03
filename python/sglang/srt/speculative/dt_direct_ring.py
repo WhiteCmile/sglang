@@ -955,7 +955,7 @@ class DraftRingEndpoint:
                 slot_generation,
                 payload_len,
                 epoch,
-            ) = struct.unpack_from("<IIQIIIII", mailbox, MAIL_HEADER)
+            ) = ENTRY_V1_HEADER.unpack_from(mailbox, MAIL_HEADER)
             if v1_seq != low or epoch != seq >> 32:
                 return None
             if payload_len > MAX_PAYLOAD_BYTES:
