@@ -3197,6 +3197,15 @@ class FlashMTPDraftEngine:
         }
         observed_ns = time.monotonic_ns()
         quiescent = not any(active.values()) and not any(fatal.values())
+        rings = {
+            "remote": {
+                session_id: {
+                    "records_taken": endpoint.records_taken,
+                    "next_seq": endpoint.next_seq,
+                }
+                for session_id, endpoint in self._remote_ring_endpoints.items()
+            },
+        }
         last_measurement_ns = getattr(self, "_last_direct_gpu_measurement_ns", 0)
         request_evidence_ready = bool(
             quiescent
@@ -3226,6 +3235,7 @@ class FlashMTPDraftEngine:
                 else []
             ),
             "active": active,
+            "rings": rings,
             "fatal": fatal,
             "resources": resources,
             "terminal": {

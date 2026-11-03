@@ -1635,6 +1635,7 @@ class DraftRemoteRing:
         self.ring_id = ring_id
         self.capacity = RING_CAPACITY
         self.next_seq = 1
+        self.records_taken = 0
         self.pool_generation = ""
         self.source_session_id = ""
         self._conn = _DraftConnection(
@@ -1700,6 +1701,7 @@ class DraftRemoteRing:
             generation_table=self._table,
         )
         self.next_seq = next_seq(self.next_seq)
+        self.records_taken += 1
         self._conn.qp.post_recv()
         return entry
 
