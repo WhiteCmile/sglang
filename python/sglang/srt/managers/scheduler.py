@@ -1880,13 +1880,33 @@ class Scheduler(
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            sample_started_ns = (
+                time.monotonic_ns() if target_phase_profile_enabled else 0
+            )
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+            sample_finished_ns = (
+                time.monotonic_ns() if target_phase_profile_enabled else 0
+            )
 
             if self.dt_target_controller is not None and batch is not None:
                 self.dt_target_controller.detach_overlap_inflight_batch(
                     running_batch=self.running_batch,
                     launched_batch=batch,
+                )
+            detach_finished_ns = (
+                time.monotonic_ns() if target_phase_profile_enabled else 0
+            )
+            if (
+                target_phase_profile_enabled
+                and self.dt_target_controller is not None
+                and batch is not None
+            ):
+                self.dt_target_controller.record_target_iteration_tail(
+                    batch,
+                    sample_ns=sample_finished_ns - sample_started_ns,
+                    detach_ns=detach_finished_ns - sample_finished_ns,
+                    iteration_started_ns=iteration_started_ns,
                 )
 
             # Update last_batch. An idle iteration that clears last_batch while
