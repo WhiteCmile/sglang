@@ -681,8 +681,19 @@ class DTTargetController:
         self._lease_marks: list[tuple[str, str]] = []
         # Remote ring records written ahead of their Coordinator batch
         # (transfer_id -> written seq): a batch whose submit does not go out
-        # is re-flushed under its original stamp, not rewritten.
+        # is re-flushed under its original stamp, not rewritten.  The
+        # destination the visible record names is remembered with the seq:
+        # a re-flush must not reserve a new destination while the ring still
+        # names the old one.
         self._remote_ring_records: dict[str, int] = {}
+        self._remote_ring_destinations: dict[str, object] = {}
+        # Retired-unaccepted remote ring rounds (transfer_id -> draft session
+        # id or None) whose source lease still waits for the Draft's
+        # authenticated read proof (the cancelled candidate push over the
+        # RDMA push leg) or for the session's revocation.  The Coordinator
+        # confirms neither, and drops both a SourceReadDone and a failure
+        # result for a transfer it never accepted.
+        self._remote_source_retirement: dict[str, str | None] = {}
         self._ring_revoked_sessions: set[str] = set()
         # Owner lease per request from Coordinator assignments:
         # request_id -> (draft_instance_id, draft_session_id, owner_epoch).
@@ -849,6 +860,7 @@ class DTTargetController:
                         pool=self._feature_source_pool,
                         arena=self._candidate_arena,
                         device_index=owner.device.index,
+                        on_cancelled_push=self._consume_remote_source_tombstone,
                     )
                     self._host_tcp_server = HostTcpServer("0.0.0.0", dt_tcp_port)
                     self._host_tcp_server.register_handler(
@@ -5333,12 +5345,29 @@ class DTTargetController:
             if candidate_budget is not None:
                 with_destinations = []
                 try:
+                    remote_destinations = getattr(
+                        self, "_remote_ring_destinations", None
+                    )
                     for task in dispatchable:
                         if (
                             not task.requires_proposal
                             or task.candidate_destination is not None
                         ):
                             with_destinations.append(task)
+                            continue
+                        remembered = (
+                            remote_destinations.get(task.transfer_id)
+                            if remote_destinations is not None
+                            else None
+                        )
+                        if remembered is not None:
+                            # The ring record already visible at the Draft
+                            # names this destination; re-reserving would free
+                            # the old slot for reuse while the record still
+                            # names it (CI review, PR #207 round 4).
+                            with_destinations.append(
+                                replace(task, candidate_destination=remembered)
+                            )
                             continue
                         destination = self._candidate_arena.reserve(task.transfer_id)
                         reserved.append(task.transfer_id)
@@ -5364,16 +5393,26 @@ class DTTargetController:
                 entries=tuple(dispatchable),
                 sent_ns=time.monotonic_ns(),
             )
+            remote_records = getattr(self, "_remote_ring_records", None)
             try:
                 submitted = self._client.submit(dispatch_batch)
             except Exception:
                 for transfer_id in reserved:
+                    if remote_records is not None and transfer_id in remote_records:
+                        # A ring record naming this destination is already
+                        # visible at the Draft; keep the reservation so the
+                        # re-flushed copy still matches the record.
+                        continue
                     self._candidate_arena.cancel(
                         transfer_id, remote_quiescent=True
                     )
                 raise
             if not submitted:
                 for transfer_id in reserved:
+                    if remote_records is not None and transfer_id in remote_records:
+                        # Keep the destination the visible record names; the
+                        # re-flush reuses it together with the reused seq.
+                        continue
                     self._candidate_arena.cancel(
                         transfer_id, remote_quiescent=True
                     )
@@ -5421,6 +5460,7 @@ class DTTargetController:
                 # marked once its (re)submitted round is registered.
                 retained_marks = []
                 remote_records = getattr(self, "_remote_ring_records", None)
+                remote_destinations = getattr(self, "_remote_ring_destinations", None)
                 for transfer_id, instance_id in lease_marks:
                     if self._ledger.get(transfer_id) is None:
                         retained_marks.append((transfer_id, instance_id))
@@ -5430,6 +5470,8 @@ class DTTargetController:
                         )
                         if remote_records is not None:
                             remote_records.pop(transfer_id, None)
+                            if remote_destinations is not None:
+                                remote_destinations.pop(transfer_id, None)
                 self._lease_marks = retained_marks
             outbox = self._delivery_outbox
             outbox.add("task_batch", dispatch_batch.batch_id, dispatch_batch)
@@ -5543,7 +5585,7 @@ class DTTargetController:
                 for task in retry_tasks:
                     if task.transfer_id in self._cancelled_transfers:
                         self._ledger.finish(task.transfer_id)
-                        self._retire_unaccepted_transfer(task.transfer_id)
+                        self._retire_unaccepted_transfer(task.transfer_id, task)
                         self._cancelled_transfers.discard(task.transfer_id)
                     else:
                         active_retries.append(task)
@@ -6561,14 +6603,14 @@ class DTTargetController:
                 for task in batch.entries
                 if task.transfer_id not in self._cancelled_transfers
             )
-            removed = {
-                task.transfer_id
+            removed = tuple(
+                task
                 for task in batch.entries
                 if task.transfer_id in self._cancelled_transfers
-            }
-            for transfer_id in removed:
-                self._retire_unaccepted_transfer(transfer_id)
-                self._cancelled_transfers.discard(transfer_id)
+            )
+            for task in removed:
+                self._retire_unaccepted_transfer(task.transfer_id, task)
+                self._cancelled_transfers.discard(task.transfer_id)
             if entries:
                 retained.append(
                     TargetTaskBatch(
@@ -6581,7 +6623,7 @@ class DTTargetController:
                 )
         self._pending_send = retained
 
-    def _retire_unaccepted_transfer(self, transfer_id: str) -> None:
+    def _retire_unaccepted_transfer(self, transfer_id: str, task=None) -> None:
         """Release a transfer the Coordinator never accepted.
 
         Without a direct copy no Draft can hold it.  A direct copy may already
@@ -6595,12 +6637,77 @@ class DTTargetController:
             # an owner revocation.
             direct_sent.discard(transfer_id)
             remote_records = getattr(self, "_remote_ring_records", None)
+            remote = remote_records is not None and transfer_id in remote_records
             if remote_records is not None:
                 remote_records.pop(transfer_id, None)
+            destinations = getattr(self, "_remote_ring_destinations", None)
+            if destinations is not None:
+                destinations.pop(transfer_id, None)
             self._release_candidate_destination(transfer_id, remote_quiescent=False)
+            if remote:
+                # A remote record has no early read proof and the Coordinator
+                # confirms nothing for this round: it drops both the
+                # SourceReadDone and the failure result of a transfer it
+                # never accepted (router.py classifies them stale).  The
+                # source lease therefore retires on the Draft's authenticated
+                # candidate tombstone (the cancelled push over the RDMA push
+                # leg, validated against the destination's generation and
+                # nonce) or, if the Draft dies first, on this session's
+                # revocation — never on Coordinator confirmation.
+                retirement = getattr(self, "_remote_source_retirement", None)
+                if retirement is None:
+                    return
+                binding = (
+                    self._draft_binding.get(task.request_id)
+                    if task is not None
+                    else None
+                )
+                retirement[transfer_id] = binding[1] if binding else None
             return
         self._release_source_slot(transfer_id)
         self._release_candidate_destination(transfer_id, remote_quiescent=True)
+
+    def _consume_remote_source_tombstone(self, transfer_id: str) -> None:
+        """Retire a retired-unaccepted remote round's source lease.
+
+        The push leg lands a cancelled candidate record only after the arena
+        authenticated it against the destination slot's generation, nonce,
+        and producer tag, so the round's source read is complete or never
+        started: either way the lease is quiescent and the bounded pool
+        reclaims it here.  Rounds the Coordinator accepted are not
+        registered in ``_remote_source_retirement`` and keep retiring on the
+        relayed SourceReadDone.
+        """
+        retirement = getattr(self, "_remote_source_retirement", None)
+        if retirement is None or transfer_id not in retirement:
+            return
+        retirement.pop(transfer_id)
+        source_ref = self._source_slot_by_transfer.get(transfer_id)
+        if source_ref is None:
+            return
+        pool = self._feature_source_pool
+        if not self.uses_direct_gpu_source or pool is None:
+            return
+        try:
+            pool.read_done(
+                transfer_id=transfer_id,
+                source_slot_id=source_ref[0],
+                slot_generation=source_ref[1],
+                source_session_id=pool.source_session_id,
+                pool_generation=pool.pool_generation,
+            )
+        except Exception:
+            logger.exception(
+                "remote source retirement tombstone failed for %s; "
+                "the slot stays quarantined",
+                transfer_id,
+            )
+            return
+        self._source_slot_by_transfer.pop(transfer_id, None)
+        self._source_deadline_by_transfer.pop(transfer_id, None)
+        staged_leases = getattr(self, "_staged_flashmtp_source_leases", None)
+        if staged_leases is not None:
+            staged_leases.discard(transfer_id)
 
     def _remember_draft_binding(self, assignment) -> None:
         bindings = getattr(self, "_draft_binding", None)
@@ -8260,6 +8367,12 @@ class DTTargetController:
                 if seq != ring_task.direct_ring_seq:
                     raise RuntimeError("direct ring sequence diverged from its plan")
                 self._remote_ring_records[task.transfer_id] = seq
+                # Remember the destination with the seq: if this submit does
+                # not go out, the re-flush must reuse both together, never a
+                # fresh destination under the old stamp.
+                destinations = getattr(self, "_remote_ring_destinations", None)
+                if destinations is not None:
+                    destinations[task.transfer_id] = ring_task.candidate_destination
                 # Applied after ledger.begin() registers the round.
                 self._lease_marks.append((task.transfer_id, instance_id))
                 self._direct_sent.add(task.transfer_id)
@@ -8285,10 +8398,14 @@ class DTTargetController:
         """Stop planning a session onto its remote ring after a write failure.
 
         Unlike :meth:`_revoke_ring_owner` (owner death), the Draft session
-        stays alive: its relayed rounds still push candidates from it, so
-        the candidate arena and the bindings keep the session's producer
+        stays alive: its relayed rounds still pull features and push
+        candidates from it, so only the ring QP is fenced — the pull and
+        push legs keep serving that Coordinator-relay fallback, and the
+        candidate arena and the bindings keep the session's producer
         authorization.  Remote ring rounds never reach ``_ring_outstanding``
-        (no early read proof exists remotely), so no lease retirement runs.
+        (no early read proof exists remotely); accepted rounds retire on the
+        relayed SourceReadDone, retired-unaccepted rounds on the Draft's
+        authenticated candidate tombstone.
         """
 
         if draft_session_id in self._ring_revoked_sessions:
@@ -8298,9 +8415,12 @@ class DTTargetController:
         if getattr(writer, "is_remote", False):
             rdma = getattr(self, "_rdma_endpoint", None)
             if rdma is not None:
-                # Idempotent with the writer's own fencing: proves the
-                # Draft's NIC no longer touches its ring.
-                rdma.fence(writer.draft_instance_id, draft_session_id)
+                # Idempotent with the writer's own fencing: retires only the
+                # ring QP.  The pull and push legs keep moving the
+                # Coordinator-relay fallback's features and candidates; a
+                # full fence() here would kill that fallback with them
+                # (CI review, PR #207 round 4).
+                rdma.fence_ring(writer.draft_instance_id, draft_session_id)
         writer.close()
         logger.warning(
             "retired failed remote ring writer for draft session %s",
@@ -8488,6 +8608,20 @@ class DTTargetController:
                 self._release_source_slot(transfer_id)
             else:
                 self._quarantine_source_slot(transfer_id)
+        retirement = getattr(self, "_remote_source_retirement", None)
+        if retirement:
+            # Retired-unaccepted remote rounds of this session: the fence
+            # above destroyed their Draft's queue pairs, so their source
+            # reads are provably quiescent — the same destroyed-QP proof as
+            # the local ring rounds above.
+            for transfer_id, session_id in tuple(retirement.items()):
+                if session_id != draft_session_id:
+                    continue
+                retirement.pop(transfer_id)
+                if quiescent:
+                    self._release_source_slot(transfer_id)
+                else:
+                    self._quarantine_source_slot(transfer_id)
         if self._candidate_arena is not None:
             self._candidate_arena.revoke_producer(draft_session_id, quiescent=quiescent)
         for request_id, binding in tuple(self._draft_binding.items()):

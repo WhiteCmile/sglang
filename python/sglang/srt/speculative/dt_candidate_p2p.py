@@ -1031,17 +1031,18 @@ class TargetCandidateArena:
         producer_tag_value: int,
         metadata_bytes: bytes,
         data_bytes: bytes,
-    ) -> bool:
+    ) -> str | None:
         """Land one remote Draft's candidate record (RDMA backend, #165).
 
-        Returns ``False`` while the slot's record expectations are not armed
+        Returns ``None`` while the slot's record expectations are not armed
         yet (dispatch ordering can race the push; the caller retries), and
-        ``True`` once landed.  A record naming a stale transfer, generation,
-        or session raises; a nonce or producer mismatch also quarantines the
-        slot.  Landing copies the row and metadata words into the arena on a
-        side stream and synchronizes that copy -- the GPU visibility barrier
-        -- before this arena's 64-byte completion record is written (payload
-        words first, the reservation nonce last), so the existing observer and
+        the landed ``transfer_id`` once landed.  A record naming a stale
+        transfer, generation, or session raises; a nonce or producer
+        mismatch also quarantines the slot.  Landing copies the row and
+        metadata words into the arena on a side stream and synchronizes that
+        copy -- the GPU visibility barrier -- before this arena's 64-byte
+        completion record is written (payload words first, the reservation
+        nonce last), so the existing observer and
         authenticate path consumes cross-host pushes like GPU-written records.
         """
 
@@ -1089,7 +1090,7 @@ class TargetCandidateArena:
                 and int(self._record_generation[slot_id]) == generation
                 and int(self._record_tag[slot_id]) == producer_tag_value
             ):
-                return False
+                return None
             transfer_id = slot.transfer_id
         rows_host = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.int32).copy())
         meta_host = torch.from_numpy(
@@ -1129,7 +1130,7 @@ class TargetCandidateArena:
         # x86 TSO keeps the in-order host stores visible; publishing the
         # nonce (seq) word last matches the GPU kernel's release ordering.
         record[COMPLETION_SEQ_WORD] = np.uint64(nonce)
-        return True
+        return transfer_id
 
     def notify_host_completion(
         self,

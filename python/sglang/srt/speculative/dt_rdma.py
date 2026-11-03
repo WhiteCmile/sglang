@@ -62,7 +62,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS
+from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS, VALID_LENGTH_WORD
 from sglang.srt.speculative.dt_direct_ring import (
     ENTRY_BYTES,
     ENTRY_HEADER_BYTES,
@@ -680,6 +680,9 @@ class _TargetSession:
         # Set once fence() destroyed the session's queue pairs; the session
         # id can never connect again (a new Draft incarnation has a new one).
         self.fenced = False
+        # Set once fence_ring() destroyed the task-record ring leg; the
+        # pull/push legs stay alive for the Coordinator-relay fallback.
+        self.ring_fenced = False
 
     def queue_pairs(self) -> tuple[QueuePair, ...]:
         return tuple(
@@ -693,9 +696,10 @@ class TargetRdmaEndpoint:
     accepts Draft connections through the bootstrap server, publishes ready
     records, and lands candidate pushes into the arena."""
 
-    def __init__(self, *, pool, arena, device_index: int) -> None:
+    def __init__(self, *, pool, arena, device_index: int, on_cancelled_push=None) -> None:
         self._pool = pool
         self._arena = arena
+        self._on_cancelled_push = on_cancelled_push
         self._device_index = device_index
         self.device = RdmaDevice(closest_ib_device(device_index))
         self._lock = threading.Lock()
@@ -796,7 +800,7 @@ class TargetRdmaEndpoint:
                     ring_cq.close()
                 raise RdmaTransportError("RDMA endpoint is closed")
             session = self._sessions.setdefault(key, _TargetSession(*key))
-            if session.fenced:
+            if session.fenced or (leg == LEG_RING and session.ring_fenced):
                 qp.close()
                 if leg == LEG_RING:
                     ring_cq.close()
@@ -911,7 +915,11 @@ class TargetRdmaEndpoint:
             for session in self._sessions.values():
                 if session.draft_session_id != draft_session_id:
                     continue
-                if session.ring_qp is None or session.fenced:
+                if (
+                    session.ring_qp is None
+                    or session.fenced
+                    or session.ring_fenced
+                ):
                     return None
                 if session.ring_writer is None:
                     slot_count = self._pool.slot_count if self._pool is not None else 0
@@ -1031,7 +1039,7 @@ class TargetRdmaEndpoint:
                 pending[slot_id] = (session.draft_session_id, transfer_hash, tag, metadata, row)
             for slot_id, (session_id, transfer_hash, tag, metadata, row) in tuple(pending.items()):
                 try:
-                    landed = self._arena.land_remote_push(
+                    landed_transfer = self._arena.land_remote_push(
                         slot_id=slot_id, transfer_hash=transfer_hash, producer_tag_value=tag,
                         metadata_bytes=metadata, data_bytes=row,
                     )
@@ -1040,9 +1048,26 @@ class TargetRdmaEndpoint:
                     logger.warning(
                         "rejected candidate push for slot %d from %s: %s", slot_id, session_id, exc
                     )
-                    landed = True
-                if landed:
+                    landed_transfer = None
                     pending.pop(slot_id)
+                if landed_transfer is None:
+                    continue
+                pending.pop(slot_id)
+                if self._on_cancelled_push is not None and not struct.unpack(
+                    f"<{METADATA_WORDS}I", metadata
+                )[VALID_LENGTH_WORD]:
+                    # A cancelled candidate record (valid length 0) is the
+                    # Draft's authenticated tombstone: the arena validated it
+                    # against the slot's generation, nonce, and producer tag
+                    # before landing it.  Let the controller retire what the
+                    # tombstone proves quiescent (a retired-unaccepted
+                    # round's source lease).
+                    try:
+                        self._on_cancelled_push(landed_transfer)
+                    except Exception:  # noqa: BLE001 - the lease stays fenced
+                        logger.exception(
+                            "cancelled-push callback failed for %s", landed_transfer
+                        )
 
     # -- failure handling ---------------------------------------------------
 
@@ -1079,6 +1104,34 @@ class TargetRdmaEndpoint:
                 draft_instance_id, fenced,
             )
         return fenced
+
+    def fence_ring(self, draft_instance_id: str, draft_session_id: str) -> bool:
+        """Destroy only the session's task-record ring queue pair.
+
+        A ring-leg write or completion failure must not take the pull and
+        push legs with it: the session's Draft stays alive and its
+        Coordinator-relayed rounds still move features (pull leg) and
+        candidates (push leg).  The ring leg itself can never reconnect;
+        record planning falls back to the Coordinator relay.
+        """
+        with self._lock:
+            session = self._sessions.get((draft_instance_id, draft_session_id))
+            if session is None:
+                return False
+            session.ring_fenced = True
+            qp = session.ring_qp
+            session.ring_qp = None
+            if qp is not None:
+                self._by_tag.pop(qp.tag, None)
+                try:
+                    qp.close()
+                except RdmaTransportError:
+                    pass
+            if session.ring_cq is not None:
+                session.ring_cq.close()
+                session.ring_cq = None
+            session.ring_writer = None
+            return qp is None or qp.handle is None
 
     def close(self) -> None:
         with self._lock:
@@ -1513,11 +1566,13 @@ class TargetRemoteRingWriter:
     def _fail(self, reason: str) -> None:
         self._broken = reason
         logger.error(
-            "task-record ring to draft session %s failed: %s; fencing it",
+            "task-record ring to draft session %s failed: %s; fencing its ring leg",
             self.draft_session_id,
             reason,
         )
-        self._endpoint.fence(self.draft_instance_id, self.draft_session_id)
+        # Only the ring QP is destroyed: the session's pull and push legs
+        # keep serving the Coordinator-relay fallback.
+        self._endpoint.fence_ring(self.draft_instance_id, self.draft_session_id)
 
     def _reap(self) -> None:
         """Reap this session's signaled record completions in post order."""

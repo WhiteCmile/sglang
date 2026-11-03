@@ -3873,6 +3873,35 @@ class FlashMTPDraftEngine:
             getattr(self, "_ring_pending_ids", set()).discard(transfer_id)
             task = self._direct_tasks_by_transfer.pop(transfer_id, None)
             self._ring_record_positions.pop(transfer_id, None)
+            if (
+                task is not None
+                and task.candidate_destination is not None
+                and self._candidate_push_transport is not None
+                and task.candidate_destination.target_instance_id
+                in getattr(self, "_remote_targets", ())
+            ):
+                # The Coordinator never accepted this round, so neither a
+                # SourceReadDone nor the failure below can reach the owning
+                # Target through it: the router drops both as stale for an
+                # unknown transfer.  Publish the authenticated candidate
+                # tombstone over the RDMA push leg instead; the Target's
+                # arena validates it against the destination's generation
+                # and nonce, and the controller retires the round's source
+                # lease from it — an explicit read proof that needs no
+                # Coordinator confirmation.
+                push = self._candidate_push_transport.publish_cancelled([task])
+                self._pending_candidate_pushes.append(
+                    PendingCandidatePush(
+                        push=push,
+                        tasks=[task],
+                        result_slot=None,
+                        candidates=None,
+                        cancelled=True,
+                        # The failure publication below already reports the
+                        # round; the Coordinator never knew this transfer.
+                        coordinator_result=False,
+                    )
+                )
             logger.warning(
                 "dropping direct Draft task never confirmed by Coordinator: %s",
                 transfer_id,
