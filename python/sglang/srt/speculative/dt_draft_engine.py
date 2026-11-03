@@ -5003,8 +5003,10 @@ class FlashMTPDraftEngine:
         self._feature_staging_refcounts[staging_slot] = len(pending)
         self._publish_capacity()
 
-    def _feature_source_descriptor(self, task) -> FeatureSourceDescriptor:
+    def _feature_source_descriptor(self, task):
         """The pull transport's descriptor view of a task's source."""
+        from sglang.srt.speculative.dt_feature_p2p import FeatureSourceDescriptor
+
         source = task.source
         return FeatureSourceDescriptor(
             target_instance_id=source.target_instance_id,
