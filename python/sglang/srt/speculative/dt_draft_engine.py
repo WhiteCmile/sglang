@@ -2443,7 +2443,7 @@ class FlashMTPDraftEngine:
         endpoint = DraftRemoteRing(
             host=registration.host_addr,
             port=int(registration.data_port),
-            device=self.device,
+            device=self._canonical_draft_device(self.device),
             draft_instance_id=self.instance_id,
             draft_session_id=self._client.instance_session_id,
             target_instance_id=registration.target_instance_id,
