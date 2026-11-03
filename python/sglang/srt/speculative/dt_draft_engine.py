@@ -2180,11 +2180,22 @@ class FlashMTPDraftEngine:
                 preparation = self._take_batch()
                 if preparation:
                     self._execute_batch(preparation)
+                    # A pull that completed during the take/submit above is
+                    # promoted here, at the next point the loop already
+                    # passes, instead of after the tail and the next
+                    # iteration's head (issue #195). Observing completion
+                    # late leaves its admission credit reserved and, under
+                    # load, costs a full busy-stretch of this loop thread.
+                    self._poll_feature_batches()
                 if self._ring_worker is not None:
                     self._poll_direct_rings()
                 ready = self._take_input_ready_batch()
                 if ready:
                     self._execute_input_ready_batch(ready)
+                    # The host submit above is the longest stage of this
+                    # loop; a pull that completed during it promotes here
+                    # rather than waiting out the tail and the next head.
+                    self._poll_feature_batches()
             elif self._draft_compute_batches_inflight() < 2:
                 batch = self._take_batch()
                 if batch:
@@ -4954,9 +4965,12 @@ class FlashMTPDraftEngine:
 
         if self._fatal_gpu_quarantine_active():
             return
+        transport = getattr(self, "_feature_pull_transport", None)
+        scan_needed = getattr(transport, "scan_needed", None)
+        scan = transport is None or scan_needed is None or scan_needed()
         retained = deque()
         capacity_changed = False
-        while self._pending_feature_batches:
+        while scan and self._pending_feature_batches:
             feature_batch = self._pending_feature_batches.popleft()
             unfinished_pending = []
             unfinished_ranges = []
@@ -5139,7 +5153,8 @@ class FlashMTPDraftEngine:
                 feature_batch.row_ranges = tuple(unfinished_ranges)
                 feature_batch.futures = tuple(unfinished_futures)
                 retained.append(feature_batch)
-        self._pending_feature_batches = retained
+        if scan:
+            self._pending_feature_batches = retained
         if self.batch_source_read_done:
             self._flush_source_done()
         self._resume_feature_finalizations()

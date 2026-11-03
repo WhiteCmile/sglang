@@ -989,15 +989,19 @@ class _RemotePullFuture:
     The Target's remote worker thread resolves the future once the READ
     landed and was copied into the destination; ``done()`` is a plain flag
     read so the scheduler loop polls it exactly like the inline future.
+    Resolution also raises the transport's completion flag so the
+    scheduler can skip scanning entirely while no pull can have finished
+    (issue #195); the worker records completions only.
     """
 
-    __slots__ = ("_done", "_result", "_exception", "_resolved")
+    __slots__ = ("_done", "_result", "_exception", "_resolved", "_completion_event")
 
-    def __init__(self) -> None:
+    def __init__(self, completion_event: threading.Event | None = None) -> None:
         self._done = False
         self._result: FeaturePullMetrics | None = None
         self._exception: BaseException | None = None
         self._resolved = threading.Event()
+        self._completion_event = completion_event
 
     def done(self) -> bool:
         return self._done
@@ -1016,11 +1020,15 @@ class _RemotePullFuture:
         self._result = result
         self._done = True
         self._resolved.set()
+        if self._completion_event is not None:
+            self._completion_event.set()
 
     def _reject(self, exc: BaseException) -> None:
         self._exception = exc
         self._done = True
         self._resolved.set()
+        if self._completion_event is not None:
+            self._completion_event.set()
 
 
 class DraftFeaturePullTransport:
@@ -1074,6 +1082,10 @@ class DraftFeaturePullTransport:
         self._remote_queues: dict[str, queue.Queue] = {}
         self._remote_streams: dict[str, torch.cuda.Stream] = {}
         self._remote_inflight: set[_RemotePullFuture] = set()
+        # Set by the remote worker thread whenever it resolves or rejects a
+        # pull, so the scheduler loop can skip scanning pending batches
+        # while no cross-host pull can have completed (issue #195).
+        self._remote_completion_flag = threading.Event()
         # Inline mode enqueues the copy on the calling scheduler thread and
         # completes it by event query. No helper thread is on the hot path.
         self._inline_submit = os.environ.get("DT_FEATURE_PULL_INLINE", "1") == "1"
@@ -1172,6 +1184,28 @@ class DraftFeaturePullTransport:
     def query(future: Future[FeaturePullMetrics]) -> FeaturePullMetrics | None:
         """Return completed metrics without waiting, or ``None`` while in flight."""
         return future.result() if future.done() else None
+
+    def scan_needed(self) -> bool:
+        """Whether a scheduler poll can observe a newly completed pull.
+
+        The cross-host worker thread sets the completion flag when it
+        resolves or rejects a pull; it records completions only and never
+        makes scheduling decisions. Inline futures complete through the
+        poll itself, so any inline pull keeps scanning enabled. A set flag
+        is consumed here: a completion landing during the scan sets it
+        again and the next poll observes it.
+        """
+        if getattr(self, "_inline_inflight", None):
+            return True
+        # Missing attributes mean a narrow fixture, not a live transport:
+        # keep the pre-#195 behavior and always scan.
+        flag = getattr(self, "_remote_completion_flag", None)
+        if flag is None:
+            return True
+        if flag.is_set():
+            flag.clear()
+            return True
+        return False
 
     def wait(self, future: Future[FeaturePullMetrics]) -> FeaturePullMetrics:
         """Wait only in a worker/shutdown path, never a scheduler hot path."""
@@ -1547,7 +1581,7 @@ class DraftFeaturePullTransport:
                 )
             self._admitted_pulls += 1
         self._ensure_remote_worker(source.target_instance_id)
-        future = _RemotePullFuture()
+        future = _RemotePullFuture(self._remote_completion_flag)
         with self._admission:
             self._remote_inflight.add(future)
         self._remote_queues[source.target_instance_id].put((future, source, destination))
