@@ -667,8 +667,9 @@ class _TargetSession:
         self.ring_rkey = 0
         self.ring_capacity = 0
         self.ring_writer: TargetRemoteRingWriter | None = None
-        # Pinned staging of the per-slot generation snapshot written at ring
-        # connect; the ring writer reuses it for per-change generation posts.
+        # Pinned staging of the per-slot generation table the ring writer
+        # posts into the Draft's ring ahead of a record naming a changed
+        # slot; created at ring connect and published with the ring leg.
         self.table_staging = None
         self.table_staging_np: np.ndarray | None = None
         self.table_mr: MemoryRegion | None = None
@@ -792,17 +793,47 @@ class TargetRdmaEndpoint:
             if leg == LEG_RING:
                 ring_cq.close()
             raise
+        table_staging = None
+        table_staging_np = None
+        table_mr = None
+        slot_count = 0
+        if leg == LEG_RING:
+            slot_count = self._pool.slot_count if self._pool is not None else 0
+            if slot_count:
+                # Pinned staging for the per-slot generation posts the ring
+                # writer makes ahead of a record naming a changed slot.
+                # Build it before the lock and publish it with the ring leg
+                # in one step: a ring writer must never be visible while its
+                # table state is still missing (issue #211).
+                try:
+                    table_staging = torch.zeros(
+                        slot_count, dtype=torch.uint32, pin_memory=True
+                    )
+                    table_staging_np = table_staging.numpy()
+                    table_mr = self.device.register(
+                        table_staging.data_ptr(), table_staging.nbytes, remote=0
+                    )
+                except Exception:
+                    if table_mr is not None:
+                        table_mr.close()
+                    qp.close()
+                    ring_cq.close()
+                    raise
         with self._lock:
             if self._closed:
                 qp.close()
                 if leg == LEG_RING:
                     ring_cq.close()
+                    if table_mr is not None:
+                        table_mr.close()
                 raise RdmaTransportError("RDMA endpoint is closed")
             session = self._sessions.setdefault(key, _TargetSession(*key))
             if session.fenced or (leg == LEG_RING and session.ring_fenced):
                 qp.close()
                 if leg == LEG_RING:
                     ring_cq.close()
+                    if table_mr is not None:
+                        table_mr.close()
                 raise RdmaTransportError("draft session was fenced")
             if leg == LEG_PULL:
                 previous = session.pull_qp
@@ -814,6 +845,8 @@ class TargetRdmaEndpoint:
                 qp.close()
                 if leg == LEG_RING:
                     ring_cq.close()
+                    if table_mr is not None:
+                        table_mr.close()
                 raise RdmaTransportError(f"draft session already holds a {leg} leg")
             if leg == LEG_PULL:
                 session.pull_qp = qp
@@ -827,6 +860,9 @@ class TargetRdmaEndpoint:
                 session.ring_addr = int(header["ring_addr"])
                 session.ring_rkey = int(header["ring_rkey"])
                 session.ring_capacity = int(header["ring_capacity"])
+                session.table_staging = table_staging
+                session.table_staging_np = table_staging_np
+                session.table_mr = table_mr
             self._by_tag[qp.tag] = session
         response = qp.endpoint(self.device.lid)
         if leg == LEG_PULL:
@@ -848,31 +884,14 @@ class TargetRdmaEndpoint:
                 row_width=self._arena.row_width,
             )
         else:
-            # Mirror the per-slot generation table into the Draft's ring
-            # before any record can reference it: same-QP post order
-            # guarantees the snapshot lands first, so a record naming a slot
-            # reserved before this connect still validates.
-            slot_count = self._pool.slot_count if self._pool is not None else 0
-            if slot_count:
-                snapshot = self._pool.generation_snapshot()
-                staging = torch.zeros(slot_count, dtype=torch.uint32, pin_memory=True)
-                staging_np = staging.numpy()
-                staging_np[:] = np.asarray(snapshot, dtype=np.uint32)
-                mr = self.device.register(
-                    staging.data_ptr(), staging.nbytes, remote=0
-                )
-                try:
-                    qp.post_write(
-                        mr, mr.address, staging.nbytes,
-                        session.ring_addr, session.ring_rkey,
-                        with_imm=False, signaled=False,
-                    )
-                except Exception:
-                    mr.close()
-                    raise
-                session.table_staging = staging
-                session.table_staging_np = staging_np
-                session.table_mr = mr
+            # The per-record generation post is the only fence a fresh table
+            # needs: the ring writer posts a slot's generation before its
+            # first record naming that (slot, generation), and same-QP post
+            # order makes the table land before the record.  Valid
+            # generations are >= 1 (a slot's generation is incremented on
+            # reservation) and the Draft's table starts zeroed like the
+            # writer's _sent_generations, so a record naming a slot reserved
+            # before this connect still triggers that first post.
             response.update(
                 slot_count=slot_count,
                 pool_generation=(
