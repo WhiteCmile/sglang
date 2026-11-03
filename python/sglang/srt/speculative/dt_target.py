@@ -51,6 +51,10 @@ DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
 DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
 DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
+# Target round-expiry scan cadence (issue #193): expiry is failure detection
+# with second-scale timeouts, so the O(parked) scan runs at most every 2 ms
+# instead of inside every scheduler poll.
+_EXPIRE_SCAN_INTERVAL_NS = 2_000_000
 # Late-freeze lead estimation: p90 over the last N poll -> launch samples per
 # wave class (extend/decode). A mean-tracking estimator systematically
 # underestimates the tail and lands the next launch after the in-flight
@@ -3527,6 +3531,45 @@ class DTTargetController:
             self._last_target_verify_end_event = observation.end_event
         self._pending_target_gpu_observations = retained
 
+    def record_target_loop_iteration(
+        self,
+        *,
+        iteration_started_ns: int,
+        receive_finished_ns: int,
+        poll_finished_ns: int,
+        selection_finished_ns: int,
+        detach_finished_ns: int,
+        has_batch: bool,
+        held: bool,
+        deferred: bool,
+    ) -> None:
+        """Trace one scheduler iteration, including no-batch defer turns."""
+
+        if not getattr(self, "target_phase_profile_enabled", False):
+            return
+        now_ns = time.monotonic_ns()
+        self._profile_emit(
+            "target_loop_iteration",
+            started_ns=iteration_started_ns,
+            recv_ns=receive_finished_ns - iteration_started_ns,
+            poll_ns=poll_finished_ns - receive_finished_ns,
+            select_ns=(
+                selection_finished_ns - poll_finished_ns
+                if selection_finished_ns >= poll_finished_ns
+                else 0
+            ),
+            launch_tail_ns=(
+                detach_finished_ns - selection_finished_ns
+                if has_batch and detach_finished_ns >= selection_finished_ns
+                else 0
+            ),
+            finish_ns=now_ns,
+            total_ns=now_ns - iteration_started_ns,
+            has_batch=has_batch,
+            held=held,
+            deferred=deferred,
+        )
+
     def record_target_iteration_tail(
         self,
         launched_batch,
@@ -5949,6 +5992,13 @@ class DTTargetController:
         )
 
         now_ns = time.monotonic_ns()
+        # Round timeouts are failure detection, not scheduling: scanning is
+        # cadenced so the O(parked) pass does not tax every scheduler poll
+        # (issue #193).  The deadline cache below remains an exact lower
+        # bound, so deferring the scan only delays detection, never skips it.
+        if now_ns < getattr(self, "_next_expire_scan_ns", 0):
+            return []
+        self._next_expire_scan_ns = now_ns + _EXPIRE_SCAN_INTERVAL_NS
         if now_ns < getattr(self, "_next_local_expiry_ns", 0):
             # No live round can be due yet: a round expires no earlier than
             # its deadline, and one kept alive past its deadline by fresh

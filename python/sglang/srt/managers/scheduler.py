@@ -1918,6 +1918,21 @@ class Scheduler(
                 if batch is not None or not self.result_queue:
                     self.last_batch = batch
 
+            if (
+                target_phase_profile_enabled
+                and self.dt_target_controller is not None
+            ):
+                self.dt_target_controller.record_target_loop_iteration(
+                    iteration_started_ns=iteration_started_ns,
+                    receive_finished_ns=receive_finished_ns,
+                    poll_finished_ns=poll_finished_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    detach_finished_ns=detach_finished_ns,
+                    has_batch=batch is not None,
+                    held=bool(self.dt_target_controller.hold_next_batch),
+                    deferred=bool(defer_dt_result),
+                )
+
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
