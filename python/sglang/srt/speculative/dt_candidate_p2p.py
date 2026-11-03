@@ -2341,6 +2341,28 @@ class _RemotePushBatch:
         return True
 
 
+class _RemotePinnedArena:
+    """One pinned staging buffer shared by a submit's rows to one Target.
+
+    A single arena replaces the per-row pinned acquire, D2H gate event, and
+    lets the sender threads release the buffer only after the last staged row
+    was sent (issue #208: batch the cross-host staging into per-Target
+    groups instead of per-task driver calls).
+    """
+
+    def __init__(self, tensor: torch.Tensor, rows: int) -> None:
+        self.tensor = tensor
+        self._remaining = rows
+        self._lock = Lock()
+
+    def release_row(self, pool_release) -> None:
+        with self._lock:
+            self._remaining -= 1
+            done = self._remaining == 0
+        if done:
+            pool_release(self.tensor)
+
+
 
 class DraftCandidatePushTransport:
     """Map Target destinations and enqueue candidate copy+publication in place."""
@@ -2917,12 +2939,13 @@ class DraftCandidatePushTransport:
         publications = []
         cold = 0
         remote_batch: _RemotePushBatch | None = None
+        remote_groups: dict[str, list[int]] = {}
         candidates_ptr = candidates.data_ptr()
         for index, task in enumerate(tasks):
             destination = task.candidate_destination
             if destination.target_instance_id in self._remote:
-                remote_batch = self._enqueue_remote_push(
-                    task, candidates[index], remote_batch
+                remote_groups.setdefault(destination.target_instance_id, []).append(
+                    index
                 )
                 continue
             local_tasks.append(task)
@@ -2970,6 +2993,10 @@ class DraftCandidatePushTransport:
                     kind = _PUSH_BATCH_READY
             publications.append(
                 (task, destination, metadata_address, record_address, kind)
+            )
+        for target_instance_id, indices in remote_groups.items():
+            remote_batch = self._enqueue_remote_group(
+                target_instance_id, indices, tasks, candidates, remote_batch
             )
         stream = torch.cuda.current_stream(self.device)
         start_event = (
@@ -3069,42 +3096,79 @@ class DraftCandidatePushTransport:
             "root_token": int(task.next_token_id) & 0xFFFFFFFF,
         }
 
-    def _enqueue_remote_push(
-        self, task, candidate_row: torch.Tensor, batch: "_RemotePushBatch | None"
+    def _enqueue_remote_group(
+        self,
+        target_instance_id: str,
+        indices: list[int],
+        tasks: list[object],
+        candidates: torch.Tensor,
+        batch: "_RemotePushBatch | None",
     ) -> _RemotePushBatch:
-        """Stage one cross-host candidate row for the per-Target sender.
+        """Stage this submit's rows to one cross-host Target as one group.
 
-        The D2H copy is enqueued on the current stream (ordered after the
-        rows' producer and any later in-stream buffer reuse) and the sender
-        thread owns the blocking RDMA write.
+        One pinned arena, one gate event, and one queue entry per row replace
+        the retired per-task pinned acquire + event + copy ordering (issue
+        #208): the per-row D2H copy stays per row (stream-ordered after its
+        producer), everything else amortizes across the group.  The sender
+        thread still owns the blocking RDMA write per row.
         """
 
-        destination = task.candidate_destination
-        host, port = self._remote[destination.target_instance_id]
-        if not port:
-            raise CandidateTransportError("remote candidate Target has no data port")
+        row_numel = int(candidates.shape[1])
         if batch is None:
             batch = _RemotePushBatch()
-        pinned = None
+        arena = _RemotePinnedArena(
+            self._acquire_remote_pinned(len(indices) * row_numel), len(indices)
+        )
+        offsets = []
         try:
-            batch.item_added()
-            pinned = self._acquire_remote_pinned(candidate_row.numel())
-            pinned.copy_(candidate_row, non_blocking=True)
+            offset = 0
+            for index in indices:
+                batch.item_added()
+                arena.tensor[offset : offset + row_numel].copy_(
+                    candidates[index], non_blocking=True
+                )
+                offsets.append(offset)
+                offset += row_numel
             ready = torch.cuda.Event(enable_timing=False)
             ready.record()
-            metadata = self._remote_metadata_words(
-                destination, valid_length=destination.row_width, task=task
-            )
-            header = self._remote_push_header(task, destination)
         except Exception:
-            if pinned is not None:
-                self._release_remote_pinned(pinned)
-            batch.item_done()
+            # Nothing was queued yet: balance every item_added above and
+            # return the arena to the pool immediately.
+            for _ in offsets:
+                batch.item_done()
+            self._release_remote_pinned(arena.tensor)
             raise
-        self._ensure_remote_sender(destination.target_instance_id)
-        self._remote_queues[destination.target_instance_id].put(
-            (ready, pinned, header, metadata, batch, candidate_row.numel() * 4)
-        )
+        self._ensure_remote_sender(target_instance_id)
+        work_queue = self._remote_queues[target_instance_id]
+        queued = 0
+        try:
+            for index, offset in zip(indices, offsets, strict=True):
+                task = tasks[index]
+                destination = task.candidate_destination
+                metadata = self._remote_metadata_words(
+                    destination, valid_length=destination.row_width, task=task
+                )
+                header = self._remote_push_header(task, destination)
+                work_queue.put(
+                    (
+                        ready,
+                        arena.tensor[offset : offset + row_numel],
+                        arena,
+                        header,
+                        metadata,
+                        batch,
+                        row_numel * 4,
+                    )
+                )
+                queued += 1
+        except Exception:
+            # Rows already queued own their arena reference through the
+            # sender; balance only the rows never handed over.
+            for _ in range(len(indices) - queued):
+                batch.item_done()
+            for _ in range(len(indices) - queued):
+                arena.release_row(self._release_remote_pinned)
+            raise
         return batch
 
     def _enqueue_remote_tombstone(
@@ -3125,7 +3189,7 @@ class DraftCandidatePushTransport:
         header = self._remote_push_header(task, destination)
         self._ensure_remote_sender(destination.target_instance_id)
         self._remote_queues[destination.target_instance_id].put(
-            (None, None, header, metadata, batch, destination.nbytes)
+            (None, None, None, header, metadata, batch, destination.nbytes)
         )
         return batch
 
@@ -3176,7 +3240,7 @@ class DraftCandidatePushTransport:
                 item = work_queue.get()
                 if item is None:
                     return
-                ready, pinned, header, metadata, batch, nbytes = item
+                ready, pinned, arena, header, metadata, batch, nbytes = item
                 try:
                     if connect_error is not None:
                         raise connect_error
@@ -3204,7 +3268,11 @@ class DraftCandidatePushTransport:
                 else:
                     finalize = batch.item_done()
                 finally:
-                    if pinned is not None:
+                    if arena is not None:
+                        # One arena reference per staged row; the pool takes
+                        # the buffer back with the last released row.
+                        arena.release_row(self._release_remote_pinned)
+                    elif pinned is not None:
                         self._release_remote_pinned(pinned)
                 if finalize:
                     try:
