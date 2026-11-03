@@ -679,6 +679,10 @@ class DTTargetController:
         # relayed SourceReadDone is an idempotent repeat.
         self._ring_proven: OrderedDict[str, None] = OrderedDict()
         self._lease_marks: list[tuple[str, str]] = []
+        # Remote ring records written ahead of their Coordinator batch
+        # (transfer_id -> written seq): a batch whose submit does not go out
+        # is re-flushed under its original stamp, not rewritten.
+        self._remote_ring_records: dict[str, int] = {}
         self._ring_revoked_sessions: set[str] = set()
         # Owner lease per request from Coordinator assignments:
         # request_id -> (draft_instance_id, draft_session_id, owner_epoch).
@@ -5416,6 +5420,7 @@ class DTTargetController:
                 # A ring copy written before a submit that did not go out is
                 # marked once its (re)submitted round is registered.
                 retained_marks = []
+                remote_records = getattr(self, "_remote_ring_records", None)
                 for transfer_id, instance_id in lease_marks:
                     if self._ledger.get(transfer_id) is None:
                         retained_marks.append((transfer_id, instance_id))
@@ -5423,6 +5428,8 @@ class DTTargetController:
                         self._ledger.mark_lease_dispatched(
                             transfer_id, draft_instance_id=instance_id
                         )
+                        if remote_records is not None:
+                            remote_records.pop(transfer_id, None)
                 self._lease_marks = retained_marks
             outbox = self._delivery_outbox
             outbox.add("task_batch", dispatch_batch.batch_id, dispatch_batch)
@@ -6587,6 +6594,9 @@ class DTTargetController:
             # completion or tombstone, its source for the ring read proof or
             # an owner revocation.
             direct_sent.discard(transfer_id)
+            remote_records = getattr(self, "_remote_ring_records", None)
+            if remote_records is not None:
+                remote_records.pop(transfer_id, None)
             self._release_candidate_destination(transfer_id, remote_quiescent=False)
             return
         self._release_source_slot(transfer_id)
@@ -8104,7 +8114,13 @@ class DTTargetController:
         return writer if writer.state == STATE_SERVING else None
 
     def _plan_direct_ring(self, tasks):
-        """Choose owner-known rounds for the ring and stamp their ring seq."""
+        """Choose owner-known rounds for the ring and stamp their ring seq.
+
+        Remote ring records are published here, before the Coordinator batch
+        goes out, so a stamped (confirmation-only) copy never names a record
+        whose write failed; local ring records stay planned for the
+        post-submit publish, as before.
+        """
 
         from dt_protocol import DraftTaskKind
         from msgspec.structs import replace
@@ -8113,6 +8129,7 @@ class DTTargetController:
 
         from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
         from sglang.srt.speculative.dt_direct_ring import MAX_PAYLOAD_BYTES, next_seq
+        from sglang.srt.speculative.dt_rdma import RdmaTransportError
 
         if not self.is_persistent or self.candidate_transport != "cuda-ipc":
             return tasks, ()
@@ -8156,6 +8173,13 @@ class DTTargetController:
                 continue
             binding = self._draft_binding.get(task.request_id)
             writer = None
+            # A record already written for this transfer (its first submit
+            # did not go out) keeps its original stamp on re-plan, matching
+            # the record on the ring, even if the ring writer retired since.
+            reused_seq = self._remote_ring_records.get(task.transfer_id)
+            if reused_seq is not None:
+                stamped.append(replace(task, direct_ring_seq=reused_seq))
+                continue
             if (
                 task.kind == DraftTaskKind.RECONCILE
                 and task.candidate_destination is not None
@@ -8207,45 +8231,103 @@ class DTTargetController:
                 )
                 stamped.append(task)
                 continue
+            if getattr(writer, "is_remote", False):
+                # Publish the remote record BEFORE the Coordinator copy goes
+                # out: a stamped copy is confirmation-only at the Draft, so
+                # the stamp in the batch must never name a record whose
+                # write failed.  A failed write retires this session's ring
+                # writer and the round goes out unstamped, over the
+                # Coordinator relay.
+                written_ns = time.monotonic_ns()
+                source = task.source
+                try:
+                    if source is None:
+                        seq = writer.write(payload=payload, has_pull=False)
+                    else:
+                        seq = writer.write(
+                            payload=payload,
+                            has_pull=True,
+                            source_offset=source.allocation_offset + source.byte_offset,
+                            nbytes=source.nbytes,
+                            source_slot_id=source.source_slot_id,
+                            slot_generation=source.slot_generation,
+                            event_handle=source.producer_event_handle,
+                        )
+                except RdmaTransportError:
+                    self._retire_failed_ring_writer(session_id, writer)
+                    stamped.append(task)
+                    continue
+                if seq != ring_task.direct_ring_seq:
+                    raise RuntimeError("direct ring sequence diverged from its plan")
+                self._remote_ring_records[task.transfer_id] = seq
+                # Applied after ledger.begin() registers the round.
+                self._lease_marks.append((task.transfer_id, instance_id))
+                self._direct_sent.add(task.transfer_id)
+                if self._profile_active:
+                    self._profile_emit(
+                        "target_ring_write",
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        ring_seq=seq,
+                        written_ns=written_ns,
+                        remote=True,
+                    )
+                stamped.append(ring_task)
+                continue
             planned_next[binding[1]] = next_seq(seq)
             planned_count[binding[1]] = count + 1
             plan.append((binding[1], writer, ring_task, payload))
             stamped.append(ring_task)
         return stamped, tuple(plan)
 
-    def _write_direct_ring(self, plan) -> None:
-        """Publish planned ring entries after the Coordinator submit succeeded."""
+    def _retire_failed_ring_writer(self, draft_session_id: str, writer) -> None:
+        """Stop planning a session onto its remote ring after a write failure.
 
-        from sglang.srt.speculative.dt_rdma import RdmaTransportError
+        Unlike :meth:`_revoke_ring_owner` (owner death), the Draft session
+        stays alive: its relayed rounds still push candidates from it, so
+        the candidate arena and the bindings keep the session's producer
+        authorization.  Remote ring rounds never reach ``_ring_outstanding``
+        (no early read proof exists remotely), so no lease retirement runs.
+        """
+
+        if draft_session_id in self._ring_revoked_sessions:
+            return
+        self._ring_revoked_sessions.add(draft_session_id)
+        self._ring_writers.pop(draft_session_id, None)
+        if getattr(writer, "is_remote", False):
+            rdma = getattr(self, "_rdma_endpoint", None)
+            if rdma is not None:
+                # Idempotent with the writer's own fencing: proves the
+                # Draft's NIC no longer touches its ring.
+                rdma.fence(writer.draft_instance_id, draft_session_id)
+        writer.close()
+        logger.warning(
+            "retired failed remote ring writer for draft session %s",
+            draft_session_id,
+        )
+
+    def _write_direct_ring(self, plan) -> None:
+        """Publish planned local ring entries after the Coordinator submit succeeded."""
 
         for draft_session_id, writer, task, payload in plan:
             # Stamped before the seq store: the Draft may take it immediately.
             written_ns = time.monotonic_ns()
             source = task.source
-            try:
-                if source is None:
-                    seq = writer.write(payload=payload, has_pull=False)
-                    pull = None
-                else:
-                    seq = writer.write(
-                        payload=payload,
-                        has_pull=True,
-                        source_offset=source.allocation_offset + source.byte_offset,
-                        nbytes=source.nbytes,
-                        source_slot_id=source.source_slot_id,
-                        slot_generation=source.slot_generation,
-                        event_handle=source.producer_event_handle,
-                    )
-                    pull = (source.source_slot_id, source.slot_generation)
-            except RdmaTransportError:
-                if not writer.is_remote:
-                    raise
-                # The ring leg died: fence the session's queue pairs (proves
-                # the NIC no longer touches the ring), revoke the owner so
-                # later rounds plan onto the Coordinator relay, and let the
-                # Coordinator copies of the already-planned rounds carry them.
-                self._revoke_ring_owner(draft_session_id, quiescent=True)
-                continue
+            if source is None:
+                seq = writer.write(payload=payload, has_pull=False)
+                pull = None
+            else:
+                seq = writer.write(
+                    payload=payload,
+                    has_pull=True,
+                    source_offset=source.allocation_offset + source.byte_offset,
+                    nbytes=source.nbytes,
+                    source_slot_id=source.source_slot_id,
+                    slot_generation=source.slot_generation,
+                    event_handle=source.producer_event_handle,
+                )
+                pull = (source.source_slot_id, source.slot_generation)
             if seq != task.direct_ring_seq:
                 raise RuntimeError("direct ring sequence diverged from its plan")
             # Applied after ledger.begin() registers the round.
@@ -8261,13 +8343,8 @@ class DTTargetController:
                     round_id=task.round_id,
                     ring_seq=seq,
                     written_ns=written_ns,
-                    remote=writer.is_remote,
+                    remote=False,
                 )
-            if writer.is_remote:
-                # No early read proof exists remotely: the source lease
-                # retires on the Coordinator's SourceReadDone, exactly like
-                # a relayed task's (see _consume_source_read_done).
-                continue
             self._ring_unproven[task.transfer_id] = draft_session_id
             self._ring_outstanding[draft_session_id].append(
                 (seq, task.transfer_id, pull)
