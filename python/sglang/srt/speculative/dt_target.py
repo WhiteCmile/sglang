@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
@@ -36,6 +38,9 @@ from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
+
+# Critical-section fallback for controller doubles that never ran __init__.
+_NULL_CONTEXT = contextlib.nullcontext()
 
 # Coordinator failure codes meaning the assigned Draft session is gone.
 RING_OWNER_LOSS_CODES = frozenset(
@@ -706,6 +711,15 @@ class DTTargetController:
         # recorded, and the set is pruned with that set, so it cannot grow
         # past the pending-round population.
         self._remote_source_proof_landed: set[str] = set()
+        # Pairs the RDMA completion thread (on_landed_push ->
+        # _consume_remote_source_proof) with the scheduler thread
+        # (retirement, Coordinator ACK cleanup) on the proof/retirement
+        # handshake: the waiter registry, the early-proof cache, and the
+        # unconfirmed-round set must be checked and mutated in one critical
+        # section, otherwise a landed proof is lost between two checks or
+        # recorded after the ACK cleanup that should have pruned it
+        # (CI review, PR #210).
+        self._remote_source_lock = threading.Lock()
         self._ring_revoked_sessions: set[str] = set()
         # Owner lease per request from Coordinator assignments:
         # request_id -> (draft_instance_id, draft_session_id, owner_epoch).
@@ -5575,15 +5589,10 @@ class DTTargetController:
                         self._remember_draft_binding(assignment)
                     direct_sent = getattr(self, "_direct_sent", None)
                     if direct_sent:
-                        direct_sent.difference_update(message.accepted_transfer_ids)
-                        direct_sent.difference_update(message.duplicate_transfer_ids)
-                        # An accepted round retires its source on the relayed
-                        # SourceReadDone; any proof recorded while it was
-                        # still unconfirmed has no waiter left to serve.
-                        landed = getattr(self, "_remote_source_proof_landed", None)
-                        if landed is not None:
-                            landed.difference_update(message.accepted_transfer_ids)
-                            landed.difference_update(message.duplicate_transfer_ids)
+                        self._ack_confirmed_remote_rounds(
+                            message.accepted_transfer_ids,
+                            message.duplicate_transfer_ids,
+                        )
                 self._prune_obsolete_task_retries(
                     state.task
                     for transfer_id in (
@@ -6649,6 +6658,37 @@ class DTTargetController:
                 )
         self._pending_send = retained
 
+    def _remote_source_guard(self):
+        """Critical-section guard for the remote proof/retirement handshake."""
+        lock = getattr(self, "_remote_source_lock", None)
+        return lock if lock is not None else _NULL_CONTEXT
+
+    def _ack_confirmed_remote_rounds(
+        self, accepted_transfer_ids, duplicate_transfer_ids
+    ) -> None:
+        """Drop unconfirmed-round bookkeeping once the Coordinator confirms.
+
+        Accepted and duplicate rounds retire their source on the relayed
+        SourceReadDone, so the publish-time session marker and any proof
+        recorded while the round was still unconfirmed have no waiter left
+        to serve; keeping either would grow without bound (CI review,
+        PR #210).  One critical section with the completion thread's
+        waiter/cache check.
+        """
+        direct_sent = getattr(self, "_direct_sent", None)
+        if not direct_sent:
+            return
+        confirmed = (*accepted_transfer_ids, *duplicate_transfer_ids)
+        with self._remote_source_guard():
+            direct_sent.difference_update(confirmed)
+            landed = getattr(self, "_remote_source_proof_landed", None)
+            if landed is not None:
+                landed.difference_update(confirmed)
+            ring_sessions = getattr(self, "_remote_ring_sessions", None)
+            if ring_sessions is not None:
+                for transfer_id in confirmed:
+                    ring_sessions.pop(transfer_id, None)
+
     def _retire_unaccepted_transfer(self, transfer_id: str) -> None:
         """Release a transfer the Coordinator never accepted.
 
@@ -6661,15 +6701,37 @@ class DTTargetController:
             # A ring copy exists: its candidate slot waits for the Draft's
             # completion or tombstone, its source for the ring read proof or
             # an owner revocation.
-            direct_sent.discard(transfer_id)
             remote_records = getattr(self, "_remote_ring_records", None)
-            remote = remote_records is not None and transfer_id in remote_records
             if remote_records is not None:
                 remote_records.pop(transfer_id, None)
             destinations = getattr(self, "_remote_ring_destinations", None)
             if destinations is not None:
                 destinations.pop(transfer_id, None)
-            retirement = None
+            retirement = getattr(self, "_remote_source_retirement", None)
+            # The publish-time session marker classifies the round:
+            # _remote_ring_records is cleared as soon as the round is
+            # submitted (the submit precedes the Coordinator ACK), so a
+            # submitted-but-backpressured remote round would misclassify as
+            # local without this marker (CI review, PR #210).
+            ring_sessions = getattr(self, "_remote_ring_sessions", None)
+            remote = ring_sessions is not None and transfer_id in ring_sessions
+            replay = False
+            # One critical section: discarding the unconfirmed marker,
+            # registering the waiter (with the publish-time session id;
+            # abort paths such as pop_aborted() drop the _draft_binding
+            # before this runs), and replaying a proof that landed before
+            # registration must be atomic with the completion thread's
+            # waiter/cache check, else the only proof is lost between the
+            # two checks (CI review, PR #210).
+            with self._remote_source_guard():
+                direct_sent.discard(transfer_id)
+                if remote and retirement is not None:
+                    retirement[transfer_id] = ring_sessions.pop(transfer_id, None)
+                    landed = getattr(self, "_remote_source_proof_landed", None)
+                    if landed is not None and transfer_id in landed:
+                        landed.discard(transfer_id)
+                        replay = True
+            self._release_candidate_destination(transfer_id, remote_quiescent=False)
             if remote:
                 # A remote record has no early read proof and the Coordinator
                 # confirms nothing for this round: it drops both the
@@ -6680,33 +6742,13 @@ class DTTargetController:
                 # validated against the destination's generation and nonce)
                 # or, if the Draft dies first, on this session's revocation —
                 # never on Coordinator confirmation.
-                #
-                # Register the waiter BEFORE cancelling the candidate
-                # destination: the Draft's authenticated push may land inside
-                # that window and a proof observing no waiter is lost (CI
-                # review, PR #207 round 5).  The session id is the
-                # publish-time one: abort paths such as pop_aborted() remove
-                # the _draft_binding before this runs, so reading it here
-                # could store None and defeat _revoke_ring_owner's match.
-                retirement = getattr(self, "_remote_source_retirement", None)
-                if retirement is not None:
-                    ring_sessions = getattr(self, "_remote_ring_sessions", None)
-                    retirement[transfer_id] = (
-                        ring_sessions.pop(transfer_id, None)
-                        if ring_sessions is not None
-                        else None
-                    )
-            self._release_candidate_destination(transfer_id, remote_quiescent=False)
-            if remote:
                 if retirement is None:
                     return
-                # The Draft's push may also have landed before this
-                # registration (its own abandon under Coordinator
-                # backpressure); that proof was recorded in
-                # _remote_source_proof_landed and is replayed now.
-                landed = getattr(self, "_remote_source_proof_landed", None)
-                if landed is not None and transfer_id in landed:
-                    landed.discard(transfer_id)
+                if replay:
+                    # The Draft's push may also have landed before this
+                    # registration (its own abandon under Coordinator
+                    # backpressure); that proof was recorded in
+                    # _remote_source_proof_landed and is replayed now.
                     self._consume_remote_source_proof(transfer_id)
             return
         self._release_source_slot(transfer_id)
@@ -6731,17 +6773,24 @@ class DTTargetController:
         retirement = getattr(self, "_remote_source_retirement", None)
         if retirement is None:
             return
-        if transfer_id not in retirement:
-            # No waiter (yet).  Only a round the Coordinator has not
-            # confirmed can gain one later; recording its proof costs one
-            # entry for the lifetime of its pending round.
-            direct_sent = getattr(self, "_direct_sent", None)
-            if direct_sent is not None and transfer_id in direct_sent:
-                landed = getattr(self, "_remote_source_proof_landed", None)
-                if landed is not None:
-                    landed.add(transfer_id)
-            return
-        retirement.pop(transfer_id)
+        # Runs on the RDMA completion thread; the scheduler thread mutates
+        # the same tables in retirement and ACK cleanup.  The waiter lookup,
+        # the unconfirmed-marker check, and the cache insert must be one
+        # critical section, else a proof is lost between the waiter check
+        # and the cache insert, or recorded after the ACK cleanup (CI
+        # review, PR #210).
+        with self._remote_source_guard():
+            if transfer_id not in retirement:
+                # No waiter (yet).  Only a round the Coordinator has not
+                # confirmed can gain one later; recording its proof costs one
+                # entry for the lifetime of its pending round.
+                direct_sent = getattr(self, "_direct_sent", None)
+                if direct_sent is not None and transfer_id in direct_sent:
+                    landed = getattr(self, "_remote_source_proof_landed", None)
+                    if landed is not None:
+                        landed.add(transfer_id)
+                return
+            retirement.pop(transfer_id)
         source_ref = self._source_slot_by_transfer.get(transfer_id)
         if source_ref is None:
             return
@@ -8678,15 +8727,23 @@ class DTTargetController:
             # Retired-unaccepted remote rounds of this session: the fence
             # above destroyed their Draft's queue pairs, so their source
             # reads are provably quiescent — the same destroyed-QP proof as
-            # the local ring rounds above.
-            for transfer_id, session_id in tuple(retirement.items()):
-                if session_id != draft_session_id:
-                    continue
-                retirement.pop(transfer_id)
-                if quiescent:
-                    self._release_source_slot(transfer_id)
-                else:
-                    self._quarantine_source_slot(transfer_id)
+            # the local ring rounds above.  Claim the entries in the same
+            # critical section as the completion thread so a proof that just
+            # landed cannot retire the same lease twice.
+            release_ids: list[str] = []
+            quarantine_ids: list[str] = []
+            with self._remote_source_guard():
+                for retired_id, session_id in tuple(retirement.items()):
+                    if session_id != draft_session_id:
+                        continue
+                    retirement.pop(retired_id)
+                    (release_ids if quiescent else quarantine_ids).append(
+                        retired_id
+                    )
+            for retired_id in release_ids:
+                self._release_source_slot(retired_id)
+            for retired_id in quarantine_ids:
+                self._quarantine_source_slot(retired_id)
         if self._candidate_arena is not None:
             self._candidate_arena.revoke_producer(draft_session_id, quiescent=quiescent)
         for request_id, binding in tuple(self._draft_binding.items()):
