@@ -1045,8 +1045,7 @@ class FlashMTPDraftEngine:
         self._ring_endpoints: dict[str, object] = {}
         self._ring_targets: dict[int, str] = {}
         # Cross-host task-record rings (issue #182), keyed by Target session;
-        # consumed in _poll_direct_rings like the local rings, but the hidden
-        # pull runs lazily over the RDMA pull leg instead of the ring worker.
+        # served by the same native ring worker as the local rings (#198).
         self._remote_ring_endpoints: dict[str, object] = {}
         # Sessions whose ring leg failed to connect: never retried (the
         # Coordinator relay remains their path).
@@ -2345,23 +2344,11 @@ class FlashMTPDraftEngine:
                 queued_at_launch=True,
             )
 
-    def _open_direct_ring(self, registration) -> None:
-        """Create this Draft's ring for one Target session (same host only)."""
+    def _ensure_ring_worker(self):
+        """The native ring worker and its landing buffers, created once."""
 
-        from sglang.srt.speculative.dt_direct_ring import (
-            RING_CAPACITY,
-            DraftRingEndpoint,
-            DraftRingWorker,
-            ring_path,
-        )
+        from sglang.srt.speculative.dt_direct_ring import DraftRingWorker
 
-        if (
-            not self._persistent
-            or self.candidate_transport != "cuda-ipc"
-            or self._candidate_push_transport is None
-            or registration.target_session_id in self._ring_endpoints
-        ):
-            return
         if self._ring_worker is None:
             if self._is_feature_backed:
                 count = int(os.environ.get("DT_DIRECT_RING_LANDING", "4"))
@@ -2409,6 +2396,25 @@ class FlashMTPDraftEngine:
                 landing=landing,
                 row_bytes=row_bytes,
             )
+        return self._ring_worker
+
+    def _open_direct_ring(self, registration) -> None:
+        """Create this Draft's ring for one Target session (same host only)."""
+
+        from sglang.srt.speculative.dt_direct_ring import (
+            RING_CAPACITY,
+            DraftRingEndpoint,
+            ring_path,
+        )
+
+        if (
+            not self._persistent
+            or self.candidate_transport != "cuda-ipc"
+            or self._candidate_push_transport is None
+            or registration.target_session_id in self._ring_endpoints
+        ):
+            return
+        self._ensure_ring_worker()
         ring_id = len(self._ring_targets) + 1
         endpoint = DraftRingEndpoint(
             path=ring_path(
@@ -2427,9 +2433,18 @@ class FlashMTPDraftEngine:
         self._ring_targets[ring_id] = registration.target_instance_id
 
     def _open_remote_ring(self, registration) -> None:
-        """Create the RDMA task-record ring for one cross-host Target."""
+        """Create the RDMA task-record ring for one cross-host Target.
 
-        from sglang.srt.speculative.dt_rdma import DraftRemoteRing
+        The native ring worker serves it like a same-host ring (issue #198):
+        it READs each record's hidden rows into the shared landing buffers,
+        gated on the Target's ready records, so the row enters through
+        ``_poll_direct_rings`` -> ``_admit_ring_tasks``.  Relayed rounds to
+        the same Target share the ring's pull leg on the Python pull path,
+        which also keeps it, draining its ready records itself, if the ring
+        cannot be served.
+        """
+
+        from sglang.srt.speculative.dt_rdma import DraftRdmaPuller, DraftRemoteRing
 
         if (
             not self._persistent
@@ -2439,17 +2454,51 @@ class FlashMTPDraftEngine:
             or registration.target_session_id in self._remote_ring_failed
         ):
             return
+        worker = self._ensure_ring_worker()
         ring_id = len(self._ring_targets) + 1
-        endpoint = DraftRemoteRing(
-            host=registration.host_addr,
-            port=int(registration.data_port),
-            device=self._canonical_draft_device(self.device),
-            draft_instance_id=self.instance_id,
-            draft_session_id=self._client.instance_session_id,
-            target_instance_id=registration.target_instance_id,
-            target_session_id=registration.target_session_id,
-            ring_id=ring_id,
-        )
+        device = self._canonical_draft_device(self.device)
+        puller = None
+        if self._is_feature_backed:
+            puller = DraftRdmaPuller(
+                host=registration.host_addr,
+                port=int(registration.data_port),
+                device=device,
+                draft_instance_id=self.instance_id,
+                draft_session_id=self._client.instance_session_id,
+                native_ready=True,
+            )
+        try:
+            endpoint = DraftRemoteRing(
+                host=registration.host_addr,
+                port=int(registration.data_port),
+                device=device,
+                draft_instance_id=self.instance_id,
+                draft_session_id=self._client.instance_session_id,
+                target_instance_id=registration.target_instance_id,
+                target_session_id=registration.target_session_id,
+                ring_id=ring_id,
+                landing=worker.landing if self._is_feature_backed else None,
+                max_entry_bytes=worker.landing_bytes if self._is_feature_backed else 0,
+                puller=puller,
+            )
+            try:
+                worker.attach_remote(endpoint)
+            except Exception:
+                endpoint.close()
+                raise
+        except Exception:
+            if puller is not None:
+                # Closing the pull leg would make the Target fence the whole
+                # session; the relay keeps it with Python draining it.
+                puller.native_ready = False
+                self._feature_pull_transport.adopt_remote_puller(
+                    registration.target_instance_id, puller
+                )
+            raise
+        if puller is not None:
+            self._feature_pull_transport.adopt_remote_puller(
+                registration.target_instance_id, puller
+            )
         self._remote_ring_endpoints[registration.target_session_id] = endpoint
         self._ring_targets[ring_id] = registration.target_instance_id
         logger.info(
@@ -2472,8 +2521,8 @@ class FlashMTPDraftEngine:
         if decoder is None:
             decoder = self._ring_task_decoder = msgspec.msgpack.Decoder(DraftTask)
         for endpoint in self._remote_ring_endpoints.values():
-            # A failed leg is fail-stop: a lost or stale record must never be
-            # silently skipped (the queue pair is fenced by the close).
+            # The worker validated and pulled every record it published; a
+            # failed leg stops it (worker.check above raises).
             for _ in range(256):
                 entry = endpoint.take_ready()
                 if entry is None:
@@ -2567,7 +2616,7 @@ class FlashMTPDraftEngine:
                 or source.allocation_offset + source.byte_offset != entry.source_offset
                 or source.source_session_id != endpoint.source_session_id
                 or source.pool_generation != endpoint.pool_generation
-                or (not endpoint.is_remote and entry.landing_index < 0)
+                or entry.landing_index < 0
             ):
                 raise ValueError("direct ring pull does not match its task source")
         elif task.source is not None:
@@ -2590,7 +2639,7 @@ class FlashMTPDraftEngine:
         self._pending_ids.add(transfer_id)
         self._ring_pending_ids.add(transfer_id)
         self._received_ns_by_transfer[transfer_id] = received_ns
-        if entry.has_pull and not endpoint.is_remote:
+        if entry.has_pull:
             slot = self._landing_slot_base + entry.landing_index
             row_bytes = self._ring_worker.row_bytes
             first = entry.landing_offset // row_bytes
@@ -2604,9 +2653,6 @@ class FlashMTPDraftEngine:
             self._publish_source_done(task)
             self._ring_admission.append((task, slot, rows))
         else:
-            # No-pull local entries, and remote entries: a remote ring's
-            # hidden rows are pulled lazily at execution over the RDMA pull
-            # leg (#165), exactly like a relayed task's.
             self._pending.append(task)
         profile_emit(
             "draft_ring_take",

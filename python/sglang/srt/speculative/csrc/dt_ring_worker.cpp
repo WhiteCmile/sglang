@@ -18,11 +18,23 @@
 //
 // The Python side (dt_direct_ring.py) owns every allocation and mapping and
 // keeps them alive until the worker is destroyed (stream drained).
+//
+// Cross-host rings (issue #198) take the same path through a different data
+// mover.  The Target writes v1 entries into a pinned Draft ring with RDMA
+// WRITE_WITH_IMM (issue #182); the worker consumes the arrival completions,
+// applies the local fences plus the per-slot generation table the Target
+// mirrors onto the ring, waits for the slot's ready record (the Target's
+// producer finished), places the rows in the same landing buffers, and posts
+// the GPUDirect RDMA READ itself.  One cuFlushGPUDirectRDMAWrites covers every
+// READ completed in a pass, after which the INPUT_READY words are stored.
+// Verbs are reached through dt_rdma_verbs.cpp's entry points, passed in at
+// attach; this library still links no RDMA library.
 
 #include <dlfcn.h>
 #include <sched.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include <atomic>
 #include <deque>
@@ -61,6 +73,7 @@ struct Api {
   CUresult (*cuStreamWriteValue32)(CUstream, CUdeviceptr, uint32_t, unsigned);
   CUresult (*cuIpcOpenEventHandle)(CUevent*, CUipcEventHandle);
   CUresult (*cuEventDestroy)(CUevent);
+  CUresult (*cuFlushGPUDirectRDMAWrites)(int, int);
 };
 
 bool load_api(Api* api) {
@@ -84,6 +97,7 @@ bool load_api(Api* api) {
   LOAD(cuStreamWriteValue32, "cuStreamWriteValue32_v2");
   LOAD(cuIpcOpenEventHandle, "cuIpcOpenEventHandle");
   LOAD(cuEventDestroy, "cuEventDestroy_v2");
+  LOAD(cuFlushGPUDirectRDMAWrites, "cuFlushGPUDirectRDMAWrites");
 #undef LOAD
   return true;
 }
@@ -131,6 +145,70 @@ struct RecordV2Header {
 };
 static_assert(sizeof(RecordV2Header) == 128, "v2 record header must be 128 bytes");
 
+// dt_rdma_verbs.cpp entry points (ctypes passes their addresses at attach).
+typedef int (*PostReadFn)(void* qp, uint64_t wr_id, uint64_t local_addr, uint32_t length,
+                          uint32_t lkey, uint64_t remote_addr, uint32_t rkey);
+typedef int (*PostRecvFn)(void* qp, uint64_t wr_id, int count);
+typedef int (*PollFn)(void* cq, int max, uint64_t timeout_ns, uint64_t* wr_id,
+                      uint32_t* status, uint32_t* opcode, uint32_t* imm, uint32_t* qpn);
+
+// Attach-time description of one cross-host ring; every field is a u64 so the
+// ctypes mirror (dt_direct_ring.RemoteRingSpec) is a flat list in this order.
+struct RemoteRingSpec {
+  uint64_t post_read, post_recv, poll;
+  // Task-record leg: arrivals on recv_cq; the worker's READs go out on the
+  // same queue pair and complete on send_cq.
+  uint64_t record_qp, record_recv_cq, record_send_cq, record_tag;
+  uint64_t table_host;   // per-slot generation table the Target mirrors
+  uint64_t read_window;  // READs outstanding at once (the QP's send depth)
+  uint64_t landing_lkey;
+  // Remote feature pool: READ address = pool_addr + offset - allocation_offset.
+  uint64_t pool_addr, pool_rkey, pool_allocation_offset, slot_nbytes, slot_count;
+  // Ready-record leg (#165): the worker is its only consumer.  ready_qp == 0
+  // when the Target serves no feature pool (token-only rounds).
+  uint64_t ready_qp, ready_recv_cq, ready_tag, ready_ring_host, ready_depth,
+      ready_first_seq, ready_table_host, pool_tag, session_tag;
+  uint64_t drain_timeout_ns;  // destroy() waits this long for posted READs
+};
+
+// The READY record dt_rdma.encode_ready_record writes (struct "<QQQII").
+struct ReadyRecord {
+  uint64_t seq;
+  uint64_t pool_tag;
+  uint64_t session_tag;
+  uint32_t slot_id;
+  uint32_t slot_generation;
+};
+static_assert(sizeof(ReadyRecord) == 32, "ready record must be 32 bytes");
+
+constexpr uint32_t kWcRecvRdmaWithImm = 129;  // IBV_WC_RECV_RDMA_WITH_IMM
+constexpr int kCuFlushTargetCurrentCtx = 0;   // CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX
+constexpr int kCuFlushToOwner = 100;          // CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER
+
+// One served cross-host entry, published strictly in seq order.
+struct Flight {
+  uint64_t seq;
+  uint32_t index;
+  uint32_t slot_id;
+  uint32_t slot_generation;
+  bool read;  // a READ was posted for it
+  bool done;  // its READ completed (or it had none)
+};
+
+struct Remote {
+  RemoteRingSpec spec{};
+  PostReadFn post_read = nullptr;
+  PostRecvFn post_recv = nullptr;
+  PollFn poll = nullptr;
+  uint32_t* ready_host = nullptr;        // INPUT_READY words (host memory)
+  const uint32_t* table = nullptr;       // Target-mirrored slot generations
+  uint32_t* ready_table = nullptr;       // slot -> highest ready generation
+  uint64_t ready_expected = 1;           // next ready-record seq
+  std::deque<uint32_t> arrived;          // immediates of unserved records
+  std::deque<Flight> flights;            // served, not yet INPUT_READY
+  uint64_t reads_outstanding = 0;
+};
+
 struct Ring {
   int id = 0;
   const uint8_t* entries = nullptr;  // host address of entry 0
@@ -157,6 +235,7 @@ struct Ring {
   uint64_t mailbox_stride = 0;
   const uint64_t* mail_ack = nullptr;  // last mailbox seq the main loop parsed
   void* ledger = nullptr;          // native rid ledger (v2 records), or null
+  std::unique_ptr<Remote> remote;  // set for a cross-host ring
 };
 
 // Mailbox slot layout (all offsets in bytes).  The worker publishes the seq
@@ -200,6 +279,12 @@ struct Worker {
   std::atomic<uint64_t> landing_stalls{0};
   std::thread thread;
 };
+
+uint64_t now_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 void fail(Worker* w, int code, int ring_id) {
   int expected = 0;
@@ -475,6 +560,243 @@ bool serve_entry(Worker* w, Ring* r) {
   return serve_entry_v1(w, r);
 }
 
+// Fences of one arrived cross-host entry: the local v1 fences (seq and epoch
+// lap, format, flags, payload length) plus the registered-source fences the
+// worker applies to kernel-published records (the slot's generation, here as
+// mirrored onto the ring by the Target, and a row-aligned range inside that
+// slot that fits one landing buffer).  The arrival completion already proved
+// the record complete, so a seq mismatch is a stale or forged record, never
+// "not yet published".  0: valid; -4: malformed record; -5: stale source.
+int remote_record_check(const EntryHeader& h, uint64_t expected_seq, uint64_t payload_cap,
+                        const uint32_t* table, uint64_t slot_count,
+                        uint64_t allocation_offset, uint64_t slot_nbytes,
+                        uint64_t row_bytes, uint64_t landing_bytes) {
+  if (h.seq != (uint32_t)expected_seq || h.epoch != (uint32_t)(expected_seq >> 32)) return -4;
+  if ((uint32_t)(h.source_offset >> 32) == kRecordVersion2) return -4;
+  if (h.flags & ~kEntryHasPull || h.payload_len > payload_cap) return -4;
+  if (!(h.flags & kEntryHasPull))
+    return h.nbytes || h.source_slot_id || h.slot_generation || h.source_offset ? -4 : 0;
+  if (table == nullptr || h.nbytes == 0 || h.nbytes % row_bytes || h.nbytes > landing_bytes)
+    return -4;
+  if (h.source_slot_id >= slot_count || h.slot_generation == 0 ||
+      table[h.source_slot_id] != h.slot_generation)
+    return -5;
+  const uint64_t slot_base = allocation_offset + (uint64_t)h.source_slot_id * slot_nbytes;
+  if (h.source_offset < slot_base || (h.source_offset - slot_base) % row_bytes ||
+      h.source_offset + h.nbytes > slot_base + slot_nbytes)
+    return -5;
+  return 0;
+}
+
+// Consume every arrived ready record: validated exactly as
+// dt_rdma.decode_ready_record does, then each receive is re-posted.
+bool drain_ready(Worker* w, Ring* r) {
+  Remote& m = *r->remote;
+  if (!m.spec.ready_qp) return true;
+  uint64_t wr_id[64];
+  uint32_t status[64], opcode[64], imm[64], qpn[64];
+  const int n = m.poll(reinterpret_cast<void*>(m.spec.ready_recv_cq), 64, 0, wr_id, status,
+                       opcode, imm, qpn);
+  if (n < 0) {
+    fail(w, -7, r->id);
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (status[i] != 0 || opcode[i] != kWcRecvRdmaWithImm) {
+      fail(w, -7, r->id);
+      return false;
+    }
+    ReadyRecord rec;
+    memcpy(&rec,
+           reinterpret_cast<const uint8_t*>(m.spec.ready_ring_host) +
+               (uint64_t)(imm[i] % m.spec.ready_depth) * sizeof(ReadyRecord),
+           sizeof(rec));
+    if (rec.session_tag != m.spec.session_tag || rec.pool_tag != m.spec.pool_tag ||
+        rec.seq != m.ready_expected || rec.slot_id >= m.spec.slot_count ||
+        rec.slot_generation == 0) {
+      fail(w, -6, r->id);
+      return false;
+    }
+    ++m.ready_expected;
+    if (rec.slot_generation > m.ready_table[rec.slot_id])
+      __atomic_store_n(&m.ready_table[rec.slot_id], rec.slot_generation, __ATOMIC_RELEASE);
+  }
+  if (n > 0 && m.post_recv(reinterpret_cast<void*>(m.spec.ready_qp), m.spec.ready_tag, n) != 0) {
+    fail(w, -7, r->id);
+    return false;
+  }
+  return true;
+}
+
+// Serve the oldest arrived record: 1 served, 0 retry next pass, -1 failed.
+int serve_remote_record(Worker* w, Ring* r) {
+  Remote& m = *r->remote;
+  const uint32_t index = r->next_seq % r->capacity;
+  if (m.arrived.front() != index) {
+    fail(w, -4, r->id);
+    return -1;
+  }
+  const uint8_t* slot = r->entries + (uint64_t)index * r->entry_bytes;
+  EntryHeader h;
+  memcpy(&h, slot, sizeof(h));
+  const int check = remote_record_check(
+      h, r->next_seq, r->entry_bytes - 128, m.spec.ready_qp ? m.table : nullptr,
+      m.spec.slot_count, m.spec.pool_allocation_offset, m.spec.slot_nbytes, w->row_bytes,
+      w->landing_bytes);
+  if (check != 0) {
+    fail(w, check, r->id);
+    return -1;
+  }
+  const bool has_pull = h.flags & kEntryHasPull;
+  if (has_pull) {
+    // The Target's producer has not finished this slot generation yet.
+    const uint32_t ready =
+        __atomic_load_n(&m.ready_table[h.source_slot_id], __ATOMIC_ACQUIRE);
+    if (ready < h.slot_generation) return 0;
+    if (ready != h.slot_generation) {
+      fail(w, -5, r->id);  // republished while this record still leases it
+      return -1;
+    }
+    if (m.reads_outstanding >= m.spec.read_window) return 0;
+  }
+  if (!mailbox_free(r)) return 0;
+  uint64_t offset = 0;
+  int k = -1;
+  if (has_pull) {
+    k = place_locked(w, h.nbytes, &offset);
+    if (k < 0) {
+      w->landing_stalls.fetch_add(1, std::memory_order_relaxed);
+      return 0;
+    }
+  }
+  // Snapshot first: after the receive is re-posted the Target may rewrite
+  // this ring entry.
+  mailbox_publish(r, index, 1, h.payload_len, 0, slot, sizeof(h), nullptr, 0, nullptr, 0,
+                  slot + 128, h.payload_len);
+  m.arrived.pop_front();
+  if (m.post_recv(reinterpret_cast<void*>(m.spec.record_qp), m.spec.record_tag, 1) != 0) {
+    fail(w, -7, r->id);
+    return -1;
+  }
+  r->placement_buffer[index] = k;
+  r->placement_offset[index] = offset;
+  if (has_pull) {
+    if (m.post_read(reinterpret_cast<void*>(m.spec.record_qp), m.spec.record_tag,
+                    w->landing_base + (uint64_t)k * w->landing_bytes + offset,
+                    (uint32_t)h.nbytes, (uint32_t)m.spec.landing_lkey,
+                    m.spec.pool_addr + h.source_offset - m.spec.pool_allocation_offset,
+                    (uint32_t)m.spec.pool_rkey) != 0) {
+      fail(w, -7, r->id);
+      return -1;
+    }
+    w->cursor = offset + h.nbytes;
+    w->landing_placed[k] += 1;
+    ++m.reads_outstanding;
+  }
+  m.flights.push_back(
+      Flight{r->next_seq, index, h.source_slot_id, h.slot_generation, has_pull, !has_pull});
+  advance_seq(r);
+  return 1;
+}
+
+// Publish INPUT_READY for the completed prefix of served entries, with one
+// GPU-visibility fence for every READ among them.
+bool publish_remote(Worker* w, Ring* r) {
+  Remote& m = *r->remote;
+  size_t count = 0;
+  bool any_read = false;
+  for (const Flight& f : m.flights) {
+    if (!f.done) break;
+    ++count;
+    any_read |= f.read;
+  }
+  if (!count) return true;
+  if (any_read) {
+    // A republication whose ready record arrived meanwhile may have
+    // overwritten a range under its READ.
+    if (!drain_ready(w, r)) return false;
+    for (size_t i = 0; i < count; ++i) {
+      const Flight& f = m.flights[i];
+      if (f.read &&
+          __atomic_load_n(&m.ready_table[f.slot_id], __ATOMIC_ACQUIRE) != f.slot_generation) {
+        fail(w, -5, r->id);
+        return false;
+      }
+    }
+    if (CUresult rc = w->api.cuFlushGPUDirectRDMAWrites(kCuFlushTargetCurrentCtx,
+                                                        kCuFlushToOwner);
+        rc != 0) {
+      fail(w, rc, r->id);
+      return false;
+    }
+  }
+  for (size_t i = 0; i < count; ++i) {
+    const Flight& f = m.flights.front();
+    __atomic_store_n(&m.ready_host[f.index], (uint32_t)f.seq, __ATOMIC_RELEASE);
+    m.flights.pop_front();
+    w->entries_done.fetch_add(1, std::memory_order_relaxed);
+  }
+  return true;
+}
+
+// Reap READ completions; they complete in posting order on one RC queue pair.
+bool reap_reads(Worker* w, Ring* r) {
+  Remote& m = *r->remote;
+  if (!m.reads_outstanding) return true;
+  uint64_t wr_id[64];
+  uint32_t status[64], opcode[64], imm[64], qpn[64];
+  const int n = m.poll(reinterpret_cast<void*>(m.spec.record_send_cq), 64, 0, wr_id, status,
+                       opcode, imm, qpn);
+  if (n < 0) {
+    fail(w, -7, r->id);
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (status[i] != 0) {
+      fail(w, -7, r->id);  // a failed READ (or a QP in error) is fail-stop
+      return false;
+    }
+    for (Flight& f : m.flights)
+      if (f.read && !f.done) {
+        f.done = true;
+        break;
+      }
+    --m.reads_outstanding;
+  }
+  return true;
+}
+
+// One pass over a cross-host ring; true when anything moved.
+bool serve_remote(Worker* w, Ring* r) {
+  Remote& m = *r->remote;
+  const uint64_t done_before = w->entries_done.load(std::memory_order_relaxed);
+  if (!drain_ready(w, r) || !reap_reads(w, r)) return false;
+  uint64_t wr_id[64];
+  uint32_t status[64], opcode[64], imm[64], qpn[64];
+  const int n = m.poll(reinterpret_cast<void*>(m.spec.record_recv_cq), 64, 0, wr_id, status,
+                       opcode, imm, qpn);
+  if (n < 0) {
+    fail(w, -7, r->id);
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (status[i] != 0 || opcode[i] != kWcRecvRdmaWithImm) {
+      fail(w, -7, r->id);
+      return false;
+    }
+    m.arrived.push_back(imm[i] % r->capacity);
+  }
+  bool served = false;
+  for (int i = 0; i < 64 && !m.arrived.empty(); ++i) {
+    const int rc = serve_remote_record(w, r);
+    if (rc < 0) return false;
+    if (rc == 0) break;
+    served = true;
+  }
+  if (!publish_remote(w, r)) return false;
+  return n > 0 || served || w->entries_done.load(std::memory_order_relaxed) != done_before;
+}
+
 void run(Worker* w) {
   if (w->cpu >= 0) {
     cpu_set_t set;
@@ -496,6 +818,10 @@ void run(Worker* w) {
       // that ever changes.
       for (Ring* r : w->rings) {
         if (r->detached) continue;
+        if (r->remote) {
+          if (serve_remote(w, r)) progressed = true;
+          continue;
+        }
         if (r->ledger != nullptr) dt_rid_ledger_reader_open(r->ledger);
         // Bounded per ring per pass so one busy Target cannot starve another.
         for (int i = 0; i < 64 && serve_entry(w, r); ++i) progressed = true;
@@ -758,6 +1084,63 @@ int dt_ring_worker_attach(void* handle, int ring_id, uint64_t entries_host, uint
   return 0;
 }
 
+// Attach a cross-host ring (issue #198).  `entries_host` is entry 0 of the
+// pinned ring the Target writes; `ready_words_host` the INPUT_READY words the
+// main loop reads; the mailbox contract is the local one (v1 snapshots).
+int dt_ring_worker_attach_remote(void* handle, int ring_id, uint64_t entries_host,
+                                 uint64_t entry_bytes, uint32_t capacity,
+                                 uint64_t ready_words_host, uint64_t placement_buffer,
+                                 uint64_t placement_offset, uint64_t first_seq,
+                                 uint64_t mailbox_base, uint64_t mailbox_stride,
+                                 uint64_t mail_ack_host, const RemoteRingSpec* spec) {
+  Worker* w = static_cast<Worker*>(handle);
+  if (!w || !spec || !entries_host || entry_bytes < 128 || !capacity || !first_seq ||
+      !ready_words_host || !placement_buffer || !placement_offset || !mailbox_base ||
+      mailbox_stride < kMailMinStride || !mail_ack_host || !spec->post_read ||
+      !spec->post_recv || !spec->poll || !spec->record_qp || !spec->record_recv_cq ||
+      !spec->record_send_cq || !spec->read_window ||
+      (spec->ready_qp && (!spec->ready_recv_cq || !spec->ready_ring_host ||
+                          !spec->ready_depth || !spec->ready_table_host ||
+                          !spec->table_host || !spec->slot_nbytes)))
+    return -1;
+  Ring* r = new Ring();
+  r->id = ring_id;
+  r->entries = reinterpret_cast<const uint8_t*>(entries_host);
+  r->entry_bytes = entry_bytes;
+  r->capacity = capacity;
+  r->placement_buffer = reinterpret_cast<int32_t*>(placement_buffer);
+  r->placement_offset = reinterpret_cast<uint64_t*>(placement_offset);
+  r->next_seq = first_seq;
+  r->mailbox = reinterpret_cast<uint8_t*>(mailbox_base);
+  r->mailbox_stride = mailbox_stride;
+  r->mail_ack = reinterpret_cast<const uint64_t*>(mail_ack_host);
+  r->remote.reset(new Remote());
+  Remote& m = *r->remote;
+  m.spec = *spec;
+  m.post_read = reinterpret_cast<PostReadFn>(spec->post_read);
+  m.post_recv = reinterpret_cast<PostRecvFn>(spec->post_recv);
+  m.poll = reinterpret_cast<PollFn>(spec->poll);
+  m.ready_host = reinterpret_cast<uint32_t*>(ready_words_host);
+  m.table = reinterpret_cast<const uint32_t*>(spec->table_host);
+  m.ready_table = reinterpret_cast<uint32_t*>(spec->ready_table_host);
+  m.ready_expected = spec->ready_first_seq;
+  std::lock_guard<std::mutex> guard(w->lock);
+  w->rings.push_back(r);
+  return 0;
+}
+
+// CPU-testable form of the cross-host record fences (see remote_record_check).
+int dt_ring_remote_record_check(const uint8_t* entry, uint64_t entry_bytes,
+                                uint64_t expected_seq, const uint32_t* table,
+                                uint64_t slot_count, uint64_t allocation_offset,
+                                uint64_t slot_nbytes, uint64_t row_bytes,
+                                uint64_t landing_bytes) {
+  EntryHeader h;
+  memcpy(&h, entry, sizeof(h));
+  return remote_record_check(h, expected_seq, entry_bytes - 128, table, slot_count,
+                             allocation_offset, slot_nbytes, row_bytes, landing_bytes);
+}
+
 // Stop serving a ring; returns its next unserved seq.  Its queued copies may
 // still run: drain with dt_ring_worker_sync before unmapping anything.
 uint64_t dt_ring_worker_detach(void* handle, int ring_id) {
@@ -826,7 +1209,8 @@ int dt_ring_worker_sync(void* handle) {
     for (Ring* r : w->rings) ring_streams.push_back(r->stream);
   }
   for (CUstream s : ring_streams)
-    if (int rrc = w->api.cuStreamSynchronize(s); rrc != 0 && rc == 0) rc = rrc;
+    if (s != nullptr)  // cross-host rings have no stream
+      if (int rrc = w->api.cuStreamSynchronize(s); rrc != 0 && rc == 0) rc = rrc;
   return rc;
 }
 
@@ -839,6 +1223,18 @@ int dt_ring_worker_destroy(void* handle) {
   w->api.cuCtxSetCurrent(w->ctx);
   int rc = w->api.cuStreamSynchronize(w->stream);
   for (Ring* r : w->rings) {
+    // Posted READs still write the landing buffers: reap them before the
+    // caller may release those buffers.  A READ that never completes leaves
+    // the QP to the owner's close (destroying it stops the NIC).
+    if (r->remote) {
+      const uint64_t deadline = now_ns() + r->remote->spec.drain_timeout_ns;
+      while (r->remote->reads_outstanding && now_ns() < deadline) {
+        const uint64_t before = r->remote->reads_outstanding;
+        if (!reap_reads(w, r)) break;
+        if (r->remote->reads_outstanding == before) sched_yield();
+      }
+      if (r->remote->reads_outstanding && rc == 0) rc = -7;
+    }
     // cuStreamDestroy returns immediately when the stream has pending work and
     // releases it lazily; drain first so no copy or ready write can still touch
     // buffers the caller is about to release after we return.

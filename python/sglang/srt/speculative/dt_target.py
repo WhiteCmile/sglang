@@ -8420,10 +8420,7 @@ class DTTargetController:
             source = task.source
             if writer is not None and source is not None and (
                 source.ipc_handle != writer.source_ipc_handle
-                or (
-                    writer.max_entry_bytes is not None
-                    and source.nbytes > writer.max_entry_bytes
-                )
+                or source.nbytes > writer.max_entry_bytes
                 or len(source.producer_event_handle) != 64
             ):
                 writer = None

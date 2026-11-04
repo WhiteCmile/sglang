@@ -819,123 +819,38 @@ class TargetRingWriter:
         self._ring.close(unlink=unlink)
 
 
-class DraftRingEndpoint:
-    """Draft-side consumer state of one ring."""
+class MailboxConsumer:
+    """Main-loop side of a ring the native worker serves.
 
-    # The RDMA consumer (dt_rdma.DraftRemoteRing) sets this True; the ring
-    # admission path branches on it for the hidden-pull placement.
-    is_remote = False
+    The worker publishes an entry's INPUT_READY word into ``ready_words``
+    once its hidden rows sit in a landing buffer (placement in
+    ``placement_buffer``/``placement_offset``) and its content in the
+    mailbox.  Same-host rings (:class:`DraftRingEndpoint`) and cross-host
+    rings (``dt_rdma.DraftRemoteRing``) share this consumer, so a cross-host
+    row reaches ring admission exactly like a same-host row (issue #198).
+    """
 
-    def __init__(
-        self,
-        *,
-        path: str,
-        ring_id: int,
-        target_session_id: str,
-        capacity: int,
-        max_entry_bytes: int,
-        runtime,
-    ) -> None:
-        self._ring = _RingMapping(path, capacity=capacity, create=True)
-        self.path = path
-        self.ring_id = ring_id
-        self.target_session_id = target_session_id
+    def _init_mailbox(self, capacity: int) -> None:
         self.capacity = capacity
-        header = self._ring.header
-        header[H_MAGIC] = RING_MAGIC
-        header[H_VERSION] = RING_VERSION
-        header[H_CAPACITY] = capacity
-        header[H_ENTRY_BYTES] = ENTRY_BYTES
-        header[H_CONSUMED] = 0
-        header[H_MAX_ENTRY_BYTES] = max_entry_bytes
-        header[H_OWNER_PID] = os.getpid()
-        self._runtime = runtime
-        self.device_base = runtime.host_register(
-            self._ring.host_address, self._ring.total_bytes
-        )
-        self.ready_device = self.device_base + self._ring.ready_offset
         self.placement_buffer = np.full(capacity, -1, dtype=np.int32)
         self.placement_offset = np.zeros(capacity, dtype=np.uint64)
         self._mailbox = np.zeros((capacity, MAIL_STRIDE), dtype=np.uint8)
         self._mail_ack = np.zeros(1, dtype=np.uint64)
         self.next_seq = 1
-        self.attached = False
-        self.pool_generation = ""
-        self.source_session_id = ""
-        header[H_STATE] = STATE_CREATED
-        self._ring.publish()
-
-    @property
-    def entries_address(self) -> int:
-        return self._ring.host_address + self._ring.entries_offset
-
-    def registration(self) -> tuple[bytes, int, str, str] | None:
-        ring = self._ring
-        if int(ring.header[H_STATE]) != STATE_REGISTERED:
-            return None
-        handle = ring.raw[SOURCE_HANDLE_OFFSET : SOURCE_HANDLE_OFFSET + 64].tobytes()
-        length = int(ring.header[H_SOURCE_LENGTH_LO]) | (
-            int(ring.header[H_SOURCE_LENGTH_HI]) << 32
-        )
-        return (
-            handle,
-            length,
-            ring.read_text(POOL_GENERATION_OFFSET),
-            ring.read_text(SOURCE_SESSION_OFFSET),
-        )
-
-    def destination(
-        self, seq: int, position: int
-    ) -> tuple[int, int, int, int, int] | None:
-        """The arena destination for one request of a published wave.
-
-        Returns (slot_id, generation, authorization_nonce, data_buffer_offset,
-        metadata_buffer_offset) once the Target has written the wave's
-        validity word, else None.  The buffer offsets let the Draft build the
-        same allocation-relative destination the Coordinator copy carries.
-
-        Seqlock read: accept only if the validity word equals ``seq`` both
-        before and after the field reads, so a lap rewrite landing mid-read
-        (fields partially overwritten under the old validity word) is
-        rejected and the caller falls back to the Coordinator copy.  A full
-        lap overwrite reads back the newer seq and likewise returns None.
-        """
-
-        index = seq % self.capacity
-        base = self._ring.dest_offset + index * V2_DEST_STRIDE
-        raw = self._ring.raw
-        for _ in range(2):
-            first = struct.unpack_from("<Q", raw, base + V2_DEST_SEQ_OFFSET)[0]
-            if first != seq:
-                return None
-            slot_id, generation, nonce = struct.unpack_from(
-                "<IIQ", raw, base + position * V2_DEST_ENTRY_BYTES
-            )
-            data_offset, metadata_offset = struct.unpack_from(
-                "<QQ", raw, base + V2_DEST_DATA_OFFSET
-            )
-            if struct.unpack_from("<Q", raw, base + V2_DEST_SEQ_OFFSET)[0] == first:
-                return (slot_id, generation, nonce, data_offset, metadata_offset)
-        return None
-
-    def mark_serving(self, *, pool_generation: str, source_session_id: str) -> None:
-        self.pool_generation = pool_generation
-        self.source_session_id = source_session_id
-        self.attached = True
-        self._ring.header[H_STATE] = STATE_SERVING
 
     def take_ready(self) -> RingEntry | RingRecordV2 | None:
         """Return the next entry whose worker publication completed, in order.
 
         Content comes from the worker's mailbox slot, not the ring entry:
-        the native worker advances H_CONSUMED itself once the snapshot is
-        sealed, so the Target may already have rewritten the ring entry.
+        the native worker releases the entry to the Target itself once the
+        snapshot is sealed (H_CONSUMED, or a re-posted receive cross-host),
+        so the Target may already have rewritten the ring entry.
         """
 
         seq = self.next_seq
         index = seq % self.capacity
         low = seq & SEQ_MASK
-        if int(self._ring.ready[index]) != low:
+        if int(self.ready_words[index]) != low:
             return None
         mailbox = self._mailbox[index]
         if struct.unpack_from("<Q", mailbox, MAIL_SEQ_TAG)[0] != seq:
@@ -1051,6 +966,107 @@ class DraftRingEndpoint:
             dropped_mask=dropped_mask,
         )
 
+
+class DraftRingEndpoint(MailboxConsumer):
+    """Draft-side consumer state of one same-host ring."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        ring_id: int,
+        target_session_id: str,
+        capacity: int,
+        max_entry_bytes: int,
+        runtime,
+    ) -> None:
+        self._ring = _RingMapping(path, capacity=capacity, create=True)
+        self.path = path
+        self.ring_id = ring_id
+        self.target_session_id = target_session_id
+        self._init_mailbox(capacity)
+        header = self._ring.header
+        header[H_MAGIC] = RING_MAGIC
+        header[H_VERSION] = RING_VERSION
+        header[H_CAPACITY] = capacity
+        header[H_ENTRY_BYTES] = ENTRY_BYTES
+        header[H_CONSUMED] = 0
+        header[H_MAX_ENTRY_BYTES] = max_entry_bytes
+        header[H_OWNER_PID] = os.getpid()
+        self._runtime = runtime
+        self.device_base = runtime.host_register(
+            self._ring.host_address, self._ring.total_bytes
+        )
+        self.ready_device = self.device_base + self._ring.ready_offset
+        self.attached = False
+        self.pool_generation = ""
+        self.source_session_id = ""
+        header[H_STATE] = STATE_CREATED
+        self._ring.publish()
+
+    @property
+    def entries_address(self) -> int:
+        return self._ring.host_address + self._ring.entries_offset
+
+    @property
+    def ready_words(self) -> np.ndarray:
+        return self._ring.ready
+
+    def registration(self) -> tuple[bytes, int, str, str] | None:
+        ring = self._ring
+        if int(ring.header[H_STATE]) != STATE_REGISTERED:
+            return None
+        handle = ring.raw[SOURCE_HANDLE_OFFSET : SOURCE_HANDLE_OFFSET + 64].tobytes()
+        length = int(ring.header[H_SOURCE_LENGTH_LO]) | (
+            int(ring.header[H_SOURCE_LENGTH_HI]) << 32
+        )
+        return (
+            handle,
+            length,
+            ring.read_text(POOL_GENERATION_OFFSET),
+            ring.read_text(SOURCE_SESSION_OFFSET),
+        )
+
+    def destination(
+        self, seq: int, position: int
+    ) -> tuple[int, int, int, int, int] | None:
+        """The arena destination for one request of a published wave.
+
+        Returns (slot_id, generation, authorization_nonce, data_buffer_offset,
+        metadata_buffer_offset) once the Target has written the wave's
+        validity word, else None.  The buffer offsets let the Draft build the
+        same allocation-relative destination the Coordinator copy carries.
+
+        Seqlock read: accept only if the validity word equals ``seq`` both
+        before and after the field reads, so a lap rewrite landing mid-read
+        (fields partially overwritten under the old validity word) is
+        rejected and the caller falls back to the Coordinator copy.  A full
+        lap overwrite reads back the newer seq and likewise returns None.
+        """
+
+        index = seq % self.capacity
+        base = self._ring.dest_offset + index * V2_DEST_STRIDE
+        raw = self._ring.raw
+        for _ in range(2):
+            first = struct.unpack_from("<Q", raw, base + V2_DEST_SEQ_OFFSET)[0]
+            if first != seq:
+                return None
+            slot_id, generation, nonce = struct.unpack_from(
+                "<IIQ", raw, base + position * V2_DEST_ENTRY_BYTES
+            )
+            data_offset, metadata_offset = struct.unpack_from(
+                "<QQ", raw, base + V2_DEST_DATA_OFFSET
+            )
+            if struct.unpack_from("<Q", raw, base + V2_DEST_SEQ_OFFSET)[0] == first:
+                return (slot_id, generation, nonce, data_offset, metadata_offset)
+        return None
+
+    def mark_serving(self, *, pool_generation: str, source_session_id: str) -> None:
+        self.pool_generation = pool_generation
+        self.source_session_id = source_session_id
+        self.attached = True
+        self._ring.header[H_STATE] = STATE_SERVING
+
     def close(self) -> None:
         if self._ring is None:
             return
@@ -1131,6 +1147,23 @@ def _build_worker_library() -> Path:
     )
 
 
+class RemoteRingSpec(ctypes.Structure):
+    """Mirror of ``RemoteRingSpec`` in csrc/dt_ring_worker.cpp (all u64)."""
+
+    _fields_ = [
+        (name, ctypes.c_uint64)
+        for name in (
+            "post_read", "post_recv", "poll",
+            "record_qp", "record_recv_cq", "record_send_cq", "record_tag",
+            "table_host", "read_window", "landing_lkey",
+            "pool_addr", "pool_rkey", "pool_allocation_offset", "slot_nbytes", "slot_count",
+            "ready_qp", "ready_recv_cq", "ready_tag", "ready_ring_host", "ready_depth",
+            "ready_first_seq", "ready_table_host", "pool_tag", "session_tag",
+            "drain_timeout_ns",
+        )
+    ]
+
+
 class DraftRingWorker:
     """ctypes owner of the native ring worker thread and its landing buffers."""
 
@@ -1144,6 +1177,11 @@ class DraftRingWorker:
             u64, u64, u64, u64, vp,
         ]
         lib.dt_ring_worker_attach.restype = i32
+        lib.dt_ring_worker_attach_remote.argtypes = [
+            vp, i32, u64, u64, u32, u64, u64, u64, u64, u64, u64, u64,
+            ctypes.POINTER(RemoteRingSpec),
+        ]
+        lib.dt_ring_worker_attach_remote.restype = i32
         lib.dt_ring_worker_detach.argtypes = [vp, i32]
         lib.dt_ring_worker_detach.restype = u64
         lib.dt_ring_worker_seal.argtypes = [vp, u32]
@@ -1226,6 +1264,32 @@ class DraftRingWorker:
         )
         if rc != 0:
             raise DirectRingError("native ring worker rejected a ring")
+        self._endpoints[endpoint.ring_id] = endpoint
+
+    def attach_remote(self, endpoint) -> None:
+        """Serve a cross-host ring (``dt_rdma.DraftRemoteRing``): the worker
+        consumes its records, READs their rows into the landing buffers and
+        publishes INPUT_READY into ``endpoint.ready_words``."""
+
+        spec = endpoint.native_spec()
+        endpoint._mail_ack[0] = endpoint.next_seq - 1
+        rc = self._lib.dt_ring_worker_attach_remote(
+            self._handle,
+            endpoint.ring_id,
+            endpoint.entries_address,
+            ENTRY_BYTES,
+            endpoint.capacity,
+            endpoint.ready_words.ctypes.data,
+            endpoint.placement_buffer.ctypes.data,
+            endpoint.placement_offset.ctypes.data,
+            endpoint.next_seq,
+            endpoint._mailbox.ctypes.data,
+            MAIL_STRIDE,
+            endpoint._mail_ack.ctypes.data,
+            ctypes.byref(spec),
+        )
+        if rc != 0:
+            raise DirectRingError("native ring worker rejected a remote ring")
         self._endpoints[endpoint.ring_id] = endpoint
 
     def seal(self, landing_index: int) -> int:

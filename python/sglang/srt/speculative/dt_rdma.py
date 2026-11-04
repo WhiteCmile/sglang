@@ -29,12 +29,14 @@ queue pairs, following the #163 measurements:
   pinned ring + receive CQ, issue #182): cross-host owner pairs get the same
   4096-byte task-record ring same-host pairs have in ``/dev/shm``.  The Target
   stages each record image in pinned memory and writes it into the Draft's
-  ring; the Draft's main loop consumes completions in seq order and applies
-  the local ring's validation (sequence, epoch, per-slot generation against a
-  generation table the Target mirrors onto the ring, owner/session identity).
-  The hidden rows are not copied eagerly: the round's RDMA hidden pull (#165)
-  runs lazily at execution, so a ring record's source lease retires on the
-  Coordinator's SourceReadDone exactly like a relayed task's.
+  ring.  The Draft's native ring worker (csrc/dt_ring_worker.cpp, issue #198)
+  consumes the completions in seq order with the local ring's validation
+  (sequence, epoch, per-slot generation against a generation table the
+  Target mirrors onto the ring, a row-aligned range inside the slot), waits
+  for the slot's ready record, READs the rows into its landing buffers over
+  the ring queue pair, fences once per batch of READs and publishes
+  INPUT_READY, so the main loop admits the row like a same-host one.  The
+  source lease still retires on the Coordinator's SourceReadDone.
 
 Queue pairs are bootstrapped over the Target's framed-TCP server
 (``dt_host_tcp``).  On a QP error, or when the Coordinator reports a Draft
@@ -46,7 +48,6 @@ behalf.  Until that proof exists the affected slots stay quarantined.
 
 from __future__ import annotations
 
-import collections
 import ctypes
 import itertools
 import logging
@@ -66,7 +67,6 @@ from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS
 from sglang.srt.speculative.dt_direct_ring import (
     ENTRY_BYTES,
     ENTRY_HEADER_BYTES,
-    ENTRY_V1_HEADER,
     E_EPOCH,
     E_FLAGS,
     E_NBYTES,
@@ -80,12 +80,12 @@ from sglang.srt.speculative.dt_direct_ring import (
     EVENT_HANDLE_OFFSET,
     FLAG_HAS_PULL,
     MAX_PAYLOAD_BYTES,
+    MailboxConsumer,
     PAYLOAD_OFFSET,
     RING_CAPACITY,
     SEQ_MASK,
     STATE_CLOSED,
     STATE_SERVING,
-    V2_VERSION,
     RingEntry,
     _build_native_library,
     next_seq,
@@ -133,8 +133,12 @@ _IDLE_WAIT_S = 0.05
 # a candidate write, or a hidden pull (its ready record and READ together).
 RDMA_OP_TIMEOUT_S = 30.0
 # Hidden-pull READs a Draft posts before polling completions; it is the pull
-# queue pair's send-queue depth, so a read_batch never overruns the QP.
+# queue pair's send-queue depth, so a read_batch never overruns the QP.  The
+# native ring worker uses the same window on the ring queue pair.
 PULL_READ_WINDOW = 4
+# Poll period of a relayed pull waiting on a ready record the native ring
+# worker consumes (DraftRdmaPuller native_ready).
+_NATIVE_READY_WAIT_S = 50e-6
 
 _IBV_ACCESS_LOCAL_WRITE = 1
 _IBV_ACCESS_REMOTE_WRITE = 2
@@ -216,9 +220,9 @@ def decode_candidate_record(
 # header with the wire seq released last, the producer-event handle, and the
 # msgpack DraftTask payload.  A single RDMA WRITE delivers the whole entry,
 # so the release ordering is moot on the wire; keeping one image format lets
-# both sides share the header SSOT and the validation below mirror the
-# native worker's (csrc/dt_ring_worker.cpp serve_entry_v1), plus the
-# per-slot generation fence the worker applies to kernel-published records.
+# both sides share the header SSOT, and the Draft's native worker validate it
+# with the local fences plus the per-slot generation fence it applies to
+# kernel-published records (csrc/dt_ring_worker.cpp remote_record_check).
 
 def encode_task_record(
     *,
@@ -255,68 +259,6 @@ def encode_task_record(
     # Released last, mirroring the local writer.
     struct.pack_into("<I", words, 4 * E_SEQ, seq & SEQ_MASK)
     return bytes(image)
-
-
-def decode_task_record(
-    record: bytes, *, expected_seq: int, generation_table
-) -> RingEntry:
-    """Validate one arrived task-record image; raise on a stale record.
-
-    Checks the same fences as the local ring worker: the wire seq and its
-    epoch lap, the payload geometry, and — for records with a hidden pull —
-    the named slot's generation against the table the Target mirrors onto
-    the ring (so a record naming a recycled source slot is rejected before
-    any pull, exactly like a kernel-published record on the local ring).
-    """
-
-    if len(record) != ENTRY_BYTES:
-        raise RdmaTransportError("task record has an invalid size")
-    (
-        wire_seq,
-        flags,
-        source_offset,
-        nbytes,
-        source_slot_id,
-        slot_generation,
-        payload_len,
-        epoch,
-    ) = ENTRY_V1_HEADER.unpack_from(record, 0)
-    offset_lo = source_offset & SEQ_MASK
-    offset_hi = source_offset >> 32
-    if wire_seq != expected_seq & SEQ_MASK or epoch != (expected_seq >> 32) & SEQ_MASK:
-        raise RdmaTransportError(
-            f"task record sequence is stale: wire {epoch << 32 | wire_seq}, "
-            f"expected {expected_seq}"
-        )
-    if offset_hi == V2_VERSION:
-        raise RdmaTransportError(
-            "kernel-published records cannot arrive on a remote task ring"
-        )
-    if flags & ~FLAG_HAS_PULL:
-        raise RdmaTransportError("task record has unknown flags")
-    if payload_len > MAX_PAYLOAD_BYTES:
-        raise RdmaTransportError("task record payload length is invalid")
-    has_pull = bool(flags & FLAG_HAS_PULL)
-    if has_pull:
-        if source_slot_id >= len(generation_table):
-            raise RdmaTransportError("task record names no valid source slot")
-        if slot_generation == 0 or generation_table[source_slot_id] != slot_generation:
-            raise RdmaTransportError("task record names a stale source generation")
-        if nbytes == 0:
-            raise RdmaTransportError("task record pull range is invalid")
-    elif nbytes or source_slot_id or slot_generation or offset_lo or offset_hi:
-        raise RdmaTransportError("task record without a pull carries source fields")
-    return RingEntry(
-        seq=expected_seq,
-        has_pull=has_pull,
-        source_offset=offset_lo | (offset_hi << 32),
-        nbytes=nbytes,
-        source_slot_id=source_slot_id,
-        slot_generation=slot_generation,
-        payload=record[PAYLOAD_OFFSET : PAYLOAD_OFFSET + payload_len],
-        landing_index=-1,
-        landing_offset=0,
-    )
 
 
 def _verbs_library() -> ctypes.CDLL:
@@ -666,6 +608,8 @@ class _TargetSession:
         self.ring_addr = 0
         self.ring_rkey = 0
         self.ring_capacity = 0
+        # Largest hidden range the Draft's landing buffers take per record.
+        self.ring_max_entry_bytes = 0
         self.ring_writer: TargetRemoteRingWriter | None = None
         # Pinned staging of the per-slot generation table the ring writer
         # posts into the Draft's ring ahead of a record naming a changed
@@ -860,6 +804,7 @@ class TargetRdmaEndpoint:
                 session.ring_addr = int(header["ring_addr"])
                 session.ring_rkey = int(header["ring_rkey"])
                 session.ring_capacity = int(header["ring_capacity"])
+                session.ring_max_entry_bytes = int(header["max_entry_bytes"])
                 session.table_staging = table_staging
                 session.table_staging_np = table_staging_np
                 session.table_mr = table_mr
@@ -872,6 +817,7 @@ class TargetRdmaEndpoint:
                 pool_rkey=self._pool_mr.rkey,
                 slot_nbytes=pool.slot_nbytes,
                 slot_count=pool.slot_count,
+                allocation_offset=pool.allocation_offset,
                 pool_generation=pool.pool_generation,
                 source_session_id=pool.source_session_id,
             )
@@ -1227,10 +1173,15 @@ class DraftRdmaPuller:
 
     Owned by exactly one pull worker thread: it consumes ready records,
     posts READs into a registered landing buffer, fences GPU visibility, and
-    copies the range into the destination on the worker's stream."""
+    copies the range into the destination on the worker's stream.
+
+    With ``native_ready`` the Draft's native ring worker is the only consumer
+    of the ready records (it gates its own READs on them, issue #198) and
+    keeps ``_ready`` current in place; this object then only pulls."""
 
     def __init__(self, *, host: str, port: int, device: torch.device,
-                 draft_instance_id: str, draft_session_id: str) -> None:
+                 draft_instance_id: str, draft_session_id: str,
+                 native_ready: bool = False) -> None:
         self._conn = _DraftConnection(
             leg=LEG_PULL, host=host, port=port, device_index=_index(device),
             draft_instance_id=draft_instance_id, draft_session_id=draft_session_id,
@@ -1263,6 +1214,8 @@ class DraftRdmaPuller:
             self._pool_rkey = int(remote["pool_rkey"])
             self._slot_nbytes = int(remote["slot_nbytes"])
             self._slot_count = int(remote["slot_count"])
+            self.allocation_offset = int(remote["allocation_offset"])
+            self.native_ready = native_ready
             self._device = device
             self._landing: torch.Tensor | None = None
             self._landing_mr = None
@@ -1278,6 +1231,8 @@ class DraftRdmaPuller:
     def drain(self, timeout_ns: int = 0) -> None:
         """Consume every arrived ready record; raise on a stale one."""
 
+        if self.native_ready:
+            return
         completions = self._conn.recv_cq.poll(timeout_ns)
         for _wr_id, status, opcode, index, _qpn in completions:
             if status != _IBV_WC_SUCCESS or opcode != _IBV_WC_RECV_RDMA_WITH_IMM:
@@ -1335,7 +1290,10 @@ class DraftRdmaPuller:
         while self._ready[slot_id] < generation:
             if time.monotonic() >= deadline:
                 raise RdmaTransportError("ready record for the source slot did not arrive")
-            self.drain(1_000_000)
+            if self.native_ready:
+                time.sleep(_NATIVE_READY_WAIT_S)
+            else:
+                self.drain(1_000_000)
         if self._ready[slot_id] != generation:
             raise StaleDescriptorError("feature source slot was republished before the read")
         return {
@@ -1539,17 +1497,13 @@ class TargetRemoteRingWriter:
     Signaled send completions are reaped in order and bound the staging
     reuse; the Draft-side consumption credit is what actually protects the
     remote slot.  Unlike the local writer there is no early read proof (the
-    hidden pull runs lazily at execution over the pull leg), so the Target's
+    Draft's READ completion is not observable here), so the Target's
     planner publishes the record before the Coordinator copy goes out and
     skips the ring-outstanding bookkeeping; the source lease retires on the
     Coordinator's SourceReadDone, exactly like a relayed task's.
     """
 
     is_remote = True
-    # None: no eager landing copy exists remotely, so the planner's
-    # landing-capacity bound does not apply (the execution-time pull bounds
-    # the range through the feature staging geometry, as for relayed tasks).
-    max_entry_bytes: int | None = None
 
     def __init__(
         self, endpoint: TargetRdmaEndpoint, session: _TargetSession, *, slot_count: int
@@ -1559,6 +1513,8 @@ class TargetRemoteRingWriter:
         self.draft_instance_id = session.draft_instance_id
         self.draft_session_id = session.draft_session_id
         self.capacity = session.ring_capacity
+        # The Draft worker READs each record's rows into one landing buffer.
+        self.max_entry_bytes = session.ring_max_entry_bytes
         self.next_seq = 1
         self.source_ipc_handle = b""
         self._slot_count = slot_count
@@ -1691,20 +1647,26 @@ class TargetRemoteRingWriter:
         self._staging_np = None
 
 
-class DraftRemoteRing:
-    """Draft-side consumer of one remote Target's task-record ring.
+class DraftRemoteRing(MailboxConsumer):
+    """Draft-side end of one remote Target's task-record ring.
 
     The ring buffer is one pinned region: page 0 holds the per-slot
     generation table the Target mirrors remotely, followed by
-    ``capacity`` 4096-byte entries.  Posted receives are entry credits; each
-    arrived ``WRITE_WITH_IMM`` completion (immediate = slot) releases one
-    entry, validated by :func:`decode_task_record` with the same fences as
-    the local ring worker.  A receive failure or a stale record is
-    fail-stop: the leg must never silently skip a record, and a fenced queue
-    pair proves the Target's NIC no longer touches this ring.
-    """
+    ``capacity`` 4096-byte entries.  Posted receives are entry credits.  The
+    native ring worker (``DraftRingWorker.attach_remote``) is the only
+    consumer: it validates each arrived record, re-posts its receive once the
+    record is snapshotted, READs its hidden rows into the shared landing
+    buffers over this ring's queue pair (gated on ``puller``'s ready records)
+    and publishes INPUT_READY; the main loop takes entries through
+    :class:`MailboxConsumer`.  A failed leg is fail-stop in the worker: a
+    record is never silently skipped, and a fenced queue pair proves the
+    Target's NIC no longer touches this ring.
 
-    is_remote = True
+    ``landing`` is the worker's landing tensor (None for token-only rounds);
+    ``puller`` the Target's pull leg, opened in ``native_ready`` mode (None
+    for token-only rounds), owned by the feature pull transport.  This object
+    owns the ring and landing registrations and outlives the worker.
+    """
 
     def __init__(
         self,
@@ -1717,25 +1679,38 @@ class DraftRemoteRing:
         target_instance_id: str,
         target_session_id: str,
         ring_id: int,
+        landing: torch.Tensor | None,
+        max_entry_bytes: int,
+        puller: DraftRdmaPuller | None,
     ) -> None:
         self.target_session_id = target_session_id
         self.target_instance_id = target_instance_id
         self.ring_id = ring_id
-        self.capacity = RING_CAPACITY
-        self.next_seq = 1
+        self._init_mailbox(RING_CAPACITY)
+        self.ready_words = np.zeros(RING_CAPACITY, dtype=np.uint32)
         self.records_taken = 0
         self.pool_generation = ""
         self.source_session_id = ""
-        self._conn = _DraftConnection(
-            leg=LEG_RING, host=host, port=port, device_index=_index(device),
-            draft_instance_id=draft_instance_id, draft_session_id=draft_session_id,
-        )
+        self._puller = puller
+        self._landing = landing
+        self._landing_mr: MemoryRegion | None = None
         self._ring_mr: MemoryRegion | None = None
+        self._conn: _DraftConnection | None = None
         try:
-            conn = self._conn
+            self._conn = conn = _DraftConnection(
+                leg=LEG_RING, host=host, port=port, device_index=_index(device),
+                draft_instance_id=draft_instance_id, draft_session_id=draft_session_id,
+            )
+            if landing is not None:
+                # Registered before the leg connects: once connected, the
+                # Target may write records the worker must be able to READ.
+                self._landing_mr = conn.device.register(
+                    landing.data_ptr(), landing.numel() * landing.element_size(), remote=0
+                )
             conn.recv_cq = conn.device.completion_queue(2 * RING_CAPACITY)
             conn.qp = conn.device.queue_pair(
-                conn.send_cq, conn.recv_cq, max_send=4, max_recv=RING_CAPACITY
+                conn.send_cq, conn.recv_cq, max_send=PULL_READ_WINDOW,
+                max_recv=RING_CAPACITY,
             )
             buffer = torch.zeros(
                 REMOTE_RING_TABLE_BYTES + RING_CAPACITY * ENTRY_BYTES,
@@ -1754,6 +1729,7 @@ class DraftRemoteRing:
                     "ring_rkey": self._ring_mr.rkey,
                     "ring_capacity": RING_CAPACITY,
                     "entry_bytes": ENTRY_BYTES,
+                    "max_entry_bytes": max_entry_bytes,
                 }
             )
             self.pool_generation = str(remote["pool_generation"])
@@ -1761,47 +1737,74 @@ class DraftRemoteRing:
             self._slot_count = int(remote["slot_count"])
             if self._slot_count * 4 > REMOTE_RING_TABLE_BYTES:
                 raise RdmaTransportError("source slot count exceeds the ring table")
+            if puller is not None and (
+                puller.pool_generation != self.pool_generation
+                or puller.source_session_id != self.source_session_id
+            ):
+                raise RdmaTransportError("ring and pull legs name different sources")
         except Exception:
             self.close()
             raise
-        # Completions polled in batches but consumed one admission at a time.
-        self._pending = collections.deque()
-
-    def take_ready(self) -> RingEntry | None:
-        """The next validated record, in seq order, or None when empty."""
-
-        if not self._pending:
-            completions = self._conn.recv_cq.poll(0)
-            if completions:
-                self._pending.extend(completions)
-        if not self._pending:
-            return None
-        _tag, status, opcode, imm, _qpn = self._pending.popleft()
-        if status != _IBV_WC_SUCCESS or opcode != _IBV_WC_RECV_RDMA_WITH_IMM:
-            raise RdmaTransportError(
-                f"task-record ring receive failed (status {status})"
-            )
-        slot = int(imm) % self.capacity
-        start = REMOTE_RING_TABLE_BYTES + slot * ENTRY_BYTES
-        entry = decode_task_record(
-            self._buffer_np[start : start + ENTRY_BYTES].tobytes(),
-            expected_seq=self.next_seq,
-            generation_table=self._table,
-        )
-        self.next_seq = next_seq(self.next_seq)
-        self.records_taken += 1
-        self._conn.qp.post_recv()
-        return entry
 
     @property
-    def _table(self) -> np.ndarray:
-        return self._buffer_np[:REMOTE_RING_TABLE_BYTES].view(np.uint32)[
-            : self._slot_count
-        ]
+    def entries_address(self) -> int:
+        return self._ring_mr.address + REMOTE_RING_TABLE_BYTES
+
+    def native_spec(self):
+        """The worker's view of this ring (``RemoteRingSpec``)."""
+
+        from sglang.srt.speculative.dt_direct_ring import RemoteRingSpec
+
+        lib = _lib()
+        conn = self._conn
+        spec = RemoteRingSpec(
+            post_read=ctypes.cast(lib.dt_rdma_post_read, ctypes.c_void_p).value,
+            post_recv=ctypes.cast(lib.dt_rdma_post_recv, ctypes.c_void_p).value,
+            poll=ctypes.cast(lib.dt_rdma_poll, ctypes.c_void_p).value,
+            record_qp=conn.qp.handle,
+            record_recv_cq=conn.recv_cq.handle,
+            record_send_cq=conn.send_cq.handle,
+            record_tag=conn.qp.tag,
+            table_host=self._ring_mr.address,
+            read_window=PULL_READ_WINDOW,
+            drain_timeout_ns=int(RDMA_OP_TIMEOUT_S * 1e9),
+        )
+        puller = self._puller
+        if puller is not None:
+            ready = puller._conn
+            spec.landing_lkey = self._landing_mr.lkey
+            spec.pool_addr = puller._pool_addr
+            spec.pool_rkey = puller._pool_rkey
+            spec.pool_allocation_offset = puller.allocation_offset
+            spec.slot_nbytes = puller._slot_nbytes
+            spec.slot_count = puller._slot_count
+            spec.ready_qp = ready.qp.handle
+            spec.ready_recv_cq = ready.recv_cq.handle
+            spec.ready_tag = ready.qp.tag
+            spec.ready_ring_host = puller._ring_mr.address
+            spec.ready_depth = READY_RING_DEPTH
+            spec.ready_first_seq = puller._expected_seq
+            spec.ready_table_host = puller._ready.ctypes.data
+            spec.pool_tag = puller._pool_tag
+            spec.session_tag = puller._session_tag
+        return spec
+
+    def take_ready(self) -> RingEntry | None:
+        entry = super().take_ready()
+        if entry is not None:
+            self.records_taken += 1
+        return entry
 
     def close(self) -> None:
-        self._conn.close()
-        if self._ring_mr is not None:
-            self._ring_mr.close()
-            self._ring_mr = None
-        self._conn.device.close()
+        if self._conn is not None:
+            self._conn.close()
+        self._puller = None
+        for mr in (self._ring_mr, self._landing_mr):
+            if mr is not None:
+                mr.close()
+        self._ring_mr = None
+        self._landing_mr = None
+        self._landing = None
+        if self._conn is not None:
+            self._conn.device.close()
+            self._conn = None

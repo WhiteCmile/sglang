@@ -286,6 +286,12 @@ class TargetFeatureSourcePool:
         return self._slot_nbytes
 
     @property
+    def allocation_offset(self) -> int:
+        """Byte offset of slot 0 inside the pool's IPC allocation."""
+
+        return self._buffer.allocation_offset
+
+    @property
     def free_slot_count(self) -> int:
         self.poll_cancelled_producers()
         with self._lock:
@@ -1078,6 +1084,11 @@ class DraftFeaturePullTransport:
         # One worker per remote Target: pulls to different Targets proceed in
         # parallel, so a slow or busy peer cannot queue behind another.
         self._remote_workers: dict[str, threading.Thread] = {}
+        # Pull legs the engine opened with a remote task-record ring (issue
+        # #198), not yet taken by their Target's worker: a Target serves one
+        # pull leg per Draft session, so the worker adopts it instead of
+        # opening its own.  This transport owns and closes them.
+        self._adopted_pullers: dict[str, DraftRdmaPuller] = {}
         self._remote_queues: dict[str, queue.Queue] = {}
         self._remote_streams: dict[str, torch.cuda.Stream] = {}
         self._remote_inflight: set[_RemotePullFuture] = set()
@@ -1334,6 +1345,10 @@ class DraftFeaturePullTransport:
                     self._fatal_error = FeatureTransportQuiescenceError(
                         "remote feature pull did not quiesce at close"
                     )
+        # Adopted pull legs no worker took (no relayed pull ever ran).
+        adopted = getattr(self, "_adopted_pullers", {})
+        while adopted:
+            adopted.popitem()[1].close()
         self._executor.shutdown(wait=True, cancel_futures=True)
         if getattr(self, "_inline_inflight", None):
             try:
@@ -1563,6 +1578,15 @@ class DraftFeaturePullTransport:
             self._remote_targets = dict(mapping)
             self._draft_identity = (draft_instance_id, draft_session_id)
 
+    def adopt_remote_puller(self, target_instance_id: str, puller: DraftRdmaPuller) -> None:
+        """Serve relayed pulls to one Target over ``puller`` and own it.
+
+        A Target's worker takes the puller at its first pull; one already
+        running keeps the leg it has."""
+
+        with self._lock:
+            self._adopted_pullers[target_instance_id] = puller
+
     def _submit_remote(
         self, source: FeatureSourceDescriptor, destination: torch.Tensor
     ) -> _RemotePullFuture:
@@ -1708,6 +1732,9 @@ class DraftFeaturePullTransport:
                         raise FeatureTransportError(
                             f"RDMA hidden-pull leg to {target_instance_id} failed"
                         ) from failure
+                    if puller is None:
+                        with self._lock:
+                            puller = self._adopted_pullers.pop(target_instance_id, None)
                     if puller is None:
                         host, port = self._remote_targets[target_instance_id]
                         draft_instance_id, draft_session_id = self._draft_identity

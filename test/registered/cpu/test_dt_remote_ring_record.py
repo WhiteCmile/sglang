@@ -1,15 +1,17 @@
-"""CPU contract for the cross-host task-record ring (issue #182).
+"""CPU contract for the cross-host task-record ring (issues #182, #198).
 
 The wire image is a local-ring v1 entry (dt_direct_ring header SSOT), so the
-remote ring's admission can apply the local ring worker's validation without
-a second format.  These tests pin that parity and the fault fences: a record
-whose sequence, epoch, per-slot generation, or geometry is stale is rejected
-before admission, and the consumed entry always carries the lazy-pull
-placement (landing_index -1) the Draft engine's remote branch expects.
+Draft's native ring worker validates it with the local ring's fences plus the
+registered-source fences it applies to kernel-published records.  These tests
+pin that parity and the fault fences through the worker's pure validator
+(``dt_ring_remote_record_check``, no CUDA): a record whose sequence, epoch,
+per-slot generation, or geometry is stale or forged is rejected before the
+worker places, READs or publishes anything for it.
 
 Run only after the task's external release/gate; imports can load heavy modules.
 """
 
+import ctypes
 import struct
 
 import numpy as np
@@ -24,41 +26,67 @@ from sglang.srt.speculative.dt_direct_ring import (
     PAYLOAD_OFFSET,
     RING_CAPACITY,
     V2_VERSION,
+    _build_worker_library,
     next_seq,
 )
-from sglang.srt.speculative.dt_rdma import (
-    RdmaTransportError,
-    decode_task_record,
-    encode_task_record,
-)
+from sglang.srt.speculative.dt_rdma import encode_task_record
 
-_SLOT_COUNT = 4
 _GENERATIONS = np.array([3, 7, 1, 42], dtype=np.uint32)
+_ALLOCATION_OFFSET = 8192
+_SLOT_NBYTES = 1 << 20
+_ROW_BYTES = 256
+_LANDING_BYTES = 1 << 19
+_MALFORMED = -4
+_STALE_SOURCE = -5
 
 
-def _encode(seq, *, payload=b"task", has_pull=True, **kwargs):
-    if has_pull and "event_handle" not in kwargs:
-        kwargs["event_handle"] = bytes(range(64))
-    return encode_task_record(seq=seq, payload=payload, has_pull=has_pull, **kwargs)
+@pytest.fixture(scope="module")
+def check():
+    lib = ctypes.CDLL(str(_build_worker_library()))
+    fn = lib.dt_ring_remote_record_check
+    u64 = ctypes.c_uint64
+    fn.argtypes = [ctypes.c_char_p, u64, u64, ctypes.c_void_p, u64, u64, u64, u64, u64]
+    fn.restype = ctypes.c_int
+
+    def run(record, expected_seq, table=_GENERATIONS):
+        return fn(
+            record,
+            ENTRY_BYTES,
+            expected_seq,
+            table.ctypes.data,
+            len(table),
+            _ALLOCATION_OFFSET,
+            _SLOT_NBYTES,
+            _ROW_BYTES,
+            _LANDING_BYTES,
+        )
+
+    return run
 
 
-def _decode(record, expected_seq):
-    return decode_task_record(
-        record, expected_seq=expected_seq, generation_table=_GENERATIONS
+def _offset(slot_id, row=0):
+    return _ALLOCATION_OFFSET + slot_id * _SLOT_NBYTES + row * _ROW_BYTES
+
+
+def _pull(seq, *, slot_id=1, generation=None, row=0, rows=4, payload=b"task", **kwargs):
+    fields = dict(
+        source_offset=_offset(slot_id, row),
+        nbytes=rows * _ROW_BYTES,
+        source_slot_id=slot_id,
+        slot_generation=int(_GENERATIONS[slot_id]) if generation is None else generation,
+        event_handle=bytes(range(64)),
     )
+    fields.update(kwargs)
+    return encode_task_record(seq=seq, payload=payload, has_pull=True, **fields)
 
 
-def test_round_trip_matches_local_v1_layout():
+def _plain(seq, payload=b"task", **kwargs):
+    return encode_task_record(seq=seq, payload=payload, has_pull=False, **kwargs)
+
+
+def test_round_trip_matches_local_v1_layout(check):
     seq = next_seq(1)  # 2: the wire-0 skip both sides apply identically
-    record = _encode(
-        seq,
-        payload=b"payload-bytes",
-        has_pull=True,
-        source_offset=1 << 20,
-        nbytes=4096,
-        source_slot_id=2,
-        slot_generation=int(_GENERATIONS[2]),
-    )
+    record = _pull(seq, slot_id=2, row=3, rows=16, payload=b"payload-bytes")
     assert len(record) == ENTRY_BYTES
     (
         wire_seq,
@@ -73,107 +101,72 @@ def test_round_trip_matches_local_v1_layout():
     assert wire_seq == seq & 0xFFFFFFFF
     assert epoch == seq >> 32
     assert flags == 1
-    assert source_offset == 1 << 20
+    assert source_offset == _offset(2, 3)
     assert (nbytes, source_slot, slot_generation, payload_len) == (
-        4096,
+        16 * _ROW_BYTES,
         2,
         int(_GENERATIONS[2]),
         len(b"payload-bytes"),
     )
     assert record[PAYLOAD_OFFSET : PAYLOAD_OFFSET + payload_len] == b"payload-bytes"
-
-    entry = _decode(record, seq)
-    assert entry.seq == seq
-    assert entry.has_pull
-    assert entry.source_offset == 1 << 20
-    assert entry.payload == b"payload-bytes"
-    # Remote records never carry a local landing placement.
-    assert entry.landing_index == -1
-    assert entry.landing_offset == 0
+    assert check(record, seq) == 0
+    assert check(_plain(seq), seq) == 0
 
 
-def test_epoch_lap_is_validated():
+def test_epoch_lap_is_validated(check):
     lap_seq = (1 << 32) + 3
-    record = _encode(lap_seq, has_pull=False)
-    assert _decode(record, lap_seq).seq == lap_seq
+    record = _plain(lap_seq)
+    assert check(record, lap_seq) == 0
     # Same wire word with the wrong lap must not alias into this seq.
     stale = bytearray(record)
     struct.pack_into("<I", stale, 4 * E_EPOCH, 0)  # back to lap 0
-    with pytest.raises(RdmaTransportError, match="stale"):
-        _decode(bytes(stale), lap_seq)
+    assert check(bytes(stale), lap_seq) == _MALFORMED
 
 
-def test_replayed_record_with_stale_sequence_is_rejected():
-    first = _encode(1, payload=b"first", has_pull=False)
-    assert _decode(first, 1).payload == b"first"
-    replayed = _encode(1, payload=b"forged", has_pull=False)
-    with pytest.raises(RdmaTransportError, match="stale"):
-        _decode(replayed, next_seq(1))
+def test_replayed_record_with_stale_sequence_is_rejected(check):
+    assert check(_plain(1, payload=b"first"), 1) == 0
+    assert check(_plain(1, payload=b"forged"), next_seq(1)) == _MALFORMED
 
 
-def test_stale_slot_generation_is_rejected():
-    record = _encode(
-        1, source_slot_id=1, slot_generation=6  # table holds 7
-    )
-    with pytest.raises(RdmaTransportError, match="stale source generation"):
-        _decode(record, 1)
-    zero = _encode(1, source_slot_id=1, slot_generation=0)
-    with pytest.raises(RdmaTransportError, match="stale source generation"):
-        _decode(zero, 1)
-    unknown = _encode(1, source_slot_id=_SLOT_COUNT, slot_generation=1)
-    with pytest.raises(RdmaTransportError, match="no valid source slot"):
-        _decode(unknown, 1)
+def test_stale_slot_generation_is_rejected(check):
+    assert check(_pull(1, slot_id=1, generation=6), 1) == _STALE_SOURCE  # table holds 7
+    assert check(_pull(1, slot_id=1, generation=0), 1) == _STALE_SOURCE
+    unknown = _pull(1, slot_id=1, source_slot_id=len(_GENERATIONS), slot_generation=1)
+    assert check(unknown, 1) == _STALE_SOURCE
 
 
-def test_kernel_published_record_cannot_arrive_remotely():
-    record = bytearray(_encode(1, has_pull=True, slot_generation=int(_GENERATIONS[1])))
+def test_kernel_published_record_cannot_arrive_remotely(check):
+    record = bytearray(_pull(1))
     struct.pack_into("<I", record, 4 * E_SOURCE_OFFSET_HI, V2_VERSION)
-    with pytest.raises(RdmaTransportError, match="kernel-published"):
-        _decode(bytes(record), 1)
+    assert check(bytes(record), 1) == _MALFORMED
 
 
-def test_geometry_faults_are_rejected():
-    oversized = bytearray(_encode(1, has_pull=False, payload=b"x"))
+def test_geometry_faults_are_rejected(check):
+    oversized = bytearray(_plain(1, payload=b"x"))
     struct.pack_into("<I", oversized, 4 * E_PAYLOAD_LEN, ENTRY_BYTES)
-    with pytest.raises(RdmaTransportError, match="payload length"):
-        _decode(bytes(oversized), 1)
+    assert check(bytes(oversized), 1) == _MALFORMED
+    # Malformed pull ranges: empty, not whole rows, larger than one landing
+    # buffer.
+    assert check(_pull(1, nbytes=0), 1) == _MALFORMED
+    assert check(_pull(1, nbytes=_ROW_BYTES + 2), 1) == _MALFORMED
+    assert check(_pull(1, rows=_LANDING_BYTES // _ROW_BYTES + 1), 1) == _MALFORMED
+    # Source ranges outside the named slot, or not row-aligned inside it.
+    assert check(_pull(1, slot_id=1, source_offset=_offset(0)), 1) == _STALE_SOURCE
+    last_row = _SLOT_NBYTES // _ROW_BYTES - 1
+    assert check(_pull(1, slot_id=1, row=last_row, rows=2), 1) == _STALE_SOURCE
+    assert check(_pull(1, slot_id=1, source_offset=_offset(1) + 2), 1) == _STALE_SOURCE
+    assert check(_plain(1, nbytes=16, source_slot_id=0), 1) == _MALFORMED
 
-    empty_pull = _encode(1, nbytes=0, source_slot_id=0, slot_generation=3)
-    with pytest.raises(RdmaTransportError, match="pull range"):
-        _decode(empty_pull, 1)
 
-    source_fields = _encode(1, has_pull=False, nbytes=16, source_slot_id=0)
-    with pytest.raises(RdmaTransportError, match="carries source fields"):
-        _decode(source_fields, 1)
-
-
-def test_sequence_advances_across_laps():
+def test_sequence_advances_across_laps(check):
     # Drive the ring past one full lap: the slot index wraps (seq %
     # RING_CAPACITY aliases seq 1 onto slot 1 again) while the logical
-    # sequence must keep decoding in order, epoch word included.
-    table = np.zeros(_SLOT_COUNT, dtype=np.uint32)
-    table[0] = 5
+    # sequence must keep validating in order, epoch word included.
     seq = 1
     for expected in range(1, RING_CAPACITY + 2):
-        record = _encode(
-            seq,
-            has_pull=True,
-            nbytes=256,
-            source_slot_id=0,
-            slot_generation=int(table[0]),
-        )
-        entry = decode_task_record(
-            record, expected_seq=expected, generation_table=table
-        )
-        assert entry.seq == expected
+        assert check(_pull(seq, slot_id=0, rows=1), expected) == 0
         seq = next_seq(seq)
     # The lap boundary aliases slots, not sequences: the previous lap's
-    # record must not decode as the freshly written one.
-    stale = _encode(1, has_pull=False)
-    with pytest.raises(RdmaTransportError, match="stale"):
-        decode_task_record(
-            stale, expected_seq=RING_CAPACITY + 1, generation_table=table
-        )
-    fresh = _encode(RING_CAPACITY + 1, has_pull=False)
-    with pytest.raises(RdmaTransportError, match="stale"):
-        decode_task_record(fresh, expected_seq=1, generation_table=table)
+    # record must not validate as the freshly written one.
+    assert check(_plain(1), RING_CAPACITY + 1) == _MALFORMED
+    assert check(_plain(RING_CAPACITY + 1), 1) == _MALFORMED

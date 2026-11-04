@@ -120,6 +120,7 @@ class _StubPool:
     def __init__(self, slot_count=_SLOT_COUNT):
         self.slot_count = slot_count
         self.slot_nbytes = 4096
+        self.allocation_offset = 0
         self.pool_generation = "pool-gen"
         self.source_session_id = "source-session"
 
@@ -165,6 +166,7 @@ def _ring_header():
         "draft_session_id": "sess",
         "ring_capacity": RING_CAPACITY,
         "entry_bytes": ENTRY_BYTES,
+        "max_entry_bytes": 1 << 20,
         "ring_addr": 0xDEAD0000,
         "ring_rkey": 0xBEEF,
     }
