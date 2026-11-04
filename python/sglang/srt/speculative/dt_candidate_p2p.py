@@ -13,14 +13,16 @@ and then the record (generation last) on its push stream, so the Target CPU
 observes READY from host memory without waiting for a Draft-side completion
 poll or the direct notice.  The notice stays as the retirement/fallback path.
 
-With DT_PUSH_COMPLETION_RECORD=1 the Draft instead queues a one-block kernel
-on its push stream after the candidate copy.  The kernel writes a per-slot
-completion record into a second shared file — payload words first, the
-reservation's authorization nonce (the seq word) published last with a
-system-scope release store.  For a negotiated Target the record carries a
-superset of the READY record words, so the legacy READY record writes and
-the ZMQ completion notice are both skipped: the Target observes READY only
-by scanning the completion records from host memory.
+With DT_PUSH_COMPLETION_RECORD=1 the Draft instead queues one batched
+kernel on its push stream after the candidate copy.  The kernel writes a
+per-slot completion record into a second shared file for every local row of
+the wave — payload words first, the reservation's authorization nonce (the
+seq word) published last with a system-scope release store.  For a
+negotiated Target the record carries a superset of the READY record words,
+so the legacy READY record writes and the ZMQ completion notice are both
+skipped: the Target observes READY only by scanning the completion records
+from host memory.  Waves without a completion-record row keep the
+cuStreamWriteValue32 memop publication and never load the kernel library.
 
 Request, assignment, timeout, and retirement policy remain in the existing DT
 controller/router.  This module owns only allocation-relative CUDA transport
@@ -99,12 +101,29 @@ READY_RECORD_WORDS = 8
 READY_RECORD_BYTES = READY_RECORD_WORDS * 4
 PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
-# One batched-publication descriptor per pushed row, matching
-# DtPushCompletionDesc in csrc/dt_push_completion.cu (five u64, five u32,
-# four pad bytes).
-_PUSH_BATCH_DESC = struct.Struct("<5Q5I4x")
+# One batched-publication descriptor per pushed row.  This table is the
+# single source of the publication ABI: the CUDA struct, kind values and
+# record word indices are generated from these constants into a header at
+# library build time (see _push_completion_layout_header), so the packed
+# descriptors and the kernel's DtPushCompletionDesc cannot drift apart.
+_PUSH_BATCH_DESC_FIELDS = (
+    ("record", "Q"),  # record base address (0 = no record writes)
+    ("meta", "Q"),  # reservation metadata base address (always written)
+    ("seq", "Q"),  # reservation authorization nonce
+    ("record_hash", "Q"),  # transfer id hash
+    ("globaltimer_offset_ns", "Q"),  # producer's globaltimer->realtime offset
+    ("generation", "I"),
+    ("valid_length", "I"),
+    ("root_token", "I"),
+    ("producer_tag", "I"),
+    ("kind", "I"),
+    ("pad0", "4x"),  # struct tail padding; implicit in the C struct
+)
 _PUSH_BATCH_COMPLETION = 1
 _PUSH_BATCH_READY = 2
+_PUSH_BATCH_DESC = struct.Struct(
+    "<" + "".join(fmt for _, fmt in _PUSH_BATCH_DESC_FIELDS)
+)
 # One 64-byte host completion record per slot: eight u64 words, the seq word
 # published last with a system-scope release store.
 COMPLETION_RECORD_WORDS = 8
@@ -185,10 +204,57 @@ class _ReadyRecordFile:
                 pass
 
 
+_C_DESCRIPTOR_TYPES = {"Q": "std::uint64_t", "I": "std::uint32_t"}
+
+
+def _push_completion_layout_header() -> str:
+    """Render the CUDA layout header from the Python ABI constants.
+
+    The descriptor struct, the kind values and the metadata/record word
+    indices the kernel compiles against are all generated here, so Python
+    stays the single source and the two sides cannot disagree silently.
+    """
+    fields = []
+    for name, fmt in _PUSH_BATCH_DESC_FIELDS:
+        if fmt.endswith("x"):
+            # Padding only exists in the packed record; the C struct gets it
+            # as tail alignment padding.
+            continue
+        ctype = _C_DESCRIPTOR_TYPES[fmt]
+        fields.append(f"  {ctype} {name};")
+    return (
+        "// Generated from the publication ABI constants in\n"
+        "// dt_candidate_p2p.py by _push_completion_layout_header(); do not\n"
+        "// edit.  The Python constants are the single source; this header is\n"
+        "// rewritten from them on every library build.\n"
+        "#pragma once\n"
+        "#include <cstdint>\n\n"
+        "struct DtPushCompletionDesc {\n" + "\n".join(fields) + "\n};\n\n"
+        f"static_assert(sizeof(DtPushCompletionDesc) == {_PUSH_BATCH_DESC.size},\n"
+        '              "DtPushCompletionDesc drifted from the Python layout");\n\n'
+        f"#define DT_PUSH_KIND_COMPLETION {_PUSH_BATCH_COMPLETION}\n"
+        f"#define DT_PUSH_KIND_READY {_PUSH_BATCH_READY}\n"
+        f"#define DT_PUSH_META_GENERATION_WORD {GENERATION_WORD}\n"
+        f"#define DT_PUSH_META_NONCE_LOW_WORD {NONCE_LOW_WORD}\n"
+        f"#define DT_PUSH_META_NONCE_HIGH_WORD {NONCE_HIGH_WORD}\n"
+        f"#define DT_PUSH_META_VALID_LENGTH_WORD {VALID_LENGTH_WORD}\n"
+        f"#define DT_PUSH_META_ROOT_TOKEN_WORD {ROOT_TOKEN_WORD}\n"
+        f"#define DT_PUSH_META_PRODUCER_TAG_WORD {PRODUCER_TAG_WORD}\n"
+        f"#define DT_PUSH_RECORD_SEQ_WORD {COMPLETION_SEQ_WORD}\n"
+        f"#define DT_PUSH_RECORD_META_WORD {COMPLETION_META_WORD}\n"
+        f"#define DT_PUSH_RECORD_HASH_WORD {COMPLETION_HASH_WORD}\n"
+        f"#define DT_PUSH_RECORD_TOKEN_WORD {COMPLETION_TOKEN_WORD}\n"
+        f"#define DT_PUSH_RECORD_PRODUCED_WORD {COMPLETION_PRODUCED_WORD}\n"
+        f"#define DT_PUSH_RECORD_OFFSET_WORD {COMPLETION_OFFSET_WORD}\n"
+        f"#define DT_PUSH_RECORD_WORDS {COMPLETION_RECORD_WORDS}\n"
+    )
+
+
 def _build_push_completion_library() -> Path:
     source = Path(__file__).with_name("csrc") / "dt_push_completion.cu"
     text = source.read_bytes()
-    digest = hashlib.sha256(text).hexdigest()[:16]
+    header_text = _push_completion_layout_header().encode()
+    digest = hashlib.sha256(text + header_text).hexdigest()[:16]
     cache = Path(
         os.environ.get(
             "DT_PUSH_COMPLETION_BUILD_DIR",
@@ -197,12 +263,17 @@ def _build_push_completion_library() -> Path:
     )
     cache.mkdir(parents=True, exist_ok=True)
     library = cache / f"dt_push_completion-{digest}.so"
-    if library.exists():
+    # The generated layout header lives in a digest-private include dir so
+    # concurrent builds of different ABIs never overwrite each other.
+    include_dir = cache / f"inc-{digest}"
+    if library.exists() and include_dir.exists():
         return library
     arch = os.environ.get("DT_PUSH_COMPLETION_ARCH", "sm_90")
     with open(cache / ".build.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not library.exists():
+            include_dir.mkdir(parents=True, exist_ok=True)
+            (include_dir / "dt_push_completion_layout.h").write_bytes(header_text)
             partial = library.with_suffix(f".so.{os.getpid()}")
             subprocess.run(
                 [
@@ -213,6 +284,8 @@ def _build_push_completion_library() -> Path:
                     "-Xcompiler",
                     "-fPIC",
                     f"-arch={arch}",
+                    "-I",
+                    str(include_dir),
                     "-cudart",
                     "static",
                     "-o",
@@ -2683,6 +2756,95 @@ class DraftCandidatePushTransport:
             self._batch_desc_events[slot] = torch.cuda.Event()
         return buffer, self._batch_desc_events[slot]
 
+    def _publish_batch_kernel(self, publications, stream) -> None:
+        """Publish one batch's rows with the single batched kernel.
+
+        One 64-byte descriptor per local row publishes the row's five
+        reservation metadata words and either its 64-byte completion record
+        or its 32-byte READY record, replacing the per-task
+        cuStreamWriteValue32 memops and per-task record kernel that
+        dominated this loop (issue #208).  Stream order keeps the
+        publication after the candidate copy; the kernel's release stores
+        are the same publish edges the memop sequence provided.
+        """
+        descs = []
+        for task, destination, metadata_address, record_address, kind in (
+            publications
+        ):
+            descs.append(
+                self._batch_desc_for(
+                    task,
+                    destination=destination,
+                    metadata_address=metadata_address,
+                    record_address=record_address,
+                    kind=kind,
+                )
+            )
+        buffer, event = self._batch_desc_slot_buffer(
+            len(descs) * _PUSH_BATCH_DESC.size
+        )
+        ctypes.memmove(
+            buffer.data_ptr(), b"".join(descs), len(descs) * _PUSH_BATCH_DESC.size
+        )
+        kernel = self._completion_kernel
+        if kernel is None:
+            kernel = self._completion_kernel = _PushCompletionKernel()
+        kernel.launch_batch(
+            device=self.device_index,
+            descs_ptr=buffer.data_ptr(),
+            count=len(descs),
+            stream=stream.cuda_stream,
+        )
+        event.record(stream)
+
+    def _publish_batch_memops(self, publications, stream) -> None:
+        """Publish one batch's rows with per-task cuStreamWriteValue32 memops.
+
+        Used only when no row in the batch has a completion record; the
+        write sets and word order match the batched kernel exactly (metadata
+        generation last, record generation released last).
+        """
+        write_value32 = self._runtime._stream_write_value32
+        if write_value32 is None:
+            raise CandidateTransportError("cuStreamWriteValue32 is unavailable")
+        check_driver = self._runtime._check_driver
+        c_stream = ctypes.c_void_p(stream.cuda_stream)
+        c_uint64 = ctypes.c_uint64
+        c_uint32 = ctypes.c_uint32
+        c_zero = ctypes.c_uint(0)
+        for task, destination, metadata_address, record_address, kind in (
+            publications
+        ):
+            nonce = int(destination.authorization_nonce)
+            words = (
+                (NONCE_LOW_WORD, nonce & 0xFFFFFFFF),
+                (NONCE_HIGH_WORD, (nonce >> 32) & 0xFFFFFFFF),
+                (VALID_LENGTH_WORD, destination.row_width),
+                (ROOT_TOKEN_WORD, int(task.next_token_id) & 0xFFFFFFFF),
+                # Publish generation last: the Target wait is the acquire edge.
+                (GENERATION_WORD, destination.generation),
+            )
+            for word, value in words:
+                rc = write_value32(
+                    c_stream, c_uint64(metadata_address + word * 4), c_uint32(value), c_zero
+                )
+                if rc:
+                    check_driver(rc, "cuStreamWriteValue32")
+            if kind == _PUSH_BATCH_READY:
+                for word, value in (
+                    *words[:-1],
+                    (PRODUCER_TAG_WORD, self._producer_tag),
+                    words[-1],
+                ):
+                    rc = write_value32(
+                        c_stream,
+                        c_uint64(record_address + word * 4),
+                        c_uint32(value),
+                        c_zero,
+                    )
+                    if rc:
+                        check_driver(rc, "cuStreamWriteValue32")
+
     def _mapping(self, destination):
         mapped = self._registered.get(self._registration_key(destination))
         if mapped is None:
@@ -3009,41 +3171,20 @@ class DraftCandidatePushTransport:
         if segments:
             self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
         if publications:
-            # One batched kernel publishes every local row's metadata words
-            # and record; it replaces the per-task cuStreamWriteValue32 memops
-            # and per-task record kernel, which dominated this loop (issue
-            # #208). Stream order keeps the publication after the candidate
-            # copy above; the kernel's release stores are the same publish
-            # edges the memop sequence provided.
-            descs = []
-            for task, destination, metadata_address, record_address, kind in (
-                publications
+            if any(
+                kind == _PUSH_BATCH_COMPLETION
+                for _task, _dest, _meta, _record, kind in publications
             ):
-                descs.append(
-                    self._batch_desc_for(
-                        task,
-                        destination=destination,
-                        metadata_address=metadata_address,
-                        record_address=record_address,
-                        kind=kind,
-                    )
-                )
-            buffer, event = self._batch_desc_slot_buffer(
-                len(descs) * _PUSH_BATCH_DESC.size
-            )
-            ctypes.memmove(
-                buffer.data_ptr(), b"".join(descs), len(descs) * _PUSH_BATCH_DESC.size
-            )
-            kernel = self._completion_kernel
-            if kernel is None:
-                kernel = self._completion_kernel = _PushCompletionKernel()
-            kernel.launch_batch(
-                device=self.device_index,
-                descs_ptr=buffer.data_ptr(),
-                count=len(descs),
-                stream=stream.cuda_stream,
-            )
-            event.record(stream)
+                self._publish_batch_kernel(publications, stream)
+            else:
+                # No completion record in this batch: publish with the bound
+                # cuStreamWriteValue32 driver call, exactly as before the
+                # batched kernel existed.  A batch without a completion record
+                # must not touch the custom CUDA library, so the
+                # feature-off fallback (DT_PUSH_COMPLETION_RECORD=0, or a
+                # Target whose record file is unavailable) keeps working with
+                # no nvcc and an empty build cache.
+                self._publish_batch_memops(publications, stream)
         if remote_batch is None:
             event = torch.cuda.Event(enable_timing=start_event is not None)
             event.record(stream)

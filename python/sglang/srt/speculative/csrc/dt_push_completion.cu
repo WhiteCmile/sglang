@@ -1,12 +1,17 @@
-// One-block completion record publication for Draft->Target candidate pushes.
+// Batched completion record publication for Draft->Target candidate pushes.
 // Launched on the push stream after the candidate copy: the payload words are
-// written first, then a system-scope release store publishes the seq word
-// last, so a Target CPU that observes the seq word also observes every
-// payload word.  The seq word carries the reservation's authorization nonce
-// (unique per reservation, known to both sides), so a stale record from a
-// prior reservation or producer can never pass the Target's scan.
+// written first, then a system-scope release store publishes the reservation
+// word last, so a Target CPU that observes the published word also observes
+// every payload word.  The reservation word carries the reservation's
+// authorization nonce (unique per reservation, known to both sides), so a
+// stale record from a prior reservation or producer can never pass the
+// Target's scan.
 //
-// Record layout per slot (64 bytes, naturally aligned):
+// The descriptor struct, kind values and record word indices come from
+// dt_push_completion_layout.h, generated at library build time from the
+// Python constants in dt_candidate_p2p.py (the single source of the ABI).
+//
+// Completion record layout per slot (64 bytes, naturally aligned):
 //   0   u64 seq               (reservation authorization nonce, published LAST)
 //   8   u32 generation
 //   12  u32 valid_length
@@ -22,74 +27,12 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-extern "C" __global__ void dt_push_completion_k(
-    std::uint64_t* record,
-    std::uint64_t seq,
-    std::uint32_t generation,
-    std::uint32_t valid_length,
-    std::uint64_t transfer_id_hash,
-    std::uint32_t root_token,
-    std::uint32_t producer_tag,
-    std::uint64_t globaltimer_offset_ns) {
-  std::uint64_t produced_ns;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(produced_ns));
-  record[1] = std::uint64_t(generation) | (std::uint64_t(valid_length) << 32);
-  record[2] = transfer_id_hash;
-  record[3] = std::uint64_t(root_token) | (std::uint64_t(producer_tag) << 32);
-  record[4] = produced_ns;
-  record[5] = globaltimer_offset_ns;
-  record[6] = 0;
-  record[7] = 0;
-  __threadfence_system();
-  asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(record), "l"(seq)
-               : "memory");
-}
-
-extern "C" int dt_push_completion_launch(
-    int device,
-    void* record_device_ptr,
-    std::uint64_t seq,
-    std::uint32_t generation,
-    std::uint32_t valid_length,
-    std::uint64_t transfer_id_hash,
-    std::uint32_t root_token,
-    std::uint32_t producer_tag,
-    std::uint64_t globaltimer_offset_ns,
-    std::uint64_t stream) {
-  cudaError_t err = cudaSetDevice(device);
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
-  }
-  dt_push_completion_k<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-      static_cast<std::uint64_t*>(record_device_ptr),
-      seq,
-      generation,
-      valid_length,
-      transfer_id_hash,
-      root_token,
-      producer_tag,
-      globaltimer_offset_ns);
-  return static_cast<int>(cudaGetLastError());
-}
+#include "dt_push_completion_layout.h"
 
 // Batched publication for one push wave. One descriptor per local task; a
 // single launch replaces the per-task cuStreamWriteValue32 metadata memops
 // and the per-task record kernel, which were the dominant per-task host cost
 // of the retire path (issue #208).
-struct DtPushCompletionDesc {
-  std::uint64_t record;  // record base address (0 = no record writes)
-  std::uint64_t meta;  // reservation metadata base address (always written)
-  std::uint64_t seq;
-  std::uint64_t record_hash;
-  std::uint64_t globaltimer_offset_ns;
-  std::uint32_t generation;
-  std::uint32_t valid_length;
-  std::uint32_t root_token;
-  std::uint32_t producer_tag;
-  std::uint32_t kind;  // 1 = completion record, 2 = READY record
-  std::uint32_t pad0;
-};
-
 extern "C" __global__ void dt_push_completion_batch_k(
     const DtPushCompletionDesc* descs,
     int n) {
@@ -104,39 +47,42 @@ extern "C" __global__ void dt_push_completion_batch_k(
   // treats that generation as its acquire edge).
   {
     unsigned* meta = reinterpret_cast<unsigned*>(d.meta);
-    meta[1] = static_cast<unsigned>(d.seq);
-    meta[2] = static_cast<unsigned>(d.seq >> 32);
-    meta[3] = d.valid_length;
-    meta[4] = d.root_token;
+    meta[DT_PUSH_META_NONCE_LOW_WORD] = static_cast<unsigned>(d.seq);
+    meta[DT_PUSH_META_NONCE_HIGH_WORD] = static_cast<unsigned>(d.seq >> 32);
+    meta[DT_PUSH_META_VALID_LENGTH_WORD] = d.valid_length;
+    meta[DT_PUSH_META_ROOT_TOKEN_WORD] = d.root_token;
     __threadfence_system();
     asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(meta),
                  "r"(d.generation)
                  : "memory");
   }
-  if (d.kind == 1) {
+  if (d.kind == DT_PUSH_KIND_COMPLETION) {
     std::uint64_t* record = reinterpret_cast<std::uint64_t*>(d.record);
     std::uint64_t produced_ns;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(produced_ns));
-    record[1] = std::uint64_t(d.generation) |
-                (std::uint64_t(d.valid_length) << 32);
-    record[2] = d.record_hash;
-    record[3] = std::uint64_t(d.root_token) |
-                (std::uint64_t(d.producer_tag) << 32);
-    record[4] = produced_ns;
-    record[5] = d.globaltimer_offset_ns;
-    record[6] = 0;
-    record[7] = 0;
+    record[DT_PUSH_RECORD_META_WORD] = std::uint64_t(d.generation) |
+                                       (std::uint64_t(d.valid_length) << 32);
+    record[DT_PUSH_RECORD_HASH_WORD] = d.record_hash;
+    record[DT_PUSH_RECORD_TOKEN_WORD] = std::uint64_t(d.root_token) |
+                                        (std::uint64_t(d.producer_tag) << 32);
+    record[DT_PUSH_RECORD_PRODUCED_WORD] = produced_ns;
+    record[DT_PUSH_RECORD_OFFSET_WORD] = d.globaltimer_offset_ns;
+    for (std::uint32_t w = DT_PUSH_RECORD_OFFSET_WORD + 1;
+         w < DT_PUSH_RECORD_WORDS;
+         ++w) {
+      record[w] = 0;
+    }
     __threadfence_system();
     asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(record),
                  "l"(d.seq)
                  : "memory");
-  } else if (d.kind == 2) {
+  } else if (d.kind == DT_PUSH_KIND_READY) {
     unsigned* record = reinterpret_cast<unsigned*>(d.record);
-    record[1] = static_cast<unsigned>(d.seq);
-    record[2] = static_cast<unsigned>(d.seq >> 32);
-    record[3] = d.valid_length;
-    record[4] = d.root_token;
-    record[5] = d.producer_tag;
+    record[DT_PUSH_META_NONCE_LOW_WORD] = static_cast<unsigned>(d.seq);
+    record[DT_PUSH_META_NONCE_HIGH_WORD] = static_cast<unsigned>(d.seq >> 32);
+    record[DT_PUSH_META_VALID_LENGTH_WORD] = d.valid_length;
+    record[DT_PUSH_META_ROOT_TOKEN_WORD] = d.root_token;
+    record[DT_PUSH_META_PRODUCER_TAG_WORD] = d.producer_tag;
     __threadfence_system();
     asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(record),
                  "r"(d.generation)
