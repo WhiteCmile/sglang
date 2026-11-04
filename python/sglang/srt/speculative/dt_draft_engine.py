@@ -10350,6 +10350,11 @@ class FlashMTPDraftEngine:
                     "queue_delay_ms": round(self._last_queue_delay_ns / 1e6, 3),
                     "batch_size": self._last_batch_size,
                     "step_ms": round(self._last_step_ns / 1e6, 3),
+                    # Ring entries the native worker deferred because every
+                    # shared landing buffer was busy (cumulative).
+                    "ring_landing_stalls": (
+                        0 if self._ring_worker is None else self._ring_worker.landing_stalls
+                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
