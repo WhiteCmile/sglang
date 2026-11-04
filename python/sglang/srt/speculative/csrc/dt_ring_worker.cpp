@@ -169,21 +169,37 @@ struct RemoteRingSpec {
   uint64_t ready_qp, ready_recv_cq, ready_tag, ready_ring_host, ready_depth,
       ready_first_seq, ready_table_host, pool_tag, session_tag;
   uint64_t drain_timeout_ns;  // destroy() waits this long for posted READs
+  // Values dt_rdma owns, passed here instead of copied: the work-completion
+  // status/opcode the worker accepts, the cuFlushGPUDirectRDMAWrites
+  // arguments, and the ready-record layout (stride, then each field's byte
+  // offset and width as dt_rdma's record struct defines it).
+  uint64_t wc_success, wc_recv_with_imm, flush_target, flush_scope;
+  uint64_t ready_record_bytes;
+  uint64_t ready_seq_at, ready_seq_bytes, ready_pool_tag_at, ready_pool_tag_bytes,
+      ready_session_tag_at, ready_session_tag_bytes, ready_slot_id_at, ready_slot_id_bytes,
+      ready_slot_generation_at, ready_slot_generation_bytes;
 };
 
-// The READY record dt_rdma.encode_ready_record writes (struct "<QQQII").
-struct ReadyRecord {
-  uint64_t seq;
-  uint64_t pool_tag;
-  uint64_t session_tag;
-  uint32_t slot_id;
-  uint32_t slot_generation;
-};
-static_assert(sizeof(ReadyRecord) == 32, "ready record must be 32 bytes");
+// Every ready-record field the spec names fits a u64 and lies in the record.
+bool ready_layout_ok(const RemoteRingSpec& s) {
+  const uint64_t fields[][2] = {
+      {s.ready_seq_at, s.ready_seq_bytes},
+      {s.ready_pool_tag_at, s.ready_pool_tag_bytes},
+      {s.ready_session_tag_at, s.ready_session_tag_bytes},
+      {s.ready_slot_id_at, s.ready_slot_id_bytes},
+      {s.ready_slot_generation_at, s.ready_slot_generation_bytes},
+  };
+  for (const auto& f : fields)
+    if (!f[1] || f[1] > 8 || f[0] + f[1] > s.ready_record_bytes) return false;
+  return true;
+}
 
-constexpr uint32_t kWcRecvRdmaWithImm = 129;  // IBV_WC_RECV_RDMA_WITH_IMM
-constexpr int kCuFlushTargetCurrentCtx = 0;   // CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX
-constexpr int kCuFlushToOwner = 100;          // CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER
+// One little-endian field of a ready record, at the offset/width the spec names.
+uint64_t ready_field(const uint8_t* record, uint64_t at, uint64_t width) {
+  uint64_t value = 0;
+  memcpy(&value, record + at, width);
+  return value;
+}
 
 // One served cross-host entry, published strictly in seq order.
 struct Flight {
@@ -602,24 +618,26 @@ bool drain_ready(Worker* w, Ring* r) {
     return false;
   }
   for (int i = 0; i < n; ++i) {
-    if (status[i] != 0 || opcode[i] != kWcRecvRdmaWithImm) {
+    if (status[i] != m.spec.wc_success || opcode[i] != m.spec.wc_recv_with_imm) {
       fail(w, -7, r->id);
       return false;
     }
-    ReadyRecord rec;
-    memcpy(&rec,
-           reinterpret_cast<const uint8_t*>(m.spec.ready_ring_host) +
-               (uint64_t)(imm[i] % m.spec.ready_depth) * sizeof(ReadyRecord),
-           sizeof(rec));
-    if (rec.session_tag != m.spec.session_tag || rec.pool_tag != m.spec.pool_tag ||
-        rec.seq != m.ready_expected || rec.slot_id >= m.spec.slot_count ||
-        rec.slot_generation == 0) {
+    const RemoteRingSpec& s = m.spec;
+    const uint8_t* rec = reinterpret_cast<const uint8_t*>(s.ready_ring_host) +
+                         (uint64_t)(imm[i] % s.ready_depth) * s.ready_record_bytes;
+    const uint64_t slot_id = ready_field(rec, s.ready_slot_id_at, s.ready_slot_id_bytes);
+    const uint64_t generation =
+        ready_field(rec, s.ready_slot_generation_at, s.ready_slot_generation_bytes);
+    if (ready_field(rec, s.ready_session_tag_at, s.ready_session_tag_bytes) != s.session_tag ||
+        ready_field(rec, s.ready_pool_tag_at, s.ready_pool_tag_bytes) != s.pool_tag ||
+        ready_field(rec, s.ready_seq_at, s.ready_seq_bytes) != m.ready_expected ||
+        slot_id >= s.slot_count || generation == 0) {
       fail(w, -6, r->id);
       return false;
     }
     ++m.ready_expected;
-    if (rec.slot_generation > m.ready_table[rec.slot_id])
-      __atomic_store_n(&m.ready_table[rec.slot_id], rec.slot_generation, __ATOMIC_RELEASE);
+    if (generation > m.ready_table[slot_id])
+      __atomic_store_n(&m.ready_table[slot_id], (uint32_t)generation, __ATOMIC_RELEASE);
   }
   if (n > 0 && m.post_recv(reinterpret_cast<void*>(m.spec.ready_qp), m.spec.ready_tag, n) != 0) {
     fail(w, -7, r->id);
@@ -723,8 +741,8 @@ bool publish_remote(Worker* w, Ring* r) {
         return false;
       }
     }
-    if (CUresult rc = w->api.cuFlushGPUDirectRDMAWrites(kCuFlushTargetCurrentCtx,
-                                                        kCuFlushToOwner);
+    if (CUresult rc = w->api.cuFlushGPUDirectRDMAWrites((int)m.spec.flush_target,
+                                                        (int)m.spec.flush_scope);
         rc != 0) {
       fail(w, rc, r->id);
       return false;
@@ -753,7 +771,7 @@ bool reap_reads(Worker* w, Ring* r) {
   }
   m.reads_outstanding -= n;  // error completions retire their READs too
   for (int i = 0; i < n; ++i) {
-    if (status[i] != 0) {
+    if (status[i] != m.spec.wc_success) {
       fail(w, -7, r->id);  // a failed READ (or a QP in error) is fail-stop
       return false;
     }
@@ -780,7 +798,7 @@ bool serve_remote(Worker* w, Ring* r) {
     return false;
   }
   for (int i = 0; i < n; ++i) {
-    if (status[i] != 0 || opcode[i] != kWcRecvRdmaWithImm) {
+    if (status[i] != m.spec.wc_success || opcode[i] != m.spec.wc_recv_with_imm) {
       fail(w, -7, r->id);
       return false;
     }
@@ -1101,7 +1119,8 @@ int dt_ring_worker_attach_remote(void* handle, int ring_id, uint64_t entries_hos
       !spec->record_send_cq || !spec->read_window ||
       (spec->ready_qp && (!spec->ready_recv_cq || !spec->ready_ring_host ||
                           !spec->ready_depth || !spec->ready_table_host ||
-                          !spec->table_host || !spec->slot_nbytes)))
+                          !spec->table_host || !spec->slot_nbytes ||
+                          !ready_layout_ok(*spec))))
     return -1;
   Ring* r = new Ring();
   r->id = ring_id;

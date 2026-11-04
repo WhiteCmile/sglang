@@ -1160,6 +1160,13 @@ class RemoteRingSpec(ctypes.Structure):
             "ready_qp", "ready_recv_cq", "ready_tag", "ready_ring_host", "ready_depth",
             "ready_first_seq", "ready_table_host", "pool_tag", "session_tag",
             "drain_timeout_ns",
+            "wc_success", "wc_recv_with_imm", "flush_target", "flush_scope",
+            "ready_record_bytes",
+            *(
+                f"ready_{field}_{part}"
+                for field in ("seq", "pool_tag", "session_tag", "slot_id", "slot_generation")
+                for part in ("at", "bytes")
+            ),
         )
     ]
 

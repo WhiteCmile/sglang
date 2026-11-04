@@ -2683,6 +2683,9 @@ class FlashMTPDraftEngine:
         if waiting is not None:
             self._received_tasks += 1  # its Coordinator copy retires here
         if entry.has_pull:
+            # The worker placed it in a landing buffer: count it as released
+            # (no staging reference) so try_free's placed/released match holds.
+            self._landing_taken[entry.landing_index] += 1
             self._publish_source_done(waiting or task)
         transport = self._candidate_push_transport
         if transport is not None and task.candidate_destination is not None:

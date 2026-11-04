@@ -105,8 +105,23 @@ LEG_RING = "ring"
 
 # Ready record: seq, pool-generation tag, source-session tag, slot id, slot
 # generation.  One record per published feature slot per connected Draft.
-_READY_RECORD = struct.Struct("<QQQII")
+_READY_RECORD_FIELDS = (
+    ("seq", "Q"),
+    ("pool_tag", "Q"),
+    ("session_tag", "Q"),
+    ("slot_id", "I"),
+    ("slot_generation", "I"),
+)
+_READY_RECORD = struct.Struct("<" + "".join(code for _, code in _READY_RECORD_FIELDS))
 READY_RECORD_BYTES = _READY_RECORD.size
+# Field name -> (byte offset, width); the native ring worker decodes by it.
+READY_RECORD_LAYOUT = {
+    name: (
+        struct.calcsize("<" + "".join(code for _, code in _READY_RECORD_FIELDS[:i])),
+        struct.calcsize("<" + code),
+    )
+    for i, (name, code) in enumerate(_READY_RECORD_FIELDS)
+}
 # Ready records a Draft can hold unconsumed; each is one posted receive, so
 # the Target's sends past this depth wait on RNR retry (backpressure).
 READY_RING_DEPTH = 1024
@@ -1768,7 +1783,15 @@ class DraftRemoteRing(MailboxConsumer):
             table_host=self._ring_mr.address,
             read_window=PULL_READ_WINDOW,
             drain_timeout_ns=int(RDMA_OP_TIMEOUT_S * 1e9),
+            wc_success=_IBV_WC_SUCCESS,
+            wc_recv_with_imm=_IBV_WC_RECV_RDMA_WITH_IMM,
+            flush_target=_CU_FLUSH_TARGET_CURRENT_CTX,
+            flush_scope=_CU_FLUSH_TO_OWNER,
+            ready_record_bytes=READY_RECORD_BYTES,
         )
+        for name, (offset, width) in READY_RECORD_LAYOUT.items():
+            setattr(spec, f"ready_{name}_at", offset)
+            setattr(spec, f"ready_{name}_bytes", width)
         puller = self._puller
         if puller is not None:
             ready = puller._conn
