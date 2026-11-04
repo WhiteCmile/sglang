@@ -751,6 +751,7 @@ bool reap_reads(Worker* w, Ring* r) {
     fail(w, -7, r->id);
     return false;
   }
+  m.reads_outstanding -= n;  // error completions retire their READs too
   for (int i = 0; i < n; ++i) {
     if (status[i] != 0) {
       fail(w, -7, r->id);  // a failed READ (or a QP in error) is fail-stop
@@ -761,7 +762,6 @@ bool reap_reads(Worker* w, Ring* r) {
         f.done = true;
         break;
       }
-    --m.reads_outstanding;
   }
   return true;
 }
