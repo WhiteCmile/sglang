@@ -13,16 +13,18 @@ and then the record (generation last) on its push stream, so the Target CPU
 observes READY from host memory without waiting for a Draft-side completion
 poll or the direct notice.  The notice stays as the retirement/fallback path.
 
-With DT_PUSH_COMPLETION_RECORD=1 the Draft instead queues one batched
-kernel on its push stream after the candidate copy.  The kernel writes a
-per-slot completion record into a second shared file for every local row of
-the wave — payload words first, the reservation's authorization nonce (the
-seq word) published last with a system-scope release store.  For a
-negotiated Target the record carries a superset of the READY record words,
-so the legacy READY record writes and the ZMQ completion notice are both
-skipped: the Target observes READY only by scanning the completion records
-from host memory.  Waves without a completion-record row keep the
-cuStreamWriteValue32 memop publication and never load the kernel library.
+With DT_PUSH_COMPLETION_RECORD=1 the Draft also queues a per-slot
+completion record into a second shared file for every local row of the
+wave — payload words first, the reservation's authorization nonce (the seq
+word) published last, all with cuStreamWriteValue32 memops on the push
+stream.  For a negotiated Target the record carries a superset of the
+READY record words, so the legacy READY record writes and the ZMQ
+completion notice are both skipped: the Target observes READY only by
+scanning the completion records from host memory.  No custom CUDA library
+is built on either setting: the publication is stream memops end to end
+(issue #208 round 3: the batched publication kernel this replaces cost
+~6% TPOT p90 on 3T2D in the CI A/B and in the interleaved reproduction,
+so the kernel path was retired again).
 
 Request, assignment, timeout, and retirement policy remain in the existing DT
 controller/router.  This module owns only allocation-relative CUDA transport
@@ -101,42 +103,20 @@ READY_RECORD_WORDS = 8
 READY_RECORD_BYTES = READY_RECORD_WORDS * 4
 PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
-# One batched-publication descriptor per pushed row.  This table is the
-# single source of the publication ABI: the CUDA struct, kind values and
-# record word indices are generated from these constants into a header at
-# library build time (see _push_completion_layout_header), so the packed
-# descriptors and the kernel's DtPushCompletionDesc cannot drift apart.
-_PUSH_BATCH_DESC_FIELDS = (
-    ("record", "Q"),  # record base address (0 = no record writes)
-    ("meta", "Q"),  # reservation metadata base address (always written)
-    ("seq", "Q"),  # reservation authorization nonce
-    ("record_hash", "Q"),  # transfer id hash
-    ("globaltimer_offset_ns", "Q"),  # producer's globaltimer->realtime offset
-    ("generation", "I"),
-    ("valid_length", "I"),
-    ("root_token", "I"),
-    ("producer_tag", "I"),
-    ("kind", "I"),
-    ("pad0", "4x"),  # struct tail padding; implicit in the C struct
-)
-_PUSH_BATCH_COMPLETION = 1
-_PUSH_BATCH_READY = 2
-_PUSH_BATCH_DESC = struct.Struct(
-    "<" + "".join(fmt for _, fmt in _PUSH_BATCH_DESC_FIELDS)
-)
+# Publication selectors for one pushed row: which host record the row's
+# memop sequence writes after the five reservation metadata words.
+_RECORD_KIND_COMPLETION = 1
+_RECORD_KIND_READY = 2
 # One 64-byte host completion record per slot: eight u64 words, the seq word
-# published last with a system-scope release store.
+# published last.
 COMPLETION_RECORD_WORDS = 8
 COMPLETION_RECORD_BYTES = COMPLETION_RECORD_WORDS * 8
 COMPLETION_SEQ_WORD = 0
 COMPLETION_META_WORD = 1  # generation (low u32), valid length (high u32)
 COMPLETION_HASH_WORD = 2  # transfer id hash
 COMPLETION_TOKEN_WORD = 3  # root token (low u32), producer tag (high u32)
-COMPLETION_PRODUCED_WORD = 4  # %globaltimer publication timestamp
+COMPLETION_PRODUCED_WORD = 4  # %globaltimer publication timestamp (0: memops)
 COMPLETION_OFFSET_WORD = 5  # producer's globaltimer->realtime offset (0 = none)
-GLOBALTIMER_CALIBRATION_SAMPLES = 64
-# A best-sample round trip above this cannot bound the offset usefully.
-GLOBALTIMER_CALIBRATION_MAX_UNCERTAINTY_NS = 1_000_000
 
 logger = logging.getLogger(__name__)
 
@@ -202,151 +182,6 @@ class _ReadyRecordFile:
                 os.unlink(self.path)
             except FileNotFoundError:
                 pass
-
-
-_C_DESCRIPTOR_TYPES = {"Q": "std::uint64_t", "I": "std::uint32_t"}
-
-
-def _push_completion_layout_header() -> str:
-    """Render the CUDA layout header from the Python ABI constants.
-
-    The descriptor struct, the kind values and the metadata/record word
-    indices the kernel compiles against are all generated here, so Python
-    stays the single source and the two sides cannot disagree silently.
-    """
-    fields = []
-    for name, fmt in _PUSH_BATCH_DESC_FIELDS:
-        if fmt.endswith("x"):
-            # Padding only exists in the packed record; the C struct gets it
-            # as tail alignment padding.
-            continue
-        ctype = _C_DESCRIPTOR_TYPES[fmt]
-        fields.append(f"  {ctype} {name};")
-    return (
-        "// Generated from the publication ABI constants in\n"
-        "// dt_candidate_p2p.py by _push_completion_layout_header(); do not\n"
-        "// edit.  The Python constants are the single source; this header is\n"
-        "// rewritten from them on every library build.\n"
-        "#pragma once\n"
-        "#include <cstdint>\n\n"
-        "struct DtPushCompletionDesc {\n" + "\n".join(fields) + "\n};\n\n"
-        f"static_assert(sizeof(DtPushCompletionDesc) == {_PUSH_BATCH_DESC.size},\n"
-        '              "DtPushCompletionDesc drifted from the Python layout");\n\n'
-        f"#define DT_PUSH_KIND_COMPLETION {_PUSH_BATCH_COMPLETION}\n"
-        f"#define DT_PUSH_KIND_READY {_PUSH_BATCH_READY}\n"
-        f"#define DT_PUSH_META_GENERATION_WORD {GENERATION_WORD}\n"
-        f"#define DT_PUSH_META_NONCE_LOW_WORD {NONCE_LOW_WORD}\n"
-        f"#define DT_PUSH_META_NONCE_HIGH_WORD {NONCE_HIGH_WORD}\n"
-        f"#define DT_PUSH_META_VALID_LENGTH_WORD {VALID_LENGTH_WORD}\n"
-        f"#define DT_PUSH_META_ROOT_TOKEN_WORD {ROOT_TOKEN_WORD}\n"
-        f"#define DT_PUSH_META_PRODUCER_TAG_WORD {PRODUCER_TAG_WORD}\n"
-        f"#define DT_PUSH_RECORD_SEQ_WORD {COMPLETION_SEQ_WORD}\n"
-        f"#define DT_PUSH_RECORD_META_WORD {COMPLETION_META_WORD}\n"
-        f"#define DT_PUSH_RECORD_HASH_WORD {COMPLETION_HASH_WORD}\n"
-        f"#define DT_PUSH_RECORD_TOKEN_WORD {COMPLETION_TOKEN_WORD}\n"
-        f"#define DT_PUSH_RECORD_PRODUCED_WORD {COMPLETION_PRODUCED_WORD}\n"
-        f"#define DT_PUSH_RECORD_OFFSET_WORD {COMPLETION_OFFSET_WORD}\n"
-        f"#define DT_PUSH_RECORD_WORDS {COMPLETION_RECORD_WORDS}\n"
-    )
-
-
-def _build_push_completion_library() -> Path:
-    source = Path(__file__).with_name("csrc") / "dt_push_completion.cu"
-    text = source.read_bytes()
-    header_text = _push_completion_layout_header().encode()
-    digest = hashlib.sha256(text + header_text).hexdigest()[:16]
-    cache = Path(
-        os.environ.get(
-            "DT_PUSH_COMPLETION_BUILD_DIR",
-            Path.home() / ".cache" / "dt-push-completion",
-        )
-    )
-    cache.mkdir(parents=True, exist_ok=True)
-    library = cache / f"dt_push_completion-{digest}.so"
-    # The generated layout header lives in a digest-private include dir so
-    # concurrent builds of different ABIs never overwrite each other.
-    include_dir = cache / f"inc-{digest}"
-    if library.exists() and include_dir.exists():
-        return library
-    arch = os.environ.get("DT_PUSH_COMPLETION_ARCH", "sm_90")
-    with open(cache / ".build.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not library.exists():
-            include_dir.mkdir(parents=True, exist_ok=True)
-            (include_dir / "dt_push_completion_layout.h").write_bytes(header_text)
-            partial = library.with_suffix(f".so.{os.getpid()}")
-            subprocess.run(
-                [
-                    os.environ.get("NVCC", "nvcc"),
-                    "-O2",
-                    "-std=c++17",
-                    "-shared",
-                    "-Xcompiler",
-                    "-fPIC",
-                    f"-arch={arch}",
-                    "-I",
-                    str(include_dir),
-                    "-cudart",
-                    "static",
-                    "-o",
-                    str(partial),
-                    str(source),
-                ],
-                check=True,
-            )
-            os.replace(partial, library)
-    return library
-
-
-class _PushCompletionKernel:
-    """ctypes handle for the batched completion record publication kernel."""
-
-    def __init__(self) -> None:
-        lib = ctypes.CDLL(str(_build_push_completion_library()))
-        lib.dt_push_completion_batch_launch.argtypes = [
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_uint64,
-        ]
-        lib.dt_push_completion_batch_launch.restype = ctypes.c_int
-        lib.dt_push_completion_sample_globaltimer.argtypes = [
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-        ]
-        lib.dt_push_completion_sample_globaltimer.restype = ctypes.c_int
-        self._lib = lib
-
-    def launch_batch(
-        self,
-        *,
-        device: int,
-        descs_ptr: int,
-        count: int,
-        stream: int,
-    ) -> None:
-        rc = self._lib.dt_push_completion_batch_launch(
-            device,
-            descs_ptr,
-            count,
-            stream,
-        )
-        if rc != 0:
-            raise CandidateTransportError(
-                f"push completion kernel launch failed with cudaError {rc}"
-            )
-
-    def sample_globaltimer(self, *, device: int, address: int, stream: int) -> None:
-        """Store the device %globaltimer into one mapped u64."""
-
-        rc = self._lib.dt_push_completion_sample_globaltimer(
-            device, address, stream
-        )
-        if rc != 0:
-            raise CandidateTransportError(
-                f"globaltimer sample kernel launch failed with cudaError {rc}"
-            )
 
 
 def _build_record_observer_library() -> Path:
@@ -480,53 +315,6 @@ class _RecordObserver:
         self._ready_words = None
         self._record_seq_expected = None
         self._record_generation = None
-
-
-def _calibrate_globaltimer_offset(
-    runtime: CudaIpcRuntime, kernel: _PushCompletionKernel, device_index: int
-) -> int:
-    """Estimate CLOCK_REALTIME minus %globaltimer on the producer's device.
-
-    The completion kernel stamps records with %globaltimer; turning those
-    stamps into delivery latencies needs the offset from the GPU timebase to
-    host realtime, measured on the GPU whose kernel writes the stamps —
-    %globaltimer bases differ across same-host GPUs.  Each sample brackets a
-    one-block kernel with realtime reads; the median offset is the estimate
-    and the best round trip bounds its uncertainty.
-    """
-
-    page = mmap.PAGESIZE
-    sample_map = mmap.mmap(-1, page)
-    try:
-        view = np.frombuffer(sample_map, dtype=np.uint64)
-        device_ptr = 0
-        try:
-            device_ptr = runtime.host_register(int(view.ctypes.data), page)
-            offsets = []
-            best_uncertainty_ns = None
-            for _ in range(GLOBALTIMER_CALIBRATION_SAMPLES):
-                rt1 = time.time_ns()
-                kernel.sample_globaltimer(
-                    device=device_index, address=device_ptr, stream=0
-                )
-                runtime.stream_synchronize(0)
-                rt2 = time.time_ns()
-                offsets.append(((rt1 + rt2) // 2) - int(view[0]))
-                uncertainty = rt2 - rt1
-                if best_uncertainty_ns is None or uncertainty < best_uncertainty_ns:
-                    best_uncertainty_ns = uncertainty
-            if best_uncertainty_ns > GLOBALTIMER_CALIBRATION_MAX_UNCERTAINTY_NS:
-                raise CandidateTransportError(
-                    "globaltimer calibration round trip is too noisy"
-                )
-            return int(np.median(offsets))
-        finally:
-            if device_ptr:
-                runtime.host_unregister(int(view.ctypes.data))
-            # Drop the view before closing the mapping.
-            view = None
-    finally:
-        sample_map.close()
 
 
 class CandidateTransportError(RuntimeError):
@@ -2484,19 +2272,8 @@ class DraftCandidatePushTransport:
         self._ready_records: dict[tuple[str, str, str, str], tuple[_ReadyRecordFile, int]] = {}
         self._producer_tag = producer_tag(draft_session_id)
         # Target completion record mappings: key -> (file, device base
-        # address), plus the publication kernel.
+        # address).
         self._completion_records: dict[tuple[str, str, str, str], tuple[_ReadyRecordFile, int]] = {}
-        self._completion_kernel: _PushCompletionKernel | None = None
-        # Batched-publication descriptor staging: two pinned slots guarded by
-        # per-slot stream events so a repack never races the previous wave's
-        # kernel still reading its descriptors (issue #208).
-        self._batch_desc_slots: list = [None, None]
-        self._batch_desc_events: list = [None, None]
-        self._batch_desc_slot = 0
-        # CLOCK_REALTIME minus this GPU's %globaltimer, calibrated once on
-        # first use; None when uncalibrated (records then carry offset 0).
-        self._globaltimer_offset_ns: int | None = None
-        self._globaltimer_calibrated = False
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
@@ -2646,16 +2423,12 @@ class DraftCandidatePushTransport:
                     device_base = self._runtime.host_register(
                         records.host_address, records.nbytes
                     )
-                    kernel = self._completion_kernel
-                    if kernel is None:
-                        kernel = self._completion_kernel = _PushCompletionKernel()
                 except Exception:
                     if device_base:
                         self._runtime.host_unregister(records.host_address)
                     records.close(unlink=False)
                     raise
                 self._completion_records[key] = (records, device_base)
-                self._ensure_globaltimer_offset()
 
     def has_ready_records(self, tasks: list[object]) -> bool:
         """Whether every task's Target arena accepts GPU-written READY records."""
@@ -2675,134 +2448,15 @@ class DraftCandidatePushTransport:
             for task in tasks
         )
 
-    def _ensure_globaltimer_offset(self) -> None:
-        """Calibrate this GPU's globaltimer offset exactly once, best effort.
-
-        The completion kernel stamps records on this device, so the offset
-        must come from this device: %globaltimer bases differ across
-        same-host GPUs.  Failure leaves the offset unset; records then carry
-        0 and the Target leaves delivery_ns at 0.
-        """
-
-        if self._globaltimer_calibrated:
-            return
-        self._globaltimer_calibrated = True
-        try:
-            self._globaltimer_offset_ns = _calibrate_globaltimer_offset(
-                self._runtime, self._completion_kernel, self.device_index
-            )
-        except Exception:
-            logger.warning(
-                "globaltimer calibration failed; completion records carry "
-                "offset 0 and Target delivery_ns stays 0",
-                exc_info=True,
-            )
-        else:
-            logger.info(
-                "globaltimer offset %d ns calibrated on device %d",
-                self._globaltimer_offset_ns,
-                self.device_index,
-            )
-
-    def _batch_desc_for(
-        self,
-        task,
-        *,
-        destination,
-        metadata_address: int,
-        record_address: int,
-        kind: int,
-    ) -> bytes:
-        """Pack one batched-publication descriptor for a local push row."""
-        self._ensure_globaltimer_offset()
-        # The offset can be negative (GPU timebase ahead of host realtime);
-        # store the wrapped u64, exactly what the retired ctypes c_uint64
-        # argument carried.
-        offset_ns = int(self._globaltimer_offset_ns or 0) & 0xFFFFFFFFFFFFFFFF
-        return _PUSH_BATCH_DESC.pack(
-            record_address,
-            metadata_address,
-            int(destination.authorization_nonce),
-            transfer_id_hash(task.transfer_id),
-            offset_ns,
-            int(destination.generation),
-            int(destination.row_width),
-            int(task.next_token_id) & 0xFFFFFFFF,
-            self._producer_tag,
-            kind,
-        )
-
-    def _batch_desc_slot_buffer(self, nbytes: int) -> tuple:
-        """Return the next pinned descriptor slot plus its guard event.
-
-        Two slots alternate; a slot is repacked only after the stream event
-        recorded behind its previous kernel reports complete, so the host
-        never overwrites descriptors a queued wave still reads.
-        """
-        slot = self._batch_desc_slot
-        self._batch_desc_slot = slot ^ 1
-        old_event = self._batch_desc_events[slot]
-        if old_event is not None and not old_event.query():
-            # The previous wave's kernel may still read this slot's pinned
-            # descriptors (or the buffer about to be replaced); wait for it
-            # before repacking or freeing.
-            old_event.synchronize()
-        buffer = self._batch_desc_slots[slot]
-        if buffer is None or buffer.numel() < nbytes:
-            buffer = torch.empty(
-                max(nbytes, 4096), dtype=torch.uint8, pin_memory=True
-            )
-            self._batch_desc_slots[slot] = buffer
-            self._batch_desc_events[slot] = torch.cuda.Event()
-        return buffer, self._batch_desc_events[slot]
-
-    def _publish_batch_kernel(self, publications, stream) -> None:
-        """Publish one batch's rows with the single batched kernel.
-
-        One 64-byte descriptor per local row publishes the row's five
-        reservation metadata words and either its 64-byte completion record
-        or its 32-byte READY record, replacing the per-task
-        cuStreamWriteValue32 memops and per-task record kernel that
-        dominated this loop (issue #208).  Stream order keeps the
-        publication after the candidate copy; the kernel's release stores
-        are the same publish edges the memop sequence provided.
-        """
-        descs = []
-        for task, destination, metadata_address, record_address, kind in (
-            publications
-        ):
-            descs.append(
-                self._batch_desc_for(
-                    task,
-                    destination=destination,
-                    metadata_address=metadata_address,
-                    record_address=record_address,
-                    kind=kind,
-                )
-            )
-        buffer, event = self._batch_desc_slot_buffer(
-            len(descs) * _PUSH_BATCH_DESC.size
-        )
-        ctypes.memmove(
-            buffer.data_ptr(), b"".join(descs), len(descs) * _PUSH_BATCH_DESC.size
-        )
-        kernel = self._completion_kernel
-        if kernel is None:
-            kernel = self._completion_kernel = _PushCompletionKernel()
-        kernel.launch_batch(
-            device=self.device_index,
-            descs_ptr=buffer.data_ptr(),
-            count=len(descs),
-            stream=stream.cuda_stream,
-        )
-        event.record(stream)
-
     def _publish_batch_memops(self, publications, stream) -> None:
         """Publish one batch's rows with per-task cuStreamWriteValue32 memops.
 
-        Used only when no row in the batch has a completion record; the
-        write sets and word order match the batched kernel exactly (metadata
-        generation last, record generation released last).
+        The write sets and word order are the publish edges the Target's
+        scans acquire on: the reservation metadata generation last, then the
+        record's payload words and its own release word last.  Memops are
+        stream-ordered after the candidate copy and need no SMs, so the
+        publication never competes with the proposal kernels (issue #208
+        round 3).
         """
         write_value32 = self._runtime._stream_write_value32
         if write_value32 is None:
@@ -2830,7 +2484,7 @@ class DraftCandidatePushTransport:
                 )
                 if rc:
                     check_driver(rc, "cuStreamWriteValue32")
-            if kind == _PUSH_BATCH_READY:
+            if kind == _RECORD_KIND_READY:
                 for word, value in (
                     *words[:-1],
                     (PRODUCER_TAG_WORD, self._producer_tag),
@@ -2839,6 +2493,38 @@ class DraftCandidatePushTransport:
                     rc = write_value32(
                         c_stream,
                         c_uint64(record_address + word * 4),
+                        c_uint32(value),
+                        c_zero,
+                    )
+                    if rc:
+                        check_driver(rc, "cuStreamWriteValue32")
+            if kind == _RECORD_KIND_COMPLETION:
+                # 64-byte completion record: payload words first, produced
+                # and offset zeroed (a memop cannot sample %globaltimer, so
+                # the Target leaves delivery_ns at 0), and the seq word
+                # published last, high half before low.  Memops to the same
+                # host mapping arrive in issue order — the same edge the
+                # READY-record sequence above relies on; a torn seq read
+                # mismatches the nonce and is retried, and every payload
+                # word is already final when either seq half lands.
+                record_hash = transfer_id_hash(task.transfer_id)
+                for byte_offset, value in (
+                    (8, int(destination.generation)),
+                    (12, int(destination.row_width)),
+                    (16, record_hash & 0xFFFFFFFF),
+                    (20, (record_hash >> 32) & 0xFFFFFFFF),
+                    (24, int(task.next_token_id) & 0xFFFFFFFF),
+                    (28, self._producer_tag),
+                    (32, 0),
+                    (36, 0),
+                    (40, 0),
+                    (44, 0),
+                    (4, (nonce >> 32) & 0xFFFFFFFF),
+                    (0, nonce & 0xFFFFFFFF),
+                ):
+                    rc = write_value32(
+                        c_stream,
+                        c_uint64(record_address + byte_offset),
                         c_uint32(value),
                         c_zero,
                     )
@@ -3135,7 +2821,7 @@ class DraftCandidatePushTransport:
                 record_address = (
                     device_base + destination.slot_id * COMPLETION_RECORD_BYTES
                 )
-                kind = _PUSH_BATCH_COMPLETION
+                kind = _RECORD_KIND_COMPLETION
             else:
                 # The completion record carries a superset of the READY record
                 # words; only Targets without one take the READY record path.
@@ -3152,7 +2838,7 @@ class DraftCandidatePushTransport:
                     record_address = (
                         device_base + destination.slot_id * READY_RECORD_BYTES
                     )
-                    kind = _PUSH_BATCH_READY
+                    kind = _RECORD_KIND_READY
             publications.append(
                 (task, destination, metadata_address, record_address, kind)
             )
@@ -3171,20 +2857,7 @@ class DraftCandidatePushTransport:
         if segments:
             self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
         if publications:
-            if any(
-                kind == _PUSH_BATCH_COMPLETION
-                for _task, _dest, _meta, _record, kind in publications
-            ):
-                self._publish_batch_kernel(publications, stream)
-            else:
-                # No completion record in this batch: publish with the bound
-                # cuStreamWriteValue32 driver call, exactly as before the
-                # batched kernel existed.  A batch without a completion record
-                # must not touch the custom CUDA library, so the
-                # feature-off fallback (DT_PUSH_COMPLETION_RECORD=0, or a
-                # Target whose record file is unavailable) keeps working with
-                # no nvcc and an empty build cache.
-                self._publish_batch_memops(publications, stream)
+            self._publish_batch_memops(publications, stream)
         if remote_batch is None:
             event = torch.cuda.Event(enable_timing=start_event is not None)
             event.record(stream)

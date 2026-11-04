@@ -20,7 +20,6 @@ The arena/transport constructors need CUDA, so objects are built with
 object.__new__ plus only the attributes the methods under test touch.
 """
 
-import ctypes
 import os
 import shutil
 import time
@@ -47,19 +46,17 @@ from sglang.srt.speculative.dt_candidate_p2p import (
     COMPLETION_RETRY_NS,
     COMPLETION_SEQ_WORD,
     COMPLETION_TOKEN_WORD,
-    GLOBALTIMER_CALIBRATION_SAMPLES,
     READY_RECORD_WORDS,
     CandidateSlotState,
     CandidateTransportError,
     DraftCandidatePushTransport,
     TargetCandidateArena,
-    _calibrate_globaltimer_offset,
     _CandidateSlot,
     _PendingCompletionNotice,
     _ReadyRecordFile,
     _RecordObserver,
-    _PUSH_BATCH_COMPLETION,
-    _PUSH_BATCH_DESC,
+    _RECORD_KIND_COMPLETION,
+    _RECORD_KIND_READY,
     producer_tag,
     transfer_id_hash,
 )
@@ -360,7 +357,7 @@ def write_completion_record(
     offset=0,
     release=True,
 ):
-    """Emulate the kernel: payload words first, the nonce released last."""
+    """Emulate the producer's record writes: payload first, nonce last."""
 
     words = arena._completion_words[slot_id]
     words[COMPLETION_META_WORD] = generation | (ROW_WIDTH << 32)
@@ -375,12 +372,12 @@ def write_completion_record(
 
 
 class FakeRuntime:
-    """CudaIpcRuntime stand-in for the calibration sampling loop."""
+    """CudaIpcRuntime stand-in capturing the stream-memop write sequence."""
 
     def __init__(self):
         self.registered = []
         self.unregistered = []
-        self.syncs = 0
+        self.writes = []
 
     def host_register(self, address, length):
         self.registered.append((address, length))
@@ -389,158 +386,100 @@ class FakeRuntime:
     def host_unregister(self, address):
         self.unregistered.append(address)
 
-    def stream_synchronize(self, stream):
-        self.syncs += 1
+    def _stream_write_value32(self, stream, address, value, flags):
+        self.writes.append((int(address.value), int(value.value)))
+        return 0
 
-
-class FakeSampleKernel:
-    """_PushCompletionKernel stand-in writing a fake globaltimer sample."""
-
-    def __init__(self, *, offset=4242, fail=False):
-        self.offset = offset
-        self.fail = fail
-        self.samples = 0
-
-    def sample_globaltimer(self, *, device, address, stream):
-        self.samples += 1
-        if self.fail:
-            raise CandidateTransportError("sample launch failed")
-        ctypes.c_uint64.from_address(address).value = (
-            time.time_ns() - self.offset
-        )
-
-
-class TestGlobaltimerCalibration:
-    def test_calibration_estimates_offset_and_releases_buffer(self):
-        runtime = FakeRuntime()
-        kernel = FakeSampleKernel(offset=4242)
-        offset = _calibrate_globaltimer_offset(runtime, kernel, 0)
-        assert kernel.samples == GLOBALTIMER_CALIBRATION_SAMPLES
-        assert runtime.syncs == GLOBALTIMER_CALIBRATION_SAMPLES
-        assert abs(offset - 4242) < 500_000  # midpoint bracketing noise
-        assert len(runtime.registered) == 1
-        assert runtime.unregistered == [runtime.registered[0][0]]
-
-    def test_calibration_failure_still_releases_buffer(self):
-        runtime = FakeRuntime()
-        kernel = FakeSampleKernel(fail=True)
-        with pytest.raises(CandidateTransportError):
-            _calibrate_globaltimer_offset(runtime, kernel, 0)
-        assert runtime.unregistered == [runtime.registered[0][0]]
+    def _check_driver(self, rc, what):
+        if rc:
+            raise CandidateTransportError(f"{what} failed with {rc}")
 
 
 def make_push_transport():
     transport = object.__new__(DraftCandidatePushTransport)
     transport.device_index = 0
     transport._producer_tag = producer_tag("draft")
-    transport._globaltimer_offset_ns = None
-    transport._globaltimer_calibrated = False
     transport._runtime = FakeRuntime()
-    transport._completion_kernel = None
     return transport
 
 
-class TestProducerOffsetPublication:
-    def test_batch_desc_stamps_calibrated_offset(self):
+class TestPublishMemopSequence:
+    """The memop word sequence is the publish edge the Target acquires on."""
+
+    def test_completion_record_words_and_release_order(self):
         transport = make_push_transport()
-        transport._globaltimer_calibrated = True
-        transport._globaltimer_offset_ns = 1234
+        nonce = (3 << 32) | 222
+        destination = SimpleNamespace(
+            authorization_nonce=nonce, generation=2, row_width=ROW_WIDTH
+        )
+        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
+        transport._publish_batch_memops(
+            [(task, destination, 8192, 4096, _RECORD_KIND_COMPLETION)],
+            SimpleNamespace(cuda_stream=0),
+        )
+        record_hash = transfer_id_hash("tid-1")
+        assert transport._runtime.writes == [
+            # Reservation metadata words, the generation word published last.
+            (8192 + 4, 222),
+            (8192 + 8, 3),
+            (8192 + 12, ROW_WIDTH),
+            (8192 + 16, 77),
+            (8192 + 0, 2),
+            # Completion record payload words; produced/offset zeroed.
+            (4096 + 8, 2),
+            (4096 + 12, ROW_WIDTH),
+            (4096 + 16, record_hash & 0xFFFFFFFF),
+            (4096 + 20, (record_hash >> 32) & 0xFFFFFFFF),
+            (4096 + 24, 77),
+            (4096 + 28, producer_tag("draft")),
+            (4096 + 32, 0),
+            (4096 + 36, 0),
+            (4096 + 40, 0),
+            (4096 + 44, 0),
+            # The seq word released last, high half before low.
+            (4096 + 4, 3),
+            (4096 + 0, 222),
+        ]
+
+    def test_ready_record_words_and_release_order(self):
+        transport = make_push_transport()
+        nonce = (3 << 32) | 222
+        destination = SimpleNamespace(
+            authorization_nonce=nonce, generation=2, row_width=ROW_WIDTH
+        )
+        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
+        transport._publish_batch_memops(
+            [(task, destination, 8192, 4096, _RECORD_KIND_READY)],
+            SimpleNamespace(cuda_stream=0),
+        )
+        assert transport._runtime.writes[5:] == [
+            # READY record: the metadata words minus generation, then the
+            # producer tag, with the generation word published last.
+            (4096 + 4, 222),
+            (4096 + 8, 3),
+            (4096 + 12, ROW_WIDTH),
+            (4096 + 16, 77),
+            (4096 + 20, producer_tag("draft")),
+            (4096 + 0, 2),
+        ]
+
+    def test_row_without_record_writes_metadata_only(self):
+        transport = make_push_transport()
         destination = SimpleNamespace(
             authorization_nonce=222, generation=2, row_width=ROW_WIDTH
         )
         task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
-        desc = _PUSH_BATCH_DESC.unpack(
-            transport._batch_desc_for(
-                task,
-                destination=destination,
-                metadata_address=8192,
-                record_address=4096,
-                kind=_PUSH_BATCH_COMPLETION,
-            )
+        transport._publish_batch_memops(
+            [(task, destination, 8192, 0, 0)],
+            SimpleNamespace(cuda_stream=0),
         )
-        (
-            record_address,
-            metadata_address,
-            seq,
-            record_hash,
-            offset_ns,
-            generation,
-            valid_length,
-            root_token,
-            tag,
-            kind,
-        ) = desc
-        assert record_address == 4096
-        assert metadata_address == 8192
-        assert seq == 222
-        assert record_hash == transfer_id_hash("tid-1")
-        assert offset_ns == 1234
-        assert generation == 2
-        assert valid_length == ROW_WIDTH
-        assert root_token == 77
-        assert tag == producer_tag("draft")
-        assert kind == _PUSH_BATCH_COMPLETION
-
-    def test_batch_desc_wraps_negative_offset_like_ctypes_u64(self):
-        # The calibrated offset can be negative (GPU timebase ahead of host
-        # realtime); the retired ctypes c_uint64 argument wrapped it modulo
-        # 2**64 and the packed descriptor must carry the same bits.
-        transport = make_push_transport()
-        transport._globaltimer_calibrated = True
-        transport._globaltimer_offset_ns = -99
-        destination = SimpleNamespace(
-            authorization_nonce=222, generation=2, row_width=ROW_WIDTH
-        )
-        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
-        desc = _PUSH_BATCH_DESC.unpack(
-            transport._batch_desc_for(
-                task,
-                destination=destination,
-                metadata_address=8192,
-                record_address=4096,
-                kind=_PUSH_BATCH_COMPLETION,
-            )
-        )
-        assert desc[4] == (1 << 64) - 99
-
-    def test_batch_desc_stamps_zero_offset_when_uncalibrated(self):
-        transport = make_push_transport()
-        transport._globaltimer_calibrated = True
-        destination = SimpleNamespace(
-            authorization_nonce=222, generation=2, row_width=ROW_WIDTH
-        )
-        task = SimpleNamespace(transfer_id="tid-1", next_token_id=77)
-        desc = _PUSH_BATCH_DESC.unpack(
-            transport._batch_desc_for(
-                task,
-                destination=destination,
-                metadata_address=8192,
-                record_address=0,
-                kind=0,
-            )
-        )
-        assert desc[4] == 0
-        assert desc[0] == 0
-        assert desc[9] == 0
-
-    def test_calibration_runs_exactly_once(self):
-        transport = make_push_transport()
-        transport._completion_kernel = FakeSampleKernel(offset=4242)
-        transport._ensure_globaltimer_offset()
-        assert abs(transport._globaltimer_offset_ns - 4242) < 500_000
-        transport._ensure_globaltimer_offset()
-        assert (
-            transport._completion_kernel.samples == GLOBALTIMER_CALIBRATION_SAMPLES
-        )
-
-    def test_calibration_failure_degrades_without_retry(self):
-        transport = make_push_transport()
-        transport._completion_kernel = FakeSampleKernel(fail=True)
-        transport._ensure_globaltimer_offset()
-        assert transport._globaltimer_offset_ns is None
-        assert transport._globaltimer_calibrated
-        transport._ensure_globaltimer_offset()
-        assert transport._completion_kernel.samples == 1
+        assert transport._runtime.writes == [
+            (8192 + 4, 222),
+            (8192 + 8, 0),
+            (8192 + 12, ROW_WIDTH),
+            (8192 + 16, 77),
+            (8192 + 0, 2),
+        ]
 
 
 class TestCompletionRecords:
