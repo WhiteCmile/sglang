@@ -943,6 +943,67 @@ class TestRecordObserver:
         finally:
             observer.destroy()
 
+    def test_observer_wrong_producer_tag_quarantines_once(self):
+        # A record with the reservation's nonce and transfer but another
+        # producer's tag fails native authentication: quarantine, consume
+        # once, and the authenticated record of a rearm is still accepted.
+        arena, observer = make_observed_arena()
+        try:
+            arm_completion_slot(arena, 0, transfer_id="t", generation=2, nonce=111)
+            write_completion_record(
+                arena, 0, nonce=111, generation=2, transfer_id="t", session="other"
+            )
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    arena.poll_completion_records()
+                except CandidateTransportError as exc:
+                    assert "completion record" in str(exc)
+                    break
+                time.sleep(0.001)
+            else:
+                pytest.fail("forged producer tag was not quarantined")
+            assert arena._slots[0].state is CandidateSlotState.QUARANTINED
+            # The failed record cannot re-raise on every poll.
+            assert arena._record_seq_expected[0] == 0
+            assert arena.poll_completion_records() == 0
+        finally:
+            observer.destroy()
+
+    def test_observer_record_beats_ack_then_authorized(self):
+        # The record lands while the expectations are still unarmed (the
+        # assignment ACK has not been processed): it must stay inert, and
+        # arming the expectations (authorize) plus the kick must make the
+        # observer re-check the slot without waiting for a backoff cycle.
+        arena, observer = make_observed_arena()
+        try:
+            slot = arena._slots[0]
+            slot.generation = 2
+            slot.state = CandidateSlotState.ARMED
+            slot.transfer_id = "t"
+            slot.authorization_nonce = 111
+            slot.draft_instance_id = "d"
+            slot.draft_session_id = "draft"
+            arena._active["t"] = 0
+            arena._record_hash_expected[0] = transfer_id_hash("t")
+            # No _record_seq_expected/_record_generation/_record_tag yet:
+            # the reservation is armed but the assignment is not.
+            write_completion_record(arena, 0, nonce=111, generation=2, transfer_id="t")
+            time.sleep(0.02)
+            assert arena.poll_completion_records() == 0
+            assert arena._slots[0].state is CandidateSlotState.ARMED
+            # authorize() arms the expectations and kicks the observer.
+            arena._record_tag[0] = producer_tag("draft")
+            arena._record_generation[0] = 2
+            arena._record_seq_expected[0] = 111
+            observer.kick()
+            assert poll_observed(arena, observer, arena.poll_completion_records)
+            slot = arena._slots[0]
+            assert slot.state is CandidateSlotState.READY
+            assert slot.completion.transfer_id == "t"
+        finally:
+            observer.destroy()
+
     def test_observer_records_legacy_ready_record(self):
         arena, observer = make_observed_arena()
         try:
