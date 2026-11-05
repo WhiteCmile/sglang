@@ -15,8 +15,17 @@
 // Records that land while the loop is in select, launch or park therefore
 // reach READY without waiting for the next poll's drain.  authorize() kicks
 // the observer after arming the expectations so a record that beat its ACK
-// is re-checked immediately instead of after the idle backoff.  No GIL, no
-// CUDA: the library links only pthread.
+// is re-checked immediately instead of after the idle backoff.  No GIL.
+//
+// Cross-host producers (issue #223) GPUDirect-WRITE the candidate row into
+// the arena and then the record into this mapping over one RC queue pair.
+// Once an arena accepts such a producer, dt_record_observer_enable_flush
+// arms one cuFlushGPUDirectRDMAWrites per scan pass that matched a
+// completion record, issued after the matches were read and before any of
+// them is published to the READY table: every row whose record was seen is
+// then visible to the arena's GPU consumers.  libcuda is resolved at run
+// time (the process already loaded it); an arena that never accepts a
+// remote producer never flushes and never touches CUDA here.
 //
 // Record word indices (completion seq/meta, READY generation, and the
 // completion payload words) are passed in by the Python owner, which
@@ -27,12 +36,14 @@
 // and the Python snapshot revalidates every entry under the lock before
 // consuming it.
 
+#include <dlfcn.h>
 #include <stdint.h>
 #include <time.h>
 
 #include <atomic>
 #include <new>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -91,6 +102,9 @@ uint64_t now_ns() {
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+typedef int CUresult;
+typedef struct CUctx_st* CUcontext;
+
 struct Observer {
   uint32_t slot_count = 0;
   // Word indices inside one completion record (u64 words) and one READY
@@ -129,6 +143,19 @@ struct Observer {
   std::atomic<uint64_t> tail[1];
   std::atomic<uint64_t> dropped{0};
   std::atomic<uint64_t> wake_epoch{0};
+  // GPUDirect flush (issue #223): `flush_ctx` is the device's primary
+  // context, retained by enable_flush and made current on this thread at the
+  // first flushing pass.  A failed flush publishes nothing for that pass and
+  // counts here; the Python owner fails closed on a nonzero count.
+  std::atomic<CUcontext> flush_ctx{nullptr};
+  CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
+  CUresult (*cuFlushGPUDirectRDMAWrites)(int, int) = nullptr;
+  CUresult (*cuDevicePrimaryCtxRelease)(int) = nullptr;
+  int flush_device = -1;
+  // cuFlushGPUDirectRDMAWrites arguments, passed in by the Python owner
+  // (dt_rdma.py single-sources them).
+  int flush_target = 0, flush_scope = 0;
+  std::atomic<uint64_t> flush_failures{0};
   std::atomic<bool> stop{false};
   std::thread thread;
 };
@@ -173,8 +200,18 @@ void run(Observer* o) {
   // within one slice rather than after the full backoff.
   uint64_t backoff_ns = kBackoffMinNs;
   uint64_t seen_epoch = o->wake_epoch.load(std::memory_order_relaxed);
+  struct Match {
+    uint32_t slot;
+    uint64_t seq, kind, meta, token, produced, offset;
+  };
+  std::vector<Match> matched;
+  matched.reserve(o->slot_count);
+  bool ctx_current = false;
   while (!o->stop.load(std::memory_order_relaxed)) {
     bool progressed = false;
+    CUcontext ctx = o->flush_ctx.load(std::memory_order_acquire);
+    if (ctx && !ctx_current) ctx_current = o->cuCtxSetCurrent(ctx) == 0;
+    matched.clear();
     for (uint32_t s = 0; s < o->slot_count; ++s) {
       uint64_t expected = o->seq_expected[s];
       if (!expected) continue;
@@ -204,10 +241,21 @@ void run(Observer* o) {
         kind = kReadyKindTombstone;
       else if (valid_length != o->row_width)
         kind = kReadyKindBadLength;
-      publish_ready(o, s, seq, kind, meta, token,
-                    rec[o->completion_produced_word],
-                    rec[o->completion_offset_word]);
-      o->reported_seq[s] = seq;
+      matched.push_back({s, seq, kind, meta, token,
+                         rec[o->completion_produced_word],
+                         rec[o->completion_offset_word]});
+    }
+    if (!matched.empty() && ctx &&
+        (!ctx_current ||
+         o->cuFlushGPUDirectRDMAWrites(o->flush_target, o->flush_scope) != 0)) {
+      // Unproven visibility: publish nothing; the records stay matched in
+      // their mapping and the owner fails closed on the count.
+      o->flush_failures.fetch_add(1, std::memory_order_relaxed);
+      matched.clear();
+    }
+    for (const Match& m : matched) {
+      publish_ready(o, m.slot, m.seq, m.kind, m.meta, m.token, m.produced, m.offset);
+      o->reported_seq[m.slot] = m.seq;
       progressed = true;
     }
     if (o->ready) {
@@ -398,6 +446,41 @@ uint64_t dt_record_observer_drain(void* handle, uint64_t kind, uint64_t* out,
   return n;
 }
 
+// Arm the per-pass GPUDirect flush for CUDA device `device` (issue #223),
+// as cuFlushGPUDirectRDMAWrites(target, scope).  Idempotent; returns 0 on
+// success, -1 when libcuda or the device's primary context is unavailable
+// (the caller must not accept the remote producer).
+int dt_record_observer_enable_flush(void* handle, int device, int target, int scope) {
+  Observer* o = static_cast<Observer*>(handle);
+  if (!o) return -1;
+  if (o->flush_ctx.load(std::memory_order_acquire)) return o->flush_device == device ? 0 : -1;
+  void* h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+  if (!h) h = dlopen("libcuda.so.1", RTLD_NOW);
+  if (!h) return -1;
+  auto get_device = reinterpret_cast<CUresult (*)(int*, int)>(dlsym(h, "cuDeviceGet"));
+  auto retain = reinterpret_cast<CUresult (*)(CUcontext*, int)>(dlsym(h, "cuDevicePrimaryCtxRetain"));
+  o->cuDevicePrimaryCtxRelease =
+      reinterpret_cast<CUresult (*)(int)>(dlsym(h, "cuDevicePrimaryCtxRelease_v2"));
+  o->cuCtxSetCurrent = reinterpret_cast<CUresult (*)(CUcontext)>(dlsym(h, "cuCtxSetCurrent"));
+  o->cuFlushGPUDirectRDMAWrites =
+      reinterpret_cast<CUresult (*)(int, int)>(dlsym(h, "cuFlushGPUDirectRDMAWrites"));
+  int dev = 0;
+  CUcontext ctx = nullptr;
+  if (!get_device || !retain || !o->cuDevicePrimaryCtxRelease || !o->cuCtxSetCurrent ||
+      !o->cuFlushGPUDirectRDMAWrites || get_device(&dev, device) != 0 || retain(&ctx, dev) != 0)
+    return -1;
+  o->flush_device = dev;
+  o->flush_target = target;
+  o->flush_scope = scope;
+  o->flush_ctx.store(ctx, std::memory_order_release);
+  return 0;
+}
+
+uint64_t dt_record_observer_flush_failures(void* handle) {
+  Observer* o = static_cast<Observer*>(handle);
+  return o ? o->flush_failures.load(std::memory_order_relaxed) : 0;
+}
+
 uint64_t dt_record_observer_dropped(void* handle) {
   Observer* o = static_cast<Observer*>(handle);
   return o ? o->dropped.load(std::memory_order_relaxed) : 0;
@@ -410,6 +493,7 @@ int dt_record_observer_destroy(void* handle) {
   if (!o) return 0;
   o->stop.store(true);
   if (o->thread.joinable()) o->thread.join();
+  if (o->flush_ctx.load()) o->cuDevicePrimaryCtxRelease(o->flush_device);
   delete[] o->reported_seq;
   delete[] o->reported_gen;
   delete[] o->ready_entries;

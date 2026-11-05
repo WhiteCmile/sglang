@@ -4,11 +4,14 @@
 // dt_rdma.py: one device context + protection domain, completion queues,
 // reliable-connected queue pairs addressed by LID (the DT hosts share one
 // InfiniBand subnet), memory registration (host or GPUDirect GPU memory), and
-// the three posts the backend uses: zero-SGE receives, inline
-// RDMA_WRITE_WITH_IMM records, and RDMA READ.  Every function is called from
-// Python through ctypes, which releases the GIL for the call, so the bounded
-// spin-then-sleep poll below never stalls the scheduler thread.  No CUDA: the
-// GPU visibility fence after a READ lives in Python (cuFlushGPUDirectRDMAWrites).
+// the posts the backend uses: zero-SGE receives, inline
+// RDMA_WRITE_WITH_IMM records, RDMA READ, and the candidate-return chain
+// (dt_rdma_post_candidates).  Every function is called from Python through
+// ctypes, which releases the GIL for the call, so the bounded spin-then-sleep
+// poll below never stalls the scheduler thread; dt_rdma_post_candidates is
+// also a CUDA host function (CUhostFn).  No CUDA: the GPU visibility fences
+// live in Python and in the Target's record observer
+// (cuFlushGPUDirectRDMAWrites).
 
 #include <arpa/inet.h>
 #include <infiniband/verbs.h>
@@ -18,6 +21,7 @@
 #include <time.h>
 
 #include <new>
+#include <vector>
 
 namespace {
 
@@ -288,6 +292,96 @@ int dt_rdma_post_read(void* qp_handle, uint64_t wr_id, uint64_t local_addr,
   wr.wr.rdma.rkey = rkey;
   ibv_send_wr* bad = nullptr;
   return ibv_post_send((ibv_qp*)qp_handle, &wr, &bad);
+}
+
+// Candidate return (issue #223): one group of rows to one Target, laid out
+// by dt_rdma.py (CANDIDATE_GROUP_HEADER / CANDIDATE_GROUP_ROW).  Per row, on
+// the one RC queue pair: a GPUDirect WRITE of the row from the Draft's
+// registered GPU mirror into the Target's GPU arena slot (absent for a
+// tombstone), then the 64-byte completion record into the Target's
+// host-mapped record slot as two inline WRITEs -- bytes 8..63 first, the
+// seq (reservation nonce) word last -- so the responder places the payload,
+// the record body and the seq word in that order.  Only the group's last
+// WR is signaled (wr_id = the group ticket): RC completes in order, so its
+// completion retires the whole group.  `status` is written last: 0 when the
+// chain was posted, else the ibv_post_send error.
+struct CandidateGroupHeader {
+  uint64_t qp;
+  uint64_t wr_id;
+  uint32_t data_rkey;
+  uint32_t record_rkey;
+  uint32_t source_lkey;
+  uint32_t rows;
+  int32_t status;
+  uint32_t reserved[7];
+};
+static_assert(sizeof(CandidateGroupHeader) == 64, "candidate group header is 64 bytes");
+struct CandidateGroupRow {
+  uint64_t source_addr;
+  uint64_t data_addr;
+  uint64_t record_addr;
+  uint32_t nbytes;  // 0: record only (tombstone)
+  uint32_t reserved;
+  uint64_t record[8];
+};
+static_assert(sizeof(CandidateGroupRow) == 96, "candidate group row is 96 bytes");
+
+static void post_candidate_group(CandidateGroupHeader* h) {
+  CandidateGroupRow* rows = (CandidateGroupRow*)(h + 1);
+  std::vector<ibv_send_wr> wrs(3 * (size_t)h->rows);
+  std::vector<ibv_sge> sges(wrs.size());
+  size_t n = 0;
+  for (uint32_t i = 0; i < h->rows; ++i) {
+    CandidateGroupRow& r = rows[i];
+    if (r.nbytes) {
+      sges[n] = {r.source_addr, r.nbytes, h->source_lkey};
+      memset(&wrs[n], 0, sizeof(ibv_send_wr));
+      wrs[n].opcode = IBV_WR_RDMA_WRITE;
+      wrs[n].wr.rdma.remote_addr = r.data_addr;
+      wrs[n].wr.rdma.rkey = h->data_rkey;
+      ++n;
+    }
+    sges[n] = {(uint64_t)&r.record[1], 56, 0};
+    memset(&wrs[n], 0, sizeof(ibv_send_wr));
+    wrs[n].opcode = IBV_WR_RDMA_WRITE;
+    wrs[n].send_flags = IBV_SEND_INLINE;
+    wrs[n].wr.rdma.remote_addr = r.record_addr + 8;
+    wrs[n].wr.rdma.rkey = h->record_rkey;
+    ++n;
+    sges[n] = {(uint64_t)&r.record[0], 8, 0};
+    memset(&wrs[n], 0, sizeof(ibv_send_wr));
+    wrs[n].opcode = IBV_WR_RDMA_WRITE;
+    wrs[n].send_flags = IBV_SEND_INLINE;
+    wrs[n].wr.rdma.remote_addr = r.record_addr;
+    wrs[n].wr.rdma.rkey = h->record_rkey;
+    ++n;
+  }
+  int rc = 0;
+  if (n) {
+    for (size_t i = 0; i < n; ++i) {
+      wrs[i].wr_id = h->wr_id;
+      wrs[i].sg_list = &sges[i];
+      wrs[i].num_sge = 1;
+      wrs[i].next = i + 1 < n ? &wrs[i + 1] : nullptr;
+    }
+    wrs[n - 1].send_flags |= IBV_SEND_SIGNALED;
+    ibv_send_wr* bad = nullptr;
+    rc = ibv_post_send((ibv_qp*)h->qp, wrs.data(), &bad);
+  }
+  __atomic_store_n(&h->status, rc, __ATOMIC_RELEASE);
+}
+
+// Posts every group of one submit: `list` is a u64 count followed by that
+// many group addresses (one group per Target queue pair).  One call -- one
+// CUDA host function -- per submit, because host functions run one at a
+// time and each blocks its stream until it returns.
+// The list is read in full before the first post: the owner may release it
+// once every group's status is written, and a group only after its own.
+void dt_rdma_post_candidates(void* list) {
+  const uint64_t* words = (const uint64_t*)list;
+  std::vector<CandidateGroupHeader*> groups(words[0]);
+  for (size_t i = 0; i < groups.size(); ++i) groups[i] = (CandidateGroupHeader*)words[1 + i];
+  for (CandidateGroupHeader* h : groups) post_candidate_group(h);
 }
 
 // Polls up to `max` completions, waiting at most `timeout_ns` for the

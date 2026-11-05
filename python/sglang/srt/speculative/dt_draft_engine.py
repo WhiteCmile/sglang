@@ -10430,14 +10430,6 @@ class FlashMTPDraftEngine:
                             getattr(push_transport, "submit_lane_ns", None) or {}
                         )
                     ),
-                    # Off-loop memo: cross-host sender-thread wall split into
-                    # D2H staging wait and tobytes + WRITE_WITH_IMM push; the
-                    # #223 GPUDirect return removes this whole path.
-                    "push_sender_ns": (
-                        None
-                        if push_transport is None
-                        else dict(getattr(push_transport, "sender_ns", None) or {})
-                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),

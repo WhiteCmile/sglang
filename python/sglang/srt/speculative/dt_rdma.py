@@ -16,15 +16,20 @@ queue pairs, following the #163 measurements:
   buffer, fences GPU visibility (``cuFlushGPUDirectRDMAWrites``), and copies
   it into the destination on its stream.  INPUT_READY and SourceReadDone
   follow through the existing future, unchanged.
-- **Candidate push** (Draft -> Target, ``WRITE_WITH_IMM`` into pinned host
-  staging + receive CQ): the candidate row, its five metadata words, the
-  transfer hash and the producer tag land in the staging slot of the arena
-  slot; the Target's push thread validates them against the slot (session
-  tag, generation, nonce), copies them into the GPU arena, synchronizes that
-  copy (the GPU visibility barrier), and only then publishes the slot's
-  64-byte completion record, so the existing observer/authenticate path makes
-  the candidate READY.  #163 measured that a direct RDMA WRITE into Target
-  VRAM is not reliably observable, so the payload never targets GPU memory.
+- **Candidate push** (Draft -> Target, GPUDirect RDMA WRITEs, issue #223):
+  symmetric with the same-host CUDA-IPC push.  The Draft copies each row
+  into its registered GPU mirror of the Target arena slot on the push
+  stream, and a CUDA host function stream-ordered after that copy
+  (csrc/dt_rdma_verbs.cpp ``dt_rdma_post_candidates``) posts, on one RC
+  queue pair, the row WRITE straight into the Target's GPU arena slot and
+  then the slot's 64-byte completion record into the Target's host-mapped
+  record mapping, the seq (reservation nonce) word last.  The Target runs no
+  thread for this leg: its native record observer issues one
+  ``cuFlushGPUDirectRDMAWrites`` per scan pass that matched a record, before
+  publishing it to its READY table, and the observer's existing validation
+  (nonce, generation, transfer hash, producer tag) makes the candidate READY
+  exactly like a same-host record.  #223 measured 0 stale rows in that order; #163's stale
+  observations came from posting before its GPU source write completed.
 - **Task record** (Target -> Draft, ``WRITE_WITH_IMM`` into a pre-posted
   pinned ring + receive CQ, issue #182): cross-host owner pairs get the same
   4096-byte task-record ring same-host pairs have in ``/dev/shm``.  The Target
@@ -63,7 +68,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from sglang.srt.speculative.dt_candidate_p2p import METADATA_WORDS
+from sglang.srt.speculative.dt_candidate_p2p import (
+    COMPLETION_RECORD_BYTES,
+    COMPLETION_RECORD_WORDS,
+)
 from sglang.srt.speculative.dt_direct_ring import (
     ENTRY_BYTES,
     ENTRY_HEADER_BYTES,
@@ -125,15 +133,42 @@ READY_RECORD_LAYOUT = {
 # Ready records a Draft can hold unconsumed; each is one posted receive, so
 # the Target's sends past this depth wait on RNR retry (backpressure).
 READY_RING_DEPTH = 1024
-# Candidate record header: transfer hash, producer tag, then the int32
-# metadata words exactly as the arena stores them.  The int32 row follows.
-_CANDIDATE_PREFIX = struct.Struct("<QI")
-CANDIDATE_HEADER_BYTES = _CANDIDATE_PREFIX.size + METADATA_WORDS * 4
 # Inline-data cap requested for every send queue; records must fit inline so
 # their send buffers need no registration and are reusable at post time.
 MAX_INLINE_BYTES = 256
 # Outstanding signaled sends per Target-side ready-record queue pair.
 READY_SEND_DEPTH = 1024
+# Send-queue depth of a Draft's candidate-push queue pair, in work requests
+# (a row is three, a tombstone two); a full queue makes the next group wait
+# for completions of earlier ones.
+PUSH_SEND_DEPTH = 4096
+# One candidate-return group as csrc/dt_rdma_verbs.cpp lays it out
+# (CandidateGroupHeader, then `rows` CandidateGroupRow).
+CANDIDATE_GROUP_HEADER = np.dtype(
+    [
+        ("qp", "<u8"),
+        ("wr_id", "<u8"),
+        ("data_rkey", "<u4"),
+        ("record_rkey", "<u4"),
+        ("source_lkey", "<u4"),
+        ("rows", "<u4"),
+        ("status", "<i4"),
+        ("reserved", "<u4", 7),
+    ]
+)
+CANDIDATE_GROUP_ROW = np.dtype(
+    [
+        ("source_addr", "<u8"),
+        ("data_addr", "<u8"),
+        ("record_addr", "<u8"),
+        ("nbytes", "<u4"),
+        ("reserved", "<u4"),
+        ("record", "<u8", COMPLETION_RECORD_WORDS),
+    ]
+)
+assert CANDIDATE_GROUP_HEADER.itemsize == 64 and CANDIDATE_GROUP_ROW.itemsize == 96
+# Group status before its post ran; the native post writes 0 or the error.
+_GROUP_PENDING = -1
 
 # Task-record ring (issue #182): one page holds the per-slot generation
 # table the Target mirrors remotely (entry image offsets below share the
@@ -173,12 +208,6 @@ class StaleDescriptorError(RdmaTransportError):
     """One pull named a stale source; the leg itself stays healthy."""
 
 
-def candidate_record_stride(row_width: int) -> int:
-    """Bytes of one candidate staging slot, 8-byte aligned."""
-
-    return -(-(CANDIDATE_HEADER_BYTES + row_width * 4) // 8) * 8
-
-
 def encode_ready_record(
     *, seq: int, pool_tag: int, session_tag: int, slot_id: int, slot_generation: int
 ) -> bytes:
@@ -209,25 +238,6 @@ def decode_ready_record(
     if slot_id >= slot_count or generation == 0:
         raise RdmaTransportError("ready record names no valid source slot")
     return slot_id, generation
-
-
-def encode_candidate_record(
-    *, transfer_hash: int, producer_tag: int, metadata: bytes, row: bytes
-) -> bytes:
-    if len(metadata) != METADATA_WORDS * 4:
-        raise RdmaTransportError("candidate metadata has an invalid length")
-    return _CANDIDATE_PREFIX.pack(transfer_hash, producer_tag) + metadata + row
-
-
-def decode_candidate_record(
-    record: bytes, row_width: int
-) -> tuple[int, int, bytes, bytes]:
-    """Return ``(transfer_hash, producer_tag, metadata_bytes, row_bytes)``."""
-
-    transfer_hash, tag = _CANDIDATE_PREFIX.unpack_from(record, 0)
-    metadata = record[_CANDIDATE_PREFIX.size : CANDIDATE_HEADER_BYTES]
-    row = record[CANDIDATE_HEADER_BYTES : CANDIDATE_HEADER_BYTES + row_width * 4]
-    return transfer_hash, tag, metadata, row
 
 
 # Task-record ring (issue #182).  The wire image is byte-identical to the
@@ -314,6 +324,7 @@ def _verbs_library() -> ctypes.CDLL:
         "dt_rdma_post_write_imm_inline": ([vp, u64, ctypes.c_char_p, u32, u64, u32, u32], i32),
         "dt_rdma_post_read": ([vp, u64, u64, u32, u32, u64, u32], i32),
         "dt_rdma_poll": ([vp, i32, u64, pu64, pu32, pu32, pu32, pu32], i32),
+        "dt_rdma_post_candidates": ([vp], None),
     }
     for name, (argtypes, restype) in signatures.items():
         fn = getattr(lib, name)
@@ -336,11 +347,28 @@ def _lib() -> ctypes.CDLL:
 
 def _cuda_driver() -> ctypes.CDLL:
     driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuLaunchHostFunc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    driver.cuLaunchHostFunc.restype = ctypes.c_int
     driver.cuFlushGPUDirectRDMAWrites.argtypes = [ctypes.c_int, ctypes.c_int]
     driver.cuFlushGPUDirectRDMAWrites.restype = ctypes.c_int
     driver.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     driver.cuDeviceGetPCIBusId.restype = ctypes.c_int
     return driver
+
+
+_HOST_POST: tuple | None = None
+
+
+def _host_post() -> tuple:
+    """(cuLaunchHostFunc, the native post as a CUhostFn), resolved once."""
+
+    global _HOST_POST
+    if _HOST_POST is None:
+        _HOST_POST = (
+            _cuda_driver().cuLaunchHostFunc,
+            ctypes.c_void_p(ctypes.cast(_lib().dt_rdma_post_candidates, ctypes.c_void_p).value),
+        )
+    return _HOST_POST
 
 
 def make_gpu_visible(driver: ctypes.CDLL) -> None:
@@ -651,14 +679,14 @@ class _TargetSession:
 
 class TargetRdmaEndpoint:
     """Target side of the RDMA backend: registers the feature pool (READ
-    source) and a pinned candidate staging region (WRITE_WITH_IMM sink),
-    accepts Draft connections through the bootstrap server, publishes ready
-    records, and lands candidate pushes into the arena."""
+    source) and the candidate arena's GPU rows and host completion records
+    (GPUDirect WRITE sinks), accepts Draft connections through the bootstrap
+    server, and publishes ready records.  Candidate pushes need no thread
+    here: the arena's record observer consumes them (issue #223)."""
 
     def __init__(self, *, pool, arena, device_index: int, on_landed_push=None) -> None:
         self._pool = pool
         self._arena = arena
-        self._on_landed_push = on_landed_push
         self._device_index = device_index
         self.device = RdmaDevice(closest_ib_device(device_index))
         self._lock = threading.Lock()
@@ -673,10 +701,9 @@ class TargetRdmaEndpoint:
         # Signaled ready-record sends not yet reaped, per pull QP tag; a fenced
         # QP's entry goes with it, so its late completions count for nothing.
         self._outstanding: dict[int, int] = {}
-        self._staging: torch.Tensor | None = None
-        self._staging_mr: MemoryRegion | None = None
+        self._arena_mr: MemoryRegion | None = None
+        self._record_mr: MemoryRegion | None = None
         self._push_cq: CompletionQueue | None = None
-        self.rejected_pushes = 0
         self._threads: list[threading.Thread] = []
         if pool is not None:
             storage = pool._storage
@@ -690,19 +717,19 @@ class TargetRdmaEndpoint:
             pool.set_ready_listener(self._publications.put)
             self._start(self._publisher_loop, "dt-rdma-ready-publisher")
         if arena is not None:
-            self._stride = candidate_record_stride(arena.row_width)
-            if self._stride > MAX_INLINE_BYTES:
-                raise RdmaTransportError("candidate record exceeds the inline cap")
-            self._staging = torch.zeros(
-                arena.slot_count * self._stride, dtype=torch.uint8, pin_memory=True
+            records = arena._completion_records
+            if records is None:
+                raise RdmaTransportError("candidate arena has no completion records")
+            storage = arena.storage
+            self._arena_mr = self.device.register(
+                storage.data_ptr(), storage.nbytes, remote=_IBV_ACCESS_REMOTE_WRITE
             )
-            self._staging_np = self._staging.numpy()
-            self._staging_mr = self.device.register(
-                self._staging.data_ptr(), self._staging.nbytes,
-                remote=_IBV_ACCESS_REMOTE_WRITE,
+            self._record_mr = self.device.register(
+                records.host_address, records.nbytes, remote=_IBV_ACCESS_REMOTE_WRITE
             )
-            self._push_cq = self.device.completion_queue(4 * arena.slot_count)
-            self._start(self._push_loop, "dt-rdma-push-lander")
+            # Push queue pairs only receive WRITEs: nothing completes here.
+            self._push_cq = self.device.completion_queue(1)
+            arena.remote_record_listener = on_landed_push
 
     def _start(self, target, name: str) -> None:
         thread = threading.Thread(target=target, name=name, daemon=True)
@@ -716,7 +743,7 @@ class TargetRdmaEndpoint:
         key = (str(header["draft_instance_id"]), str(header["draft_session_id"]))
         if (
             leg == LEG_PULL and self._pool_mr is None
-            or leg == LEG_PUSH and self._staging_mr is None
+            or leg == LEG_PUSH and self._arena_mr is None
         ):
             raise RdmaTransportError(f"this Target serves no {leg} leg")
         if leg == LEG_PULL:
@@ -724,11 +751,7 @@ class TargetRdmaEndpoint:
                 self._ready_cq, self._ready_cq, max_send=READY_SEND_DEPTH, max_recv=1
             )
         elif leg == LEG_PUSH:
-            qp = self.device.queue_pair(
-                self._push_cq, self._push_cq, max_send=1,
-                max_recv=self._arena.slot_count,
-            )
-            qp.post_recv(self._arena.slot_count)
+            qp = self.device.queue_pair(self._push_cq, self._push_cq, max_send=1, max_recv=1)
         else:
             if leg != LEG_RING or (self._pool is None and self._arena is None):
                 raise RdmaTransportError(f"unknown RDMA leg {leg!r}")
@@ -812,6 +835,17 @@ class TargetRdmaEndpoint:
                 session.ready_addr = int(header["ready_addr"])
                 session.ready_rkey = int(header["ready_rkey"])
             elif leg == LEG_PUSH:
+                # Admitted before its first write can land: from here the
+                # observer flushes GPUDirect writes ahead of every record.
+                try:
+                    self._arena.accept_remote_producer(
+                        key[1],
+                        flush_target=_CU_FLUSH_TARGET_CURRENT_CTX,
+                        flush_scope=_CU_FLUSH_TO_OWNER,
+                    )
+                except Exception:
+                    qp.close()
+                    raise
                 session.push_qp = qp
             else:
                 session.ring_qp = qp
@@ -838,9 +872,10 @@ class TargetRdmaEndpoint:
             )
         elif leg == LEG_PUSH:
             response.update(
-                staging_addr=self._staging_mr.address,
-                staging_rkey=self._staging_mr.rkey,
-                record_stride=self._stride,
+                arena_addr=self._arena_mr.address,
+                arena_rkey=self._arena_mr.rkey,
+                record_addr=self._record_mr.address,
+                record_rkey=self._record_mr.rkey,
                 slot_count=self._arena.slot_count,
                 row_width=self._arena.row_width,
             )
@@ -980,73 +1015,6 @@ class TargetRdmaEndpoint:
                 )
                 self.fence(session.draft_instance_id, session.draft_session_id)
 
-    # -- candidate pushes ---------------------------------------------------
-
-    def _push_loop(self) -> None:
-        torch.cuda.set_device(self._device_index)
-        pending: dict[int, tuple[str, int, int, bytes, bytes]] = {}
-        while not self._closed:
-            # The poll returns at the first completion; its timeout only bounds
-            # how often an idle thread takes the GIL (or retries a deferred push).
-            timeout_ns = 1_000_000 if pending else int(_IDLE_WAIT_S * 1e9)
-            for tag, status, _opcode, slot_id, _qpn in self._push_cq.poll(timeout_ns):
-                with self._lock:
-                    # Under the lock: fence() may destroy the QP concurrently.
-                    session = self._by_tag.get(tag)
-                    if session is not None and status == _IBV_WC_SUCCESS:
-                        session.push_qp.post_recv()
-                if session is None:
-                    continue  # a fenced session's late completion
-                if status != _IBV_WC_SUCCESS:
-                    logger.error(
-                        "candidate push from draft session %s failed (status %d); fencing it",
-                        session.draft_session_id, status,
-                    )
-                    self.fence(session.draft_instance_id, session.draft_session_id)
-                    continue
-                if slot_id >= self._arena.slot_count:
-                    self.rejected_pushes += 1
-                    continue
-                start = slot_id * self._stride
-                # Copy out of staging at once: the Draft may reuse the slot
-                # only after this slot's generation retires, but a stale writer
-                # must never alter a record while it is validated.
-                record = self._staging_np[start : start + self._stride].tobytes()
-                transfer_hash, tag, metadata, row = decode_candidate_record(
-                    record, self._arena.row_width
-                )
-                pending[slot_id] = (session.draft_session_id, transfer_hash, tag, metadata, row)
-            for slot_id, (session_id, transfer_hash, tag, metadata, row) in tuple(pending.items()):
-                try:
-                    landed_transfer = self._arena.land_remote_push(
-                        slot_id=slot_id, transfer_hash=transfer_hash, producer_tag_value=tag,
-                        metadata_bytes=metadata, data_bytes=row,
-                    )
-                except Exception as exc:  # noqa: BLE001 - a rejected record is dropped
-                    self.rejected_pushes += 1
-                    logger.warning(
-                        "rejected candidate push for slot %d from %s: %s", slot_id, session_id, exc
-                    )
-                    landed_transfer = None
-                    pending.pop(slot_id)
-                if landed_transfer is None:
-                    continue
-                pending.pop(slot_id)
-                if self._on_landed_push is not None:
-                    # Every candidate push the arena authenticated and landed
-                    # — a cancelled tombstone (valid length 0) or a
-                    # successful row — proves that Draft's source read
-                    # complete or never started.  Let the controller retire
-                    # what the proof makes quiescent (a retired-unaccepted
-                    # round's source lease); the callback is a no-op for
-                    # rounds the Coordinator accepted.
-                    try:
-                        self._on_landed_push(landed_transfer)
-                    except Exception:  # noqa: BLE001 - the lease stays fenced
-                        logger.exception(
-                            "landed-push callback failed for %s", landed_transfer
-                        )
-
     # -- failure handling ---------------------------------------------------
 
     def fence(self, draft_instance_id: str, draft_session_id: str = "") -> dict[str, bool]:
@@ -1135,9 +1103,12 @@ class TargetRdmaEndpoint:
                 session.table_mr = None
                 session.table_staging = None
                 session.table_staging_np = None
+        if self._arena is not None:
+            self._arena.remote_record_listener = None
         for resource in (
             self._pool_mr,
-            self._staging_mr,
+            self._arena_mr,
+            self._record_mr,
             self._ready_cq,
             self._push_cq,
         ):
@@ -1458,10 +1429,94 @@ class DraftRdmaPuller:
         self._conn.device.close()
 
 
+class CandidateGroup:
+    """One posted (or pending) candidate-return group to one Target.
+
+    ``buffer`` is the native descriptor the post reads and whose status it
+    writes last; the post may run in a CUDA host function after the
+    submitting call returned, so the pusher keeps every group it retired
+    until that status is written."""
+
+    __slots__ = ("pusher", "buffer", "header", "ticket", "wrs", "done", "error", "post_list")
+
+    def __init__(self, pusher, buffer, ticket: int, wrs: int) -> None:
+        self.pusher = pusher
+        self.buffer = buffer
+        self.header = buffer[: CANDIDATE_GROUP_HEADER.itemsize].view(
+            CANDIDATE_GROUP_HEADER
+        )[0]
+        self.ticket = ticket
+        self.wrs = wrs
+        self.done = False
+        self.error: BaseException | None = None
+        self.post_list = None
+
+    def poll(self) -> bool:
+        """True once the Target NIC acknowledged the group's last WRITE;
+        raises if the group can never complete."""
+
+        if not self.done and self.error is None:
+            status = int(self.header["status"])
+            if status == _GROUP_PENDING:
+                return False
+            if status != 0:
+                self.pusher._fail(
+                    RdmaTransportError(f"candidate WRITE post failed ({status})")
+                )
+            else:
+                self.pusher.reap()
+        if self.error is not None:
+            raise self.error
+        return self.done
+
+
+class CandidatePost:
+    """The native post of one submit's candidate groups (several Targets).
+
+    ``launch`` runs it from a CUDA host function stream-ordered after
+    everything already enqueued (the mirror-row copies); ``post`` runs it at
+    once, for groups that depend on no GPU work (tombstones).  The list
+    buffer must outlive the host function, so the groups keep it."""
+
+    def __init__(self, groups: list[CandidateGroup]) -> None:
+        self.groups = [group for group in groups if group.error is None]
+        self._list = np.array(
+            [len(self.groups), *(group.buffer.ctypes.data for group in self.groups)],
+            dtype=np.uint64,
+        )
+        for group in self.groups:
+            group.post_list = self._list
+
+    def launch(self, stream: torch.cuda.Stream) -> None:
+        if not self.groups:
+            return
+        launch_host_func, post_fn = _host_post()
+        rc = launch_host_func(
+            ctypes.c_void_p(stream.cuda_stream),
+            post_fn,
+            ctypes.c_void_p(self._list.ctypes.data),
+        )
+        if rc != 0:
+            error = RdmaTransportError(f"cuLaunchHostFunc failed ({rc})")
+            for group in self.groups:
+                group.pusher._fail(error)
+
+    def post(self) -> None:
+        if self.groups:
+            _lib().dt_rdma_post_candidates(ctypes.c_void_p(self._list.ctypes.data))
+
+
 class DraftRdmaPusher:
-    """Candidate-push leg of one Draft to one remote Target; owned by one
-    sender thread.  Each record is one inline WRITE_WITH_IMM into the
-    Target's staging slot for the arena slot, immediate = slot id."""
+    """Candidate-return leg of one Draft to one remote Target (issue #223).
+
+    Holds the queue pair, the Target arena's GPU rows and host completion
+    records (remote addresses and keys), and a registered GPU mirror of the
+    arena rows that serves as the GPUDirect WRITE source: a row for slot s is
+    copied there on the push stream, and slot s is reused only after the
+    Target freed it, which needs the record that this leg posts after the
+    row, so the mirror row is never rewritten under a pending WRITE.
+    Not thread-safe: the scheduler thread owns it; only the native post may
+    run on a CUDA host-function thread."""
 
     def __init__(self, *, host: str, port: int, device: torch.device,
                  draft_instance_id: str, draft_session_id: str) -> None:
@@ -1469,34 +1524,136 @@ class DraftRdmaPusher:
             leg=LEG_PUSH, host=host, port=port, device_index=_index(device),
             draft_instance_id=draft_instance_id, draft_session_id=draft_session_id,
         )
+        self._mirror_mr: MemoryRegion | None = None
+        self._groups: dict[int, CandidateGroup] = {}
+        # Retired (completed or failed) groups whose native post has not
+        # written its status yet: their descriptors must outlive it.
+        self._unposted: list[CandidateGroup] = []
+        self._tickets = itertools.count(1)
+        self._pending_wrs = 0
+        self._broken: BaseException | None = None
         try:
             conn = self._conn
-            conn.qp = conn.device.queue_pair(conn.send_cq, conn.send_cq, max_send=4, max_recv=1)
+            # One completion per group at most, so the queue depth bounds
+            # them too.
+            conn.send_cq.close()
+            conn.send_cq = conn.device.completion_queue(PUSH_SEND_DEPTH)
+            conn.qp = conn.device.queue_pair(
+                conn.send_cq, conn.send_cq, max_send=PUSH_SEND_DEPTH, max_recv=1
+            )
             remote = conn.connect({})
-            self._staging_addr = int(remote["staging_addr"])
-            self._staging_rkey = int(remote["staging_rkey"])
-            self._stride = int(remote["record_stride"])
+            self._arena_addr = int(remote["arena_addr"])
+            self._arena_rkey = int(remote["arena_rkey"])
+            self._record_addr = int(remote["record_addr"])
+            self._record_rkey = int(remote["record_rkey"])
             self._slot_count = int(remote["slot_count"])
             self.row_width = int(remote["row_width"])
+            self._mirror = torch.zeros(
+                (self._slot_count, self.row_width), dtype=torch.int32, device=device
+            )
+            self._mirror_mr = conn.device.register(
+                self._mirror.data_ptr(), self._mirror.nbytes, remote=0
+            )
         except Exception:
             self.close()
             raise
 
-    def push(self, slot_id: int, record: bytes) -> None:
-        if slot_id >= self._slot_count or len(record) > self._stride:
-            raise RdmaTransportError("candidate record does not fit the staging slot")
-        self._conn.qp.post_write_imm(
-            record, self._staging_addr + slot_id * self._stride,
-            self._staging_rkey, slot_id,
+    def mirror_row(self, slot_id: int) -> int:
+        """Device address of the mirror row the push copies slot ``slot_id`` into."""
+
+        if not 0 <= slot_id < self._slot_count:
+            raise RdmaTransportError("candidate slot is outside the Target arena")
+        return self._mirror.data_ptr() + slot_id * self.row_width * 4
+
+    def group(self, rows) -> CandidateGroup:
+        """Describe one group: ``rows`` are ``(slot_id, with_row, record)``
+        with ``record`` the slot's eight completion-record words."""
+
+        if self._broken is not None:
+            group = CandidateGroup(self, np.zeros(64, np.uint8), 0, 0)
+            group.error = self._broken
+            return group
+        wrs = sum(3 if with_row else 2 for _slot, with_row, _record in rows)
+        deadline = time.monotonic() + RDMA_OP_TIMEOUT_S
+        while self._pending_wrs + wrs > PUSH_SEND_DEPTH:
+            # Queue full: earlier groups' host functions run as the push
+            # stream advances, then their completions free the queue.
+            self.reap(1_000_000)
+            if self._broken is not None:
+                return self.group(rows)
+            if time.monotonic() >= deadline:
+                raise RdmaTransportError("candidate push queue pair did not drain")
+        buffer = np.zeros(
+            CANDIDATE_GROUP_HEADER.itemsize + len(rows) * CANDIDATE_GROUP_ROW.itemsize,
+            dtype=np.uint8,
         )
-        _wait_one(
-            self._conn.send_cq,
-            "candidate WRITE_WITH_IMM",
-            time.monotonic() + RDMA_OP_TIMEOUT_S,
-        )
+        ticket = next(self._tickets)
+        header = buffer[: CANDIDATE_GROUP_HEADER.itemsize].view(CANDIDATE_GROUP_HEADER)
+        header["qp"] = self._conn.qp.handle
+        header["wr_id"] = ticket
+        header["data_rkey"] = self._arena_rkey
+        header["record_rkey"] = self._record_rkey
+        header["source_lkey"] = self._mirror_mr.lkey
+        header["rows"] = len(rows)
+        header["status"] = _GROUP_PENDING
+        table = buffer[CANDIDATE_GROUP_HEADER.itemsize :].view(CANDIDATE_GROUP_ROW)
+        row_nbytes = self.row_width * 4
+        for index, (slot_id, with_row, record) in enumerate(rows):
+            entry = table[index]
+            if with_row:
+                entry["source_addr"] = self.mirror_row(slot_id)
+                entry["nbytes"] = row_nbytes
+            elif not 0 <= slot_id < self._slot_count:
+                raise RdmaTransportError("candidate slot is outside the Target arena")
+            entry["data_addr"] = self._arena_addr + slot_id * row_nbytes
+            entry["record_addr"] = self._record_addr + slot_id * COMPLETION_RECORD_BYTES
+            entry["record"] = record
+        group = CandidateGroup(self, buffer, ticket, wrs)
+        self._groups[ticket] = group
+        self._pending_wrs += wrs
+        return group
+
+    def reap(self, timeout_ns: int = 0) -> None:
+        if self._unposted:
+            self._unposted = [
+                group
+                for group in self._unposted
+                if int(group.header["status"]) == _GROUP_PENDING
+            ]
+        if self._broken is not None or not self._groups:
+            return
+        for ticket, status, _opcode, _imm, _qpn in self._conn.send_cq.poll(timeout_ns):
+            if status != _IBV_WC_SUCCESS:
+                self._fail(
+                    RdmaTransportError(f"candidate WRITE completed with status {status}")
+                )
+                return
+            group = self._groups.pop(ticket, None)
+            if group is not None:
+                group.done = True
+                self._pending_wrs -= group.wrs
+                if int(group.header["status"]) == _GROUP_PENDING:
+                    self._unposted.append(group)
+
+    def _fail(self, error: BaseException) -> None:
+        """A failed post or completion: the queue pair is unusable, so every
+        unfinished group and every later one fails."""
+
+        if self._broken is None:
+            self._broken = error
+        for group in self._groups.values():
+            if group.error is None:
+                group.error = self._broken
+            if int(group.header["status"]) == _GROUP_PENDING:
+                self._unposted.append(group)
+        self._groups.clear()
+        self._pending_wrs = 0
 
     def close(self) -> None:
         self._conn.close()
+        if self._mirror_mr is not None:
+            self._mirror_mr.close()
+            self._mirror_mr = None
         self._conn.device.close()
 
 
