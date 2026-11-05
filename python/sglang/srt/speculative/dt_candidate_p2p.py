@@ -2513,6 +2513,21 @@ class DraftCandidatePushTransport:
         self._remote_pinned: list[torch.Tensor] = []
         self._remote_pinned_lock = Lock()
         self._closed = False
+        # Cumulative scheduler-thread wall time in submit() per push lane
+        # (issue #222); the Draft's throttled stats line samples these.
+        # cross_host splits into stage (pinned arena + D2H copies + ready
+        # record) and handoff (header/metadata build + sender-queue puts) so
+        # the table shows exactly what the #223 GPUDirect return removes.
+        self.submit_lane_ns = {
+            "same_host": 0,
+            "cross_host": 0,
+            "cross_host_stage": 0,
+            "cross_host_handoff": 0,
+        }
+        # Cumulative sender-thread wall per staged row, split into the D2H
+        # staging wait and the tobytes + WRITE_WITH_IMM push (issue #222);
+        # off-loop memo, sampled by the same stats line.
+        self.sender_ns = {"wait": 0, "push": 0}
         self._ring_debug: _RingDebugLog | None = (
             _RingDebugLog(f"draft-push:{draft_instance_id}") if RING_DEBUG else None
         )
@@ -2981,6 +2996,7 @@ class DraftCandidatePushTransport:
         return acknowledgements
 
     def submit(self, *, tasks: list[object], candidates: torch.Tensor) -> CandidatePush:
+        lane_started_ns = time.monotonic_ns()
         if self._closed:
             raise CandidateTransportError("candidate push transport is closed")
         if not tasks or tuple(candidates.shape) != (
@@ -3062,10 +3078,12 @@ class DraftCandidatePushTransport:
             publications.append(
                 (task, destination, metadata_address, record_address, kind)
             )
+        lane_local_built_ns = time.monotonic_ns()
         for target_instance_id, indices in remote_groups.items():
             remote_batch = self._enqueue_remote_group(
                 target_instance_id, indices, tasks, candidates, remote_batch
             )
+        lane_remote_staged_ns = time.monotonic_ns()
         stream = torch.cuda.current_stream(self.device)
         start_event = (
             torch.cuda.Event(enable_timing=True)
@@ -3094,6 +3112,11 @@ class DraftCandidatePushTransport:
             )
             if finalize:
                 self._record_remote_batch(remote_batch)
+        lane_done_ns = time.monotonic_ns()
+        self.submit_lane_ns["same_host"] += (lane_local_built_ns - lane_started_ns) + (
+            lane_done_ns - lane_remote_staged_ns
+        )
+        self.submit_lane_ns["cross_host"] += lane_remote_staged_ns - lane_local_built_ns
         return CandidatePush(
             event=event,
             transfer_ids=tuple(task.transfer_id for task in tasks),
@@ -3150,6 +3173,7 @@ class DraftCandidatePushTransport:
         row_numel = int(candidates.shape[1])
         if batch is None:
             batch = _RemotePushBatch()
+        stage_started_ns = time.monotonic_ns()
         arena = _RemotePinnedArena(
             self._acquire_remote_pinned(len(indices) * row_numel), len(indices)
         )
@@ -3172,6 +3196,8 @@ class DraftCandidatePushTransport:
                 batch.item_done()
             self._release_remote_pinned(arena.tensor)
             raise
+        handoff_started_ns = time.monotonic_ns()
+        self.submit_lane_ns["cross_host_stage"] += handoff_started_ns - stage_started_ns
         self._ensure_remote_sender(target_instance_id)
         work_queue = self._remote_queues[target_instance_id]
         queued = 0
@@ -3203,6 +3229,9 @@ class DraftCandidatePushTransport:
             for _ in range(len(indices) - queued):
                 arena.release_row(self._release_remote_pinned)
             raise
+        self.submit_lane_ns["cross_host_handoff"] += (
+            time.monotonic_ns() - handoff_started_ns
+        )
         return batch
 
     def _enqueue_remote_tombstone(
@@ -3275,11 +3304,14 @@ class DraftCandidatePushTransport:
                 if item is None:
                     return
                 ready, pinned, arena, header, metadata, batch, nbytes = item
+                item_started_ns = time.monotonic_ns()
+                staging_waited_ns = item_started_ns
                 try:
                     if connect_error is not None:
                         raise connect_error
                     if ready is not None:
                         ready.synchronize()
+                    staging_waited_ns = time.monotonic_ns()
                     pusher.push(
                         header["slot_id"],
                         encode_candidate_record(
@@ -3308,6 +3340,9 @@ class DraftCandidatePushTransport:
                         arena.release_row(self._release_remote_pinned)
                     elif pinned is not None:
                         self._release_remote_pinned(pinned)
+                    item_done_ns = time.monotonic_ns()
+                    self.sender_ns["wait"] += staging_waited_ns - item_started_ns
+                    self.sender_ns["push"] += item_done_ns - staging_waited_ns
                 if finalize:
                     try:
                         self._record_remote_batch(batch)

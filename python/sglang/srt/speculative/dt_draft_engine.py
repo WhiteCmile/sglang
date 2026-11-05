@@ -11,7 +11,7 @@ import signal
 import time
 import uuid
 from array import array
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
@@ -959,6 +959,14 @@ class FlashMTPDraftEngine:
         # DFlash proposal batch, read by the throttled stats line below.
         self._last_step_ns = 0
         self._last_stats_log_ns = 0
+        # Loop-stage accounting (issue #222): cumulative scheduler-thread wall
+        # time and call count per named loop stage, sampled into the throttled
+        # stats line so a load point decomposes the Draft loop without
+        # tracing.  Stage names are fixed at their call sites.
+        self._loop_iters = 0
+        self._loop_wall_ns = 0
+        self._loop_stage_ns: dict[str, int] = defaultdict(int)
+        self._loop_stage_calls: dict[str, int] = defaultdict(int)
         self._data_dir = Path(data_dir).absolute()
         self._published_by_batch: dict[str, PublishedResult] = {}
         self._published_by_range: dict[tuple[str, str, int, int, int, int], str] = {}
@@ -2149,6 +2157,25 @@ class FlashMTPDraftEngine:
         head.weight = torch.nn.Parameter(weight, requires_grad=False)
         return head.to(self.device)
 
+    def _loop_stage(self, name: str, fn, *args):
+        """Time one scheduler-loop stage into the cumulative stats buckets."""
+        started_ns = time.monotonic_ns()
+        result = fn(*args)
+        self._loop_stage_ns[name] += time.monotonic_ns() - started_ns
+        self._loop_stage_calls[name] += 1
+        return result
+
+    def _push_transport_progress(self) -> None:
+        transport = self._candidate_push_transport
+        transport.progress_completions()
+        if self._profile_active:
+            for acknowledgement in transport.pop_acknowledgements():
+                profile_emit(
+                    "draft_candidate_notice_ack",
+                    draft_instance=self.instance_id,
+                    **acknowledgement,
+                )
+
     def run(self) -> None:
         logger.info("DT Draft engine serving")
         observer = None
@@ -2158,70 +2185,75 @@ class FlashMTPDraftEngine:
             observer = create(self.instance_id, "draft", 0, 1)
         self._overlap_fix_observer = observer
         while not self._stop:
+            iter_started_ns = time.monotonic_ns()
             if observer is not None:
                 observer.checkpoint()
-            self._poll_messages()
+            self._loop_stage("poll_messages", self._poll_messages)
             if self._candidate_push_transport is not None:
-                self._candidate_push_transport.progress_completions()
-                if self._profile_active:
-                    for acknowledgement in (
-                        self._candidate_push_transport.pop_acknowledgements()
-                    ):
-                        profile_emit(
-                            "draft_candidate_notice_ack",
-                            draft_instance=self.instance_id,
-                            **acknowledgement,
-                        )
+                self._loop_stage("push_progress", self._push_transport_progress)
             if self._stop:
                 break
             if self._ring_worker is not None or self._remote_ring_endpoints:
-                self._poll_direct_rings()
-            self._flush_confirmed_results()
+                self._loop_stage("poll_rings_head", self._poll_direct_rings)
+            self._loop_stage("flush_confirmed", self._flush_confirmed_results)
             if self._uses_direct_gpu_source:
-                self._poll_feature_batches()
+                self._loop_stage("poll_feature_batches", self._poll_feature_batches)
                 if self._stop:
                     break
                 # Input preparation is independent of final compute
                 # membership. Fill at most one free bounded arena per turn.
-                preparation = self._take_batch()
+                preparation = self._loop_stage("take_batch", self._take_batch)
                 if preparation:
-                    self._execute_batch(preparation)
+                    self._loop_stage(
+                        "execute_batch", self._execute_batch, preparation
+                    )
                     # A pull that completed during the take/submit above is
                     # promoted here, at the next point the loop already
                     # passes, instead of after the tail and the next
                     # iteration's head (issue #195). Observing completion
                     # late leaves its admission credit reserved and, under
                     # load, costs a full busy-stretch of this loop thread.
-                    self._poll_feature_batches()
+                    self._loop_stage(
+                        "poll_feature_batches", self._poll_feature_batches
+                    )
                 if self._ring_worker is not None or self._remote_ring_endpoints:
-                    self._poll_direct_rings()
-                ready = self._take_input_ready_batch()
+                    self._loop_stage("poll_rings_mid", self._poll_direct_rings)
+                ready = self._loop_stage(
+                    "take_input_ready", self._take_input_ready_batch
+                )
                 if ready:
-                    self._execute_input_ready_batch(ready)
+                    self._loop_stage(
+                        "host_submit", self._execute_input_ready_batch, ready
+                    )
                     # The host submit above is the longest stage of this
                     # loop; a pull that completed during it promotes here
                     # rather than waiting out the tail and the next head.
-                    self._poll_feature_batches()
+                    self._loop_stage(
+                        "poll_feature_batches", self._poll_feature_batches
+                    )
             elif self._draft_compute_batches_inflight() < 2:
-                batch = self._take_batch()
+                batch = self._loop_stage("take_batch", self._take_batch)
                 if batch:
-                    self._execute_batch(batch)
+                    self._loop_stage("execute_batch", self._execute_batch, batch)
 
             # Publish/retire old results after attempting the next READY
             # submission. This bounded pass on every turn also prevents an
             # endless input stream from starving retirement.
             if getattr(self, "_pending_eagle3_completions", ()):
-                self._poll_eagle3_completions()
+                self._loop_stage("poll_eagle3", self._poll_eagle3_completions)
             if self._uses_direct_gpu_source:
-                self._poll_flashmtp_completions()
+                self._loop_stage("poll_flashmtp", self._poll_flashmtp_completions)
                 if self._is_feature_backed:
+                    # Split internally into dflash_query/publish/retire.
                     self._poll_dflash_completions()
             if self._pending_candidate_pushes:
-                self._poll_candidate_pushes()
+                self._loop_stage("poll_candidate_pushes", self._poll_candidate_pushes)
             if self._ring_worker is not None or self._remote_ring_endpoints:
-                self._poll_direct_rings()
+                self._loop_stage("poll_rings_tail", self._poll_direct_rings)
             if self._held_ring_pushes and self._ring_publish_at_launch:
-                self._retire_tombstoned_ring_pushes()
+                self._loop_stage(
+                    "retire_tombstoned", self._retire_tombstoned_ring_pushes
+                )
 
             if (
                 not self._pending
@@ -2238,10 +2270,12 @@ class FlashMTPDraftEngine:
                     # A completion or direct candidate push is still in flight
                     # on the GPU; observe it soon instead of sleeping the full
                     # idle poll (issue #149).
-                    time.sleep(INFLIGHT_POLL_S)
+                    self._loop_stage("idle_sleep", lambda: time.sleep(INFLIGHT_POLL_S))
                 else:
-                    time.sleep(IDLE_POLL_S)
-            self._maybe_emit_lifecycle_status()
+                    self._loop_stage("idle_sleep", lambda: time.sleep(IDLE_POLL_S))
+            self._loop_stage("lifecycle", self._maybe_emit_lifecycle_status)
+            self._loop_wall_ns += time.monotonic_ns() - iter_started_ns
+            self._loop_iters += 1
 
     @contextlib.contextmanager
     def _direct_push_scope(self, ready_event, *sources: torch.Tensor):
@@ -2570,7 +2604,9 @@ class FlashMTPDraftEngine:
                     continue
                 task = decoder.decode(entry.payload)
                 self._accept_ring_task(endpoint, entry, task, DraftTaskKind)
+        admit_started_ns = time.monotonic_ns()
         self._admit_ring_tasks()
+        self._loop_stage_ns["rings_admit"] += time.monotonic_ns() - admit_started_ns
         self._collect_rid_evictions()
         if self._ring_waiting:
             now_ns = time.monotonic_ns()
@@ -2585,6 +2621,7 @@ class FlashMTPDraftEngine:
                     error = TimeoutError("direct ring copy did not arrive in time")
                     error.resources_quiescent = False
                     self._publish_failures([(task, error)])
+        landing_started_ns = time.monotonic_ns()
         pending_frees = self._landing_free_pending
         while pending_frees and pending_frees[0][1].query():
             index, _event = pending_frees.popleft()
@@ -2596,6 +2633,9 @@ class FlashMTPDraftEngine:
                 self._landing_slot_base + index, 0
             ) == 0 and not any(item[0] == index for item in pending_frees):
                 self._free_landing(index)
+        self._loop_stage_ns["rings_landing"] += (
+            time.monotonic_ns() - landing_started_ns
+        )
 
     def _accept_ring_task(self, endpoint, entry, task, task_kinds) -> None:
         if (
@@ -6518,6 +6558,13 @@ class FlashMTPDraftEngine:
             self._queue_early_candidate_push(
                 proposal_tasks, candidates, completion.completion_event
             )
+        stage_ns = self._loop_stage_ns
+        stage_ns["submit_task_prepare"] += tasks_prepared_ns - launch_started_ns
+        stage_ns["submit_metadata"] += proposal_metadata_ready_ns - tasks_prepared_ns
+        stage_ns["submit_launch"] += (
+            completion.launched_ns - proposal_metadata_ready_ns
+        )
+        self._loop_stage_calls["submit_task_prepare"] += 1
 
     def _register_dflash_completion(
         self,
@@ -7055,6 +7102,7 @@ class FlashMTPDraftEngine:
             return
         capacity_changed = False
         while self._pending_dflash_completions:
+            stage_started_ns = time.monotonic_ns()
             completion = self._pending_dflash_completions[0]
             try:
                 ready = completion.completion_event.query()
@@ -7133,6 +7181,9 @@ class FlashMTPDraftEngine:
             # feature materialization (materialize_start -> materialize_done)
             # and proposal execution (materialize_done -> proposal_done).
             self._last_step_ns = gpu_materialization_ns + proposal_gpu_ns
+            stage_query_ns = time.monotonic_ns()
+            self._loop_stage_ns["dflash_query"] += stage_query_ns - stage_started_ns
+            self._loop_stage_calls["dflash_query"] += 1
             profile_emit(
                 "draft_dflash_batch_complete",
                 draft_instance=self.instance_id,
@@ -7246,6 +7297,8 @@ class FlashMTPDraftEngine:
                         ],
                         candidate_payload,
                     )
+            stage_publish_ns = time.monotonic_ns()
+            self._loop_stage_ns["dflash_publish"] += stage_publish_ns - stage_query_ns
             for task in active_tasks:
                 profile_emit(
                     "draft_kv_materialization",
@@ -7292,6 +7345,9 @@ class FlashMTPDraftEngine:
             )
             for handle in {task.draft_kv_handle for task in tasks}:
                 self._drain_deferred_persistent_release(handle)
+            self._loop_stage_ns["dflash_retire"] += (
+                time.monotonic_ns() - stage_publish_ns
+            )
             capacity_changed = True
         if capacity_changed:
             self._publish_capacity()
@@ -10342,12 +10398,14 @@ class FlashMTPDraftEngine:
         self._last_stats_log_ns = now_ns
         from dt_protocol import DT_DRAFT_STATS_MARKER
 
+        push_transport = self._candidate_push_transport
         logger.info(
             "%s%s",
             DT_DRAFT_STATS_MARKER,
             json.dumps(
                 {
                     "instance": self.instance_id,
+                    "observed_ns": now_ns,
                     "pending": pending_tasks,
                     "max_pending": self.max_pending_tasks,
                     "queue_delay_ms": round(self._last_queue_delay_ns / 1e6, 3),
@@ -10357,6 +10415,28 @@ class FlashMTPDraftEngine:
                     # shared landing buffer was busy (cumulative).
                     "ring_landing_stalls": (
                         0 if self._ring_worker is None else self._ring_worker.landing_stalls
+                    ),
+                    # Loop-stage decomposition (issue #222): cumulative ns and
+                    # call counts per stage since process start; a windowed
+                    # diff of two samples gives ms per loop iteration.
+                    "loop_iters": self._loop_iters,
+                    "loop_wall_ns": self._loop_wall_ns,
+                    "loop_stage_ns": dict(self._loop_stage_ns),
+                    "loop_stage_calls": dict(self._loop_stage_calls),
+                    "push_lane_ns": (
+                        None
+                        if push_transport is None
+                        else dict(
+                            getattr(push_transport, "submit_lane_ns", None) or {}
+                        )
+                    ),
+                    # Off-loop memo: cross-host sender-thread wall split into
+                    # D2H staging wait and tobytes + WRITE_WITH_IMM push; the
+                    # #223 GPUDirect return removes this whole path.
+                    "push_sender_ns": (
+                        None
+                        if push_transport is None
+                        else dict(getattr(push_transport, "sender_ns", None) or {})
                     ),
                 },
                 sort_keys=True,
