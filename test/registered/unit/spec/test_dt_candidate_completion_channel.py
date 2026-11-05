@@ -310,7 +310,11 @@ def make_completion_arena(slot_count=1):
     arena._completion_words = np.zeros((slot_count, COMPLETION_RECORD_WORDS), dtype=np.uint64)
     arena._record_generation = np.zeros(slot_count, dtype=np.uint32)
     arena._record_seq_expected = np.zeros(slot_count, dtype=np.uint64)
+    arena._record_hash_expected = np.zeros(slot_count, dtype=np.uint64)
     arena._record_tag = np.zeros(slot_count, dtype=np.uint32)
+    arena._scanned_slot_epoch = 0
+    arena._release_scan = (-1, True)
+    arena._cancel_scan = (-1, True)
     arena._recent_notice_keys = deque()
     arena._recent_notice_set = set()
     arena._recent_notice_limit = 100
@@ -341,6 +345,7 @@ def arm_completion_slot(
     arena._active[transfer_id] = slot_id
     arena._record_generation[slot_id] = generation
     arena._record_seq_expected[slot_id] = nonce
+    arena._record_hash_expected[slot_id] = transfer_id_hash(transfer_id)
     arena._record_tag[slot_id] = producer_tag(session)
 
 
@@ -876,6 +881,9 @@ def make_observed_arena(slot_count=2):
         ready_words=ready_words,
         record_seq_expected=arena._record_seq_expected,
         record_generation=arena._record_generation,
+        record_hash_expected=arena._record_hash_expected,
+        record_tag=arena._record_tag,
+        row_width=ROW_WIDTH,
     )
     arena._observer = observer
     arena._observer_dropped_seen = 0
