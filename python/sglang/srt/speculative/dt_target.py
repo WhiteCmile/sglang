@@ -707,9 +707,9 @@ class DTTargetController:
         # recorded, and the set is pruned with that set, so it cannot grow
         # past the pending-round population.
         self._remote_source_proof_landed: set[str] = set()
-        # Pairs the RDMA completion thread (on_landed_push ->
-        # _consume_remote_source_proof) with the scheduler thread
-        # (retirement, Coordinator ACK cleanup) on the proof/retirement
+        # Pairs the arena's record consumption (remote_record_listener ->
+        # _consume_remote_source_proof, issue #223) with retirement and the
+        # Coordinator ACK cleanup on the proof/retirement
         # handshake: the waiter registry, the early-proof cache, and the
         # unconfirmed-round set must be checked and mutated in one critical
         # section, otherwise a landed proof is lost between two checks or
@@ -6770,10 +6770,11 @@ class DTTargetController:
     def _consume_remote_source_proof(self, transfer_id: str) -> None:
         """Retire a retired-unaccepted remote round's source lease.
 
-        The push leg lands a candidate record — a cancelled tombstone (valid
-        length 0) or a successful row — only after the arena authenticated
-        it against the destination slot's generation, nonce, and producer
-        tag, so the round's source read is complete or never started:
+        The arena reports a cross-host candidate record — a cancelled
+        tombstone (valid length 0) or a successful row — only after it
+        authenticated it against the destination slot's generation, nonce,
+        and producer tag, so the round's source read is complete or never
+        started:
         either way the lease is quiescent and the bounded pool reclaims it
         here.  A proof that lands while its round has no waiter here (the
         Coordinator never accepted it, so its copy can sit in _pending_send
@@ -6786,8 +6787,8 @@ class DTTargetController:
         retirement = getattr(self, "_remote_source_retirement", None)
         if retirement is None:
             return
-        # Runs on the RDMA completion thread; the scheduler thread mutates
-        # the same tables in retirement and ACK cleanup.  The waiter lookup,
+        # Runs from the arena's record consumption; retirement and ACK
+        # cleanup mutate the same tables.  The waiter lookup,
         # the unconfirmed-marker check, and the cache insert must be one
         # critical section, else a proof is lost between the waiter check
         # and the cache insert, or recorded after the ACK cleanup (CI
