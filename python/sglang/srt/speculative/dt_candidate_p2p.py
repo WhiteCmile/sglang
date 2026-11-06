@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import ctypes
 import fcntl
+import functools
 import hashlib
 import logging
 import mmap
@@ -50,6 +51,7 @@ import subprocess
 import time
 import uuid
 import zlib
+from array import array
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import StrEnum
@@ -99,6 +101,10 @@ READY_RECORD_WORDS = 8
 READY_RECORD_BYTES = READY_RECORD_WORDS * 4
 PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
+# Issue #244: issue each push's stream work (copies, publish words, the
+# cross-host post, the completion record) from a native worker thread
+# instead of the Draft scheduler thread.
+PUBLISH_WORKER = os.environ.get("DT_PUBLISH_WORKER", "0") == "1"
 # Publication selectors for one pushed row: which host record the row's
 # memop sequence writes after the five reservation metadata words.
 _RECORD_KIND_COMPLETION = 1
@@ -220,6 +226,71 @@ def _build_record_observer_library() -> Path:
         ["--version"],
         "DT_RECORD_OBSERVER_BUILD_DIR",
     )
+
+
+class _PublishWorker:
+    """ctypes owner of the native candidate publish worker (issue #244).
+
+    csrc/dt_publish_worker.cpp: one thread with its own CUDA stream issues
+    each push's precomputed job (event wait, copies, publish words, host
+    post, event re-record) in FIFO order.  The scheduler thread is its only
+    producer; every decision is made before the handoff.
+    """
+
+    def __init__(self, *, device_index: int, priority: int) -> None:
+        from sglang.srt.speculative.dt_direct_ring import _build_native_library
+
+        source = Path(__file__).with_name("csrc") / "dt_publish_worker.cpp"
+        lib = ctypes.CDLL(
+            str(
+                _build_native_library(
+                    "dt_publish_worker",
+                    source,
+                    [
+                        os.environ.get("CXX", "g++"),
+                        "-O2",
+                        "-std=c++17",
+                        "-shared",
+                        "-fPIC",
+                        "-ldl",
+                        "-lpthread",
+                    ],
+                    ["--version"],
+                    "DT_PUSH_COMPLETION_BUILD_DIR",
+                )
+            )
+        )
+        u64, vp = ctypes.c_uint64, ctypes.c_void_p
+        lib.dt_publish_worker_create.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.dt_publish_worker_create.restype = vp
+        lib.dt_publish_worker_submit.argtypes = [vp, vp, u64]
+        lib.dt_publish_worker_submit.restype = u64
+        lib.dt_publish_worker_status.argtypes = [vp, u64]
+        lib.dt_publish_worker_status.restype = ctypes.c_int
+        lib.dt_publish_worker_drain.argtypes = [vp]
+        lib.dt_publish_worker_drain.restype = ctypes.c_int
+        lib.dt_publish_worker_destroy.argtypes = [vp]
+        lib.dt_publish_worker_destroy.restype = ctypes.c_int
+        handle = lib.dt_publish_worker_create(device_index, priority)
+        if not handle:
+            raise CandidateTransportError("candidate publish worker failed to start")
+        self._lib = lib
+        self._handle = ctypes.c_void_p(handle)
+        self.status = functools.partial(lib.dt_publish_worker_status, self._handle)
+
+    def submit(self, job: array) -> int:
+        """Queue one job (u64 words, see the .cpp layout); returns its ticket."""
+
+        address, count = job.buffer_info()
+        ticket = self._lib.dt_publish_worker_submit(self._handle, address, count)
+        if not ticket:
+            raise CandidateTransportError("candidate publish worker is broken")
+        return ticket
+
+    def close(self) -> None:
+        rc = self._lib.dt_publish_worker_destroy(self._handle)
+        if rc:
+            raise CandidateTransportError(f"candidate publish worker drain failed ({rc})")
 
 
 class _RecordObserver:
@@ -2340,6 +2411,37 @@ class _RemotePushEvent(torch.cuda.Event):
                 group.pusher.reap(1_000_000)
 
 
+class _WorkerPushEvent(_RemotePushEvent):
+    """Completion event of a push the publish worker issues (issue #244).
+
+    The scheduler thread records it on the submitting stream; the worker
+    waits on that record, issues the push, and re-records it.  The first
+    record may already be complete, so query() stays False until the worker
+    reports the re-record issued (the recorded gate of #222), and a failed
+    job raises, like a failed RDMA group.
+    """
+
+    def gate(self, worker: _PublishWorker, ticket: int) -> None:
+        self._worker = worker
+        self._ticket = ticket
+
+    def _issued(self) -> bool:
+        status = self._worker.status(self._ticket)
+        if status < 0:
+            raise CandidateTransportError(
+                f"candidate publish worker failed (CUDA error {-status})"
+            )
+        return status == 1
+
+    def query(self) -> bool:
+        return self._issued() and super().query()
+
+    def synchronize(self) -> None:
+        while not self._issued():
+            time.sleep(0)
+        super().synchronize()
+
+
 class _FailedGroup:
     """A cross-host group that can never complete: its push leg is missing."""
 
@@ -2402,6 +2504,13 @@ class DraftCandidatePushTransport:
         # Completed candidates are pushed here rather than on the compute
         # stream, where they would queue behind the next Draft batch.
         self.push_stream = torch.cuda.Stream(device=self.device)
+        self._publish_worker = (
+            _PublishWorker(
+                device_index=self.device_index, priority=self.push_stream.priority
+            )
+            if PUBLISH_WORKER
+            else None
+        )
         # Cross-host pushes (issue #223): one GPUDirect push leg per remote
         # Target, connected at its first push; a failed connect fails that
         # Target's pushes for good, like a failed leg.
@@ -2570,29 +2679,22 @@ class DraftCandidatePushTransport:
             for task in tasks
         )
 
-    def _publish_batch_memops(self, publications, stream) -> None:
-        """Publish one batch's rows with per-task cuStreamWriteValue32 memops.
+    def _publication_words(self, publications) -> list[int]:
+        """One batch's publish edges as flat (address, value) pairs, in issue order.
 
         The write sets and word order are the publish edges the Target's
         scans acquire on: the reservation metadata generation last, then the
-        record's payload words and its own release word last.  Memops are
-        stream-ordered after the candidate copy and need no SMs, so the
-        publication never competes with the proposal kernels (issue #208
-        round 3).
+        record's payload words and its own release word last.  They are
+        issued as cuStreamWriteValue32 memops, stream-ordered after the
+        candidate copy; memops need no SMs, so the publication never competes
+        with the proposal kernels (issue #208 round 3).
         """
-        write_value32 = self._runtime._stream_write_value32
-        if write_value32 is None:
-            raise CandidateTransportError("cuStreamWriteValue32 is unavailable")
-        check_driver = self._runtime._check_driver
-        c_stream = ctypes.c_void_p(stream.cuda_stream)
-        c_uint64 = ctypes.c_uint64
-        c_uint32 = ctypes.c_uint32
-        c_zero = ctypes.c_uint(0)
+        words: list[int] = []
         for task, destination, metadata_address, record_address, kind in (
             publications
         ):
             nonce = int(destination.authorization_nonce)
-            words = (
+            meta = (
                 (NONCE_LOW_WORD, nonce & 0xFFFFFFFF),
                 (NONCE_HIGH_WORD, (nonce >> 32) & 0xFFFFFFFF),
                 (VALID_LENGTH_WORD, destination.row_width),
@@ -2600,26 +2702,15 @@ class DraftCandidatePushTransport:
                 # Publish generation last: the Target wait is the acquire edge.
                 (GENERATION_WORD, destination.generation),
             )
-            for word, value in words:
-                rc = write_value32(
-                    c_stream, c_uint64(metadata_address + word * 4), c_uint32(value), c_zero
-                )
-                if rc:
-                    check_driver(rc, "cuStreamWriteValue32")
+            for word, value in meta:
+                words += (metadata_address + word * 4, value)
             if kind == _RECORD_KIND_READY:
                 for word, value in (
-                    *words[:-1],
+                    *meta[:-1],
                     (PRODUCER_TAG_WORD, self._producer_tag),
-                    words[-1],
+                    meta[-1],
                 ):
-                    rc = write_value32(
-                        c_stream,
-                        c_uint64(record_address + word * 4),
-                        c_uint32(value),
-                        c_zero,
-                    )
-                    if rc:
-                        check_driver(rc, "cuStreamWriteValue32")
+                    words += (record_address + word * 4, value)
             if kind == _RECORD_KIND_COMPLETION:
                 # 64-byte completion record: payload words first, produced
                 # and offset zeroed (a memop cannot sample %globaltimer, so
@@ -2644,14 +2735,24 @@ class DraftCandidatePushTransport:
                     (4, (nonce >> 32) & 0xFFFFFFFF),
                     (0, nonce & 0xFFFFFFFF),
                 ):
-                    rc = write_value32(
-                        c_stream,
-                        c_uint64(record_address + byte_offset),
-                        c_uint32(value),
-                        c_zero,
-                    )
-                    if rc:
-                        check_driver(rc, "cuStreamWriteValue32")
+                    words += (record_address + byte_offset, value)
+        return words
+
+    def _publish_batch_memops(self, publications, stream) -> None:
+        """Issue one batch's publish words from this thread, in order."""
+        write_value32 = self._runtime._stream_write_value32
+        if write_value32 is None:
+            raise CandidateTransportError("cuStreamWriteValue32 is unavailable")
+        check_driver = self._runtime._check_driver
+        c_stream = ctypes.c_void_p(stream.cuda_stream)
+        c_uint64 = ctypes.c_uint64
+        c_uint32 = ctypes.c_uint32
+        c_zero = ctypes.c_uint(0)
+        words = iter(self._publication_words(publications))
+        for address, value in zip(words, words):
+            rc = write_value32(c_stream, c_uint64(address), c_uint32(value), c_zero)
+            if rc:
+                check_driver(rc, "cuStreamWriteValue32")
 
     def _mapping(self, destination):
         mapped = self._registered.get(self._registration_key(destination))
@@ -2986,22 +3087,31 @@ class DraftCandidatePushTransport:
         )
         if start_event is not None:
             start_event.record(stream)
-        if segments:
-            self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
-        if publications:
-            self._publish_batch_memops(publications, stream)
-        if remote_rows:
-            from sglang.srt.speculative.dt_rdma import CandidatePost
-
+        if getattr(self, "_publish_worker", None) is not None:
             remote_started_ns = time.monotonic_ns()
-            groups = self._remote_groups(remote_rows)
-            CandidatePost(groups).launch(stream)
-            event = _RemotePushEvent(enable_timing=start_event is not None)
-            event.watch(groups)
+            groups = self._remote_groups(remote_rows) if remote_rows else []
             cross_host_ns += time.monotonic_ns() - remote_started_ns
+            event = self._submit_to_worker(
+                stream, segments, publications, groups,
+                enable_timing=start_event is not None,
+            )
         else:
-            event = torch.cuda.Event(enable_timing=start_event is not None)
-        event.record(stream)
+            if segments:
+                self._runtime.copy_batch_async(tuple(segments), stream.cuda_stream)
+            if publications:
+                self._publish_batch_memops(publications, stream)
+            if remote_rows:
+                from sglang.srt.speculative.dt_rdma import CandidatePost
+
+                remote_started_ns = time.monotonic_ns()
+                groups = self._remote_groups(remote_rows)
+                CandidatePost(groups).launch(stream)
+                event = _RemotePushEvent(enable_timing=start_event is not None)
+                event.watch(groups)
+                cross_host_ns += time.monotonic_ns() - remote_started_ns
+            else:
+                event = torch.cuda.Event(enable_timing=start_event is not None)
+            event.record(stream)
         lane_done_ns = time.monotonic_ns()
         self.submit_lane_ns["cross_host"] += cross_host_ns
         self.submit_lane_ns["same_host"] += lane_done_ns - lane_started_ns - cross_host_ns
@@ -3013,6 +3123,35 @@ class DraftCandidatePushTransport:
             cold_mapping_count=cold,
             start_event=start_event,
         )
+
+    def _submit_to_worker(
+        self, stream, segments, publications, groups, *, enable_timing: bool
+    ) -> _WorkerPushEvent:
+        """Hand one push's stream work to the publish worker (issue #244).
+
+        Everything is decided here; the worker only issues it.  The event
+        recorded on ``stream`` orders the job after the work already queued
+        there (the candidate rows), and the job lists the copies, the publish
+        words and the cross-host post in the order the inline path issues
+        them; the worker's re-record of the event is the push's completion.
+        """
+        from sglang.srt.speculative.dt_rdma import CandidatePost
+
+        event = _WorkerPushEvent(enable_timing=enable_timing)
+        event.watch(groups)
+        event.record(stream)
+        host_fn, host_arg = CandidatePost(groups).host_call()
+        words = self._publication_words(publications)
+        job = array(
+            "Q", (event.cuda_event, len(segments), len(words) // 2, host_fn, host_arg)
+        )
+        for segment in segments:
+            job.extend(
+                (segment.destination_address, segment.source_address, segment.length)
+            )
+        job.extend(words)
+        event.gate(self._publish_worker, self._publish_worker.submit(job))
+        return event
 
     def _remote_pusher(self, target_instance_id: str):
         """The push leg to one cross-host Target, connected on first use;
@@ -3142,6 +3281,8 @@ class DraftCandidatePushTransport:
         records_by_key = getattr(self, "_ready_records", {})
         # Pushes run on push_stream; their sources and mappings must outlive them.
         self.push_stream.synchronize()
+        if getattr(self, "_publish_worker", None) is not None:
+            self._publish_worker.close()
         for records, _device_base in records_by_key.values():
             self._runtime.host_unregister(records.host_address)
             records.close(unlink=False)

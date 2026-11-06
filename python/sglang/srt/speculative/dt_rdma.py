@@ -1505,6 +1505,13 @@ class CandidatePost:
         if self.groups:
             _lib().dt_rdma_post_candidates(ctypes.c_void_p(self._list.ctypes.data))
 
+    def host_call(self) -> tuple[int, int]:
+        """The native post as (CUhostFn, argument) for another thread to
+        launch on a stream (issue #244); (0, 0) when no group is live."""
+        if not self.groups:
+            return 0, 0
+        return _host_post()[1].value, self._list.ctypes.data
+
 
 class DraftRdmaPusher:
     """Candidate-return leg of one Draft to one remote Target (issue #223).
