@@ -103,8 +103,9 @@ PRODUCER_TAG_WORD = 5
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
 # Issue #244: issue each push's stream work (copies, publish words, the
 # cross-host post, the completion record) from a native worker thread
-# instead of the Draft scheduler thread.
-PUBLISH_WORKER = os.environ.get("DT_PUBLISH_WORKER", "0") == "1"
+# instead of the Draft scheduler thread.  On by default (owner Q17);
+# DT_PUBLISH_WORKER=0 issues them inline on the scheduler thread.
+PUBLISH_WORKER = os.environ.get("DT_PUBLISH_WORKER", "1") == "1"
 # Publication selectors for one pushed row: which host record the row's
 # memop sequence writes after the five reservation metadata words.
 _RECORD_KIND_COMPLETION = 1
