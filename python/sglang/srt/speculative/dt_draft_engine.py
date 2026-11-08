@@ -10506,14 +10506,6 @@ class FlashMTPDraftEngine:
                     if isinstance(message, SourceReadDoneBatch)
                     else self._client.source_read_done(message)
                 )
-                if isinstance(message, SourceReadDoneBatch):
-                    profile_emit(
-                        "draft_source_done_batch_sent",
-                        draft_instance=self.instance_id,
-                        batch_id=message.batch_id,
-                        published_ns=time.monotonic_ns(),
-                        sent=bool(sent),
-                    )
             elif operation == "migration_status":
                 if not isinstance(message, DraftKvMigrationStatus):
                     raise TypeError("invalid migration status outbox payload")
@@ -10529,13 +10521,6 @@ class FlashMTPDraftEngine:
             else:
                 raise RuntimeError(f"unknown Draft delivery operation {operation!r}")
             if not sent:
-                profile_emit(
-                    "draft_outbox_send_blocked",
-                    draft_instance=self.instance_id,
-                    operation=operation,
-                    message_id=message_id,
-                    blocked_ns=time.monotonic_ns(),
-                )
                 break
             self._delivery_outbox.mark_sent(operation, message_id, now_ns=now_ns)
 
@@ -10560,26 +10545,12 @@ class FlashMTPDraftEngine:
             self._held_direct_source_done.setdefault(task.transfer_id, []).append(
                 message
             )
-            profile_emit(
-                "draft_source_done_held",
-                draft_instance=self.instance_id,
-                transfer_id=task.transfer_id,
-                target_instance_id=task.target_instance_id,
-                held_ns=message.completed_ns,
-            )
             return
         self._queue_source_done(message)
 
     def _queue_source_done(self, message) -> None:
         if self.batch_source_read_done:
             self._source_done_pending.append(message)
-            profile_emit(
-                "draft_source_done_queued",
-                draft_instance=self.instance_id,
-                transfer_id=message.transfer_id,
-                target_instance_id=message.target_instance_id,
-                queued_ns=message.completed_ns,
-            )
         else:
             from dt_protocol import SOURCE_READ_DONE, source_read_done_id
 
@@ -10617,20 +10588,6 @@ class FlashMTPDraftEngine:
                 self._source_done_batch_by_entry[entry_id] = message.batch_id
             self._delivery_outbox.add(
                 SOURCE_READ_DONE, source_read_done_id(message), message
-            )
-            profile_emit(
-                "draft_source_done_batch_built",
-                draft_instance=self.instance_id,
-                batch_id=message.batch_id,
-                built_ns=message.sent_ns,
-                entries=len(message.entries),
-                oldest_queued_ns=min(
-                    entry.completed_ns for entry in message.entries
-                ),
-                newest_queued_ns=max(
-                    entry.completed_ns for entry in message.entries
-                ),
-                transfer_ids=tuple(entry.transfer_id for entry in message.entries),
             )
         self._flush_reliable_outbox()
 
