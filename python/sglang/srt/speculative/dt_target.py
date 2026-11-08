@@ -805,11 +805,33 @@ class DTTargetController:
                         if self.is_feature_backed
                         else int(scheduler.max_running_requests)
                     )
+                    # Slot count (issue #260): one slot carries one deferred
+                    # DFlash feature stage, and the pool blocks every Target
+                    # forward while free slots <= pending stages.  The default
+                    # stays max(2, 2 x lanes); DT_FEATURE_SOURCE_SLOTS overrides
+                    # it.  Nothing downstream assumes 2 x lanes: the RDMA
+                    # registration and the ring worker read the real count back
+                    # (dt_rdma.py, dt_ring_worker.cpp).
+                    feature_source_slot_count = max(2, self.pipeline_lanes * 2)
+                    env_slots = os.environ.get("DT_FEATURE_SOURCE_SLOTS")
+                    if env_slots:
+                        try:
+                            feature_source_slot_count = int(env_slots)
+                        except ValueError as exc:
+                            raise ValueError(
+                                "DT_FEATURE_SOURCE_SLOTS must be an integer, "
+                                f"got {env_slots!r}"
+                            ) from exc
+                        if feature_source_slot_count <= 0:
+                            raise ValueError(
+                                "DT_FEATURE_SOURCE_SLOTS must be positive, "
+                                f"got {feature_source_slot_count}"
+                            )
                     self._feature_source_pool = TargetFeatureSourcePool(
                         target_instance_id=self.instance_id,
                         source_session_id=self._client.instance_session_id,
                         device=scheduler.device,
-                        slot_count=max(2, self.pipeline_lanes * 2),
+                        slot_count=feature_source_slot_count,
                         max_tokens=max_source_rows,
                         feature_width=self.pivot_width,
                     )
