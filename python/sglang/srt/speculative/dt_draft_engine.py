@@ -2213,6 +2213,11 @@ class FlashMTPDraftEngine:
                     # iteration's head (issue #195). Observing completion
                     # late leaves its admission credit reserved and, under
                     # load, costs a full busy-stretch of this loop thread.
+                    # A Coordinator dispatch copy that arrived during the
+                    # stage is likewise received here: its ring read-done
+                    # acks release from the direct-confirmation hold at this
+                    # mid-turn poll instead of the next head (issue #261).
+                    self._loop_stage("poll_messages", self._poll_messages)
                     self._loop_stage(
                         "poll_feature_batches", self._poll_feature_batches
                     )
@@ -2228,6 +2233,9 @@ class FlashMTPDraftEngine:
                     # The host submit above is the longest stage of this
                     # loop; a pull that completed during it promotes here
                     # rather than waiting out the tail and the next head.
+                    # Same mid-turn confirmation poll as after execute_batch
+                    # (issue #261).
+                    self._loop_stage("poll_messages", self._poll_messages)
                     self._loop_stage(
                         "poll_feature_batches", self._poll_feature_batches
                     )
