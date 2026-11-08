@@ -658,10 +658,13 @@ class DTTargetController:
         # reach B, the wait reaches T, or nothing is still out at a Draft.
         # A/B (issue #129): a short capped hold (T=10 ms, B=32) merged the
         # tiny verify waves; r24 TPOT p90 41.3 -> 39.1 ms, r20 30.3 -> 29.0 ms.
+        # Default B 32 -> 16 (issue #255, owner-approved from the #250 sweep):
+        # r56 7T2D TPOT p90 23.7/26.7 vs base 26.4-27.7/30.9-31.5 ms and the
+        # traced launch bubble 8.6->5.1 / 11.0->7.4 ms/round.
         self._ready_batch_wait_ns = int(
             float(os.environ.get("DT_TARGET_BATCH_WAIT_MS", "10")) * 1_000_000
         )
-        self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "32"))
+        self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "16"))
         self._ready_hold_started_ns = 0
         # Same-host Target -> owner-Draft descriptor rings (dt_direct_ring).
         # They replace the former ZMQ direct dispatch (DT_DIRECT_DISPATCH).
