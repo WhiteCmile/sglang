@@ -6608,7 +6608,10 @@ class FlashMTPDraftEngine:
             if self._gpu_clock is None:
                 from sglang.srt.speculative.dt_gpu_clock import GpuClock
 
-                self._gpu_clock = GpuClock(self.device)
+                # self.device may carry no index; GpuClock needs one (as T).
+                self._gpu_clock = GpuClock(
+                    torch.device("cuda", torch.cuda.current_device())
+                )
             clock_slot, clock_done = self._gpu_clock.stamp_after(proposal_done)
         candidate_rows_cpu = None
         copy_stream = None
