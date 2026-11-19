@@ -1101,7 +1101,8 @@ def _build_native_library(
     The supported build path for ``speculative/csrc`` is runtime compilation
     with the module's pinned toolchain (the dt_ring_worker.cpp pattern):
     there is no cmake path for this directory.  The cache identity covers the
-    source bytes, the resolved compiler and its version, and every flag.
+    source bytes, the headers beside it, the resolved compiler and its
+    version, and every flag.
     """
 
     cache = Path(os.environ.get(cache_dir_env, Path.home() / ".cache" / name))
@@ -1110,6 +1111,9 @@ def _build_native_library(
     identity = hashlib.sha256()
     identity.update(source.read_bytes())
     identity.update(b"\0")
+    for header in sorted(source.parent.glob("*.h")):
+        identity.update(header.read_bytes())
+        identity.update(b"\0")
     identity.update(_toolchain_tag(resolved, version_args).encode())
     identity.update(b"\0")
     identity.update("\0".join(command[1:]).encode())
@@ -1145,6 +1149,95 @@ def _build_worker_library() -> Path:
         ["--version"],
         "DT_DIRECT_RING_BUILD_DIR",
     )
+
+
+class NativeProbe:
+    """D0 per-hop stamps and driver-call histograms of one native worker
+    (csrc/dt_native_probe.h, issue #269).
+
+    Exists only while the ``draft_native_probe`` profile event is enabled.
+    ``dump`` appends the drained stamps (4 little-endian u64 words each:
+    t_ns, kind | ring << 32, seq, arg) to ``<DT_PROFILE_DIR>/native-<name>-
+    <pid>.stamps`` and emits the cumulative histograms and the name tables
+    as one ``draft_native_probe`` event.  Only the scheduler thread calls it.
+    """
+
+    CAPACITY = 1 << 18  # stamps buffered between two dumps
+
+    def __init__(self, lib, name: str) -> None:
+        u32, u64, vp = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p
+        lib.dt_probe_create.argtypes = [u64]
+        lib.dt_probe_create.restype = vp
+        lib.dt_probe_destroy.argtypes = [vp]
+        lib.dt_probe_drain.argtypes = [vp, vp, u64]
+        lib.dt_probe_drain.restype = u64
+        lib.dt_probe_dropped.argtypes = [vp]
+        lib.dt_probe_dropped.restype = u64
+        lib.dt_probe_histograms.argtypes = [vp, vp]
+        lib.dt_probe_call_count.restype = u32
+        lib.dt_probe_bucket_count.restype = u32
+        lib.dt_probe_bucket_floor.argtypes = [u32]
+        lib.dt_probe_bucket_floor.restype = u64
+        lib.dt_probe_kind_name.argtypes = [u32]
+        lib.dt_probe_kind_name.restype = ctypes.c_char_p
+        lib.dt_probe_call_name.argtypes = [u32]
+        lib.dt_probe_call_name.restype = ctypes.c_char_p
+        self._lib = lib
+        self.name = name
+        self.handle = lib.dt_probe_create(self.CAPACITY)
+        self._buffer = np.empty((self.CAPACITY, 4), dtype=np.uint64)
+        buckets = int(lib.dt_probe_bucket_count())
+        self._calls = [
+            lib.dt_probe_call_name(index).decode()
+            for index in range(int(lib.dt_probe_call_count()))
+        ]
+        self._hist = np.empty((len(self._calls), buckets), dtype=np.uint64)
+        self._floors = [int(lib.dt_probe_bucket_floor(index)) for index in range(buckets)]
+        self._kinds = {}
+        while (label := lib.dt_probe_kind_name(len(self._kinds) + 1)) is not None:
+            self._kinds[len(self._kinds) + 1] = label.decode()
+        self._stamps = 0
+        self.path = Path(os.environ["DT_PROFILE_DIR"]) / f"native-{name}-{os.getpid()}.stamps"
+
+    def dump(self) -> None:
+        from dt_profile import emit
+
+        count = int(self._lib.dt_probe_drain(self.handle, self._buffer.ctypes.data, self.CAPACITY))
+        if count:
+            with open(self.path, "ab") as stamps:
+                self._buffer[:count].tofile(stamps)
+            self._stamps += count
+        self._lib.dt_probe_histograms(self.handle, self._hist.ctypes.data)
+        emit(
+            "draft_native_probe",
+            worker=self.name,
+            stamps_path=str(self.path),
+            stamps=self._stamps,
+            dropped=int(self._lib.dt_probe_dropped(self.handle)),
+            kinds=self._kinds,
+            # call -> [[bucket floor ns, count], ...], cumulative, nonzero only
+            histograms={
+                call: [[self._floors[index], int(row[index])] for index in np.flatnonzero(row)]
+                for call, row in zip(self._calls, self._hist)
+                if row.any()
+            },
+        )
+
+    def close(self) -> None:
+        """Final dump and free; only after the worker thread has stopped."""
+
+        if self.handle:
+            self.dump()
+            self._lib.dt_probe_destroy(self.handle)
+            self.handle = None
+
+
+def native_probe(lib, name: str) -> NativeProbe | None:
+    """A probe for ``lib``'s worker, or None while it is not profiled."""
+
+    from dt_profile import event_enabled
+
+    return NativeProbe(lib, name) if event_enabled("draft_native_probe") else None
 
 
 class RemoteRingSpec(ctypes.Structure):
@@ -1197,6 +1290,8 @@ class DraftRingWorker:
         lib.dt_ring_worker_try_free.restype = i32
         lib.dt_ring_worker_start.argtypes = [vp]
         lib.dt_ring_worker_start.restype = i32
+        lib.dt_ring_worker_set_probe.argtypes = [vp, vp]
+        lib.dt_ring_worker_set_probe.restype = i32
         lib.dt_ring_worker_error.argtypes = [vp, ctypes.POINTER(i32)]
         lib.dt_ring_worker_error.restype = i32
         lib.dt_ring_worker_entries_done.argtypes = [vp]
@@ -1225,6 +1320,9 @@ class DraftRingWorker:
         if not self._handle:
             raise DirectRingError("native ring worker could not be created")
         self._endpoints: dict[int, DraftRingEndpoint] = {}
+        self.probe = native_probe(lib, "ring_worker")
+        if self.probe is not None:
+            lib.dt_ring_worker_set_probe(self._handle, self.probe.handle)
         if lib.dt_ring_worker_start(self._handle) != 0:
             lib.dt_ring_worker_destroy(self._handle)
             self._handle = None
@@ -1325,4 +1423,6 @@ class DraftRingWorker:
         rc = int(self._lib.dt_ring_worker_destroy(self._handle))
         self._handle = None
         self._endpoints.clear()
+        if self.probe is not None:
+            self.probe.close()
         return rc

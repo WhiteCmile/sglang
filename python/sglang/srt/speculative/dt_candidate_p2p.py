@@ -239,7 +239,10 @@ class _PublishWorker:
     """
 
     def __init__(self, *, device_index: int, priority: int) -> None:
-        from sglang.srt.speculative.dt_direct_ring import _build_native_library
+        from sglang.srt.speculative.dt_direct_ring import (
+            _build_native_library,
+            native_probe,
+        )
 
         source = Path(__file__).with_name("csrc") / "dt_publish_worker.cpp"
         lib = ctypes.CDLL(
@@ -272,11 +275,16 @@ class _PublishWorker:
         lib.dt_publish_worker_drain.restype = ctypes.c_int
         lib.dt_publish_worker_destroy.argtypes = [vp]
         lib.dt_publish_worker_destroy.restype = ctypes.c_int
+        lib.dt_publish_worker_set_probe.argtypes = [vp, vp]
+        lib.dt_publish_worker_set_probe.restype = ctypes.c_int
         handle = lib.dt_publish_worker_create(device_index, priority)
         if not handle:
             raise CandidateTransportError("candidate publish worker failed to start")
         self._lib = lib
         self._handle = ctypes.c_void_p(handle)
+        self.probe = native_probe(lib, "publish_worker")
+        if self.probe is not None:
+            lib.dt_publish_worker_set_probe(self._handle, self.probe.handle)
         self.status = functools.partial(lib.dt_publish_worker_status, self._handle)
 
     def submit(self, job: array) -> int:
@@ -290,6 +298,8 @@ class _PublishWorker:
 
     def close(self) -> None:
         rc = self._lib.dt_publish_worker_destroy(self._handle)
+        if self.probe is not None:
+            self.probe.close()
         if rc:
             raise CandidateTransportError(f"candidate publish worker drain failed ({rc})")
 
@@ -2369,6 +2379,8 @@ class CandidatePush:
     candidate_bytes: int
     cold_mapping_count: int
     start_event: torch.cuda.Event | None = None
+    # Publish-worker ticket (0: issued inline); joins the worker's probe stamps.
+    ticket: int = 0
 
 
 class _RemotePushEvent(torch.cuda.Event):
@@ -3123,6 +3135,7 @@ class DraftCandidatePushTransport:
             candidate_bytes=len(tasks) * row_bytes,
             cold_mapping_count=cold,
             start_event=start_event,
+            ticket=getattr(event, "_ticket", 0),  # set by _WorkerPushEvent.gate
         )
 
     def _submit_to_worker(
@@ -3273,6 +3286,13 @@ class DraftCandidatePushTransport:
             cold_mapping_count=0,
             start_event=start_event,
         )
+
+    def dump_native_probe(self) -> None:
+        """Drain the publish worker's D0 stamps into the profile (issue #269)."""
+
+        worker = getattr(self, "_publish_worker", None)
+        if worker is not None and worker.probe is not None:
+            worker.probe.dump()
 
     def close(self) -> None:
         if self._closed:

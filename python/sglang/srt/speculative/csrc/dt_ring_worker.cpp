@@ -43,7 +43,11 @@
 #include <thread>
 #include <vector>
 
+#include "dt_native_probe.h"
+
 namespace {
+
+using dt_probe::timed;
 
 typedef int CUresult;
 typedef int CUdevice;
@@ -241,6 +245,7 @@ struct Ring {
   const uint32_t* slot_generations = nullptr;  // per-slot current generation
   uint64_t pool_tag = 0;  // registered pool-generation tag for v2 records
   uint64_t next_seq = 1;
+  uint64_t seen_seq = 0;  // last seq stamped RECORD_SEEN (probe only)
   bool detached = false;
   // Per-ring copy stream: entries from different Targets must not serialize.
   CUstream stream = nullptr;
@@ -293,8 +298,16 @@ struct Worker {
   std::atomic<int> error_ring{-1};
   std::atomic<uint64_t> entries_done{0};
   std::atomic<uint64_t> landing_stalls{0};
+  dt_probe::Probe* probe = nullptr;  // set before start; null unless profiling
   std::thread thread;
 };
+
+void stamp(Worker* w, dt_probe::Kind kind, const Ring* r, uint64_t seq, uint64_t arg = 0) {
+  dt_probe::stamp(w->probe, kind, r->id, seq, arg);
+}
+
+// Landing placement as one stamp argument: buffer index above byte offset.
+uint64_t placement_arg(int k, uint64_t offset) { return (uint64_t)k << 40 | offset; }
 
 uint64_t now_ns() {
   timespec ts;
@@ -398,13 +411,16 @@ bool mailbox_resolve_rids(Ring* r, const uint8_t* reqs, uint32_t request_count,
 // word advances here — the entry's content is already sealed in the mailbox,
 // so the Target may reuse the ring entry from this point on.
 bool finish_entry(Worker* w, Ring* r) {
-  CUresult rc = w->api.cuStreamWriteValue32(
-      r->stream, r->ready_words + 4ull * (r->next_seq % r->capacity),
-      (uint32_t)r->next_seq, 0);
+  CUresult rc = timed(w->probe, dt_probe::WRITE_VALUE32, [&] {
+    return w->api.cuStreamWriteValue32(
+        r->stream, r->ready_words + 4ull * (r->next_seq % r->capacity),
+        (uint32_t)r->next_seq, 0);
+  });
   if (rc != 0) {
     fail(w, rc, r->id);
     return false;
   }
+  stamp(w, dt_probe::INPUT_READY_ISSUED, r, r->next_seq);
   if (r->header != nullptr) r->header[5] = (uint32_t)r->next_seq;
   advance_seq(r);
   w->entries_done.fetch_add(1, std::memory_order_relaxed);
@@ -426,17 +442,25 @@ bool enqueue_pull(Worker* w, Ring* r, uint32_t index, uint64_t source_offset,
   // allowed (the driver keeps the event until the wait retires).
   CUipcEventHandle event_handle;
   memcpy(&event_handle, event_handle_bytes, sizeof(event_handle));
+  stamp(w, dt_probe::PLACEMENT, r, r->next_seq, placement_arg(k, offset));
   CUevent producer = nullptr;
-  CUresult rc = w->api.cuIpcOpenEventHandle(&producer, event_handle);
-  if (rc == 0) rc = w->api.cuStreamWaitEvent(r->stream, producer, 0);
-  if (producer) w->api.cuEventDestroy(producer);
+  CUresult rc = timed(w->probe, dt_probe::IPC_OPEN_EVENT,
+                      [&] { return w->api.cuIpcOpenEventHandle(&producer, event_handle); });
   if (rc == 0)
-    rc = w->api.cuMemcpyAsync(w->landing_base + (uint64_t)k * w->landing_bytes + offset,
-                              r->source_base + source_offset, nbytes, r->stream);
+    rc = timed(w->probe, dt_probe::STREAM_WAIT_EVENT,
+               [&] { return w->api.cuStreamWaitEvent(r->stream, producer, 0); });
+  if (producer)
+    timed(w->probe, dt_probe::EVENT_DESTROY, [&] { return w->api.cuEventDestroy(producer); });
+  if (rc == 0)
+    rc = timed(w->probe, dt_probe::MEMCPY_ASYNC, [&] {
+      return w->api.cuMemcpyAsync(w->landing_base + (uint64_t)k * w->landing_bytes + offset,
+                                  r->source_base + source_offset, nbytes, r->stream);
+    });
   if (rc != 0) {
     fail(w, rc, r->id);
     return false;
   }
+  stamp(w, dt_probe::COPY_ENQUEUED, r, r->next_seq, nbytes);
   w->cursor = offset + nbytes;
   w->landing_placed[k] += 1;
   r->placement_buffer[index] = k;
@@ -507,6 +531,7 @@ bool serve_entry_v2(Worker* w, Ring* r) {
     mailbox_publish(r, index, 2, h.request_count, token_total, slot,
                     sizeof(h), reqs, h.request_count * 32, tokens,
                     token_total * 4, nullptr, 0);
+    stamp(w, dt_probe::MAILBOX_PUBLISHED, r, r->next_seq, h.request_count);
     if (dropped == (h.request_count >= 64 ? ~0ull : ((1ull << h.request_count) - 1))) {
       // Every request is released: no landing copy is needed — the draft
       // will never read this wave, so the bare INPUT_READY is the true
@@ -538,6 +563,7 @@ bool serve_entry_v1(Worker* w, Ring* r) {
     }
     mailbox_publish(r, index, 1, h.payload_len, 0, slot, sizeof(h), nullptr, 0,
                     nullptr, 0, slot + 128, h.payload_len);
+    stamp(w, dt_probe::MAILBOX_PUBLISHED, r, r->next_seq);
   }
   if (h.flags & kEntryHasPull) {
     if (h.nbytes == 0 || h.nbytes % w->row_bytes || h.nbytes > w->landing_bytes ||
@@ -564,6 +590,10 @@ bool serve_entry(Worker* w, Ring* r) {
   const uint64_t first_word = *seq_word;
   if ((uint32_t)first_word != (uint32_t)r->next_seq) return false;
   std::atomic_thread_fence(std::memory_order_acquire);
+  if (w->probe != nullptr && r->seen_seq != r->next_seq) {
+    r->seen_seq = r->next_seq;
+    stamp(w, dt_probe::RECORD_SEEN, r, r->next_seq);
+  }
   const volatile uint32_t* disc = reinterpret_cast<const volatile uint32_t*>(slot + 12);
   if (*disc == kRecordVersion2) {
     // v2 publishes the full u64 seq; anything else is a torn or stale read.
@@ -686,11 +716,13 @@ int serve_remote_record(Worker* w, Ring* r) {
       w->landing_stalls.fetch_add(1, std::memory_order_relaxed);
       return 0;
     }
+    stamp(w, dt_probe::PLACEMENT, r, r->next_seq, placement_arg(k, offset));
   }
   // Snapshot first: after the receive is re-posted the Target may rewrite
   // this ring entry.
   mailbox_publish(r, index, 1, h.payload_len, 0, slot, sizeof(h), nullptr, 0, nullptr, 0,
                   slot + 128, h.payload_len);
+  stamp(w, dt_probe::MAILBOX_PUBLISHED, r, r->next_seq);
   m.arrived.pop_front();
   if (m.post_recv(reinterpret_cast<void*>(m.spec.record_qp), m.spec.record_tag, 1) != 0) {
     fail(w, -7, r->id);
@@ -699,14 +731,17 @@ int serve_remote_record(Worker* w, Ring* r) {
   r->placement_buffer[index] = k;
   r->placement_offset[index] = offset;
   if (has_pull) {
-    if (m.post_read(reinterpret_cast<void*>(m.spec.record_qp), m.spec.record_tag,
-                    w->landing_base + (uint64_t)k * w->landing_bytes + offset,
-                    (uint32_t)h.nbytes, (uint32_t)m.spec.landing_lkey,
-                    m.spec.pool_addr + h.source_offset - m.spec.pool_allocation_offset,
-                    (uint32_t)m.spec.pool_rkey) != 0) {
+    if (timed(w->probe, dt_probe::RDMA_POST_READ, [&] {
+          return m.post_read(reinterpret_cast<void*>(m.spec.record_qp), m.spec.record_tag,
+                             w->landing_base + (uint64_t)k * w->landing_bytes + offset,
+                             (uint32_t)h.nbytes, (uint32_t)m.spec.landing_lkey,
+                             m.spec.pool_addr + h.source_offset - m.spec.pool_allocation_offset,
+                             (uint32_t)m.spec.pool_rkey);
+        }) != 0) {
       fail(w, -7, r->id);
       return -1;
     }
+    stamp(w, dt_probe::READ_POSTED, r, r->next_seq, h.nbytes);
     w->cursor = offset + h.nbytes;
     w->landing_placed[k] += 1;
     ++m.reads_outstanding;
@@ -741,8 +776,10 @@ bool publish_remote(Worker* w, Ring* r) {
         return false;
       }
     }
-    if (CUresult rc = w->api.cuFlushGPUDirectRDMAWrites((int)m.spec.flush_target,
-                                                        (int)m.spec.flush_scope);
+    if (CUresult rc = timed(w->probe, dt_probe::FLUSH_RDMA_WRITES, [&] {
+          return w->api.cuFlushGPUDirectRDMAWrites((int)m.spec.flush_target,
+                                                   (int)m.spec.flush_scope);
+        });
         rc != 0) {
       fail(w, rc, r->id);
       return false;
@@ -751,6 +788,7 @@ bool publish_remote(Worker* w, Ring* r) {
   for (size_t i = 0; i < count; ++i) {
     const Flight& f = m.flights.front();
     __atomic_store_n(&m.ready_host[f.index], (uint32_t)f.seq, __ATOMIC_RELEASE);
+    stamp(w, dt_probe::INPUT_READY_ISSUED, r, f.seq);
     m.flights.pop_front();
     w->entries_done.fetch_add(1, std::memory_order_relaxed);
   }
@@ -778,6 +816,7 @@ bool reap_reads(Worker* w, Ring* r) {
     for (Flight& f : m.flights)
       if (f.read && !f.done) {
         f.done = true;
+        stamp(w, dt_probe::READ_COMPLETED, r, f.seq);
         break;
       }
   }
@@ -802,6 +841,7 @@ bool serve_remote(Worker* w, Ring* r) {
       fail(w, -7, r->id);
       return false;
     }
+    stamp(w, dt_probe::RECORD_SEEN, r, r->next_seq + m.arrived.size());
     m.arrived.push_back(imm[i] % r->capacity);
   }
   bool served = false;
@@ -1194,6 +1234,15 @@ int dt_ring_worker_try_free(void* handle, uint32_t k, uint64_t released) {
   w->landing_sealed[k] = 0;
   w->landing_placed[k] = 0;
   return 1;
+}
+
+// Attach a dt_probe_create probe (owned by the caller, outliving the
+// worker); only before start, so the thread reads a fixed pointer.
+int dt_ring_worker_set_probe(void* handle, void* probe) {
+  Worker* w = static_cast<Worker*>(handle);
+  if (w->thread.joinable()) return -1;
+  w->probe = static_cast<dt_probe::Probe*>(probe);
+  return 0;
 }
 
 int dt_ring_worker_start(void* handle) {

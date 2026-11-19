@@ -179,6 +179,40 @@ DT_DIRECT_GPU_REQUEST_EVIDENCE_IDLE_NS = 750_000_000
 # Draft-boundness stats line (issue #174): throttled so the production path
 # pays at most one log line per interval while the queue is busy.
 DT_DRAFT_STATS_INTERVAL_NS = 2_000_000_000
+# Shadow late-freeze estimator (design §5.2; D0 only logs it, issue #269):
+# weight of the newest batch in the per-bucket EMA.
+BATCH_ESTIMATE_EMA_WEIGHT = 0.125
+
+
+class DraftBatchEstimator:
+    """Shadow G(n)/C(n) of the late-freeze design (§5.2), logged, never read.
+
+    G is a DFlash batch's GPU span (materialize_start -> proposal_done, CUDA
+    elapsed) and C the scheduler CPU work that formed and launched it
+    (selection start -> hand-off end).  Each is an EMA per power-of-two size
+    bucket, keyed both by rows and by feature tokens (design Q3); every
+    completed batch reports the predictions made before it, then updates.
+    """
+
+    def __init__(self) -> None:
+        self._ema: dict[tuple[str, int, str], float] = {}
+
+    def observe(self, *, rows: int, tokens: int, gpu_ns: int, cpu_ns: int) -> dict:
+        fields = {}
+        for key, size in (("rows", rows), ("tokens", tokens)):
+            bucket = max(size, 1).bit_length()  # sizes [2**(b-1), 2**b)
+            fields[f"{key}_bucket"] = bucket
+            for name, actual in (("g", gpu_ns), ("c", cpu_ns)):
+                predicted = self._ema.get((key, bucket, name))
+                fields[f"{name}_pred_by_{key}_ns"] = (
+                    None if predicted is None else int(predicted)
+                )
+                self._ema[(key, bucket, name)] = (
+                    actual
+                    if predicted is None
+                    else predicted + BATCH_ESTIMATE_EMA_WEIGHT * (actual - predicted)
+                )
+        return fields
 
 
 def _prepare_eagle3_extend_batch(batch: ScheduleBatch) -> bool:
@@ -423,6 +457,14 @@ class PendingDFlashCompletion:
     reconcile_prepare_phase_ns: tuple[int, ...]
     prior_unfinished_proposal_count: int
     prior_candidate_copy_pending_count: int
+    # Profile-only D0 stamps (issue #269): selection start, membership fixed,
+    # hand-off end (launch-time push queued), and the DT_GPU_CLOCK stamp of
+    # proposal_done (slot -1: none).
+    select_started_ns: int = 0
+    frozen_ns: int = 0
+    handoff_ns: int = 0
+    clock_slot: int = -1
+    clock_done: torch.cuda.Event | None = None
 
 
 @dataclass(slots=True)
@@ -877,6 +919,17 @@ class FlashMTPDraftEngine:
         self.instance_id = instance_id
         self._profile_active = profile_enabled()
         self._last_input_ready_profile_state = None
+        self._batch_estimator = (
+            DraftBatchEstimator()
+            if profile_event_enabled("draft_batch_estimate")
+            else None
+        )
+        # Absolute GPU end of each DFlash batch (dt_gpu_clock), profile only.
+        self._gpu_clock = None
+        self._gpu_clock_enabled = (
+            self._profile_active and os.environ.get("DT_GPU_CLOCK", "0") == "1"
+        )
+        self._input_ready_select_ns = (0, 0)
         self.profile = load_draft_profile(profile_path)
         if self.profile.method not in {
             "flashmtp",
@@ -2375,6 +2428,7 @@ class FlashMTPDraftEngine:
                 candidate_bytes=push.candidate_bytes,
                 cold_mapping_count=push.cold_mapping_count,
                 submitted_ns=push.submitted_ns,
+                ticket=push.ticket,
                 queued_at_launch=True,
             )
 
@@ -2700,6 +2754,7 @@ class FlashMTPDraftEngine:
             transfer_id=transfer_id,
             request_id=task.request_id,
             round_id=task.round_id,
+            ring_id=endpoint.ring_id,
             ring_seq=entry.seq,
             has_pull=entry.has_pull,
             taken_ns=received_ns,
@@ -2921,6 +2976,7 @@ class FlashMTPDraftEngine:
                 transfer_id=transfer_id,
                 request_id=task.request_id,
                 round_id=task.round_id,
+                ring_id=endpoint.ring_id,
                 ring_seq=record.seq,
                 has_pull=True,
                 taken_ns=received_ns,
@@ -3066,6 +3122,19 @@ class FlashMTPDraftEngine:
                     ready_ns=now_ns,
                 )
             )
+            if self._profile_active:
+                # Per-round READY on the direct path (issue #269; the pull
+                # path emits the same event in _poll_feature_batches).
+                profile_emit(
+                    "draft_input_ready",
+                    draft_instance=self.instance_id,
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    staging_slot=slot,
+                    ready_ns=now_ns,
+                    direct=True,
+                )
 
     def _free_landing(self, index: int) -> None:
         taken = self._landing_taken[index]
@@ -3345,6 +3414,8 @@ class FlashMTPDraftEngine:
         ):
             return
         self._last_lifecycle_status_sample_ns = now_ns
+        if self._profile_active:
+            self._dump_native_probes()
         # Capacity sends are nonblocking. Refresh cumulative credit evidence so
         # a locally backpressured final snapshot cannot strand all admission.
         self._publish_capacity()
@@ -3369,6 +3440,16 @@ class FlashMTPDraftEngine:
             DT_LIFECYCLE_STATUS_MARKER,
             json.dumps(status, sort_keys=True, separators=(",", ":")),
         )
+
+    def _dump_native_probes(self) -> None:
+        """Drain the native workers' D0 stamps into the profile (issue #269)."""
+
+        worker = self._ring_worker
+        if worker is not None and worker.probe is not None:
+            worker.probe.dump()
+        transport = self._candidate_push_transport
+        if transport is not None:
+            transport.dump_native_probe()
 
     def _quiesce_direct_gpu_source_shutdown(self) -> None:
         # Fence new coordinator admission before retiring already-dispatched
@@ -5512,6 +5593,7 @@ class FlashMTPDraftEngine:
             reason="selected",
             inflight=inflight_before,
         )
+        self._input_ready_select_ns = (selection_started_ns, selection_finished_ns)
         return selected
 
     def _profile_input_ready_state(
@@ -5594,6 +5676,12 @@ class FlashMTPDraftEngine:
                 )
             if profile_active:
                 submit_returned_ns = time.monotonic_ns()
+                select_started_ns, frozen_ns = self._input_ready_select_ns
+                if self._persistent and not self._is_eagle3:  # the DFlash launch
+                    completion = self._pending_dflash_completions[-1]
+                    completion.select_started_ns = select_started_ns
+                    completion.frozen_ns = frozen_ns
+                    completion.handoff_ns = submit_returned_ns
                 profile_emit(
                     "draft_input_ready_submit",
                     draft_instance=self.instance_id,
@@ -5607,6 +5695,8 @@ class FlashMTPDraftEngine:
                         entry.pending.task.round_id for entry in ready
                     ),
                     staging_slots=staging_slots,
+                    select_started_ns=select_started_ns,
+                    frozen_ns=frozen_ns,
                     submitted_started_ns=submit_started_ns,
                     submitted_returned_ns=submit_returned_ns,
                     submit_wall_ns=submit_returned_ns - submit_started_ns,
@@ -6513,6 +6603,13 @@ class FlashMTPDraftEngine:
             # event which makes this completion eligible for another replay.
             candidates = candidates.clone()
         proposal_done.record(torch.cuda.current_stream(self.device))
+        clock_slot, clock_done = -1, None
+        if self._gpu_clock_enabled:
+            if self._gpu_clock is None:
+                from sglang.srt.speculative.dt_gpu_clock import GpuClock
+
+                self._gpu_clock = GpuClock(self.device)
+            clock_slot, clock_done = self._gpu_clock.stamp_after(proposal_done)
         candidate_rows_cpu = None
         copy_stream = None
         if (
@@ -6549,6 +6646,8 @@ class FlashMTPDraftEngine:
             reconcile_prepare_phase_ns=tuple(reconcile_prepare_phase_ns or ()),
             prior_unfinished_proposal_count=prior_unfinished_proposal_count,
             prior_candidate_copy_pending_count=prior_candidate_copy_pending_count,
+            clock_slot=clock_slot,
+            clock_done=clock_done,
         )
         self._register_dflash_completion(
             completion=completion,
@@ -7097,6 +7196,43 @@ class FlashMTPDraftEngine:
                 state.proposal_base_len = state.valid_committed_len
             raise
 
+    def _profile_dflash_batch(self, completion, tasks, gpu_ns: int) -> None:
+        """D0 per-batch stamps (issue #269): absolute GPU end, the shadow
+        G(n)/C(n) estimate against the measured values."""
+
+        gpu_end_clock_ns = 0
+        if completion.clock_done is not None and completion.clock_done.query():
+            gpu_end_clock_ns = self._gpu_clock.read(completion.clock_slot)
+        estimate = {}
+        if self._batch_estimator is not None and completion.handoff_ns:
+            estimate = self._batch_estimator.observe(
+                rows=len(tasks),
+                tokens=sum(task.feature_token_count for task in tasks),
+                gpu_ns=gpu_ns,
+                cpu_ns=completion.handoff_ns - completion.select_started_ns,
+            )
+        profile_emit(
+            "draft_batch_estimate",
+            draft_instance=self.instance_id,
+            transfer_ids=tuple(task.transfer_id for task in tasks),
+            rows=len(tasks),
+            tokens=sum(task.feature_token_count for task in tasks),
+            proposal_rows=len(completion.proposal_tasks),
+            g_ns=gpu_ns,
+            c_ns=(
+                completion.handoff_ns - completion.select_started_ns
+                if completion.handoff_ns
+                else None
+            ),
+            select_started_ns=completion.select_started_ns,
+            frozen_ns=completion.frozen_ns,
+            submit_started_ns=completion.launch_started_ns,
+            launched_ns=completion.launched_ns,
+            handoff_ns=completion.handoff_ns,
+            gpu_end_clock_ns=gpu_end_clock_ns,
+            **estimate,
+        )
+
     def _poll_dflash_completions(self) -> None:
         if self._fatal_gpu_quarantine_active():
             return
@@ -7184,6 +7320,10 @@ class FlashMTPDraftEngine:
             stage_query_ns = time.monotonic_ns()
             self._loop_stage_ns["dflash_query"] += stage_query_ns - stage_started_ns
             self._loop_stage_calls["dflash_query"] += 1
+            if self._profile_active:
+                self._profile_dflash_batch(
+                    completion, tasks, gpu_materialization_ns + proposal_gpu_ns
+                )
             profile_emit(
                 "draft_dflash_batch_complete",
                 draft_instance=self.instance_id,
@@ -9336,6 +9476,7 @@ class FlashMTPDraftEngine:
                 candidate_bytes=push.candidate_bytes,
                 cold_mapping_count=push.cold_mapping_count,
                 submitted_ns=push.submitted_ns,
+                ticket=push.ticket,
             )
 
     def _retire_tombstoned_ring_pushes(self) -> None:

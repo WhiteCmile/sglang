@@ -42,7 +42,11 @@
 #include <thread>
 #include <vector>
 
+#include "dt_native_probe.h"
+
 namespace {
+
+using dt_probe::timed;
 
 typedef int CUresult;
 typedef int CUdevice;
@@ -118,28 +122,37 @@ struct Worker {
   std::atomic<int> error{0};
   std::atomic<bool> sleeping{false};
   std::atomic<bool> stop{false};
+  // Set once by dt_publish_worker_set_probe; null unless profiling.
+  std::atomic<dt_probe::Probe*> probe{nullptr};
   std::mutex mutex;
   std::condition_variable wake;
   std::thread thread;
 };
 
-CUresult run_job(Worker* w, const Job& job) {
+CUresult run_job(Worker* w, const Job& job, dt_probe::Probe* p) {
   const uint64_t* q = job.words.data();
   CUevent event = reinterpret_cast<CUevent>(q[0]);
   const uint64_t copies = q[1], words = q[2];
-  CUresult rc = w->api.cuStreamWaitEvent(w->stream, event, 0);
+  CUresult rc = timed(p, dt_probe::STREAM_WAIT_EVENT,
+                      [&] { return w->api.cuStreamWaitEvent(w->stream, event, 0); });
   const uint64_t* c = q + kHeaderWords;
   for (uint64_t i = 0; rc == 0 && i < copies; ++i, c += 3) {
-    rc = w->api.cuMemcpyAsync(c[0], c[1], c[2], w->stream);
+    rc = timed(p, dt_probe::MEMCPY_ASYNC,
+               [&] { return w->api.cuMemcpyAsync(c[0], c[1], c[2], w->stream); });
   }
   for (uint64_t i = 0; rc == 0 && i < words; ++i, c += 2) {
-    rc = w->api.cuStreamWriteValue32(w->stream, c[0], (uint32_t)c[1], 0);
+    rc = timed(p, dt_probe::WRITE_VALUE32, [&] {
+      return w->api.cuStreamWriteValue32(w->stream, c[0], (uint32_t)c[1], 0);
+    });
   }
   if (rc == 0 && q[3]) {
-    rc = w->api.cuLaunchHostFunc(w->stream, reinterpret_cast<CUhostFn>(q[3]),
-                                 reinterpret_cast<void*>(q[4]));
+    rc = timed(p, dt_probe::LAUNCH_HOST_FUNC, [&] {
+      return w->api.cuLaunchHostFunc(w->stream, reinterpret_cast<CUhostFn>(q[3]),
+                                     reinterpret_cast<void*>(q[4]));
+    });
   }
-  if (rc == 0) rc = w->api.cuEventRecord(event, w->stream);
+  if (rc == 0)
+    rc = timed(p, dt_probe::EVENT_RECORD, [&] { return w->api.cuEventRecord(event, w->stream); });
   return rc;
 }
 
@@ -170,11 +183,15 @@ void serve(Worker* w) {
     }
     Job* job = w->ring[tail % kRingSlots];
     if (w->failed.load() == 0) {
-      const CUresult rc = run_job(w, *job);
+      dt_probe::Probe* p = w->probe.load(std::memory_order_acquire);
+      // arg: the copy count (candidate rows) of the job.
+      dt_probe::stamp(p, dt_probe::JOB_TAKEN, -1, job->ticket, job->words[1]);
+      const CUresult rc = run_job(w, *job, p);
       if (rc != 0) {
         w->error.store(rc);
         w->failed.store(job->ticket);
       } else {
+        dt_probe::stamp(p, dt_probe::JOB_ISSUED, -1, job->ticket, job->words[1]);
         w->recorded.store(job->ticket, std::memory_order_release);
       }
     }
@@ -205,6 +222,17 @@ void* dt_publish_worker_create(int device, int priority) {
   }
   w->thread = std::thread(serve, w);
   return w;
+}
+
+// Attach a dt_probe_create probe (owned by the caller, outliving the
+// worker).  Once only: the thread may already be reading it.
+int dt_publish_worker_set_probe(void* handle, void* probe) {
+  Worker* w = static_cast<Worker*>(handle);
+  dt_probe::Probe* expected = nullptr;
+  return w->probe.compare_exchange_strong(expected, static_cast<dt_probe::Probe*>(probe),
+                                          std::memory_order_release)
+             ? 0
+             : -1;
 }
 
 // Queue one job; returns its ticket (>= 1), or 0 once the worker is broken.
