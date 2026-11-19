@@ -3354,6 +3354,39 @@ class DTTargetController:
             ring_publish_fatal,
             hold_next_batch,
         ) = packet
+        if self._profile_active and (
+            len(events) > 0
+            or broadcast_ns >= 1_000_000
+            or (
+                previous_poll_ns
+                and poll_entered_ns - previous_poll_ns >= 1_000_000
+            )
+        ):
+            # Measurement only: no collective, packet, or ordering change.
+            # ``poll_now_ns`` is stamped on the export rank and broadcast
+            # unchanged, so it groups one collective across ranks without
+            # subtracting unsynchronized per-rank monotonic clocks.  The two
+            # duration fields are same-rank measurements: work before entering
+            # the broadcast within this poll, and the host gap since this rank
+            # last left poll (its preceding loop work).
+            # Sparse idle tracing: empty polls record only when this rank's
+            # broadcast or host gap is a >=1 ms long-tail outlier.
+            local_poll_gap_ns = (
+                poll_entered_ns - previous_poll_ns if previous_poll_ns else 0
+            )
+            self._profile_emit(
+                "target_ready_broadcast",
+                tp_rank=self.scheduler.ps.tp_rank,
+                tp_size=self.scheduler.ps.tp_size,
+                poll_now_ns=poll_now_ns,
+                broadcast_enter_ns=broadcast_start_ns,
+                broadcast_exit_ns=broadcast_start_ns + broadcast_ns,
+                broadcast_ns=broadcast_ns,
+                pre_broadcast_work_ns=broadcast_start_ns - poll_entered_ns,
+                local_poll_gap_ns=local_poll_gap_ns,
+                receive_ns=receive_ns,
+                event_count=len(events),
+            )
         self._last_poll_ns = poll_now_ns
         self._overlap_launch_ns = overlap_launch_ns
         self._overlap_result_ready = result_ready
@@ -3363,8 +3396,22 @@ class DTTargetController:
             # A publication failure is fatal on the export rank; the other
             # ranks learn it here rather than through a per-wave broadcast.
             raise RuntimeError(ring_publish_fatal)
-        if self.is_export_rank and events:
-            poll_finished_ns = time.monotonic_ns()
+        # Binding the stamp in the guard keeps one clock read and adds no
+        # profile-off work (the two attribute checks short-circuit first).
+        if (
+            self.is_export_rank
+            and self._profile_active
+            and (poll_finished_ns := time.monotonic_ns()) >= poll_entered_ns
+            and (
+                len(events) > 0
+                or poll_finished_ns - poll_entered_ns >= 1_000_000
+                or receive_ns >= 1_000_000
+                or broadcast_ns >= 1_000_000
+                or max(receive_parts.values(), default=0) >= 1_000_000
+            )
+        ):
+            # Sparse idle tracing: keep event polls and empty polls whose
+            # total or a measured segment is a >=1 ms long-tail outlier.
             self._profile_emit(
                 "target_result_poll",
                 started_ns=poll_entered_ns,
