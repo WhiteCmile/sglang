@@ -3073,6 +3073,9 @@ class FlashMTPDraftEngine:
         now_ns = time.monotonic_ns()
         from dt_protocol import DraftTaskKind
 
+        # Why the FIFO stopped draining this pass (issue #269, #267 §8.1):
+        # "drained" unless one of the two head-of-line breaks below fires.
+        stop_reason = "drained"
         while queue:
             task, slot, rows = queue[0]
             if (
@@ -3106,8 +3109,10 @@ class FlashMTPDraftEngine:
                 continue
             row_cost, kv_cost = self._persistent_task_allocation(task)
             if row_cost > available_rows or kv_cost > available_kv:
+                stop_reason = "kv_rows" if row_cost > available_rows else "kv_tokens"
                 break
             if task.requires_proposal and self._proposal_admission_blocked():
+                stop_reason = "credit"
                 break
             queue.popleft()
             available_rows -= row_cost
@@ -3135,6 +3140,51 @@ class FlashMTPDraftEngine:
                     ready_ns=now_ns,
                     direct=True,
                 )
+        if self._profile_active:
+            self._profile_ring_admission_state(
+                observed_ns=now_ns,
+                reason=stop_reason,
+                queue_len=len(queue),
+                head_transfer_id=queue[0][0].transfer_id if queue else "",
+                available_rows=available_rows,
+                available_kv=available_kv,
+            )
+
+    def _profile_ring_admission_state(
+        self,
+        *,
+        observed_ns: int,
+        reason: str,
+        queue_len: int,
+        head_transfer_id: str,
+        available_rows: int,
+        available_kv: int,
+    ) -> None:
+        """Emit only transitions of the ring-admission gate (#267 §8.1).
+
+        The FIFO wait between ``draft_ring_take`` and the ``ready_ns`` of
+        ``draft_input_ready`` is the largest per-row leg (#267 §2), but the
+        gate that holds it had no event of its own.  Same transition-only
+        shape as ``_profile_input_ready_state``: one event per change of
+        (reason, head), i.e. at most about the selection rate.
+        """
+
+        available_credit = self._available_direct_proposal_admission()
+        signature = (reason, head_transfer_id)
+        if signature == getattr(self, "_last_ring_admission_profile_state", None):
+            return
+        self._last_ring_admission_profile_state = signature
+        profile_emit(
+            "draft_ring_admission_state",
+            draft_instance=self.instance_id,
+            observed_ns=observed_ns,
+            reason=reason,
+            queue_len=queue_len,
+            head_transfer_id=head_transfer_id,
+            available_rows=available_rows,
+            available_kv=available_kv,
+            available_credit=available_credit,
+        )
 
     def _free_landing(self, index: int) -> None:
         taken = self._landing_taken[index]
@@ -9482,6 +9532,25 @@ class FlashMTPDraftEngine:
                 ticket=push.ticket,
             )
 
+    def _profile_ring_push_held(self, tasks, reason: str) -> None:
+        """Stamp why a §7.1 wave push is held back (#267 §8.3, issue #269).
+
+        ``held_at_ns`` pairs with the ``submitted_ns`` of the
+        ``draft_candidate_push_submit`` the release later emits for the same
+        transfer ids, so the hold shows up as its own hop.
+        """
+
+        if not self._profile_active:
+            return
+        profile_emit(
+            "draft_ring_push_held",
+            draft_instance=self.instance_id,
+            transfer_ids=tuple(task.transfer_id for task in tasks),
+            reason=reason,
+            held_at_ns=time.monotonic_ns(),
+            held_waves=len(self._held_ring_pushes),
+        )
+
     def _retire_tombstoned_ring_pushes(self) -> None:
         """Retire held ring-push rows whose ring destination is a tombstone.
 
@@ -9729,6 +9798,7 @@ class FlashMTPDraftEngine:
                         self._held_ring_pushes.append(
                             (tasks, push_candidates, slot_id)
                         )
+                        self._profile_ring_push_held(tasks, "region_missing")
                         return
                     tasks = resolved
                 if any(
@@ -9738,6 +9808,7 @@ class FlashMTPDraftEngine:
                     for task in tasks
                 ):
                     self._held_ring_pushes.append((tasks, push_candidates, slot_id))
+                    self._profile_ring_push_held(tasks, "unconfirmed")
                     return
                 self._submit_candidate_push(
                     tasks, push_candidates, result_slot=slot_id
