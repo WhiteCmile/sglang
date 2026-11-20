@@ -1689,6 +1689,12 @@ class Scheduler(
                 False,
             )
         )
+        # Opt-in: consume a head result that poll() already proved complete
+        # before selecting the next batch. Default-off keeps the baseline
+        # iteration order byte-for-byte.
+        early_ready_result_enabled = (
+            os.environ.get("DT_TARGET_EARLY_READY_RESULT", "0") == "1"
+        )
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1803,6 +1809,22 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # Bounded early consumption of an already-complete head result.
+            # poll() broadcast the copy_done readiness decision, so every TP
+            # rank enters this branch together. Reuse pop_and_process itself
+            # (same deque FIFO, note_overlap_result_done, process_batch_result
+            # and KV/request ownership release) and suppress the later pop.
+            early_ready_result_consumed = False
+            if (
+                early_ready_result_enabled
+                and self.dt_target_controller is not None
+                and self.last_batch
+                and self.result_queue
+                and self.dt_target_controller._overlap_result_ready is True
+            ):
+                pop_and_process()
+                early_ready_result_consumed = True
+
             # Get the next batch to run
             selection_started_ns = (
                 time.monotonic_ns()
@@ -1843,7 +1865,8 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                if not early_ready_result_consumed:
+                    pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1872,7 +1895,11 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and not defer_dt_result:
+                if (
+                    not disable_overlap_for_batch
+                    and not defer_dt_result
+                    and not early_ready_result_consumed
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
