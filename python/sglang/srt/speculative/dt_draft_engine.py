@@ -141,6 +141,12 @@ def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tens
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
 DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
+# Draft redesign D1 (issue #270): DFlash scratch is per batch, not per staging
+# slot, so a row is never held behind the batch that owns its landing buffer
+# (no compute-busy, no submit-time seal; the ring worker seals on overflow).
+DRAFT_SLOT_DECOUPLE = os.environ.get("DT_DRAFT_SLOT_DECOUPLE", "0") == "1"
+# One executing plus one submitted Draft compute batch.
+DRAFT_COMPUTE_DEPTH = 2
 RING_RETIRED_LIMIT = 65536
 # cuda-ipc proposal admission bound.  The direct path carries no result-slot
 # pool, so this explicit credit replaces the admission accounting the pool
@@ -437,6 +443,9 @@ class InputReadyFeature:
     staging_slot: int
     row_range: tuple[int, int]
     ready_ns: int
+    # W7b mark, emitted only in the profile: passed over while its staging
+    # slot was compute-busy (never set under DT_DRAFT_SLOT_DECOUPLE).
+    slot_busy_blocked: bool = False
 
 
 @dataclass(slots=True)
@@ -469,6 +478,8 @@ class PendingDFlashCompletion:
     handoff_ns: int = 0
     clock_slot: int = -1
     clock_done: torch.cuda.Event | None = None
+    # DT_DRAFT_SLOT_DECOUPLE: owns per-batch scratch batch_seq % depth (-1: off).
+    batch_seq: int = -1
 
 
 @dataclass(slots=True)
@@ -861,6 +872,11 @@ def target_major(tasks: list[PendingDraftTask]) -> list[PendingDraftTask]:
 class FlashMTPDraftEngine:
     """One-GPU DT engine with the existing independent continuous batch queue."""
 
+    # DT_DRAFT_SLOT_DECOUPLE (DFlash only) and the sequence of its next
+    # per-batch scratch owner; class defaults keep __new__ fixtures legacy.
+    _slot_decouple = False
+    _dflash_batch_seq = 0
+
     # Preserve the historical transport for partially constructed test and
     # diagnostic instances that intentionally bypass ``__init__``.
     candidate_transport = "mmap"
@@ -948,6 +964,7 @@ class FlashMTPDraftEngine:
         self._is_dflash = self.profile.method == "dflash"
         self._is_eagle3 = self.profile.method == "eagle3"
         self._is_feature_backed = self._is_dflash or self._is_eagle3
+        self._slot_decouple = DRAFT_SLOT_DECOUPLE and self._is_dflash
         self._persistent = self.profile.method in {
             "standalone",
             "dflash",
@@ -1781,6 +1798,13 @@ class FlashMTPDraftEngine:
             for _ in range(self.feature_buffer_slot_count)
         ]
         self._free_feature_staging_slots.extend(range(self.feature_buffer_slot_count))
+        # Proposal metadata and pinned candidate rows: one set per staging
+        # slot, or per in-flight batch under DT_DRAFT_SLOT_DECOUPLE.
+        scratch_count = (
+            DRAFT_COMPUTE_DEPTH
+            if self._slot_decouple
+            else self.feature_buffer_slot_count
+        )
         self._proposal_req_pool_indices_host_buffers = [
             torch.empty(
                 self.max_batch_size,
@@ -1788,7 +1812,7 @@ class FlashMTPDraftEngine:
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(self.feature_buffer_slot_count)
+            for _ in range(scratch_count)
         ]
         self._proposal_req_pool_indices_buffers = [
             torch.empty(
@@ -1796,7 +1820,7 @@ class FlashMTPDraftEngine:
                 dtype=torch.int64,
                 device=self.device,
             )
-            for _ in range(self.feature_buffer_slot_count)
+            for _ in range(scratch_count)
         ]
         self._proposal_prefix_lens_host_buffers = [
             torch.empty(
@@ -1805,7 +1829,7 @@ class FlashMTPDraftEngine:
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(self.feature_buffer_slot_count)
+            for _ in range(scratch_count)
         ]
         self._proposal_prefix_lens_buffers = [
             torch.empty(
@@ -1813,7 +1837,7 @@ class FlashMTPDraftEngine:
                 dtype=torch.int64,
                 device=self.device,
             )
-            for _ in range(self.feature_buffer_slot_count)
+            for _ in range(scratch_count)
         ]
         self._proposal_bonus_tokens_host_buffers = [
             torch.empty(
@@ -1822,7 +1846,7 @@ class FlashMTPDraftEngine:
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(self.feature_buffer_slot_count)
+            for _ in range(scratch_count)
         ]
         self._proposal_bonus_tokens_buffers = [
             torch.empty(
@@ -1830,7 +1854,7 @@ class FlashMTPDraftEngine:
                 dtype=torch.int64,
                 device=self.device,
             )
-            for _ in range(self.feature_buffer_slot_count)
+            for _ in range(scratch_count)
         ]
         if self.dflash_submit_pipeline:
             self._candidate_result_host_buffers = [
@@ -1840,7 +1864,7 @@ class FlashMTPDraftEngine:
                     device="cpu",
                     pin_memory=True,
                 )
-                for _ in range(self.feature_buffer_slot_count)
+                for _ in range(scratch_count)
             ]
         if self.dflash_submit_pipeline:
             self._candidate_result_copy_stream = torch.cuda.Stream(device=self.device)
@@ -2288,7 +2312,7 @@ class FlashMTPDraftEngine:
                     self._loop_stage(
                         "poll_feature_batches", self._poll_feature_batches
                     )
-            elif self._draft_compute_batches_inflight() < 2:
+            elif self._draft_compute_batches_inflight() < DRAFT_COMPUTE_DEPTH:
                 batch = self._loop_stage("take_batch", self._take_batch)
                 if batch:
                     self._loop_stage("execute_batch", self._execute_batch, batch)
@@ -2453,10 +2477,12 @@ class FlashMTPDraftEngine:
                 self._landing_slot_base = base
                 self._feature_staging_buffers.extend(landing[index] for index in range(count))
                 # Every per-staging-slot scratch list (proposal metadata, pinned
-                # candidate rows, ...) gets entries for the landing slots too.
+                # candidate rows, ...) gets entries for the landing slots too;
+                # under DT_DRAFT_SLOT_DECOUPLE they are per batch instead.
                 for name, value in list(vars(self).items()):
                     if (
-                        name == "_feature_staging_buffers"
+                        self._slot_decouple
+                        or name == "_feature_staging_buffers"
                         or not name.endswith("_buffers")
                         or not isinstance(value, list)
                         or len(value) != base
@@ -3202,6 +3228,13 @@ class FlashMTPDraftEngine:
             return
         if not taken:
             return
+        if self._slot_decouple:
+            # DFlash releases a row only after its batch's completion event,
+            # so no GPU read is left.  The worker frees only a buffer it sealed
+            # on overflow; until then this is retried every ring pass.
+            if worker.try_free(index, taken) == 1:
+                self._landing_taken[index] = 0
+            return
         # The last consumer may have been launched just now (synchronous
         # EAGLE3 publish): return the buffer only after that GPU read.
         event = torch.cuda.Event()
@@ -3260,7 +3293,7 @@ class FlashMTPDraftEngine:
             + len(self._pending_dflash_completions)
             + len(self._pending_eagle3_completions)
         )
-        if count > 2:
+        if count > DRAFT_COMPUTE_DEPTH:
             raise RuntimeError(
                 "Draft compute invariant violated: more than one executing plus "
                 "one submitted batch"
@@ -5326,7 +5359,11 @@ class FlashMTPDraftEngine:
         staging_slots: tuple[int, ...],
         staging_slot_counts: tuple[int, ...],
     ) -> None:
-        busy = getattr(self, "_feature_staging_compute_busy", None)
+        busy = (
+            None
+            if self._slot_decouple
+            else getattr(self, "_feature_staging_compute_busy", None)
+        )
         for staging_slot, count in zip(
             staging_slots, staging_slot_counts, strict=True
         ):
@@ -5548,7 +5585,7 @@ class FlashMTPDraftEngine:
         waiting_before = tuple(
             entry.pending.task.transfer_id for entry in self._input_ready_features
         )
-        if not self._input_ready_features or inflight_before >= 2:
+        if not self._input_ready_features or inflight_before >= DRAFT_COMPUTE_DEPTH:
             self._profile_input_ready_state(
                 observed_ns=selection_started_ns,
                 waiting_transfer_ids=waiting_before,
@@ -5576,10 +5613,9 @@ class FlashMTPDraftEngine:
         while self._input_ready_features:
             entry = self._input_ready_features.popleft()
             task = entry.pending.task
-            if (
-                entry.staging_slot in self._feature_staging_compute_busy
-                or len(selected) >= self.max_batch_size
-            ):
+            slot_busy = entry.staging_slot in self._feature_staging_compute_busy
+            if slot_busy or len(selected) >= self.max_batch_size:
+                entry.slot_busy_blocked |= slot_busy
                 retained.append(entry)
                 continue
             if self._persistent and task.draft_kv_handle in busy_handles:
@@ -5697,17 +5733,20 @@ class FlashMTPDraftEngine:
         staging_slot_counts = tuple(
             entry_slots.count(slot) for slot in staging_slots
         )
-        if any(
-            slot in self._feature_staging_compute_busy for slot in staging_slots
-        ):
-            raise RuntimeError("feature staging slot already has submitted compute")
-        self._feature_staging_compute_busy.update(staging_slots)
-        landing_slot_base = getattr(self, "_landing_slot_base", -1)
-        for slot in staging_slots:
-            if 0 <= landing_slot_base <= slot:
-                # New ring arrivals land in another buffer instead of waiting
-                # behind this batch's compute ownership.
-                self._ring_worker.seal(slot - landing_slot_base)
+        if not self._slot_decouple:
+            if any(
+                slot in self._feature_staging_compute_busy for slot in staging_slots
+            ):
+                raise RuntimeError(
+                    "feature staging slot already has submitted compute"
+                )
+            self._feature_staging_compute_busy.update(staging_slots)
+            landing_slot_base = getattr(self, "_landing_slot_base", -1)
+            for slot in staging_slots:
+                if 0 <= landing_slot_base <= slot:
+                    # New ring arrivals land in another buffer instead of
+                    # waiting behind this batch's compute ownership.
+                    self._ring_worker.seal(slot - landing_slot_base)
         pending = [entry.pending for entry in ready]
         row_ranges = tuple(entry.row_range for entry in ready)
         try:
@@ -5758,6 +5797,11 @@ class FlashMTPDraftEngine:
                     ),
                     round_ids=tuple(
                         entry.pending.task.round_id for entry in ready
+                    ),
+                    slot_busy_blocked=tuple(
+                        entry.pending.task.transfer_id
+                        for entry in ready
+                        if entry.slot_busy_blocked
                     ),
                     staging_slots=staging_slots,
                     select_started_ns=select_started_ns,
@@ -6447,12 +6491,23 @@ class FlashMTPDraftEngine:
             )
         # staging_slots is per entry, parallel to row_ranges.  Temporary H2D
         # staging (proposal metadata, candidate rows) is indexed by slot; any
-        # slot this batch owns is valid, so use the first.
+        # slot this batch owns is valid, so use the first.  Under
+        # DT_DRAFT_SLOT_DECOUPLE it is indexed by batch_seq % depth instead:
+        # the depth gate and FIFO retirement free that scratch first.
         slots_used = tuple(dict.fromkeys(staging_slots))
         staging_slot_counts = tuple(
             staging_slots.count(slot) for slot in slots_used
         )
+        batch_seq = -1
         metadata_slot = slots_used[0]
+        if self._slot_decouple:
+            batch_seq = self._dflash_batch_seq
+            metadata_slot = batch_seq % DRAFT_COMPUTE_DEPTH
+            if any(
+                completion.batch_seq % DRAFT_COMPUTE_DEPTH == metadata_slot
+                for completion in self._pending_dflash_completions
+            ):
+                raise RuntimeError("DFLASH per-batch scratch is still owned")
         prior_unfinished_proposal_count = 0
         prior_candidate_copy_pending_count = 0
         for completion in self._pending_dflash_completions:
@@ -6716,11 +6771,15 @@ class FlashMTPDraftEngine:
             prior_candidate_copy_pending_count=prior_candidate_copy_pending_count,
             clock_slot=clock_slot,
             clock_done=clock_done,
+            batch_seq=batch_seq,
         )
         self._register_dflash_completion(
             completion=completion,
             copy_stream=copy_stream,
         )
+        if self._slot_decouple:
+            # A failed launch is quiesced (or fatal) and keeps its sequence.
+            self._dflash_batch_seq = batch_seq + 1
         if copy_stream is None and proposal_tasks:
             self._queue_early_candidate_push(
                 proposal_tasks, candidates, completion.completion_event
@@ -8888,8 +8947,13 @@ class FlashMTPDraftEngine:
         # Pull completion no longer implies compute submission. Keep migration
         # finalization behind every INPUT_READY consumer and its submitted
         # compute batch, matching the original same-batch ownership boundary.
-        if getattr(self, "_input_ready_features", ()) or getattr(
-            self, "_feature_staging_compute_busy", ()
+        if (
+            getattr(self, "_input_ready_features", ())
+            or getattr(self, "_feature_staging_compute_busy", ())
+            or (
+                self._slot_decouple
+                and any(c.staging_slots for c in self._pending_dflash_completions)
+            )
         ):
             return
         for migration_id, message in tuple(
