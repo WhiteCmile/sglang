@@ -70,6 +70,10 @@ def test_held_push_resolves_from_region_without_coordinator(monkeypatch):
     engine._pending_ids = {live, zombie, late}
     engine._ring_pending_ids = {live, zombie, late}
     engine._received_ns_by_transfer = {}
+    engine._pending = engine._ring_admission = engine._input_ready_features = []
+    engine._pending_feature_batches = engine._pending_flashmtp_completions = []
+    engine._pending_dflash_completions = engine._pending_eagle3_completions = []
+    engine._fatal_gpu_quarantine_reason = None
     engine._ring_destination_ref = lambda _task, resolved: (
         None if resolved[:3] == (0, 0, 0) else ("arena", resolved[:3])
     )
@@ -88,6 +92,9 @@ def test_held_push_resolves_from_region_without_coordinator(monkeypatch):
     assert engine._cancelled_ids == {zombie, late}
     assert len(engine._held_ring_pushes) == 1
     assert submitted == []
+    # The held wave owns its rows: a cancel push of a row that completes
+    # while the wave is held must not revive it (it would stall the wave).
+    assert engine._has_local_execution_owner(zombie)
 
     # The Target writes the live row's destination: the next pass adopts it
     # and pushes only that row, with no confirmation having arrived.
@@ -114,6 +121,8 @@ def test_ring_rounds_send_no_result_and_count_relayed_only():
     engine._stop = False
     engine._pending_ids = {ring, relayed}
     engine._ring_pending_ids = {ring}
+    engine._direct_tasks_by_transfer = {ring: "task", relayed: "task"}
+    engine._ring_record_positions = {ring: ("endpoint", 0)}
     engine._received_tasks = 1  # the relayed round only
     engine._capacity_sequence = 0
     engine._prepared_migrations = {}
@@ -158,6 +167,8 @@ def test_ring_rounds_send_no_result_and_count_relayed_only():
     [delivered] = sent
     assert [e.transfer_id for e in delivered.entries] == [relayed]
     assert engine._pending_ids == {relayed} and not engine._ring_pending_ids
+    assert set(engine._direct_tasks_by_transfer) == {relayed}
+    assert not engine._ring_record_positions
 
     engine._publish_capacity()
     # retired = received - pending stays monotonic: the ring round never

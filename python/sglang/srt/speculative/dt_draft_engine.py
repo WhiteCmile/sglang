@@ -9731,6 +9731,8 @@ class FlashMTPDraftEngine:
         without a push, and the Target's own round deadline answers it.
         """
 
+        if self._fatal_gpu_quarantine_active():
+            return
         from msgspec.structs import replace
 
         now_ns = time.monotonic_ns()
@@ -10199,9 +10201,6 @@ class FlashMTPDraftEngine:
                 ):
                     self._cancelled_ids.discard(task.transfer_id)
                 self._direct_tasks_by_transfer.pop(task.transfer_id, None)
-                if not self._ring_confirmation:
-                    # No Coordinator copy will retire the record position.
-                    self._ring_record_positions.pop(task.transfer_id, None)
             capacity_changed = True
             if self._profile_active:
                 profile_emit(
@@ -10248,6 +10247,15 @@ class FlashMTPDraftEngine:
         ):
             if any(item.task.transfer_id == transfer_id for item in owner.pending):
                 return True
+        if not self._ring_confirmation and any(
+            task.transfer_id == transfer_id
+            for tasks, _candidates, _slot in self._held_ring_pushes
+            for task in tasks
+        ):
+            # A held wave owns its rows until its release retires them; a
+            # cancel push completing first must not revive the row, which
+            # would hold the wave until the row's deadline.
+            return True
         return False
 
     def _publish_materialization_successes(self, tasks: list[object]) -> None:
@@ -10596,9 +10604,14 @@ class FlashMTPDraftEngine:
         enforcement.
         """
 
-        if getattr(task, "candidate_destination", None) is None:
+        ring_pending = getattr(self, "_ring_pending_ids", set())
+        if getattr(task, "candidate_destination", None) is None or (
+            # Confirmation-free, no cancel result is relayed or ACKed for a
+            # ring round, and a drop path need not have queued a cancel push.
+            not self._ring_confirmation and task.transfer_id in ring_pending
+        ):
             self._pending_ids.discard(task.transfer_id)
-            getattr(self, "_ring_pending_ids", set()).discard(task.transfer_id)
+            ring_pending.discard(task.transfer_id)
         self._cancelled_ids.discard(task.transfer_id)
         self._received_ns_by_transfer.pop(task.transfer_id, None)
         getattr(self, "_ring_record_positions", {}).pop(task.transfer_id, None)
@@ -10879,6 +10892,10 @@ class FlashMTPDraftEngine:
                 if entry.transfer_id in ring:
                     ring.discard(entry.transfer_id)
                     self._pending_ids.discard(entry.transfer_id)
+                    # A failure result is the round's last trace here, and no
+                    # Coordinator copy will retire its record position.
+                    self._direct_tasks_by_transfer.pop(entry.transfer_id, None)
+                    self._ring_record_positions.pop(entry.transfer_id, None)
             if not relayed:
                 return
             message = replace(message, entries=relayed)
