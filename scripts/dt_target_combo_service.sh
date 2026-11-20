@@ -10,7 +10,8 @@ root="$W/target-combo-results/$stamp/$label"
 mkdir -p "$root"
 
 # Every arm starts from the same Target policy.  Only the three allocator/result
-# knobs named by the arm are allowed to differ.
+# knobs named by the arm are allowed to differ.  The 2-lane code default is four
+# physical source slots; spell it out so a later default change cannot skew A/B.
 unset DT_PROFILE_DIR DT_PROFILE_EVENTS
 unset DT_TARGET_READY_REFRESH_BEFORE_SELECT DT_TARGET_ADAPTIVE_READY_HOLD
 unset DT_TARGET_EARLY_READY_RESULT DT_TARGET_LATE_FREEZE
@@ -19,6 +20,7 @@ unset DT_FEATURE_SOURCE_PAGE_ROWS
 
 case "$label" in
   control)
+    export DT_FEATURE_SOURCE_SLOTS=4
     ;;
   early_slots8)
     export DT_TARGET_EARLY_READY_RESULT=1
@@ -27,6 +29,7 @@ case "$label" in
   early_page64)
     export DT_TARGET_EARLY_READY_RESULT=1
     export DT_FEATURE_SOURCE_PAGE_ROWS=64
+    export DT_FEATURE_SOURCE_SLOTS=4
     ;;
   early_page64_slots8)
     export DT_TARGET_EARLY_READY_RESULT=1
@@ -47,7 +50,7 @@ export DT_LEASE_HELD=1
 cat >"$root/effective-flags.txt" <<EOF
 DT_TARGET_EARLY_READY_RESULT=${DT_TARGET_EARLY_READY_RESULT:-0}
 DT_FEATURE_SOURCE_PAGE_ROWS=${DT_FEATURE_SOURCE_PAGE_ROWS:-0}
-DT_FEATURE_SOURCE_SLOTS=${DT_FEATURE_SOURCE_SLOTS:-default}
+DT_FEATURE_SOURCE_SLOTS=$DT_FEATURE_SOURCE_SLOTS
 DT_DRAFT_FEATURE_BUFFER_SLOT_COUNT=$DT_DRAFT_FEATURE_BUFFER_SLOT_COUNT
 DT_TARGET_LATE_FREEZE=default
 DT_TARGET_BATCH_WAIT_MS=default
