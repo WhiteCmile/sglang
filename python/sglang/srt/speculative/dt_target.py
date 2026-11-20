@@ -51,6 +51,7 @@ DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
 DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
 DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
+TARGET_P0_HOP_PROFILE_EVENT = "target_p0_hop"
 # Target round-expiry scan cadence (issue #193): expiry is failure detection
 # with second-scale timeouts, so the O(parked) scan runs at most every 2 ms
 # instead of inside every scheduler poll.
@@ -362,6 +363,7 @@ class RingPublishRecord:
     # must not re-read the ring: the Draft consumes records and the producer
     # wraps, after which the old seq word can never reappear at its slot.
     record: object | None = None
+    observed_ns: int = 0
 
 
 @dataclass(slots=True)
@@ -383,6 +385,7 @@ class RingPublishWave:
     # (requires_proposal, previous_transfer_id).
     proposals: dict
     records: tuple  # RingPublishRecord, one per ring record
+    wave_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,6 +552,13 @@ class DTTargetController:
             self.is_eagle3
             and self.is_export_rank
             and profile_event_explicitly_enabled(EAGLE3_HOST_SPAN_PROFILE_EVENT)
+        )
+        # Issue #281 P0 is deliberately explicit-only: it emits one bounded
+        # chronology record per transfer at the existing ownership boundaries.
+        # Merely setting DT_PROFILE_DIR must not add per-row work to production.
+        self.target_p0_hop_profile_enabled = bool(
+            self.is_export_rank
+            and profile_event_explicitly_enabled(TARGET_P0_HOP_PROFILE_EVENT)
         )
         if (
             self.eagle3_host_span_profile_enabled
@@ -2169,7 +2179,11 @@ class DTTargetController:
                     profile_publish_transfer = profile_event_enabled(
                         "target_feature_publish"
                     )
-                    if profile_publish_batch or profile_publish_transfer:
+                    if (
+                        profile_publish_batch
+                        or profile_publish_transfer
+                        or getattr(self, "target_p0_hop_profile_enabled", False)
+                    ):
                         specs_by_transfer = {
                             values[1]: values for values in specs
                         }
@@ -2237,6 +2251,22 @@ class DTTargetController:
                                 descriptor_published_ns=(
                                     published.descriptor_published_ns
                                 ),
+                            )
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        for descriptor in published.descriptors:
+                            spec = specs_by_transfer[descriptor.transfer_id]
+                            self._p0_emit(
+                                "feature_published",
+                                transfer_id=descriptor.transfer_id,
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                hidden_produced_ns=published.hidden_produced_ns,
+                                descriptor_published_ns=(
+                                    published.descriptor_published_ns
+                                ),
+                                source_slot_id=descriptor.source_slot_id,
+                                slot_generation=descriptor.slot_generation,
+                                feature_rows=spec[6],
                             )
                     measurement_specs = [
                         values
@@ -2776,6 +2806,12 @@ class DTTargetController:
             total_ns=total_ns,
             can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
         )
+
+    def _p0_emit(self, hop: str, **fields) -> None:
+        """Emit one opt-in #281 P0 hop without changing scheduler state."""
+
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            self._profile_emit(TARGET_P0_HOP_PROFILE_EVENT, hop=hop, **fields)
 
     def _record_full_wave_completion(
         self, batch: ScheduleBatch, *, batch_result, batch_size: int
@@ -3383,6 +3419,27 @@ class DTTargetController:
             ring_publish_fatal,
             hold_next_batch,
         ) = packet
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            for kind, transfer_id, payload in events:
+                if kind not in ("ready", "ready_direct"):
+                    continue
+                state = self._parked.get(transfer_id)
+                if state is None:
+                    continue
+                candidate_payload = payload[0]
+                self._p0_emit(
+                    "ready_snapshot",
+                    transfer_id=transfer_id,
+                    request_id=state.req.rid,
+                    round_id=state.round_id,
+                    completion_observed_ns=getattr(
+                        candidate_payload, "observed_ns", 0
+                    ),
+                    ready_snapshot_ns=poll_now_ns,
+                    tp_broadcast_start_ns=broadcast_start_ns,
+                    tp_broadcast_end_ns=broadcast_exit_ns,
+                    broadcast_ns=broadcast_ns,
+                )
         if self._profile_active and (
             len(events) > 0
             or broadcast_ns >= 1_000_000
@@ -3507,6 +3564,15 @@ class DTTargetController:
                 applied_before_ns = time.monotonic_ns() if observe_ready else 0
                 if kind == "ready_direct":
                     state.candidate_completion = candidate_payload
+                    self._p0_emit(
+                        "tp_ready_applied",
+                        transfer_id=transfer_id,
+                        request_id=state.req.rid,
+                        round_id=state.round_id,
+                        completion_observed_ns=candidate_payload.observed_ns,
+                        tp_apply_ns=time.monotonic_ns(),
+                        broadcast_ns=broadcast_ns,
+                    )
                     if self.is_export_rank and self._profile_active:
                         self._profile_emit(
                             "target_direct_tp_apply",
@@ -3607,6 +3673,22 @@ class DTTargetController:
             poll_started_ns=poll_started_ns,
             poll_finished_ns=poll_finished_ns,
         )
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            for transfer_id in transfer_ids:
+                self._p0_emit(
+                    "verify_submitted",
+                    transfer_id=transfer_id,
+                    wave_id=wave_id,
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=submission_started_ns,
+                    submission_returned_ns=submission_returned_ns,
+                    control_phase_ns=max(
+                        0, submission_started_ns - poll_finished_ns
+                    ),
+                    poll_phase_ns=max(0, poll_finished_ns - poll_started_ns),
+                    batch_size=len(batch.reqs),
+                )
 
     def _verify_gpu_clock(self):
         clock = getattr(self, "_gpu_clock", None)
@@ -3660,6 +3742,14 @@ class DTTargetController:
                 if previous_end_event is not None
                 else None
             )
+            cuda_total_ns = int(
+                observation.start_event.elapsed_time(observation.end_event) * 1_000_000
+            )
+            gpu_end_clock_ns = (
+                self._gpu_clock.read(observation.clock_slot)
+                if observation.clock_slot >= 0
+                else 0
+            )
             self._profile_emit(
                 "target_verify_cuda_observed",
                 wave_id=observation.wave_id,
@@ -3671,19 +3761,21 @@ class DTTargetController:
                 submission_returned_ns=observation.submission_returned_ns,
                 gpu_start_observed_ns=observation.start_observed_ns,
                 gpu_end_observed_ns=end_observed_ns,
-                cuda_total_ns=int(
-                    observation.start_event.elapsed_time(observation.end_event)
-                    * 1_000_000
-                ),
+                cuda_total_ns=cuda_total_ns,
                 cuda_previous_verify_end_to_start_ns=(
                     previous_verify_end_to_start_ns
                 ),
-                gpu_end_clock_ns=(
-                    self._gpu_clock.read(observation.clock_slot)
-                    if observation.clock_slot >= 0
-                    else 0
-                ),
+                gpu_end_clock_ns=gpu_end_clock_ns,
             )
+            for transfer_id in observation.transfer_ids:
+                self._p0_emit(
+                    "verify_gpu_end",
+                    transfer_id=transfer_id,
+                    wave_id=observation.wave_id,
+                    gpu_end_observed_ns=end_observed_ns,
+                    gpu_end_clock_ns=gpu_end_clock_ns,
+                    cuda_total_ns=cuda_total_ns,
+                )
             self._last_target_verify_end_event = observation.end_event
         self._pending_target_gpu_observations = retained
 
@@ -4774,6 +4866,63 @@ class DTTargetController:
                 sampling_ns=finished_ns - relay_ready_ns,
                 total_ns=finished_ns - started_ns,
             )
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            feature_pool = getattr(self, "_feature_source_pool", None)
+            source_allocator = getattr(feature_pool, "_page_allocator", None)
+            candidate_free = (
+                self._candidate_arena.free_slot_count
+                if self._candidate_arena is not None
+                else 0
+            )
+            ring_credit_free = sum(
+                writer.free_entries()
+                for writer in getattr(self, "_ring_writers", {}).values()
+            )
+            for state in ready:
+                self._p0_emit(
+                    "frozen_for_verify",
+                    transfer_id=state.transfer_id,
+                    request_id=state.req.rid,
+                    round_id=state.round_id,
+                    wave_id=wave_id,
+                    candidate_observed_ns=state.result_received_ns,
+                    selection_started_ns=build_entry_ns,
+                    freeze_ns=freeze_ns,
+                    build_finished_ns=finished_ns,
+                    batch_size=len(ready),
+                    candidate_slots_free=candidate_free,
+                    candidate_slots_total=(
+                        self._candidate_arena.slot_count
+                        if self._candidate_arena is not None
+                        else 0
+                    ),
+                    source_slots_free=(
+                        feature_pool.free_slot_count
+                        if feature_pool is not None
+                        else 0
+                    ),
+                    source_slots_total=(
+                        feature_pool.slot_count
+                        if feature_pool is not None
+                        else 0
+                    ),
+                    source_pages_free=(
+                        source_allocator.free_page_count
+                        if source_allocator is not None
+                        else 0
+                    ),
+                    source_pages_total=(
+                        source_allocator.total_page_count
+                        if source_allocator is not None
+                        else 0
+                    ),
+                    source_largest_extent_pages=(
+                        source_allocator.largest_free_extent_pages
+                        if source_allocator is not None
+                        else 0
+                    ),
+                    ring_credit_free=ring_credit_free,
+                )
         return batch
 
     def should_defer_prefill(
@@ -5584,7 +5733,26 @@ class DTTargetController:
                         - max(task.created_ns for task in dispatch_batch.entries)
                     ),
                 )
+            ledger_begin_started_ns = (
+                time.monotonic_ns()
+                if getattr(self, "target_p0_hop_profile_enabled", False)
+                else 0
+            )
             self._ledger.begin(dispatch_batch)
+            if getattr(self, "target_p0_hop_profile_enabled", False):
+                ledger_begin_finished_ns = time.monotonic_ns()
+                for task in dispatch_batch.entries:
+                    self._p0_emit(
+                        "dispatch_registered",
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        queued_ns=queued_origin_by_transfer[task.transfer_id][1],
+                        submitted_ns=submitted_ns,
+                        ledger_begin_started_ns=ledger_begin_started_ns,
+                        ledger_begin_finished_ns=ledger_begin_finished_ns,
+                        requires_proposal=task.requires_proposal,
+                    )
             lease_marks = getattr(self, "_lease_marks", None)
             if lease_marks:
                 # A ring copy written before a submit that did not go out is
@@ -5836,6 +6004,17 @@ class DTTargetController:
                 )
                 self._note_draft_progress(completion.draft_instance_id)
                 parked.result_received_ns = completion.observed_ns
+                self._p0_emit(
+                    "candidate_observed",
+                    transfer_id=completion.transfer_id,
+                    request_id=parked.req.rid,
+                    round_id=parked.round_id,
+                    completion_observed_ns=completion.observed_ns,
+                    producer_globaltimer_ns=getattr(
+                        completion, "producer_globaltimer_ns", 0
+                    ),
+                    ready_source=getattr(completion, "ready_source", "notice"),
+                )
                 if self._profile_active:
                     export_ledger_ready_ns = time.monotonic_ns()
                     self._profile_emit(
@@ -7209,6 +7388,7 @@ class DTTargetController:
     def _launch_fallback(self, reason: str):
         if self._profile_active:
             self._profile_emit("target_ring_publish_launch_fallback", reason=reason)
+        self._p0_emit("at_launch_fallback", reason=reason)
         return None
 
     def _dflash_ring_publish_at_launch_impl(
@@ -7538,6 +7718,7 @@ class DTTargetController:
                     row_start=0,
                 ),
             ),
+            wave_id=getattr(batch, "dt_full_wave_id", None),
         )
         self._ring_publish_pending.append(wave)
         batch_result.dt_ring_publish_wave = wave
@@ -8014,6 +8195,7 @@ class DTTargetController:
             reqs={req.rid: req for req in batch.reqs},
             proposals={},
             records=records,
+            wave_id=getattr(batch, "dt_full_wave_id", None),
         )
         self._ring_publish_pending.append(wave)
         _mark("wave_build")
@@ -8141,6 +8323,7 @@ class DTTargetController:
                         f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
                     )
                     hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+                    record.observed_ns = time.monotonic_ns()
                     record.record = [
                         row_count,
                         request_count,
@@ -8150,6 +8333,18 @@ class DTTargetController:
                         hidden_produced_ns,
                         slot_seq,
                     ]
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        for spec in record.specs:
+                            self._p0_emit(
+                                "record_visible",
+                                transfer_id=spec[1],
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                wave_id=wave.wave_id,
+                                ring_seq=record.wave_seq,
+                                hidden_produced_ns=hidden_produced_ns,
+                                record_visible_ns=record.observed_ns,
+                            )
                 else:
                     # Snapshotted records proceed from the snapshot even if
                     # the producer has wrapped (the Drafts consume records
@@ -8265,6 +8460,19 @@ class DTTargetController:
                             self._candidate_arena._metadata_buffer.allocation_offset
                         ),
                     )
+                    destination_written_ns = time.monotonic_ns()
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        for spec in specs:
+                            self._p0_emit(
+                                "destination_written",
+                                transfer_id=spec[1],
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                wave_id=wave.wave_id,
+                                ring_seq=record.wave_seq,
+                                record_visible_ns=record.observed_ns,
+                                destination_written_ns=destination_written_ns,
+                            )
             # Publish the source slot exactly once, now that every record is
             # visible: all records name disjoint ranges of its rows.
             hidden_produced_ns = max(record.record[5] for record in wave.records)
@@ -8625,6 +8833,7 @@ class DTTargetController:
                     continue
                 if seq != ring_task.direct_ring_seq:
                     raise RuntimeError("direct ring sequence diverged from its plan")
+                write_finished_ns = time.monotonic_ns()
                 self._remote_ring_records[task.transfer_id] = seq
                 # Remember the destination with the seq: if this submit does
                 # not go out, the re-flush must reuse both together, never a
@@ -8644,6 +8853,16 @@ class DTTargetController:
                         written_ns=written_ns,
                         remote=True,
                     )
+                self._p0_emit(
+                    "ring_written",
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    ring_seq=seq,
+                    written_ns=written_ns,
+                    write_finished_ns=write_finished_ns,
+                    remote=True,
+                )
                 stamped.append(ring_task)
                 continue
             planned_next[binding[1]] = next_seq(seq)
@@ -8715,6 +8934,7 @@ class DTTargetController:
                 pull = (source.source_slot_id, source.slot_generation)
             if seq != task.direct_ring_seq:
                 raise RuntimeError("direct ring sequence diverged from its plan")
+            write_finished_ns = time.monotonic_ns()
             # Applied after ledger.begin() registers the round.
             self._lease_marks.append(
                 (task.transfer_id, self._draft_binding[task.request_id][0])
@@ -8730,6 +8950,16 @@ class DTTargetController:
                     written_ns=written_ns,
                     remote=False,
                 )
+            self._p0_emit(
+                "ring_written",
+                transfer_id=task.transfer_id,
+                request_id=task.request_id,
+                round_id=task.round_id,
+                ring_seq=seq,
+                written_ns=written_ns,
+                write_finished_ns=write_finished_ns,
+                remote=False,
+            )
             self._ring_unproven[task.transfer_id] = draft_session_id
             self._ring_outstanding[draft_session_id].append(
                 (seq, task.transfer_id, pull)
