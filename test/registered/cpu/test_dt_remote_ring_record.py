@@ -34,6 +34,7 @@ from sglang.srt.speculative.dt_rdma import encode_task_record
 _GENERATIONS = np.array([3, 7, 1, 42], dtype=np.uint32)
 _ALLOCATION_OFFSET = 8192
 _SLOT_NBYTES = 1 << 20
+_ALLOCATION_LENGTH = len(_GENERATIONS) * _SLOT_NBYTES
 _ROW_BYTES = 256
 _LANDING_BYTES = 1 << 19
 _MALFORMED = -4
@@ -56,7 +57,7 @@ def check():
             table.ctypes.data,
             len(table),
             _ALLOCATION_OFFSET,
-            _SLOT_NBYTES,
+            _ALLOCATION_LENGTH,
             _ROW_BYTES,
             _LANDING_BYTES,
         )
@@ -150,10 +151,22 @@ def test_geometry_faults_are_rejected(check):
     assert check(_pull(1, nbytes=0), 1) == _MALFORMED
     assert check(_pull(1, nbytes=_ROW_BYTES + 2), 1) == _MALFORMED
     assert check(_pull(1, rows=_LANDING_BYTES // _ROW_BYTES + 1), 1) == _MALFORMED
-    # Source ranges outside the named slot, or not row-aligned inside it.
-    assert check(_pull(1, slot_id=1, source_offset=_offset(0)), 1) == _STALE_SOURCE
-    last_row = _SLOT_NBYTES // _ROW_BYTES - 1
-    assert check(_pull(1, slot_id=1, row=last_row, rows=2), 1) == _STALE_SOURCE
+    # The slot id is a logical READY identity; placement may be anywhere in
+    # the registered pool, but it must stay in the pool and be row-aligned.
+    assert check(_pull(1, slot_id=1, source_offset=_offset(0)), 1) == 0
+    assert check(
+        _pull(1, slot_id=1, source_offset=_ALLOCATION_OFFSET - _ROW_BYTES), 1
+    ) == _STALE_SOURCE
+    last_row = _ALLOCATION_LENGTH // _ROW_BYTES - 1
+    assert check(
+        _pull(
+            1,
+            slot_id=1,
+            source_offset=_ALLOCATION_OFFSET + last_row * _ROW_BYTES,
+            rows=2,
+        ),
+        1,
+    ) == _STALE_SOURCE
     assert check(_pull(1, slot_id=1, source_offset=_offset(1) + 2), 1) == _STALE_SOURCE
     assert check(_plain(1, nbytes=16, source_slot_id=0), 1) == _MALFORMED
 

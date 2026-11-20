@@ -320,7 +320,8 @@ struct RemoteRingSpec {
   uint64_t read_window;  // READs outstanding at once (the QP's send depth)
   uint64_t landing_lkey;
   // Remote feature pool: READ address = pool_addr + offset - allocation_offset.
-  uint64_t pool_addr, pool_rkey, pool_allocation_offset, slot_nbytes, slot_count;
+  uint64_t pool_addr, pool_rkey, pool_allocation_offset, pool_length, slot_nbytes,
+      slot_count;
   // Ready-record leg (#165): the worker is its only consumer.  ready_qp == 0
   // when the Target serves no feature pool (token-only rounds).
   uint64_t ready_qp, ready_recv_cq, ready_tag, ready_ring_host, ready_depth,
@@ -944,22 +945,19 @@ bool serve_entry_v2(Worker* w, Ring* r) {
       h.request_count > kRecordV2MaxReq ||
       h.nbytes == 0 || h.nbytes != (uint64_t)h.row_count * h.row_bytes ||
       h.row_bytes != w->row_bytes || h.nbytes > w->landing_bytes ||
+      h.source_byte_offset < r->allocation_offset ||
       h.source_byte_offset + h.nbytes > r->source_length) {
     fail(w, -4, r->id);
     return false;
   }
-  // Registered-source fences: the record must name the attached pool
-  // generation, the slot's current generation, and a row-aligned range fully
-  // inside its registered slot.  A wave split across several records (one per
-  // owner Draft group) names a subrange that starts past the slot base.
-  const uint64_t slot_base =
-      r->allocation_offset + (uint64_t)h.source_slot_id * r->slot_nbytes;
+  // source_slot_id is a logical READY identity.  The Target may map it to any
+  // page extent in the registered pool; source_byte_offset is authoritative.
+  // Keeping readiness separate from physical placement lets a slow reader
+  // pin only its extent instead of one max-sized physical slot.
   bool geometry_ok =
-      !r->slot_nbytes ||
-      (h.source_byte_offset >= slot_base &&
-       (h.source_byte_offset - slot_base) % h.row_bytes == 0 &&
-       h.source_byte_offset + h.nbytes <=
-           r->allocation_offset + (uint64_t)(h.source_slot_id + 1) * r->slot_nbytes);
+      h.source_byte_offset >= r->allocation_offset &&
+      (h.source_byte_offset - r->allocation_offset) % h.row_bytes == 0 &&
+      h.source_byte_offset + h.nbytes <= r->source_length;
   if (h.reserved[1] != r->pool_tag ||
       (r->slot_count && h.source_slot_id >= r->slot_count) || !geometry_ok ||
       (r->slot_generations && h.source_slot_id < r->slot_count &&
@@ -1088,7 +1086,7 @@ bool serve_entry(Worker* w, Ring* r) {
 // "not yet published".  0: valid; -4: malformed record; -5: stale source.
 int remote_record_check(const EntryHeader& h, uint64_t expected_seq, uint64_t payload_cap,
                         const uint32_t* table, uint64_t slot_count,
-                        uint64_t allocation_offset, uint64_t slot_nbytes,
+                        uint64_t allocation_offset, uint64_t allocation_length,
                         uint64_t row_bytes, uint64_t landing_bytes) {
   if (h.seq != (uint32_t)expected_seq || h.epoch != (uint32_t)(expected_seq >> 32)) return -4;
   if ((uint32_t)(h.source_offset >> 32) == kRecordVersion2) return -4;
@@ -1100,9 +1098,9 @@ int remote_record_check(const EntryHeader& h, uint64_t expected_seq, uint64_t pa
   if (h.source_slot_id >= slot_count || h.slot_generation == 0 ||
       table[h.source_slot_id] != h.slot_generation)
     return -5;
-  const uint64_t slot_base = allocation_offset + (uint64_t)h.source_slot_id * slot_nbytes;
-  if (h.source_offset < slot_base || (h.source_offset - slot_base) % row_bytes ||
-      h.source_offset + h.nbytes > slot_base + slot_nbytes)
+  if (h.source_offset < allocation_offset ||
+      (h.source_offset - allocation_offset) % row_bytes ||
+      h.source_offset + h.nbytes > allocation_offset + allocation_length)
     return -5;
   return 0;
 }
@@ -1162,7 +1160,7 @@ int serve_remote_record(Worker* w, Ring* r) {
   memcpy(&h, slot, sizeof(h));
   const int check = remote_record_check(
       h, r->next_seq, r->entry_bytes - 128, m.spec.ready_qp ? m.table : nullptr,
-      m.spec.slot_count, m.spec.pool_allocation_offset, m.spec.slot_nbytes, w->row_bytes,
+      m.spec.slot_count, m.spec.pool_allocation_offset, m.spec.pool_length, w->row_bytes,
       w->landing_bytes);
   if (check != 0) {
     fail(w, check, r->id);
@@ -1698,12 +1696,13 @@ int dt_ring_worker_attach_remote(void* handle, int ring_id, uint64_t entries_hos
 int dt_ring_remote_record_check(const uint8_t* entry, uint64_t entry_bytes,
                                 uint64_t expected_seq, const uint32_t* table,
                                 uint64_t slot_count, uint64_t allocation_offset,
-                                uint64_t slot_nbytes, uint64_t row_bytes,
+                                uint64_t allocation_length, uint64_t row_bytes,
                                 uint64_t landing_bytes) {
   EntryHeader h;
   memcpy(&h, entry, sizeof(h));
   return remote_record_check(h, expected_seq, entry_bytes - 128, table, slot_count,
-                             allocation_offset, slot_nbytes, row_bytes, landing_bytes);
+                             allocation_offset, allocation_length, row_bytes,
+                             landing_bytes);
 }
 
 // Stop serving a ring; returns its next unserved seq.  Its queued copies may

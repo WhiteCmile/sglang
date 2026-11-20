@@ -40,6 +40,10 @@ from sglang.srt.speculative.dt_rdma import (
     RDMA_OP_TIMEOUT_S,
     DraftRdmaPuller,
 )
+from sglang.srt.speculative.dt_source_page_allocator import (
+    SourcePageAllocationError,
+    TargetSourcePageAllocator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +197,8 @@ class _FeatureSlot:
     state: FeatureSlotState = FeatureSlotState.FREE
     active_transfers: set[str] | None = None
     producer_event: torch.cuda.Event | None = None
+    allocation_lease_id: str | None = None
+    allocation_row_offset: int = 0
 
     def __post_init__(self) -> None:
         if self.active_transfers is None:
@@ -218,6 +224,7 @@ class TargetFeatureSourcePool:
         slot_count: int,
         max_tokens: int,
         feature_width: int,
+        page_rows: int = 0,
     ) -> None:
         if not target_instance_id or not source_session_id:
             raise ValueError("Target identity and source session must not be empty")
@@ -234,9 +241,34 @@ class TargetFeatureSourcePool:
         self.device = torch.device("cuda", self.device_index)
         self.target_instance_id = target_instance_id
         self.source_session_id = source_session_id
-        self.slot_count = int(slot_count)
+        self.physical_slot_count = int(slot_count)
         self.max_tokens = int(max_tokens)
         self.feature_width = int(feature_width)
+        self.page_rows = int(page_rows)
+        if self.page_rows < 0:
+            raise ValueError("feature source page rows must not be negative")
+        if self.page_rows and self.max_tokens % self.page_rows:
+            raise ValueError(
+                "feature source page rows must divide the physical slot rows"
+            )
+        self._page_allocator = (
+            TargetSourcePageAllocator(
+                slot_count=self.physical_slot_count,
+                slot_rows=self.max_tokens,
+                page_rows=self.page_rows,
+            )
+            if self.page_rows
+            else None
+        )
+        # The remote ready table occupies one 4 KiB page and stores one u32
+        # generation per logical slot.  In paged mode a logical slot is a
+        # reusable publication/ready identity, decoupled from the extent's
+        # physical address.  The backing allocation size remains unchanged.
+        self.slot_count = (
+            min(self._page_allocator.total_page_count, 4096 // 4)
+            if self._page_allocator is not None
+            else self.physical_slot_count
+        )
         self.dtype = torch.bfloat16
         self._slot_nbytes = self.max_tokens * self.feature_width * torch.empty(
             (), dtype=self.dtype
@@ -246,7 +278,7 @@ class TargetFeatureSourcePool:
         self._runtime = CudaIpcRuntime()
         torch.cuda.set_device(self.device)
         self._storage = torch.empty(
-            (self.slot_count, self.max_tokens, self.feature_width),
+            (self.physical_slot_count, self.max_tokens, self.feature_width),
             dtype=self.dtype,
             device=self.device,
         )
@@ -291,11 +323,34 @@ class TargetFeatureSourcePool:
 
         return self._buffer.allocation_offset
 
+    def publication_offset(self, slot_id: int, generation: int) -> int:
+        """Byte offset of a logical publication inside the IPC allocation."""
+
+        with self._lock:
+            if slot_id < 0 or slot_id >= self.slot_count:
+                raise FeatureTransportError("source slot id is out of range")
+            slot = self._slots[slot_id]
+            if slot.generation != generation or slot.state is FeatureSlotState.FREE:
+                raise FeatureTransportError("feature source reservation is stale")
+            return (
+                self._buffer.allocation_offset
+                + slot.allocation_row_offset * self.feature_width * 2
+            )
+
     @property
     def free_slot_count(self) -> int:
         self.poll_cancelled_producers()
         with self._lock:
-            return sum(slot.state is FeatureSlotState.FREE for slot in self._slots)
+            logical_free = sum(
+                slot.state is FeatureSlotState.FREE for slot in self._slots
+            )
+            page_allocator = getattr(self, "_page_allocator", None)
+            if page_allocator is None:
+                return logical_free
+            # Every admitted publication consumes at least one page.  This is
+            # conservative for scheduler backpressure; reserve() still checks
+            # the requested contiguous extent.
+            return min(logical_free, page_allocator.free_page_count)
 
     @property
     def quarantined_slot_count(self) -> int:
@@ -308,6 +363,73 @@ class TargetFeatureSourcePool:
 
         with self._lock:
             return len(self._active)
+
+    def _reserve_slot_locked(
+        self, token_count: int
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """Reserve one logical READY identity and its physical row extent."""
+
+        slot_id = next(
+            (
+                index
+                for index, slot in enumerate(self._slots)
+                if slot.state is FeatureSlotState.FREE
+            ),
+            None,
+        )
+        if slot_id is None:
+            return None
+        slot = self._slots[slot_id]
+        generation = slot.generation + 1
+        allocation_lease_id = None
+        page_allocator = getattr(self, "_page_allocator", None)
+        if page_allocator is None:
+            allocation_row_offset = slot_id * self.max_tokens
+        else:
+            allocation_lease_id = f"{slot_id}:{generation}"
+            try:
+                extent = page_allocator.allocate(allocation_lease_id, token_count)
+            except SourcePageAllocationError:
+                return None
+            allocation_row_offset = (
+                extent.slot_id * self.max_tokens + extent.row_offset
+            )
+        slot.generation = generation
+        slot.state = FeatureSlotState.RESERVED
+        slot.allocation_lease_id = allocation_lease_id
+        slot.allocation_row_offset = allocation_row_offset
+        rows = (
+            self._storage[slot_id][:token_count]
+            if page_allocator is None
+            else self._storage.view(-1, self.feature_width)[
+                allocation_row_offset : allocation_row_offset + token_count
+            ]
+        )
+        return (
+            slot_id,
+            generation,
+            rows,
+        )
+
+    def _free_slot_locked(self, slot_id: int, generation: int) -> None:
+        """Release a logical identity and its physical page extent."""
+
+        slot = self._slots[slot_id]
+        if slot.generation != generation:
+            raise FeatureTransportError("stale source slot generation")
+        allocation_lease_id = getattr(slot, "allocation_lease_id", None)
+        if allocation_lease_id is not None:
+            try:
+                self._page_allocator.release(allocation_lease_id)
+            except SourcePageAllocationError as exc:
+                raise FeatureTransportError(
+                    "feature source page lease diverged"
+                ) from exc
+        slot.state = FeatureSlotState.FREE
+        slot.active_transfers.clear()
+        slot.producer_event = None
+        slot.allocation_lease_id = None
+        slot.allocation_row_offset = 0
 
     def publish(
         self,
@@ -356,16 +478,6 @@ class TargetFeatureSourcePool:
             # initial fast-path check alone would allow post-close CUDA work.
             if self._closed:
                 raise FeatureTransportError("feature source pool is closed")
-            slot_id = next(
-                (
-                    index
-                    for index, slot in enumerate(self._slots)
-                    if slot.state is FeatureSlotState.FREE
-                ),
-                None,
-            )
-            if slot_id is None:
-                raise FeatureTransportError("all bounded feature source slots are leased")
             duplicate = next(
                 (item.transfer_id for item in slices if item.transfer_id in self._active),
                 None,
@@ -374,9 +486,11 @@ class TargetFeatureSourcePool:
                 raise FeatureTransportError(
                     f"feature transfer {duplicate!r} is already active"
                 )
+            reservation = self._reserve_slot_locked(token_count)
+            if reservation is None:
+                raise FeatureTransportError("all bounded feature source slots are leased")
+            slot_id, generation, target_rows = reservation
             slot = self._slots[slot_id]
-            slot.generation += 1
-            generation = slot.generation
             slot.state = FeatureSlotState.PUBLISHED
             slot.active_transfers = {item.transfer_id for item in slices}
             for item in slices:
@@ -391,7 +505,7 @@ class TargetFeatureSourcePool:
         )
         try:
             with torch.cuda.stream(publish_stream):
-                target = self._storage[slot_id]
+                target = target_rows
                 cat = getattr(torch, "cat", None)
                 if len(chunks) > 1 and callable(cat):
                     # Pack ragged request chunks directly into the leased,
@@ -449,27 +563,14 @@ class TargetFeatureSourcePool:
         with self._lock:
             if self._closed:
                 return None
-            slot_id = next(
-                (
-                    index
-                    for index, slot in enumerate(self._slots)
-                    if slot.state is FeatureSlotState.FREE
-                ),
-                None,
-            )
-            if slot_id is None:
-                return None
-            slot = self._slots[slot_id]
-            slot.generation += 1
-            slot.state = FeatureSlotState.RESERVED
-            return slot_id, slot.generation, self._storage[slot_id][:token_count]
+            return self._reserve_slot_locked(token_count)
 
     def release_reserved(self, slot_id: int, generation: int) -> None:
         """Return an unpublished reservation once its producer write finished."""
         with self._lock:
             slot = self._slots[slot_id]
             if slot.generation == generation and slot.state is FeatureSlotState.RESERVED:
-                slot.state = FeatureSlotState.FREE
+                self._free_slot_locked(slot_id, generation)
 
     def quarantine_reserved(self, slot_id: int, generation: int) -> None:
         """Fence a reservation whose in-place write may be incomplete."""
@@ -559,7 +660,13 @@ class TargetFeatureSourcePool:
     ) -> FeaturePublish:
         descriptor_published_ns = time.monotonic_ns()
         allocation = self._allocations[self._buffer.allocation_index]
-        slot_allocation_offset = self._buffer.allocation_offset + slot_id * self._slot_nbytes
+        current = self._slots[slot_id]
+        slot_allocation_offset = self._buffer.allocation_offset
+        publication_byte_offset = (
+            getattr(current, "allocation_row_offset", slot_id * self.max_tokens)
+            * self.feature_width
+            * 2
+        )
         descriptors = tuple(
             FeatureSourceDescriptor(
                 target_instance_id=self.target_instance_id,
@@ -569,7 +676,10 @@ class TargetFeatureSourcePool:
                 transfer_id=item.transfer_id,
                 feature_schema_id=feature_schema_id,
                 nbytes=item.row_count * self.feature_width * 2,
-                byte_offset=item.row_offset * self.feature_width * 2,
+                byte_offset=(
+                    publication_byte_offset
+                    + item.row_offset * self.feature_width * 2
+                ),
                 transport="cuda-ipc",
                 source_session_id=self.source_session_id,
                 pool_generation=self.pool_generation,
@@ -587,7 +697,6 @@ class TargetFeatureSourcePool:
         with self._lock:
             # Retain the local event object for the entire source lease; its
             # IPC handle must remain usable by every assigned Draft.
-            current = self._slots[slot_id]
             if current.generation != generation or current.state is not FeatureSlotState.PUBLISHED:
                 raise FeatureTransportError("published source slot was invalidated")
             current.producer_event = producer_event
@@ -643,8 +752,7 @@ class TargetFeatureSourcePool:
             self._remember_completed_locked(transfer_id, active)
             if slot.active_transfers:
                 return False
-            slot.state = FeatureSlotState.FREE
-            slot.producer_event = None
+            self._free_slot_locked(source_slot_id, slot_generation)
             return True
 
     def validate_read_done(
@@ -806,8 +914,7 @@ class TargetFeatureSourcePool:
                     self._remember_completed_locked(transfer_id, active)
                     retired += 1
                 if not slot.active_transfers:
-                    slot.state = FeatureSlotState.FREE
-                    slot.producer_event = None
+                    self._free_slot_locked(slot_id, generation)
         return retired
 
     def quarantine(

@@ -867,6 +867,7 @@ class TargetRdmaEndpoint:
                 slot_nbytes=pool.slot_nbytes,
                 slot_count=pool.slot_count,
                 allocation_offset=pool.allocation_offset,
+                allocation_length=pool._storage.nbytes,
                 pool_generation=pool.pool_generation,
                 source_session_id=pool.source_session_id,
             )
@@ -1201,6 +1202,7 @@ class DraftRdmaPuller:
             self._slot_nbytes = int(remote["slot_nbytes"])
             self._slot_count = int(remote["slot_count"])
             self.allocation_offset = int(remote["allocation_offset"])
+            self.allocation_length = int(remote["allocation_length"])
             self.native_ready = native_ready
             self._device = device
             self._landing: torch.Tensor | None = None
@@ -1267,11 +1269,14 @@ class DraftRdmaPuller:
         ):
             raise StaleDescriptorError("feature descriptor names a stale source incarnation")
         slot_id, generation = int(source.source_slot_id), int(source.slot_generation)
+        source_offset = int(source.allocation_offset) + int(source.byte_offset)
         if (
             slot_id >= self._slot_count
-            or source.byte_offset + source.nbytes > self._slot_nbytes
+            or source_offset < self.allocation_offset
+            or source_offset + source.nbytes
+            > self.allocation_offset + self.allocation_length
         ):
-            raise StaleDescriptorError("feature descriptor range exceeds the source slot")
+            raise StaleDescriptorError("feature descriptor range exceeds the source pool")
         deadline = time.monotonic() + RDMA_OP_TIMEOUT_S
         while self._ready[slot_id] < generation:
             if time.monotonic() >= deadline:
@@ -1285,7 +1290,7 @@ class DraftRdmaPuller:
         return {
             "slot_id": slot_id,
             "generation": generation,
-            "remote": self._pool_addr + slot_id * self._slot_nbytes + source.byte_offset,
+            "remote": self._pool_addr + source_offset - self.allocation_offset,
             "nbytes": int(source.nbytes),
             "ready_ns": time.monotonic_ns(),
         }
@@ -1963,6 +1968,7 @@ class DraftRemoteRing(MailboxConsumer):
             spec.pool_addr = puller._pool_addr
             spec.pool_rkey = puller._pool_rkey
             spec.pool_allocation_offset = puller.allocation_offset
+            spec.pool_length = puller.allocation_length
             spec.slot_nbytes = puller._slot_nbytes
             spec.slot_count = puller._slot_count
             spec.ready_qp = ready.qp.handle

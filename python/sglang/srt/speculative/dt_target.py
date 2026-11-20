@@ -837,6 +837,21 @@ class DTTargetController:
                                 "DT_FEATURE_SOURCE_SLOTS must be positive, "
                                 f"got {feature_source_slot_count}"
                             )
+                    feature_source_page_rows = 0
+                    env_page_rows = os.environ.get("DT_FEATURE_SOURCE_PAGE_ROWS")
+                    if env_page_rows:
+                        try:
+                            feature_source_page_rows = int(env_page_rows)
+                        except ValueError as exc:
+                            raise ValueError(
+                                "DT_FEATURE_SOURCE_PAGE_ROWS must be an integer, "
+                                f"got {env_page_rows!r}"
+                            ) from exc
+                        if feature_source_page_rows <= 0:
+                            raise ValueError(
+                                "DT_FEATURE_SOURCE_PAGE_ROWS must be positive, "
+                                f"got {feature_source_page_rows}"
+                            )
                     self._feature_source_pool = TargetFeatureSourcePool(
                         target_instance_id=self.instance_id,
                         source_session_id=self._client.instance_session_id,
@@ -844,6 +859,7 @@ class DTTargetController:
                         slot_count=feature_source_slot_count,
                         max_tokens=max_source_rows,
                         feature_width=self.pivot_width,
+                        page_rows=feature_source_page_rows,
                     )
                     self._profile_emit(
                         "target_feature_pool_registration",
@@ -851,6 +867,11 @@ class DTTargetController:
                         source_session_id=self._feature_source_pool.source_session_id,
                         pool_generation=self._feature_source_pool.pool_generation,
                         transport_session=self._feature_source_pool.transport_session,
+                        physical_slot_count=(
+                            self._feature_source_pool.physical_slot_count
+                        ),
+                        logical_slot_count=self._feature_source_pool.slot_count,
+                        page_rows=self._feature_source_pool.page_rows,
                     )
                     self._feature_source_free_slots = (
                         self._feature_source_pool.free_slot_count
@@ -7453,7 +7474,7 @@ class DTTargetController:
 
         staging_slot = publisher.next_launch_slot()
         publisher.stage_requests(entries, staging_slot=staging_slot)
-        source_byte_offset = pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
+        source_byte_offset = pool.publication_offset(slot_id, generation)
         try:
             return publisher.publish(
                 stream=int(self.scheduler.forward_stream.cuda_stream),
@@ -7778,9 +7799,7 @@ class DTTargetController:
                 _mark("handle_war")
                 publisher.stage_requests(entries)
                 _mark("entries")
-                source_byte_offset = (
-                    pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
-                )
+                source_byte_offset = pool.publication_offset(slot_id, generation)
                 # The kernel reads the per-slot accept counts straight from the
                 # verify's GPU tensor (same int32 layout as the staged copy); the
                 # CPU-staged counts buffer is only a fallback for CPU-side
@@ -7928,8 +7947,7 @@ class DTTargetController:
                         staging_slot=staging_slot,
                     )
                     source_byte_offset = (
-                        pool._buffer.allocation_offset
-                        + slot_id * pool._slot_nbytes
+                        pool.publication_offset(slot_id, generation)
                         + row_cursor * self.pivot_width * 2
                     )
                     wave_seq = publisher.publish(
