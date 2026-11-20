@@ -667,6 +667,14 @@ class DTTargetController:
             float(os.environ.get("DT_TARGET_BATCH_WAIT_MS", "10")) * 1_000_000
         )
         self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "16"))
+        # Experimental GPU-aware READY hold (issue #5): release the hold as soon
+        # as the TP0 poll broadcast reports the in-flight result's copy_done
+        # ready, instead of idling until the 10 ms budget.  Off by default; the
+        # env var is read once here, never from the per-poll hot path.
+        # False/None from the broadcast keep the unchanged 10 ms policy.
+        self._adaptive_ready_hold = (
+            os.environ.get("DT_TARGET_ADAPTIVE_READY_HOLD", "0") == "1"
+        )
         self._ready_hold_started_ns = 0
         # Same-host Target -> owner-Draft descriptor rings (dt_direct_ring).
         # They replace the former ZMQ direct dispatch (DT_DIRECT_DISPATCH).
@@ -4398,6 +4406,12 @@ class DTTargetController:
         )
         if not outstanding:
             self._end_ready_hold("drained", ready_count)
+            return False
+        if self._adaptive_ready_hold and self._overlap_result_ready is True:
+            # The broadcast copy_done snapshot says the in-flight result is
+            # ready, so holding longer would only leave the GPU idle.  Only an
+            # explicit True releases early; False/None fall through unchanged.
+            self._end_ready_hold("gpu_ready", ready_count)
             return False
         now_ns = self._last_poll_ns
         if not self._ready_hold_started_ns:
