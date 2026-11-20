@@ -1695,6 +1695,11 @@ class Scheduler(
         early_ready_result_enabled = (
             os.environ.get("DT_TARGET_EARLY_READY_RESULT", "0") == "1"
         )
+        # Default-off switch for the bounded second READY collection below,
+        # cached once when the loop starts so the hot path reads one bool.
+        ready_refresh_before_select = (
+            os.environ.get("DT_TARGET_READY_REFRESH_BEFORE_SELECT", "0") == "1"
+        )
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1808,6 +1813,30 @@ class Scheduler(
             )
             if self._engine_paused:
                 continue
+
+            # Bounded second READY collection (default off): refresh parked
+            # requests once between the first poll and batch selection so a
+            # candidate that completed in that window can still join this
+            # batch. The entry state is TP lockstep: the cached switch is read
+            # from the launch environment on every rank, the controller exists
+            # on every Target rank, ``len(controller)`` counts the replicated
+            # ``_parked`` rounds created/drained on every rank from the same
+            # batches and broadcast poll events, ``hold_next_batch`` is the
+            # value the export rank just broadcast in the first poll, and
+            # ``has_compute_slot()`` reads the launch/result counter every
+            # rank advances in lockstep with the shared batch sequence. This
+            # straight-line block runs at most once per loop iteration, so no
+            # per-round counter or assertion is needed.
+            if (
+                ready_refresh_before_select
+                and self.dt_target_controller is not None
+                and len(self.dt_target_controller) > 0
+                and not self.dt_target_controller.hold_next_batch
+                and self.dt_target_controller.has_compute_slot()
+            ):
+                self.dt_target_controller.poll(overlap_result=pending_result)
+                if target_phase_profile_enabled:
+                    poll_finished_ns = time.monotonic_ns()
 
             # Bounded early consumption of an already-complete head result.
             # poll() broadcast the copy_done readiness decision, so every TP
