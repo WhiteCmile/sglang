@@ -145,6 +145,11 @@ DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
 # slot, so a row is never held behind the batch that owns its landing buffer
 # (no compute-busy, no submit-time seal; the ring worker seals on overflow).
 DRAFT_SLOT_DECOUPLE = os.environ.get("DT_DRAFT_SLOT_DECOUPLE", "0") == "1"
+# Draft redesign D5 (issue #274): the dt-draft-control thread owns the
+# Coordinator socket (dt_client.DraftControlLoop) and the DFlash loop's idle
+# tail waits on the native wake word (dt_wake) for the same poll interval, so
+# a Coordinator message ends the wait at once.
+DRAFT_CONTROL_LOOP = os.environ.get("DT_DRAFT_CONTROL_LOOP", "0") == "1"
 # One executing plus one submitted Draft compute batch.
 DRAFT_COMPUTE_DEPTH = 2
 RING_RETIRED_LIMIT = 65536
@@ -876,6 +881,9 @@ class FlashMTPDraftEngine:
     # per-batch scratch owner; class defaults keep __new__ fixtures legacy.
     _slot_decouple = False
     _dflash_batch_seq = 0
+    # DT_DRAFT_CONTROL_LOOP (DFlash only): the scheduler wake word, or None
+    # for the legacy socket polling and idle sleep.
+    _wake = None
 
     # Preserve the historical transport for partially constructed test and
     # diagnostic instances that intentionally bypass ``__init__``.
@@ -1269,6 +1277,15 @@ class FlashMTPDraftEngine:
             self._client.pool = self._kv_pool
             self._client.register_draft(timeout_s=registration_timeout_s)
             self._publish_capacity()
+            if DRAFT_CONTROL_LOOP and self._is_dflash:
+                from dt_client import DraftControlLoop
+
+                from sglang.srt.speculative.dt_wake import WAKE_CONTROL, DraftWake
+
+                self._wake = DraftWake()
+                self._client = DraftControlLoop(
+                    self._client, notify=partial(self._wake.set, WAKE_CONTROL)
+                )
         except Exception:
             if self._candidate_push_transport is not None:
                 self._candidate_push_transport.close()
@@ -2279,10 +2296,13 @@ class FlashMTPDraftEngine:
 
             observer = create(self.instance_id, "draft", 0, 1)
         self._overlap_fix_observer = observer
+        wake = self._wake
         while not self._stop:
             iter_started_ns = time.monotonic_ns()
             if observer is not None:
                 observer.checkpoint()
+            # Read before draining: a set after this read ends the idle wait.
+            wake_epoch = wake.epoch() if wake is not None else 0
             self._loop_stage("poll_messages", self._poll_messages)
             if self._candidate_push_transport is not None:
                 self._loop_stage("push_progress", self._push_transport_progress)
@@ -2370,9 +2390,13 @@ class FlashMTPDraftEngine:
                     # A completion or direct candidate push is still in flight
                     # on the GPU; observe it soon instead of sleeping the full
                     # idle poll (issue #149).
-                    self._loop_stage("idle_sleep", lambda: time.sleep(INFLIGHT_POLL_S))
+                    idle_s = INFLIGHT_POLL_S
                 else:
-                    self._loop_stage("idle_sleep", lambda: time.sleep(IDLE_POLL_S))
+                    idle_s = IDLE_POLL_S
+                if wake is None:
+                    self._loop_stage("idle_sleep", time.sleep, idle_s)
+                else:
+                    self._loop_stage("idle_sleep", wake.wait, wake_epoch, idle_s)
             self._loop_stage("lifecycle", self._maybe_emit_lifecycle_status)
             self._loop_wall_ns += time.monotonic_ns() - iter_started_ns
             self._loop_iters += 1
@@ -3831,6 +3855,8 @@ class FlashMTPDraftEngine:
         for draft_kv_handle in tuple(self._persistent_requests):
             self._release_persistent_request(draft_kv_handle)
         self._client.close()
+        if self._wake is not None:
+            self._wake.close()
         if self._result_store is not None:
             self._result_store.close()
             self._result_store.unlink()
