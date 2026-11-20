@@ -298,9 +298,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--request-prefix",
+        default="",
+        help="keep only transfers whose request_id starts with this prefix",
+    )
     args = parser.parse_args()
     events, fallback = load_events(args.inputs)
     rows = build_rows(events)
+    if args.request_prefix:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("request_id", "")).startswith(args.request_prefix)
+        ]
     summary = summarize(rows, fallback)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(args.output_dir / "target-p0-hops.csv", rows)
