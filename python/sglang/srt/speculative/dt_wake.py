@@ -12,8 +12,9 @@ import ctypes
 import os
 from pathlib import Path
 
-# Reason bits (§4.4).  D5 sets only CONTROL; READY (1) and DONE (2) belong to
-# the native ingress (D6) and send loop (D8).
+# Reason bits (§4.4).  READY is set by the native ingress (D6), CONTROL by
+# the control thread (D5); DONE (2) belongs to the send loop (D8).
+WAKE_READY = 1 << 0
 WAKE_CONTROL = 1 << 2
 
 
@@ -52,6 +53,12 @@ class DraftWake:
 
     def set(self, reasons: int) -> None:
         self._lib.dt_wake_set(self._handle, reasons)
+
+    def native_setter(self) -> tuple[int, int]:
+        """(dt_wake_set address, wake handle) for a native thread that sets
+        reason bits without Python (the ring worker's READY wake)."""
+
+        return ctypes.cast(self._lib.dt_wake_set, ctypes.c_void_p).value, self._handle
 
     def wait(self, seen_epoch: int, timeout_s: float) -> int:
         """Return the reason bits taken (0 on timeout); the GIL is released."""

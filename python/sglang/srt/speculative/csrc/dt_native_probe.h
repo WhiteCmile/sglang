@@ -36,7 +36,8 @@ namespace dt_probe {
   X(READ_POSTED, "read_posted")             /* cross-host RDMA READ posted */ \
   X(READ_COMPLETED, "read_completed")       /* its completion reaped */      \
   X(JOB_TAKEN, "job_taken")                 /* publish job dequeued; seq = ticket */ \
-  X(JOB_ISSUED, "job_issued")               /* its event re-record issued */
+  X(JOB_ISSUED, "job_issued")               /* its event re-record issued */ \
+  X(READY_PUBLISHED, "ready_published")     /* D6 READY entries published; arg = count */
 
 #define DT_PROBE_CALLS(X)                            \
   X(IPC_OPEN_EVENT, "cuIpcOpenEventHandle")          \

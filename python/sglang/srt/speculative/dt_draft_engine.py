@@ -2506,7 +2506,10 @@ class FlashMTPDraftEngine:
     def _ensure_ring_worker(self):
         """The native ring worker and its landing buffers, created once."""
 
-        from sglang.srt.speculative.dt_direct_ring import DraftRingWorker
+        from sglang.srt.speculative.dt_direct_ring import (
+            DRAFT_INGRESS_NATIVE,
+            DraftRingWorker,
+        )
 
         if self._ring_worker is None:
             if self._is_feature_backed:
@@ -2556,6 +2559,9 @@ class FlashMTPDraftEngine:
                 cpu=int(os.environ.get("DT_DIRECT_RING_CPU", "-1")),
                 landing=landing,
                 row_bytes=row_bytes,
+                # D6: DFlash only; other methods keep the legacy ingress.
+                ingress=DRAFT_INGRESS_NATIVE and self._is_dflash,
+                wake=self._wake,
             )
         return self._ring_worker
 
@@ -2678,6 +2684,8 @@ class FlashMTPDraftEngine:
         worker = self._ring_worker
         if worker is not None:
             worker.check()
+            if worker.ingress:
+                worker.drain_ready()
         decoder = self._ring_task_decoder
         if decoder is None:
             decoder = self._ring_task_decoder = msgspec.msgpack.Decoder(DraftTask)
@@ -2716,6 +2724,7 @@ class FlashMTPDraftEngine:
                         if self._rid_ledger is not None
                         else None
                     ),
+                    target_instance_id=self._ring_targets[endpoint.ring_id],
                 )
                 endpoint.mark_serving(
                     pool_generation=pool_generation,

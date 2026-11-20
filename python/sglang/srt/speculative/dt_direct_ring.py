@@ -51,6 +51,7 @@ import re
 import shutil
 import struct
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +60,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
+# Draft redesign D6 (design §6): the ring worker also parses served entries
+# into READY entries for the scheduler.  The Python consumer is not switched
+# yet: it only drains the queue (DraftRingWorker.drain_ready).
+DRAFT_INGRESS_NATIVE = os.environ.get("DT_DRAFT_INGRESS", "") == "native"
 RING_CAPACITY = int(os.environ.get("DT_DIRECT_RING_CAPACITY", "256"))
 if RING_CAPACITY <= 0 or RING_CAPACITY & (RING_CAPACITY - 1):
     # Indices are derived from the 32-bit wire seq in the native worker; a
@@ -405,6 +410,10 @@ class NativeRidLedger:
         lib.dt_rid_ledger_remove.restype = i32
         lib.dt_rid_ledger_resolve.argtypes = [vp, u64, cp, u32]
         lib.dt_rid_ledger_resolve.restype = i32
+        lib.dt_rid_ledger_lookup.argtypes = [
+            vp, u64, cp, u32, ctypes.POINTER(u32), ctypes.POINTER(u32)
+        ]
+        lib.dt_rid_ledger_lookup.restype = i32
         lib.dt_rid_ledger_destroy.argtypes = [vp]
         lib.dt_rid_ledger_destroy.restype = None
         self._lib = lib
@@ -429,6 +438,17 @@ class NativeRidLedger:
         if rc < 0:
             raise DirectRingError(f"native rid ledger resolve failed: rc={rc}")
         return buf.value.decode() if rc else None
+
+    def handle(self, rid: str) -> tuple[int, int] | None:
+        """(request handle, generation) of a live ``rid``, as READY entries
+        carry them (native ingress); None when unknown or released."""
+
+        buf = ctypes.create_string_buffer(256)
+        cell, gen = ctypes.c_uint32(), ctypes.c_uint32()
+        rc = self._lib.dt_rid_ledger_lookup(
+            self._handle, rid_hash(rid), buf, len(buf), ctypes.byref(cell), ctypes.byref(gen)
+        )
+        return (cell.value, gen.value) if rc > 0 and buf.value.decode() == rid else None
 
     def evict(self, rid: str) -> None:
         self._lib.dt_rid_ledger_remove(self._handle, rid_hash(rid), rid.encode())
@@ -1151,6 +1171,32 @@ def _build_worker_library() -> Path:
     )
 
 
+def ready_abi(lib) -> tuple[np.dtype, dict[str, int]]:
+    """The native READY entry dtype and its kind/sentinel constants, read
+    from the worker library (csrc/dt_ring_worker.cpp holds the only copy)."""
+
+    u32, u64 = ctypes.c_uint32, ctypes.c_uint64
+    lib.dt_ring_ready_field.argtypes = [
+        u32, ctypes.POINTER(u64), ctypes.POINTER(u64), ctypes.POINTER(ctypes.c_int)
+    ]
+    lib.dt_ring_ready_field.restype = ctypes.c_char_p
+    lib.dt_ring_ready_constant.argtypes = [u32, ctypes.POINTER(u64)]
+    lib.dt_ring_ready_constant.restype = ctypes.c_char_p
+    names, formats, offsets, end = [], [], [], 0
+    offset, size, signed = u64(), u64(), ctypes.c_int()
+    while (name := lib.dt_ring_ready_field(len(names), offset, size, signed)) is not None:
+        names.append(name.decode())
+        formats.append(f"<{'i' if signed.value else 'u'}{size.value}")
+        offsets.append(offset.value)
+        end = max(end, offset.value + size.value)  # the struct has no tail padding
+    constants = {}
+    value = u64()
+    while (name := lib.dt_ring_ready_constant(len(constants), value)) is not None:
+        constants[name.decode()] = value.value
+    dtype = np.dtype({"names": names, "formats": formats, "offsets": offsets, "itemsize": end})
+    return dtype, constants
+
+
 class NativeProbe:
     """D0 per-hop stamps and driver-call histograms of one native worker
     (csrc/dt_native_probe.h, issue #269).
@@ -1267,14 +1313,25 @@ class RemoteRingSpec(ctypes.Structure):
 class DraftRingWorker:
     """ctypes owner of the native ring worker thread and its landing buffers."""
 
-    def __init__(self, *, device: int, cpu: int, landing, row_bytes: int) -> None:
+    READY_BATCH = 4096  # READY entries copied per drain call
+
+    def __init__(
+        self,
+        *,
+        device: int,
+        cpu: int,
+        landing,
+        row_bytes: int,
+        ingress: bool = False,
+        wake=None,
+    ) -> None:
         lib = ctypes.CDLL(str(_build_worker_library()))
         u64, u32, i32, vp = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p
         lib.dt_ring_worker_create.argtypes = [i32, i32, u64, u64, u32, u64]
         lib.dt_ring_worker_create.restype = vp
         lib.dt_ring_worker_attach.argtypes = [
             vp, i32, u64, u64, u32, u64, u64, u64, u64, u64, u64, u64, u32, u64, u64, u64,
-            u64, u64, u64, u64, vp,
+            u64, u64, u64, u64, vp, ctypes.c_char_p, u64, u64, u64,
         ]
         lib.dt_ring_worker_attach.restype = i32
         lib.dt_ring_worker_attach_remote.argtypes = [
@@ -1302,6 +1359,14 @@ class DraftRingWorker:
         lib.dt_ring_worker_sync.restype = i32
         lib.dt_ring_worker_destroy.argtypes = [vp]
         lib.dt_ring_worker_destroy.restype = i32
+        lib.dt_ring_worker_enable_ingress.argtypes = [vp, vp, vp, u32]
+        lib.dt_ring_worker_enable_ingress.restype = i32
+        lib.dt_ring_worker_ready_drain.argtypes = [vp, u64, vp, u64]
+        lib.dt_ring_worker_ready_drain.restype = ctypes.c_int64
+        lib.dt_ring_worker_ready_consume.argtypes = [vp, u64]
+        lib.dt_ring_worker_ready_consume.restype = None
+        lib.dt_ring_worker_consumed_seq_address.argtypes = [vp, i32]
+        lib.dt_ring_worker_consumed_seq_address.restype = u64
         self._lib = lib
         # ``landing`` is a contiguous [count, rows, width] CUDA tensor kept
         # alive by this object until destroy() drained the worker stream.
@@ -1320,9 +1385,25 @@ class DraftRingWorker:
         if not self._handle:
             raise DirectRingError("native ring worker could not be created")
         self._endpoints: dict[int, DraftRingEndpoint] = {}
+        self._consumed_words: dict[int, ctypes.c_uint64] = {}
         self.probe = native_probe(lib, "ring_worker")
         if self.probe is not None:
             lib.dt_ring_worker_set_probe(self._handle, self.probe.handle)
+        self.ingress = ingress
+        if ingress:
+            from dt_profile import event_enabled
+
+            from sglang.srt.speculative.dt_wake import WAKE_READY
+
+            setter, wake_handle = wake.native_setter() if wake is not None else (None, None)
+            if lib.dt_ring_worker_enable_ingress(self._handle, setter, wake_handle, WAKE_READY):
+                lib.dt_ring_worker_destroy(self._handle)
+                self._handle = None
+                raise DirectRingError("native ingress could not be enabled")
+            dtype, _ = ready_abi(lib)
+            self._ready = np.empty(self.READY_BATCH, dtype=dtype)
+            self._ready_next = 1  # next READY seq to drain
+            self._trace_drain = event_enabled("draft_ready_drain")
         if lib.dt_ring_worker_start(self._handle) != 0:
             lib.dt_ring_worker_destroy(self._handle)
             self._handle = None
@@ -1335,6 +1416,7 @@ class DraftRingWorker:
         source_base: int,
         source_length: int,
         ledger=None,
+        target_instance_id: str = "",
     ) -> None:
         header = endpoint._ring.header
         slot_nbytes = int(header[H_SOURCE_SLOT_NBYTES_LO]) | (
@@ -1366,6 +1448,10 @@ class DraftRingWorker:
             MAIL_STRIDE,
             endpoint._mail_ack.ctypes.data,
             ledger,
+            target_instance_id.encode(),
+            endpoint._ring.host_address + endpoint._ring.dest_offset,
+            V2_DEST_STRIDE,
+            V2_DEST_SEQ_OFFSET,
         )
         if rc != 0:
             raise DirectRingError("native ring worker rejected a ring")
@@ -1396,6 +1482,65 @@ class DraftRingWorker:
         if rc != 0:
             raise DirectRingError("native ring worker rejected a remote ring")
         self._endpoints[endpoint.ring_id] = endpoint
+
+    def drain_ready(self) -> int:
+        """Drain the native READY queue and pass ready_consumed_seq over it.
+
+        D6 consumer: the rows are still admitted from the mailbox
+        (``MailboxConsumer.take_ready``), so the drained entries are only
+        stamped (``draft_ready_drain``, per ring entry) and released.  The
+        mailbox ack of that consumer still gates the worker.
+        """
+
+        drained = 0
+        while True:
+            count = int(
+                self._lib.dt_ring_worker_ready_drain(
+                    self._handle, self._ready_next, self._ready.ctypes.data, self.READY_BATCH
+                )
+            )
+            if count < 0:
+                raise DirectRingError("native READY queue entry has a stale seq")
+            if count and self._trace_drain:
+                from dt_profile import emit
+
+                entries = self._ready[:count]
+                emit(
+                    "draft_ready_drain",
+                    drained_ns=time.monotonic_ns(),
+                    entries=count,
+                    records=np.unique(
+                        np.stack(
+                            [
+                                entries["ring_id"].astype(np.int64),
+                                entries["record_seq"].astype(np.int64),
+                            ],
+                            axis=1,
+                        ),
+                        axis=0,
+                    ).tolist(),
+                )
+            self._ready_next += count
+            drained += count
+            if count < self.READY_BATCH:
+                break
+        if drained:
+            self._lib.dt_ring_worker_ready_consume(self._handle, self._ready_next - 1)
+        return drained
+
+    def consumed_seq(self, ring_id: int) -> int:
+        """The last ring seq the worker consumed on ``ring_id`` (0: none).
+
+        The word's address is looked up once (under the worker lock); reads
+        after that take no lock."""
+
+        word = self._consumed_words.get(ring_id)
+        if word is None:
+            address = self._lib.dt_ring_worker_consumed_seq_address(self._handle, ring_id)
+            if not address:
+                raise DirectRingError(f"ring {ring_id} is not attached")
+            word = self._consumed_words[ring_id] = ctypes.c_uint64.from_address(address)
+        return word.value
 
     def seal(self, landing_index: int) -> int:
         return int(self._lib.dt_ring_worker_seal(self._handle, landing_index))
