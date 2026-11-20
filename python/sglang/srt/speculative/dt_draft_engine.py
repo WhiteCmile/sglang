@@ -145,10 +145,10 @@ DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
 # slot, so a row is never held behind the batch that owns its landing buffer
 # (no compute-busy, no submit-time seal; the ring worker seals on overflow).
 DRAFT_SLOT_DECOUPLE = os.environ.get("DT_DRAFT_SLOT_DECOUPLE", "0") == "1"
-# Draft redesign D5 (issue #274): the dt-draft-control thread owns the
-# Coordinator socket (dt_client.DraftControlLoop) and the DFlash loop's idle
-# tail waits on the native wake word (dt_wake) for the same poll interval, so
-# a Coordinator message ends the wait at once.
+# Draft redesign D5 (issue #274): a native thread owns the Coordinator socket
+# (dt_control.DraftControlLoop, issue #288) and the DFlash loop's idle tail
+# waits on the native wake word (dt_wake) for the same poll interval, so a
+# Coordinator message ends the wait at once.
 DRAFT_CONTROL_LOOP = os.environ.get("DT_DRAFT_CONTROL_LOOP", "0") == "1"
 # One executing plus one submitted Draft compute batch.
 DRAFT_COMPUTE_DEPTH = 2
@@ -1278,14 +1278,11 @@ class FlashMTPDraftEngine:
             self._client.register_draft(timeout_s=registration_timeout_s)
             self._publish_capacity()
             if DRAFT_CONTROL_LOOP and self._is_dflash:
-                from dt_client import DraftControlLoop
-
-                from sglang.srt.speculative.dt_wake import WAKE_CONTROL, DraftWake
+                from sglang.srt.speculative.dt_control import DraftControlLoop
+                from sglang.srt.speculative.dt_wake import DraftWake
 
                 self._wake = DraftWake()
-                self._client = DraftControlLoop(
-                    self._client, notify=partial(self._wake.set, WAKE_CONTROL)
-                )
+                self._client = DraftControlLoop(self._client, self._wake)
         except Exception:
             if self._candidate_push_transport is not None:
                 self._candidate_push_transport.close()

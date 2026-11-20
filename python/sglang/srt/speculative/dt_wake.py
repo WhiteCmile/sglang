@@ -56,7 +56,9 @@ class DraftWake:
 
     def native_setter(self) -> tuple[int, int]:
         """(dt_wake_set address, wake handle) for a native thread that sets
-        reason bits without Python (the ring worker's READY wake)."""
+        reason bits without the GIL: the ring worker's READY wake
+        (dt_ring_worker.cpp) and the control thread's CONTROL wake
+        (dt_draft_control.cpp)."""
 
         return ctypes.cast(self._lib.dt_wake_set, ctypes.c_void_p).value, self._handle
 
