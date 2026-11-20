@@ -153,24 +153,28 @@ def build_rows(events: list[dict]) -> list[dict]:
                 del row[key]
         output.append(row)
 
-    freeze_by_component: dict[str, set[int]] = {}
+    freeze_by_source: dict[tuple[str, str], set[int]] = {}
     for row in output:
         freeze_ns = int(row.get("freeze_ns") or 0)
         if freeze_ns:
-            freeze_by_component.setdefault(str(row.get("component", "")), set()).add(
-                freeze_ns
+            source_key = (
+                str(row.get("source_path", "")),
+                str(row.get("component", "")),
             )
+            freeze_by_source.setdefault(source_key, set()).add(freeze_ns)
     for row in output:
         observed_ns = int(row.get("completion_observed_ns") or 0)
         own_freeze_ns = int(row.get("freeze_ns") or 0)
         if not observed_ns or not own_freeze_ns:
             row["missed_freeze_windows"] = None
             continue
+        source_key = (
+            str(row.get("source_path", "")),
+            str(row.get("component", "")),
+        )
         row["missed_freeze_windows"] = sum(
             observed_ns < freeze_ns < own_freeze_ns
-            for freeze_ns in freeze_by_component.get(
-                str(row.get("component", "")), set()
-            )
+            for freeze_ns in freeze_by_source.get(source_key, set())
         )
     return sorted(output, key=lambda row: row["transfer_id"])
 
