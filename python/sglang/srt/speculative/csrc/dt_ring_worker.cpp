@@ -655,14 +655,14 @@ int parse_v2_rows(const RecordV2Header& h, const uint8_t* mb, uint64_t dropped,
                   const uint8_t* dest, uint64_t dest_seq_at, const ReadyEntry& base,
                   uint64_t landing_row0, ReadyEntry* out, uint32_t* tokens, uint32_t* ntok) {
   int n = 0;
-  uint32_t prefix = 0;  // compacted token position, dropped requests included
+  uint64_t prefix = 0;  // compacted token position, dropped requests included
   *ntok = 0;
   for (uint32_t i = 0; i < h.request_count; ++i) {
     RecordV2Request q;
     memcpy(&q, mb + kMailReqs + (uint64_t)i * sizeof(q), sizeof(q));
     const char* rid = reinterpret_cast<const char*>(mb + kMailRids + (uint64_t)i * 256);
-    const uint32_t first = prefix;
-    prefix += q.token_count;
+    const uint64_t first = prefix;
+    prefix += q.token_count;  // u64: a forged count cannot wrap past the bound
     if (prefix > h.row_count || prefix > 512) return -4;
     const bool is_dropped = dropped >> i & 1;
     if (!is_dropped && (q.round_id < 1 || q.token_count == 0 || q.seq_len < q.token_count ||
@@ -1712,7 +1712,9 @@ uint64_t dt_ring_worker_seal(void* handle, uint32_t k) {
   if (k >= w->landing_free.size()) return 0;
   w->landing_sealed[k] = 1;
   if (w->current == (int)k) w->current = -1;
-  return w->landing_placed[k];
+  const uint64_t placed = w->landing_placed[k];
+  if (w->ingress) landing_free_if_released(w, k);
+  return placed;
 }
 
 // Free buffer k if it is sealed and all `released` placed entries are done.

@@ -146,3 +146,7 @@ def test_malformed_and_unregistered_requests(native):
     assert parse(_record([("req-a", 3, 0, 0, 2, 11, 1)]))[0] == -4  # seq_len < tokens
     assert parse(_record([("req-a", 3, 0, 11, 2, 11, 40)]))[0] == -4  # past row_count
     assert parse(_record([("req-unknown", 3, 0, 0, 2, 11, 40)]))[0] == 0  # retried
+    # A released request's forged count must not wrap the token bound (it
+    # would let later live rows overflow the worker's per-record token buffer).
+    wrap = [_REQS[0], ("req-b", 9, 1, 4, 2**32 - 1, 12, 17), _REQS[2]]
+    assert parse(_record(wrap))[0] == -4

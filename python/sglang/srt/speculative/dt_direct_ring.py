@@ -1568,6 +1568,7 @@ class DraftRingWorker:
         rc = int(self._lib.dt_ring_worker_destroy(self._handle))
         self._handle = None
         self._endpoints.clear()
+        self._consumed_words.clear()  # the words died with their rings
         if self.probe is not None:
             self.probe.close()
         return rc
