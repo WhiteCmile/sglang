@@ -8323,6 +8323,12 @@ class DTTargetController:
                         f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
                     )
                     hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+                    gpu_clock = getattr(self, "_gpu_clock", None)
+                    hidden_produced_host_ns = (
+                        gpu_clock.globaltimer_to_monotonic(hidden_produced_ns)
+                        if gpu_clock is not None
+                        else 0
+                    )
                     record.observed_ns = time.monotonic_ns()
                     record.record = [
                         row_count,
@@ -8343,6 +8349,7 @@ class DTTargetController:
                                 wave_id=wave.wave_id,
                                 ring_seq=record.wave_seq,
                                 hidden_produced_ns=hidden_produced_ns,
+                                hidden_produced_host_ns=hidden_produced_host_ns,
                                 record_visible_ns=record.observed_ns,
                             )
                 else:

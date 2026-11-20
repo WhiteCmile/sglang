@@ -25,6 +25,14 @@ def test_p0_join_and_recommendation(tmp_path):
         ),
         dict(
             event="target_p0_hop",
+            hop="record_visible",
+            transfer_id="t1",
+            hidden_produced_ns=9_999_999,
+            hidden_produced_host_ns=100,
+            record_visible_ns=125,
+        ),
+        dict(
+            event="target_p0_hop",
             hop="dispatch_registered",
             transfer_id="t1",
             ledger_begin_finished_ns=300,
@@ -90,6 +98,7 @@ def test_p0_join_and_recommendation(tmp_path):
     rows = module.build_rows(loaded)
     summary = module.summarize(rows, fallback)
     assert rows[0]["p1_p2_corridor_ns"] == 200
+    assert rows[0]["hidden_to_record_visible_ns"] == 25
     assert rows[0]["p3_corridor_ns"] == 100
     assert rows[0]["candidate_to_ready_snapshot_ns"] == 20
     assert rows[0]["ready_snapshot_to_tp_end_ns"] == 20

@@ -95,6 +95,20 @@ def _delta(row: dict, end: str, start: str) -> int | None:
     return end_value - start_value
 
 
+def _hidden_start(row: dict) -> int:
+    return int(
+        row.get("hidden_produced_host_ns") or row.get("hidden_produced_ns") or 0
+    )
+
+
+def _delta_from_hidden(row: dict, end: str) -> int | None:
+    end_value = int(row.get(end) or 0)
+    start_value = _hidden_start(row)
+    if not end_value or not start_value or end_value < start_value:
+        return None
+    return end_value - start_value
+
+
 def build_rows(events: list[dict]) -> list[dict]:
     rows: dict[str, dict] = {}
     for event in sorted(
@@ -111,11 +125,11 @@ def build_rows(events: list[dict]) -> list[dict]:
 
     output = []
     for row in rows.values():
-        row["hidden_to_descriptor_ns"] = _delta(
-            row, "descriptor_published_ns", "hidden_produced_ns"
+        row["hidden_to_descriptor_ns"] = _delta_from_hidden(
+            row, "descriptor_published_ns"
         )
-        row["hidden_to_record_visible_ns"] = _delta(
-            row, "record_visible_ns", "hidden_produced_ns"
+        row["hidden_to_record_visible_ns"] = _delta_from_hidden(
+            row, "record_visible_ns"
         )
         row["record_to_destination_ns"] = _delta(
             row, "destination_written_ns", "record_visible_ns"
@@ -144,8 +158,8 @@ def build_rows(events: list[dict]) -> list[dict]:
         row["submit_to_verify_observed_ns"] = _delta(
             row, "gpu_end_observed_ns", "submission_returned_ns"
         )
-        row["p1_p2_corridor_ns"] = _delta(
-            row, "ledger_begin_finished_ns", "hidden_produced_ns"
+        row["p1_p2_corridor_ns"] = _delta_from_hidden(
+            row, "ledger_begin_finished_ns"
         )
         row["p3_corridor_ns"] = row["candidate_to_freeze_ns"]
         for key in tuple(row):
