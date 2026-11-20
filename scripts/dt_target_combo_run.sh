@@ -6,6 +6,7 @@ SOURCE=${DT_EXPERIMENT_SOURCE:-/data/lishuhuan/dt-v3-page}
 stamp=${1:-$(date +%Y%m%d-%H%M%S)-target-combo}
 root="$W/target-combo-results/$stamp"
 arms=(control early_slots8 early_page64 early_page64_slots8)
+local_ports_re=':(37900|37901|37902|37920|37921|38100|38101|38102|51121|51122)\b'
 
 mkdir -p "$root"
 printf '%s\n' "$stamp" >"$root/stamp.txt"
@@ -13,6 +14,7 @@ git -C "$SOURCE" rev-parse HEAD >"$root/source-commit.txt"
 printf '%s\n' "${arms[@]}" >"$root/arms.txt"
 
 service_pid=
+benchmark_pid=
 cleanup_service() {
   if [ -n "${service_pid:-}" ] && kill -0 "$service_pid" 2>/dev/null; then
     kill -INT -- "-$service_pid" 2>/dev/null || true
@@ -29,7 +31,41 @@ cleanup_service() {
   fi
   service_pid=
 }
-trap cleanup_service EXIT INT TERM
+
+cleanup_benchmark() {
+  if [ -n "${benchmark_pid:-}" ] && kill -0 "$benchmark_pid" 2>/dev/null; then
+    kill -TERM "$benchmark_pid" 2>/dev/null || true
+  fi
+  if [ -n "${benchmark_pid:-}" ]; then
+    wait "$benchmark_pid" 2>/dev/null || true
+  fi
+  benchmark_pid=
+}
+
+wait_for_local_ports_free() {
+  local free_polls=0
+  local attempt
+  for attempt in $(seq 1 180); do
+    if ss -H -ltn | grep -Eq "$local_ports_re"; then
+      free_polls=0
+    else
+      free_polls=$((free_polls + 1))
+      if [ "$free_polls" -ge 3 ]; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  echo "local DT ports did not drain within 180 seconds" >&2
+  ss -H -ltnp | grep -E "$local_ports_re" >&2 || true
+  return 1
+}
+
+cleanup_all() {
+  cleanup_benchmark
+  cleanup_service
+}
+trap cleanup_all EXIT INT TERM
 
 # Hold one global lease across all arms.  This keeps the comparison contiguous
 # and makes nested gpu-lease.sh invocations validation-only via DT_LEASE_HELD=1.
@@ -38,6 +74,7 @@ printf 'waiting\n' >"$root/status.txt"
 flock 8
 printf 'acquired\n' >"$root/global-lock-acquired"
 printf 'running\n' >"$root/status.txt"
+wait_for_local_ports_free
 
 for label in "${arms[@]}"; do
   arm_root="$root/$label"
@@ -49,14 +86,34 @@ for label in "${arms[@]}"; do
   service_pid=$!
   printf '%s\n' "$service_pid" >"$arm_root/service.pid"
 
-  if ! "$SOURCE/scripts/dt_target_combo_benchmark.sh" "$stamp" "$label" \
-      >"$arm_root/benchmark.log" 2>&1; then
+  "$SOURCE/scripts/dt_target_combo_benchmark.sh" "$stamp" "$label" \
+    >"$arm_root/benchmark.log" 2>&1 &
+  benchmark_pid=$!
+  while kill -0 "$benchmark_pid" 2>/dev/null; do
+    if ! kill -0 "$service_pid" 2>/dev/null; then
+      echo "service exited while benchmark was waiting/running: $label" \
+        >>"$arm_root/benchmark.log"
+      cleanup_benchmark
+      break
+    fi
+    sleep 1
+  done
+  benchmark_rc=0
+  if [ -n "${benchmark_pid:-}" ]; then
+    wait "$benchmark_pid" || benchmark_rc=$?
+    benchmark_pid=
+  else
+    benchmark_rc=5
+  fi
+  if [ "$benchmark_rc" -ne 0 ]; then
     printf 'benchmark-failed\n' >"$arm_root/status.txt"
     cleanup_service
+    wait_for_local_ports_free || true
     exit 4
   fi
 
   cleanup_service
+  wait_for_local_ports_free
   printf 'complete\n' >"$arm_root/status.txt"
 done
 
