@@ -146,6 +146,10 @@ RING_RETIRED_LIMIT = 65536
 # pool, so this explicit credit replaces the admission accounting the pool
 # used to provide (issue #42); 64 is the validated dev operating point.
 DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT = 64
+# Draft redesign D2 (§5.3): DT_DRAFT_ADMISSION=bound drops that credit.  The
+# batch bound (max_batch_size rows, feature_buffer_max_tokens) plus the KV and
+# req-row fit at ring admission are then the only proposal admission limits.
+DRAFT_ADMISSION_BOUND = os.environ.get("DT_DRAFT_ADMISSION", "") == "bound"
 
 
 def _resolve_direct_proposal_admission_limit() -> int:
@@ -3169,7 +3173,10 @@ class FlashMTPDraftEngine:
         (reason, head), i.e. at most about the selection rate.
         """
 
-        available_credit = self._available_direct_proposal_admission()
+        available_credit = (
+            None if DRAFT_ADMISSION_BOUND
+            else self._available_direct_proposal_admission()
+        )
         signature = (reason, head_transfer_id)
         if signature == getattr(self, "_last_ring_admission_profile_state", None):
             return
@@ -4358,7 +4365,7 @@ class FlashMTPDraftEngine:
         # it when its feature batch promotes into INPUT_READY entries.
         admission_units_left = (
             self._available_direct_proposal_admission()
-            if self.candidate_transport == "cuda-ipc"
+            if self.candidate_transport == "cuda-ipc" and not DRAFT_ADMISSION_BOUND
             else 0
         )
 
@@ -4366,7 +4373,7 @@ class FlashMTPDraftEngine:
             if not task.requires_proposal:
                 return False
             if self.candidate_transport == "cuda-ipc":
-                return admission_units_left <= 0
+                return not DRAFT_ADMISSION_BOUND and admission_units_left <= 0
             return not reserves_result_slot and not result_slot_available
 
         stop_reason = "queue_exhausted"
@@ -4640,10 +4647,14 @@ class FlashMTPDraftEngine:
 
     def _acquire_direct_proposal_admission(self) -> None:
         """Hold one cuda-ipc proposal-admission credit for a published wave."""
+        if DRAFT_ADMISSION_BOUND:
+            return  # no credit lifecycle under the batch bound
         self._direct_proposal_admission_inflight += 1
 
     def _release_direct_proposal_admission(self) -> None:
         """Return one wave's credit; every holder must release exactly once."""
+        if DRAFT_ADMISSION_BOUND:
+            return
         if self._direct_proposal_admission_inflight <= 0:
             raise RuntimeError("direct proposal admission credit underflow")
         self._direct_proposal_admission_inflight -= 1
@@ -4669,14 +4680,18 @@ class FlashMTPDraftEngine:
     def _proposal_admission_blocked(self) -> bool:
         """Whether one more proposal wave is admission-blocked right now."""
         if self.candidate_transport == "cuda-ipc":
-            return self._available_direct_proposal_admission() <= 0
+            return (
+                not DRAFT_ADMISSION_BOUND
+                and self._available_direct_proposal_admission() <= 0
+            )
         return self._available_dflash_result_slots() <= 0
 
     def _proposal_wave_buffer_exhausted(self) -> bool:
         """Raw per-wave publish buffer exhaustion (no reservation accounting)."""
         if self.candidate_transport == "cuda-ipc":
             return (
-                self._direct_proposal_admission_inflight
+                not DRAFT_ADMISSION_BOUND
+                and self._direct_proposal_admission_inflight
                 >= self.direct_proposal_admission_limit
             )
         return not self._free_result_slots
@@ -10574,8 +10589,13 @@ class FlashMTPDraftEngine:
             received_tasks=self._received_tasks,
             capacity_sequence=self._capacity_sequence,
             max_pending_tasks=self.max_pending_tasks,
+            # Under the batch bound there is no result-row resource; report
+            # the constant the Coordinator registers with (router.py, which
+            # only stores this field).
             free_result_rows=(
-                self._available_direct_proposal_admission() * self.max_batch_size
+                self.max_pending_tasks
+                if self.candidate_transport == "cuda-ipc" and DRAFT_ADMISSION_BOUND
+                else self._available_direct_proposal_admission() * self.max_batch_size
                 if self.candidate_transport == "cuda-ipc"
                 else (
                     self._available_dflash_result_slots() * self.max_batch_size
