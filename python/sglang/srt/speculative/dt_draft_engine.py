@@ -880,6 +880,14 @@ class FlashMTPDraftEngine:
     # Preserve the historical transport for partially constructed test and
     # diagnostic instances that intentionally bypass ``__init__``.
     candidate_transport = "mmap"
+    # Per-round Coordinator confirmation of ring rounds (design §8.2).  The
+    # class default is the legacy mode for instances that bypass
+    # ``__init__``; ``__init__`` reads ``DT_RING_CONFIRMATION`` through
+    # dt_protocol.  Confirmation-free (False), a ring round is born confirmed:
+    # it is never held, deduped or expired against a Coordinator copy, sends
+    # the Coordinator no result, and only a cross-host round sends a
+    # SourceReadDone (the INPUT_READY word is the same-host read proof).
+    _ring_confirmation = True
 
     def __init__(
         self,
@@ -1193,6 +1201,12 @@ class FlashMTPDraftEngine:
         # position), for arena destination resolution from the ring region.
         self._ring_record_positions: dict = {}
         self._ring_dest_region = os.environ.get("DT_RING_DEST_REGION", "1") == "1"
+        from dt_protocol import ring_confirmation_enabled
+
+        self._ring_confirmation = ring_confirmation_enabled()
+        if not self._ring_confirmation and not self._ring_dest_region:
+            # Confirmation-free, the region is a v2 row's only destination.
+            raise ValueError("DT_RING_CONFIRMATION=0 requires DT_RING_DEST_REGION=1")
         # Held results released by confirmations, sent as one batch per turn.
         self._confirmed_held_results: list = []
         self._confirmed_held_sequence = 0
@@ -2276,7 +2290,8 @@ class FlashMTPDraftEngine:
                 break
             if self._ring_worker is not None or self._remote_ring_endpoints:
                 self._loop_stage("poll_rings_head", self._poll_direct_rings)
-            self._loop_stage("flush_confirmed", self._flush_confirmed_results)
+            if self._ring_confirmation:
+                self._loop_stage("flush_confirmed", self._flush_confirmed_results)
             if self._uses_direct_gpu_source:
                 self._loop_stage("poll_feature_batches", self._poll_feature_batches)
                 if self._stop:
@@ -2331,7 +2346,11 @@ class FlashMTPDraftEngine:
                 self._loop_stage("poll_candidate_pushes", self._poll_candidate_pushes)
             if self._ring_worker is not None or self._remote_ring_endpoints:
                 self._loop_stage("poll_rings_tail", self._poll_direct_rings)
-            if self._held_ring_pushes and self._ring_publish_at_launch:
+            if self._held_ring_pushes and not self._ring_confirmation:
+                self._loop_stage(
+                    "resolve_held_pushes", self._resolve_held_ring_destinations
+                )
+            elif self._held_ring_pushes and self._ring_publish_at_launch:
                 self._loop_stage(
                     "retire_tombstoned", self._retire_tombstoned_ring_pushes
                 )
@@ -2755,11 +2774,12 @@ class FlashMTPDraftEngine:
             return
         received_ns = time.monotonic_ns()
         self._direct_tasks_by_transfer[transfer_id] = task
-        self._unconfirmed_direct[transfer_id] = task.deadline_ns
-        self._seen_transfers.add(transfer_id)
-        self._seen_transfer_order.append(transfer_id)
-        if len(self._seen_transfer_order) > 65536:
-            self._seen_transfers.discard(self._seen_transfer_order.popleft())
+        if self._ring_confirmation:
+            self._unconfirmed_direct[transfer_id] = task.deadline_ns
+            self._seen_transfers.add(transfer_id)
+            self._seen_transfer_order.append(transfer_id)
+            if len(self._seen_transfer_order) > 65536:
+                self._seen_transfers.discard(self._seen_transfer_order.popleft())
         self._pending_ids.add(transfer_id)
         self._ring_pending_ids.add(transfer_id)
         self._received_ns_by_transfer[transfer_id] = received_ns
@@ -2774,7 +2794,7 @@ class FlashMTPDraftEngine:
             refcounts[slot] = refcounts.get(slot, 0) + 1
             self._landing_taken[entry.landing_index] += 1
             # The worker's INPUT_READY write followed the copy on its stream.
-            self._publish_source_done(task)
+            self._publish_ring_source_done(task)
             self._ring_admission.append((task, slot, rows))
         else:
             self._pending.append(task)
@@ -2811,7 +2831,7 @@ class FlashMTPDraftEngine:
             # The worker placed it in a landing buffer: count it as released
             # (no staging reference) so try_free's placed/released match holds.
             self._landing_taken[entry.landing_index] += 1
-            self._publish_source_done(waiting or task)
+            self._publish_ring_source_done(waiting or task)
         transport = self._candidate_push_transport
         if transport is not None and task.candidate_destination is not None:
             push = transport.publish_cancelled([task])
@@ -2822,12 +2842,12 @@ class FlashMTPDraftEngine:
                     result_slot=None,
                     candidates=None,
                     cancelled=True,
-                    coordinator_result=report,
+                    coordinator_result=report and self._ring_confirmation,
                 )
             )
         self._cancelled_ids.discard(transfer_id)
         self._received_ns_by_transfer.pop(transfer_id, None)
-        if waiting is None:
+        if waiting is None and self._ring_confirmation:
             # A later Coordinator copy is answered by this drop.
             self._remember_ring_retired(transfer_id, failed=False)
         self._drain_deferred_persistent_release(task.draft_kv_handle)
@@ -2984,11 +3004,14 @@ class FlashMTPDraftEngine:
                         task = replace(task, candidate_destination=destination)
             received_ns = time.monotonic_ns()
             self._direct_tasks_by_transfer[transfer_id] = task
-            self._unconfirmed_direct[transfer_id] = task.deadline_ns
-            self._seen_transfers.add(transfer_id)
-            self._seen_transfer_order.append(transfer_id)
-            if len(self._seen_transfer_order) > 65536:
-                self._seen_transfers.discard(self._seen_transfer_order.popleft())
+            if self._ring_confirmation:
+                self._unconfirmed_direct[transfer_id] = task.deadline_ns
+                self._seen_transfers.add(transfer_id)
+                self._seen_transfer_order.append(transfer_id)
+                if len(self._seen_transfer_order) > 65536:
+                    self._seen_transfers.discard(
+                        self._seen_transfer_order.popleft()
+                    )
             self._pending_ids.add(transfer_id)
             self._ring_pending_ids.add(transfer_id)
             self._received_ns_by_transfer[transfer_id] = received_ns
@@ -2998,7 +3021,7 @@ class FlashMTPDraftEngine:
             refcounts = self._feature_staging_refcounts
             refcounts[slot] = refcounts.get(slot, 0) + 1
             # The worker's INPUT_READY write followed the copy on its stream.
-            self._publish_source_done(task)
+            self._publish_ring_source_done(task)
             self._ring_admission.append((task, slot, rows))
             profile_emit(
                 "draft_ring_take",
@@ -3031,7 +3054,7 @@ class FlashMTPDraftEngine:
         waiting = self._ring_waiting.pop(transfer_id, None)
         if waiting is not None:
             self._received_tasks += 1  # its Coordinator copy retires here
-        self._publish_source_done(waiting or task)
+        self._publish_ring_source_done(waiting or task)
         tombstone = waiting if waiting is not None else task
         transport = self._candidate_push_transport
         if transport is not None and tombstone.candidate_destination is not None:
@@ -3043,12 +3066,12 @@ class FlashMTPDraftEngine:
                     result_slot=None,
                     candidates=None,
                     cancelled=True,
-                    coordinator_result=report,
+                    coordinator_result=report and self._ring_confirmation,
                 )
             )
         self._cancelled_ids.discard(transfer_id)
         self._received_ns_by_transfer.pop(transfer_id, None)
-        if waiting is None:
+        if waiting is None and self._ring_confirmation:
             # A later Coordinator copy is answered by this drop.
             self._remember_ring_retired(transfer_id, failed=False)
         self._drain_deferred_persistent_release(task.draft_kv_handle)
@@ -3059,6 +3082,19 @@ class FlashMTPDraftEngine:
             ring_seq=record.seq,
             reported=report,
         )
+
+    def _publish_ring_source_done(self, task) -> None:
+        """Send a taken ring round's read proof where the Target needs it.
+
+        The worker writes the entry's INPUT_READY word after the copy on its
+        stream, and that word is the same-host Target's read proof
+        (``dt_target._poll_direct_ring_reads``).  Confirmation-free, only a
+        cross-host round, whose remote ring has no early read proof, relays a
+        SourceReadDone, at take (design §8.3 duty 1).
+        """
+
+        if self._ring_confirmation or task.target_instance_id in self._remote_targets:
+            self._publish_source_done(task)
 
     def _remember_ring_retired(self, transfer_id: str, *, failed: bool) -> None:
         retired = self._ring_retired
@@ -4244,7 +4280,11 @@ class FlashMTPDraftEngine:
         unconfirmed = getattr(self, "_unconfirmed_direct", None)
         if unconfirmed is None:
             unconfirmed = self._unconfirmed_direct = {}
-        seen = getattr(self, "_seen_transfers", None)
+        # The seen window dedups a ring round's two deliveries; confirmation-free
+        # there is only the ring one.
+        seen = (
+            getattr(self, "_seen_transfers", None) if self._ring_confirmation else None
+        )
         # Gated-queue depth for the capacity check below: only non-ring
         # identities count.  Direct-ring rounds — copies waiting for their
         # ring data, admitted or held rounds — are dispatched by the
@@ -4289,6 +4329,14 @@ class FlashMTPDraftEngine:
                     accepted = True
                 continue
             if getattr(task, "direct_ring_seq", 0):
+                if not self._ring_confirmation:
+                    # The Coordinator absorbs ring copies (design §8.2): one
+                    # here means the processes of this launch disagree on
+                    # the mode.
+                    raise ValueError(
+                        "Coordinator forwarded a ring round to a "
+                        "confirmation-free Draft"
+                    )
                 # The ring copy (and its hidden pull) is authoritative for
                 # execution; wait for it and confirm then.  Never pull again:
                 # the Target may already have retired the source on the ring
@@ -9672,6 +9720,59 @@ class FlashMTPDraftEngine:
         if changed:
             self._release_held_ring_pushes()
 
+    def _resolve_held_ring_destinations(self) -> None:
+        """Re-read the destination region for the rows of held wave pushes.
+
+        Confirmation-free, the region is a v2 row's only destination source
+        (design §7.3): a row whose entry was not written yet when its batch
+        retired is re-polled on every loop pass.  A live triple is adopted, a
+        zero triple is the Target's tombstone and cancels the row, and a row
+        still unresolved at its task deadline is failed: it is cancelled
+        without a push, and the Target's own round deadline answers it.
+        """
+
+        from msgspec.structs import replace
+
+        now_ns = time.monotonic_ns()
+        changed = False
+        for tasks, _push_candidates, _result_slot in self._held_ring_pushes:
+            for task in tasks:
+                transfer_id = task.transfer_id
+                current = self._direct_tasks_by_transfer.get(transfer_id, task)
+                if (
+                    transfer_id in self._cancelled_ids
+                    or current.candidate_destination is not None
+                ):
+                    continue
+                location = self._ring_record_positions.get(transfer_id)
+                resolved = (
+                    None
+                    if location is None
+                    else location[0].destination(task.direct_ring_seq, location[1])
+                )
+                destination = (
+                    None
+                    if resolved is None
+                    else self._ring_destination_ref(task, resolved)
+                )
+                if destination is not None:
+                    self._direct_tasks_by_transfer[transfer_id] = replace(
+                        current, candidate_destination=destination
+                    )
+                elif resolved is not None and resolved[:3] == (0, 0, 0):
+                    self._cancelled_ids.add(transfer_id)
+                elif now_ns >= task.deadline_ns:
+                    logger.warning(
+                        "held ring push row has no destination at its deadline: %s",
+                        transfer_id,
+                    )
+                    self._cancelled_ids.add(transfer_id)
+                else:
+                    continue
+                changed = True
+        if changed:
+            self._release_held_ring_pushes()
+
     def _release_held_ring_pushes(self) -> None:
         """Submit or drop §7.1 wave pushes held for Coordinator confirmation."""
 
@@ -9690,10 +9791,17 @@ class FlashMTPDraftEngine:
             ]
             live_tasks = [tasks[index] for index in live_indices]
             if live_tasks and any(
-                task.transfer_id in self._unconfirmed_direct for task in live_tasks
+                task.transfer_id in self._unconfirmed_direct
+                if self._ring_confirmation
+                else self._direct_tasks_by_transfer.get(
+                    task.transfer_id, task
+                ).candidate_destination
+                is None
+                for task in live_tasks
             ):
-                # Still waiting on a confirmation; nothing leaves the hold,
-                # so no cancelled identity is retired yet either.
+                # Still waiting on a confirmation (confirmation-free: on a
+                # destination); nothing leaves the hold, so no cancelled
+                # identity is retired yet either.
                 remaining.append((tasks, push_candidates, result_slot))
                 continue
             for task in tasks:
@@ -10091,6 +10199,9 @@ class FlashMTPDraftEngine:
                 ):
                     self._cancelled_ids.discard(task.transfer_id)
                 self._direct_tasks_by_transfer.pop(task.transfer_id, None)
+                if not self._ring_confirmation:
+                    # No Coordinator copy will retire the record position.
+                    self._ring_record_positions.pop(task.transfer_id, None)
             capacity_changed = True
             if self._profile_active:
                 profile_emit(
@@ -10639,12 +10750,29 @@ class FlashMTPDraftEngine:
         # the held request-round count.  Keep an accepted task held across
         # INPUT_READY, compute, and pending return; its publication path
         # retires this identity exactly once.
-        unconfirmed = getattr(self, "_unconfirmed_direct", None) or {}
-        # Coordinator copies waiting for their ring copy are not yet
-        # received: the Coordinator already counts them as in flight.
-        pending_tasks = len(self._pending_ids) - sum(
-            transfer_id in self._pending_ids for transfer_id in unconfirmed
-        )
+        ring_pending = getattr(self, "_ring_pending_ids", set())
+        if self._ring_confirmation:
+            unconfirmed = getattr(self, "_unconfirmed_direct", None) or {}
+            # Coordinator copies waiting for their ring copy are not yet
+            # received: the Coordinator already counts them as in flight.
+            pending_tasks = len(self._pending_ids) - sum(
+                transfer_id in self._pending_ids for transfer_id in unconfirmed
+            )
+            pending_work = pending_tasks + active_transfers
+            ring_pending_tasks = len(ring_pending) - sum(
+                transfer_id in ring_pending for transfer_id in unconfirmed
+            )
+        else:
+            # Design §8.3: ring rounds never pass through the Coordinator, so
+            # the cumulative pair (received_tasks, pending_tasks) counts
+            # relayed rounds only, while pending_work, the Coordinator's
+            # admission signal, counts every held row: READY, in flight and
+            # awaiting its push, plus the relayed queue.
+            pending_tasks = sum(
+                transfer_id not in ring_pending for transfer_id in self._pending_ids
+            )
+            pending_work = len(self._pending_ids) + active_transfers
+            ring_pending_tasks = len(ring_pending)
         self._capacity_sequence += 1
         update = DraftCapacityUpdate(
             protocol_version=PROTOCOL_VERSION,
@@ -10674,14 +10802,14 @@ class FlashMTPDraftEngine:
             ),
             free_kv_pages=(0 if allocator is None else int(allocator.available_size())),
             active_owner_count=len(self._persistent_requests),
-            pending_work=pending_tasks + active_transfers,
+            pending_work=pending_work,
             queue_delay_ns=self._last_queue_delay_ns,
             last_batch_size=self._last_batch_size,
-            ring_pending_tasks=(lambda rpi: len(rpi) - sum(t in rpi for t in unconfirmed))(getattr(self, "_ring_pending_ids", set())),
+            ring_pending_tasks=ring_pending_tasks,
         )
         if not self._client.update_capacity(update):
             logger.warning("Draft capacity update was locally backpressured")
-        self._maybe_log_draft_stats(pending_tasks)
+        self._maybe_log_draft_stats(pending_work - active_transfers)
 
     def _maybe_log_draft_stats(self, pending_tasks: int) -> None:
         """Throttled draft-boundness sample for the capacity harness (#174).
@@ -10736,6 +10864,24 @@ class FlashMTPDraftEngine:
         )
 
     def _send_result(self, message) -> None:
+        ring = self._ring_pending_ids if not self._ring_confirmation else ()
+        if ring and any(entry.transfer_id in ring for entry in message.entries):
+            # Confirmation-free, the Coordinator never dispatched a ring round
+            # and would drop its result as stale (design §8.2): the candidate
+            # push, or the Target's own deadline, is the round's outcome.
+            # Retire the identity here, as the result's ACK would have.
+            from msgspec.structs import replace
+
+            relayed = tuple(
+                entry for entry in message.entries if entry.transfer_id not in ring
+            )
+            for entry in message.entries:
+                if entry.transfer_id in ring:
+                    ring.discard(entry.transfer_id)
+                    self._pending_ids.discard(entry.transfer_id)
+            if not relayed:
+                return
+            message = replace(message, entries=relayed)
         unconfirmed = getattr(self, "_unconfirmed_direct", None)
         if unconfirmed and any(
             entry.transfer_id in unconfirmed for entry in message.entries
