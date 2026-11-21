@@ -7,7 +7,7 @@ stamp=${1:?stamp required}
 label=${2:-page64-p0}
 profile_dir="/tmp/dt-issue281-p0-$stamp"
 root="$W/issue281-p0-results/$stamp/$label"
-local_ports_re=':(37900|37901|37902|37920|37921|38100|38101|38102|51121|51122)\b'
+local_ports=(37900 37901 37902 37920 37921 38100 38101 38102 51121 51122)
 
 unset DT_TARGET_READY_REFRESH_BEFORE_SELECT DT_TARGET_ADAPTIVE_READY_HOLD
 unset DT_TARGET_EARLY_READY_RESULT DT_TARGET_LATE_FREEZE
@@ -29,7 +29,9 @@ flock 8
 # lease for a few seconds.  Do not hand that teardown race to dt_launcher.
 free_polls=0
 for _ in $(seq 1 180); do
-  if ss -H -ltn | grep -Eq "$local_ports_re"; then
+  if ! "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
+      --host 192.168.1.249 --ports "${local_ports[@]}" \
+      >"$root/port-probe.log" 2>&1; then
     free_polls=0
   else
     free_polls=$((free_polls + 1))
@@ -39,7 +41,7 @@ for _ in $(seq 1 180); do
 done
 if [ "$free_polls" -lt 3 ]; then
   echo "local DT ports did not drain before P0 launch" >&2
-  ss -H -ltnp | grep -E "$local_ports_re" >&2 || true
+  cat "$root/port-probe.log" >&2 || true
   exit 3
 fi
 

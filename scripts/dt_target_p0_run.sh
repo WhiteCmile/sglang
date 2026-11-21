@@ -7,7 +7,7 @@ stamp=${1:-$(date +%Y%m%d-%H%M%S)-issue281-p0}
 label=page64-p0
 root="$W/issue281-p0-results/$stamp"
 profile_dir="/tmp/dt-issue281-p0-$stamp"
-local_ports_re=':(37900|37901|37902|37920|37921|38100|38101|38102|51121|51122)\b'
+local_ports=(37900 37901 37902 37920 37921 38100 38101 38102 51121 51122)
 
 mkdir -p "$root/$label"
 printf '%s\n' "$stamp" >"$root/stamp.txt"
@@ -79,7 +79,9 @@ fi
 
 cleanup
 for _ in $(seq 1 180); do
-  ss -H -ltn | grep -Eq "$local_ports_re" || break
+  "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
+    --host 192.168.1.249 --ports "${local_ports[@]}" \
+    >"$root/port-probe.log" 2>&1 && break
   sleep 1
 done
 trap - EXIT INT TERM

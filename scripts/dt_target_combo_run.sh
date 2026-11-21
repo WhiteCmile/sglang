@@ -6,7 +6,7 @@ SOURCE=${DT_EXPERIMENT_SOURCE:-/data/lishuhuan/dt-v3-page}
 stamp=${1:-$(date +%Y%m%d-%H%M%S)-target-combo}
 root="$W/target-combo-results/$stamp"
 arms=(control early_slots8 early_page64 early_page64_slots8)
-local_ports_re=':(37900|37901|37902|37920|37921|38100|38101|38102|51121|51122)\b'
+local_ports=(37900 37901 37902 37920 37921 38100 38101 38102 51121 51122)
 
 mkdir -p "$root"
 printf '%s\n' "$stamp" >"$root/stamp.txt"
@@ -46,7 +46,9 @@ wait_for_local_ports_free() {
   local free_polls=0
   local attempt
   for attempt in $(seq 1 180); do
-    if ss -H -ltn | grep -Eq "$local_ports_re"; then
+    if ! "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
+        --host 192.168.1.249 --ports "${local_ports[@]}" \
+        >"$root/port-probe.log" 2>&1; then
       free_polls=0
     else
       free_polls=$((free_polls + 1))
@@ -57,7 +59,7 @@ wait_for_local_ports_free() {
     sleep 1
   done
   echo "local DT ports did not drain within 180 seconds" >&2
-  ss -H -ltnp | grep -E "$local_ports_re" >&2 || true
+  cat "$root/port-probe.log" >&2 || true
   return 1
 }
 
