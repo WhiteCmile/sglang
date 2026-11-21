@@ -415,7 +415,7 @@ class TargetFeatureSourcePool:
                 # Not reserved: restore the identity in place.
                 free_identities.appendleft(slot_id)
                 return None
-            except BaseException:
+            except Exception:
                 free_identities.appendleft(slot_id)
                 raise
             allocation_row_offset = (
