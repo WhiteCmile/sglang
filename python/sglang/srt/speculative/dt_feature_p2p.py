@@ -21,7 +21,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -215,6 +215,12 @@ class TargetFeatureSourcePool:
     read-done acknowledgement (or has been explicitly cancelled by policy).
     """
 
+    # ``object.__new__`` CPU fixtures derive these lazily; ``__init__`` sets them.
+    _free_identities: deque[int] | None = None
+    _free_count = 0
+    _reserved_count = 0
+    _quarantined_count = 0
+
     def __init__(
         self,
         *,
@@ -290,6 +296,11 @@ class TargetFeatureSourcePool:
             raise FeatureTransportError("feature source pool must use one allocation")
         self._buffer = buffers[0]
         self._slots = [_FeatureSlot() for _ in range(self.slot_count)]
+        # O(1) identity bookkeeping; reservation never scans ``_slots``.
+        self._free_identities: deque[int] = deque(range(self.slot_count))
+        self._free_count = self.slot_count
+        self._reserved_count = 0
+        self._quarantined_count = 0
         self._active: dict[str, tuple[int, int]] = {}
         # Cancelling an undelivered descriptor is not equivalent to a remote
         # read completion: the Target publication copy can still be using the
@@ -337,13 +348,29 @@ class TargetFeatureSourcePool:
                 + slot.allocation_row_offset * self.feature_width * 2
             )
 
+    def _ensure_identity_bookkeeping_locked(self) -> deque[int]:
+        """Derive identity bookkeeping once for fixtures that bypass ``__init__``."""
+
+        free_identities = self._free_identities
+        if free_identities is None:
+            free_identities = deque(
+                index
+                for index, slot in enumerate(self._slots)
+                if slot.state is FeatureSlotState.FREE
+            )
+            self._free_identities = free_identities
+            states = tuple(slot.state for slot in self._slots)
+            self._free_count = len(free_identities)
+            self._reserved_count = states.count(FeatureSlotState.RESERVED)
+            self._quarantined_count = states.count(FeatureSlotState.QUARANTINED)
+        return free_identities
+
     @property
     def free_slot_count(self) -> int:
         self.poll_cancelled_producers()
         with self._lock:
-            logical_free = sum(
-                slot.state is FeatureSlotState.FREE for slot in self._slots
-            )
+            self._ensure_identity_bookkeeping_locked()
+            logical_free = self._free_count
             page_allocator = getattr(self, "_page_allocator", None)
             if page_allocator is None:
                 return logical_free
@@ -355,7 +382,8 @@ class TargetFeatureSourcePool:
     @property
     def quarantined_slot_count(self) -> int:
         with self._lock:
-            return sum(slot.state is FeatureSlotState.QUARANTINED for slot in self._slots)
+            self._ensure_identity_bookkeeping_locked()
+            return self._quarantined_count
 
     @property
     def active_lease_count(self) -> int:
@@ -369,16 +397,10 @@ class TargetFeatureSourcePool:
     ) -> tuple[int, int, torch.Tensor] | None:
         """Reserve one logical READY identity and its physical row extent."""
 
-        slot_id = next(
-            (
-                index
-                for index, slot in enumerate(self._slots)
-                if slot.state is FeatureSlotState.FREE
-            ),
-            None,
-        )
-        if slot_id is None:
+        free_identities = self._ensure_identity_bookkeeping_locked()
+        if not free_identities:
             return None
+        slot_id = free_identities.popleft()
         slot = self._slots[slot_id]
         generation = slot.generation + 1
         allocation_lease_id = None
@@ -390,10 +412,17 @@ class TargetFeatureSourcePool:
             try:
                 extent = page_allocator.allocate(allocation_lease_id, token_count)
             except SourcePageAllocationError:
+                # Not reserved: restore the identity in place.
+                free_identities.appendleft(slot_id)
                 return None
+            except BaseException:
+                free_identities.appendleft(slot_id)
+                raise
             allocation_row_offset = (
                 extent.slot_id * self.max_tokens + extent.row_offset
             )
+        self._free_count -= 1
+        self._reserved_count += 1
         slot.generation = generation
         slot.state = FeatureSlotState.RESERVED
         slot.allocation_lease_id = allocation_lease_id
@@ -414,9 +443,15 @@ class TargetFeatureSourcePool:
     def _free_slot_locked(self, slot_id: int, generation: int) -> None:
         """Release a logical identity and its physical page extent."""
 
+        free_identities = self._ensure_identity_bookkeeping_locked()
         slot = self._slots[slot_id]
         if slot.generation != generation:
             raise FeatureTransportError("stale source slot generation")
+        if slot.state is FeatureSlotState.FREE:
+            # A second release would duplicate the identity in the freelist.
+            # Callers filter idempotent releases; reaching here is a real
+            # invariant violation, so fail stop instead of masking it.
+            raise FeatureTransportError("feature source slot is already free")
         allocation_lease_id = getattr(slot, "allocation_lease_id", None)
         if allocation_lease_id is not None:
             try:
@@ -425,11 +460,17 @@ class TargetFeatureSourcePool:
                 raise FeatureTransportError(
                     "feature source page lease diverged"
                 ) from exc
+        if slot.state is FeatureSlotState.RESERVED:
+            self._reserved_count -= 1
+        elif slot.state is FeatureSlotState.QUARANTINED:
+            self._quarantined_count -= 1
         slot.state = FeatureSlotState.FREE
         slot.active_transfers.clear()
         slot.producer_event = None
         slot.allocation_lease_id = None
         slot.allocation_row_offset = 0
+        free_identities.append(slot_id)
+        self._free_count += 1
 
     def publish(
         self,
@@ -492,6 +533,7 @@ class TargetFeatureSourcePool:
             slot_id, generation, target_rows = reservation
             slot = self._slots[slot_id]
             slot.state = FeatureSlotState.PUBLISHED
+            self._reserved_count -= 1
             slot.active_transfers = {item.transfer_id for item in slices}
             for item in slices:
                 self._active[item.transfer_id] = (slot_id, generation)
@@ -575,14 +617,18 @@ class TargetFeatureSourcePool:
     def quarantine_reserved(self, slot_id: int, generation: int) -> None:
         """Fence a reservation whose in-place write may be incomplete."""
         with self._lock:
+            self._ensure_identity_bookkeeping_locked()
             slot = self._slots[slot_id]
             if slot.generation == generation and slot.state is FeatureSlotState.RESERVED:
                 slot.state = FeatureSlotState.QUARANTINED
+                self._reserved_count -= 1
+                self._quarantined_count += 1
 
     @property
     def reserved_slot_count(self) -> int:
         with self._lock:
-            return sum(slot.state is FeatureSlotState.RESERVED for slot in self._slots)
+            self._ensure_identity_bookkeeping_locked()
+            return self._reserved_count
 
     def publish_reserved(
         self,
@@ -611,6 +657,7 @@ class TargetFeatureSourcePool:
         with self._lock:
             if self._closed:
                 raise FeatureTransportError("feature source pool is closed")
+            self._ensure_identity_bookkeeping_locked()
             slot = self._slots[slot_id]
             if slot.generation != generation or slot.state is not FeatureSlotState.RESERVED:
                 raise FeatureTransportError("feature source reservation is stale")
@@ -623,6 +670,7 @@ class TargetFeatureSourcePool:
                     f"feature transfer {duplicate!r} is already active"
                 )
             slot.state = FeatureSlotState.PUBLISHED
+            self._reserved_count -= 1
             slot.active_transfers = {item.transfer_id for item in slices}
             for item in slices:
                 self._active[item.transfer_id] = (slot_id, generation)
@@ -959,15 +1007,12 @@ class TargetFeatureSourcePool:
         # and a failed query quarantines the exact owning slot.
         self.poll_cancelled_producers()
         with self._lock:
+            self._ensure_identity_bookkeeping_locked()
             return (
                 # An unpublished in-place reservation may still be written by
                 # its verify; it blocks detaching the pool like a lease.
-                len(self._active)
-                + sum(slot.state is FeatureSlotState.RESERVED for slot in self._slots),
-                sum(
-                    slot.state is FeatureSlotState.QUARANTINED
-                    for slot in self._slots
-                ),
+                len(self._active) + self._reserved_count,
+                self._quarantined_count,
             )
 
     def _validate_hidden_states(self, hidden_states: torch.Tensor) -> None:
@@ -1034,11 +1079,13 @@ class TargetFeatureSourcePool:
             self._completed.popitem(last=False)
 
     def _quarantine_locked(self, slot_id: int, generation: int) -> None:
+        self._ensure_identity_bookkeeping_locked()
         slot = self._slot_for_generation_locked(slot_id, generation)
         # Quarantine prevents publication but retains the exact outstanding
         # readers.  A later valid read-done (or authoritative retirement
         # proof) can still drain the lease and recover the bounded slot.
         slot.state = FeatureSlotState.QUARANTINED
+        self._quarantined_count += 1
 
 
 @dataclass(slots=True)
