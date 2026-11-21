@@ -456,8 +456,12 @@ struct Ingress {
     uint32_t event;
   };
   std::deque<Hold> holds;
-  std::vector<CUevent> events;  // copy-event pool
+  // Copy-event pool, sized once at enable (one event per published record at
+  // most, so the queue capacity bounds it): the scheduler reads events[i] and
+  // event_gen[i] at submit while this thread creates further events.
+  std::vector<CUevent> events;
   std::vector<uint32_t> event_gen;
+  uint32_t event_count = 0;
   std::vector<uint32_t> free_events;
   // Landing releases (k, gen, placements), SPSC from one producer thread.
   struct Release {
@@ -721,15 +725,20 @@ bool record_copy_event(Worker* w, Ring* r, uint32_t* index, uint32_t* gen) {
     g.free_events.pop_back();
     ++g.event_gen[i];
   } else {
+    if (g.event_count == g.events.size()) {
+      fail(w, -8, r->id);
+      return false;
+    }
     CUevent event = nullptr;
     // CU_EVENT_DISABLE_TIMING: an ordering edge only.
     if (CUresult rc = w->api.cuEventCreate(&event, 0x2); rc != 0) {
       fail(w, rc, r->id);
       return false;
     }
-    i = (uint32_t)g.events.size();
-    g.events.push_back(event);
-    g.event_gen.push_back(1);
+    i = g.event_count;
+    g.events[i] = event;
+    g.event_gen[i] = 1;
+    ++g.event_count;
   }
   if (CUresult rc = timed(w->probe, dt_probe::EVENT_RECORD,
                           [&] { return w->api.cuEventRecord(g.events[i], r->stream); });
@@ -770,7 +779,8 @@ uint64_t ready_publish(Worker* w, Ring* r, ReadyEntry* e, uint32_t n, const uint
   g.published.store(first + n, std::memory_order_release);
   g.holds.push_back(Ingress::Hold{first + n, g.token_head, event});
   stamp(w, dt_probe::READY_PUBLISHED, r, e[0].record_seq, n);
-  if (g.wake_set) g.wake_set(g.wake, g.wake_bit);
+  if (g.wake_set)  // not a driver call; timed for its CPU cost (#276 decision 3)
+    timed(w->probe, dt_probe::WAKE_SET, [&] { return g.wake_set(g.wake, g.wake_bit), 0; });
   return first + n;
 }
 
@@ -968,18 +978,22 @@ bool serve_entry_v2(Worker* w, Ring* r) {
     if (!resolve_rids(r->ledger, reqs, h.request_count, mb + kMailRids, &dropped,
                       g ? g->handles : nullptr, g ? g->gens : nullptr))
       return false;
-    uint32_t token_total = 0;
+    uint64_t token_total = 0;  // u64: a forged count cannot wrap past the bound
     for (uint32_t i = 0; i < h.request_count; ++i) {
       uint32_t cnt;
       memcpy(&cnt, reqs + (uint64_t)i * 32 + 20, 4);  // token_count field
       token_total += cnt;
     }
+    if (token_total > 512) {  // the record's (and the mailbox's) token array
+      fail(w, -4, r->id);
+      return false;
+    }
     memcpy(mb + kMailMarkerB, slot + 3968, 8);
     memcpy(mb + kMailEvent, slot + kRecordV2EventHandleOffset, 64);
     *reinterpret_cast<uint64_t*>(mb + kMailDropped) = dropped;
-    mailbox_publish(r, index, 2, h.request_count, token_total, slot,
+    mailbox_publish(r, index, 2, h.request_count, (uint32_t)token_total, slot,
                     sizeof(h), reqs, h.request_count * 32, tokens,
-                    token_total * 4, nullptr, 0);
+                    (uint32_t)token_total * 4, nullptr, 0);
     stamp(w, dt_probe::MAILBOX_PUBLISHED, r, r->next_seq, h.request_count);
     if (dropped == (h.request_count >= 64 ? ~0ull : ((1ull << h.request_count) - 1))) {
       // Every request is released: no landing copy is needed — the draft
@@ -1746,6 +1760,8 @@ int dt_ring_worker_enable_ingress(void* handle, void (*wake_set)(void*, uint32_t
   g->queue.resize(capacity);
   g->tokens.resize(2 * rows + 512);  // + one record's tokens of wrap padding
   g->releases.resize(capacity);
+  g->events.assign(capacity, nullptr);
+  g->event_gen.assign(capacity, 0);
   g->wake_set = wake_set;
   g->wake = wake;
   g->wake_bit = wake_bit;
@@ -1773,6 +1789,39 @@ int64_t dt_ring_worker_ready_drain(void* handle, uint64_t from, ReadyEntry* out,
 // (its copy event waited on, its token ids and v1 payload read).
 void dt_ring_worker_ready_consume(void* handle, uint64_t seq) {
   static_cast<Worker*>(handle)->ingress->consumed.store(seq, std::memory_order_release);
+}
+
+// Scheduler side at submit (D7, §6.5): `stream` waits on the copy event of
+// each named (index, generation) before it reads the landing rows.  The
+// naming entries are not consumed yet, so none of these events can be
+// re-recorded meanwhile; a stale generation is fail-stop (R7).  0, -1 for a
+// stale or unknown event, else the CUresult.
+int dt_ring_worker_wait_copy_events(void* handle, uint64_t stream, const uint32_t* index,
+                                    const uint32_t* gen, uint32_t n) {
+  Ingress* g = static_cast<Worker*>(handle)->ingress.get();
+  if (!g) return -1;
+  Api& api = static_cast<Worker*>(handle)->api;
+  for (uint32_t i = 0; i < n; ++i) {
+    if (index[i] >= g->events.size() || g->events[index[i]] == nullptr ||
+        g->event_gen[index[i]] != gen[i])
+      return -1;
+    if (CUresult rc = api.cuStreamWaitEvent(reinterpret_cast<CUstream>(stream),
+                                            g->events[index[i]], 0);
+        rc != 0)
+      return rc;
+  }
+  return 0;
+}
+
+// READY geometry for the scheduler: returns the queue capacity (READY seqs
+// are reused modulo it) and the token arena (u32 ids, a span never wraps),
+// valid until destroy.  0: no native ingress.
+uint64_t dt_ring_worker_ready_geometry(void* handle, uint64_t* tokens, uint64_t* token_slots) {
+  Ingress* g = static_cast<Worker*>(handle)->ingress.get();
+  if (!g) return 0;
+  *tokens = reinterpret_cast<uint64_t>(g->tokens.data());
+  *token_slots = g->tokens.size();
+  return g->queue.size();
 }
 
 // Producer side of the landing release queue (one producer thread): `count`
@@ -1937,7 +1986,8 @@ int dt_ring_worker_destroy(void* handle) {
     delete r;
   }
   if (w->ingress)  // every ring stream drained: no record is pending
-    for (CUevent event : w->ingress->events) w->api.cuEventDestroy(event);
+    for (uint32_t i = 0; i < w->ingress->event_count; ++i)
+      w->api.cuEventDestroy(w->ingress->events[i]);
   w->api.cuStreamDestroy(w->stream);
   w->api.cuDevicePrimaryCtxRelease(w->device);
   delete w;

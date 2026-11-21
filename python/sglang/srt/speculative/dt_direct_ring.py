@@ -60,9 +60,9 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
-# Draft redesign D6 (design §6): the ring worker also parses served entries
-# into READY entries for the scheduler.  The Python consumer is not switched
-# yet: it only drains the queue (DraftRingWorker.drain_ready).
+# Draft redesign D6/D7 (design §6, §5.1): the ring worker parses served
+# entries into READY entries and acks its own mailbox; the DFlash scheduler
+# drains them into its READY table instead of taking mailbox entries.
 DRAFT_INGRESS_NATIVE = os.environ.get("DT_DRAFT_INGRESS", "") == "native"
 RING_CAPACITY = int(os.environ.get("DT_DIRECT_RING_CAPACITY", "256"))
 if RING_CAPACITY <= 0 or RING_CAPACITY & (RING_CAPACITY - 1):
@@ -420,6 +420,9 @@ class NativeRidLedger:
         self._handle = lib.dt_rid_ledger_create(capacity)
         if not self._handle:
             raise DirectRingError("native rid ledger could not be created")
+        # Request handle (cell) -> (generation, rid) of its last registration:
+        # READY entries name a request by handle only (native ingress).
+        self._by_cell: dict[int, tuple[int, str]] = {}
 
     def register(self, rid: str) -> int:
         value = rid_hash(rid)
@@ -428,7 +431,16 @@ class NativeRidLedger:
             raise DirectRingError(f"rid hash collision at {rid!r}")
         if rc != 0:
             raise DirectRingError(f"native rid ledger rejected {rid!r}: rc={rc}")
+        cell, gen = self.handle(rid)
+        self._by_cell[cell] = (gen, rid)
         return value
+
+    def rid_of(self, cell: int, gen: int) -> str | None:
+        """The rid a READY entry's (handle, generation) names; None once that
+        cell was registered again (the named request was released)."""
+
+        entry = self._by_cell.get(cell)
+        return entry[1] if entry is not None and entry[0] == gen else None
 
     def resolve(self, value: int) -> str | None:
         buf = ctypes.create_string_buffer(256)
@@ -878,41 +890,55 @@ class MailboxConsumer:
         format_tag = struct.unpack_from("<I", mailbox, MAIL_FORMAT)[0]
         if format_tag == 2:
             entry = self._take_ready_v2(seq, index, mailbox)
-            if entry is None:
-                return None
         else:
-            (
-                v1_seq,
-                flags,
-                source_offset,
-                nbytes,
-                source_slot_id,
-                slot_generation,
-                payload_len,
-                epoch,
-            ) = ENTRY_V1_HEADER.unpack_from(mailbox, MAIL_HEADER)
-            if v1_seq != low or epoch != seq >> 32:
-                return None
-            if payload_len > MAX_PAYLOAD_BYTES:
-                raise DirectRingError("ring entry payload length is invalid")
-            entry = RingEntry(
-                seq=seq,
-                has_pull=bool(flags & FLAG_HAS_PULL),
-                source_offset=source_offset,
-                nbytes=nbytes,
-                source_slot_id=source_slot_id,
-                slot_generation=slot_generation,
-                payload=bytes(
-                    mailbox[MAIL_V1_PAYLOAD : MAIL_V1_PAYLOAD + payload_len]
-                ),
-                landing_index=int(self.placement_buffer[index]),
-                landing_offset=int(self.placement_offset[index]),
-            )
+            entry = self._v1_entry(seq, index, mailbox)
+        if entry is None:
+            return None
         # Entries are consumed in seq order; the ack unblocks the next lap's
         # mailbox slot (credit itself moved to the native worker).
         self.next_seq = next_seq(seq)
         self._mail_ack[0] = seq
         return entry
+
+    def v1_entry(self, seq: int) -> RingEntry:
+        """The mailbox snapshot of the v1 entry a V1_PAYLOAD READY entry
+        names (native ingress: the worker pins the slot until consumed)."""
+
+        index = seq % self.capacity
+        mailbox = self._mailbox[index]
+        entry = None
+        if struct.unpack_from("<Q", mailbox, MAIL_SEQ_TAG)[0] == seq:
+            entry = self._v1_entry(seq, index, mailbox)
+        if entry is None:
+            raise DirectRingError("V1_PAYLOAD entry names a stale mailbox slot")
+        return entry
+
+    def _v1_entry(self, seq: int, index: int, mailbox) -> RingEntry | None:
+        (
+            v1_seq,
+            flags,
+            source_offset,
+            nbytes,
+            source_slot_id,
+            slot_generation,
+            payload_len,
+            epoch,
+        ) = ENTRY_V1_HEADER.unpack_from(mailbox, MAIL_HEADER)
+        if v1_seq != seq & SEQ_MASK or epoch != seq >> 32:
+            return None
+        if payload_len > MAX_PAYLOAD_BYTES:
+            raise DirectRingError("ring entry payload length is invalid")
+        return RingEntry(
+            seq=seq,
+            has_pull=bool(flags & FLAG_HAS_PULL),
+            source_offset=source_offset,
+            nbytes=nbytes,
+            source_slot_id=source_slot_id,
+            slot_generation=slot_generation,
+            payload=bytes(mailbox[MAIL_V1_PAYLOAD : MAIL_V1_PAYLOAD + payload_len]),
+            landing_index=int(self.placement_buffer[index]),
+            landing_offset=int(self.placement_offset[index]),
+        )
 
     def _take_ready_v2(self, seq: int, index: int, mailbox) -> RingRecordV2 | None:
         (
@@ -1367,6 +1393,14 @@ class DraftRingWorker:
         lib.dt_ring_worker_ready_consume.restype = None
         lib.dt_ring_worker_consumed_seq_address.argtypes = [vp, i32]
         lib.dt_ring_worker_consumed_seq_address.restype = u64
+        lib.dt_ring_worker_wait_copy_events.argtypes = [vp, u64, vp, vp, u32]
+        lib.dt_ring_worker_wait_copy_events.restype = i32
+        lib.dt_ring_worker_landing_release.argtypes = [vp, u32, u32, u64]
+        lib.dt_ring_worker_landing_release.restype = i32
+        lib.dt_ring_worker_ready_geometry.argtypes = [
+            vp, ctypes.POINTER(u64), ctypes.POINTER(u64)
+        ]
+        lib.dt_ring_worker_ready_geometry.restype = u64
         self._lib = lib
         # ``landing`` is a contiguous [count, rows, width] CUDA tensor kept
         # alive by this object until destroy() drained the worker stream.
@@ -1400,10 +1434,18 @@ class DraftRingWorker:
                 lib.dt_ring_worker_destroy(self._handle)
                 self._handle = None
                 raise DirectRingError("native ingress could not be enabled")
-            dtype, _ = ready_abi(lib)
-            self._ready = np.empty(self.READY_BATCH, dtype=dtype)
+            self.ready_dtype, self.ready_kinds = ready_abi(lib)
+            self._ready = np.empty(self.READY_BATCH, dtype=self.ready_dtype)
             self._ready_next = 1  # next READY seq to drain
             self._trace_drain = event_enabled("draft_ready_drain")
+            tokens, token_slots = u64(), u64()
+            self.ready_capacity = int(
+                lib.dt_ring_worker_ready_geometry(self._handle, tokens, token_slots)
+            )
+            self.ready_tokens = np.ctypeslib.as_array(
+                ctypes.cast(tokens.value, ctypes.POINTER(ctypes.c_uint32)),
+                shape=(token_slots.value,),
+            )
         if lib.dt_ring_worker_start(self._handle) != 0:
             lib.dt_ring_worker_destroy(self._handle)
             self._handle = None
@@ -1446,7 +1488,8 @@ class DraftRingWorker:
             endpoint._ring.header.ctypes.data,
             endpoint._mailbox.ctypes.data,
             MAIL_STRIDE,
-            endpoint._mail_ack.ctypes.data,
+            # Native ingress acks its own mailbox (the scheduler reads none).
+            0 if self.ingress else endpoint._mail_ack.ctypes.data,
             ledger,
             target_instance_id.encode(),
             endpoint._ring.host_address + endpoint._ring.dest_offset,
@@ -1476,23 +1519,22 @@ class DraftRingWorker:
             endpoint.next_seq,
             endpoint._mailbox.ctypes.data,
             MAIL_STRIDE,
-            endpoint._mail_ack.ctypes.data,
+            0 if self.ingress else endpoint._mail_ack.ctypes.data,
             ctypes.byref(spec),
         )
         if rc != 0:
             raise DirectRingError("native ring worker rejected a remote ring")
         self._endpoints[endpoint.ring_id] = endpoint
 
-    def drain_ready(self) -> int:
-        """Drain the native READY queue and pass ready_consumed_seq over it.
+    def drain_ready(self) -> np.ndarray:
+        """Copy out every READY entry published since the last drain.
 
-        D6 consumer: the rows are still admitted from the mailbox
-        (``MailboxConsumer.take_ready``), so the drained entries are only
-        stamped (``draft_ready_drain``, per ring entry) and released.  The
-        mailbox ack of that consumer still gates the worker.
+        The drain cursor is private to this side; nothing is reclaimed until
+        ``ready_consume`` passes an entry (after the submit that waited on its
+        copy event, design §6.5).
         """
 
-        drained = 0
+        parts = []
         while True:
             count = int(
                 self._lib.dt_ring_worker_ready_drain(
@@ -1521,12 +1563,38 @@ class DraftRingWorker:
                     ).tolist(),
                 )
             self._ready_next += count
-            drained += count
+            if count:
+                parts.append(self._ready[:count].copy())
             if count < self.READY_BATCH:
                 break
-        if drained:
-            self._lib.dt_ring_worker_ready_consume(self._handle, self._ready_next - 1)
-        return drained
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts) if parts else self._ready[:0]
+
+    def ready_consume(self, seq: int) -> None:
+        """ready_consumed_seq: every READY entry up to ``seq`` is done."""
+
+        self._lib.dt_ring_worker_ready_consume(self._handle, seq)
+
+    def wait_copy_events(self, stream: int, index: np.ndarray, gen: np.ndarray) -> None:
+        """Make ``stream`` wait on the named pooled copy events (u32 arrays)."""
+
+        rc = self._lib.dt_ring_worker_wait_copy_events(
+            self._handle, stream, index.ctypes.data, gen.ctypes.data, len(index)
+        )
+        if rc:
+            raise DirectRingError(f"READY copy-event wait failed: rc={rc}")
+
+    def landing_release(self, k: int, gen: int, count: int) -> None:
+        """``count`` placements of landing buffer ``k`` (generation ``gen``)
+        are no longer read; the worker frees the buffer once all are."""
+
+        rc = self._lib.dt_ring_worker_landing_release(self._handle, k, gen, count)
+        if rc:
+            raise DirectRingError(f"landing release queue rejected a release: rc={rc}")
+
+    def endpoint(self, ring_id: int):
+        return self._endpoints[ring_id]
 
     def consumed_seq(self, ring_id: int) -> int:
         """The last ring seq the worker consumed on ``ring_id`` (0: none).

@@ -48,7 +48,8 @@ namespace dt_probe {
   X(EVENT_RECORD, "cuEventRecord")                   \
   X(LAUNCH_HOST_FUNC, "cuLaunchHostFunc")            \
   X(FLUSH_RDMA_WRITES, "cuFlushGPUDirectRDMAWrites") \
-  X(RDMA_POST_READ, "ibv_post_send(READ)")
+  X(RDMA_POST_READ, "ibv_post_send(READ)")          \
+  X(WAKE_SET, "dt_wake_set")
 
 #define DT_PROBE_ENUM(id, name) id,
 enum Kind : uint32_t { KIND_NONE = 0, DT_PROBE_KINDS(DT_PROBE_ENUM) KIND_COUNT };

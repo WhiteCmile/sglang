@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import msgspec
+import numpy as np
 import torch
 import torch.nn.functional as F
 from dt_client import RetryOutbox
@@ -451,6 +452,8 @@ class InputReadyFeature:
     # W7b mark, emitted only in the profile: passed over while its staging
     # slot was compute-busy (never set under DT_DRAFT_SLOT_DECOUPLE).
     slot_busy_blocked: bool = False
+    # DT_DRAFT_INGRESS=native: the READY seq of a READY-table row (0: none).
+    ready_seq: int = 0
 
 
 @dataclass(slots=True)
@@ -475,6 +478,9 @@ class PendingDFlashCompletion:
     reconcile_prepare_phase_ns: tuple[int, ...]
     prior_unfinished_proposal_count: int
     prior_candidate_copy_pending_count: int
+    # DT_DRAFT_INGRESS=native: (ring id, record seq) of each READY-table row
+    # with a landing placement; their placements are released at retire.
+    ready_rows: tuple[tuple[int, int], ...] = ()
     # Profile-only D0 stamps (issue #269): selection start, membership fixed,
     # hand-off end (launch-time push queued), and the DT_GPU_CLOCK stamp of
     # proposal_done (slot -1: none).
@@ -884,6 +890,10 @@ class FlashMTPDraftEngine:
     # DT_DRAFT_CONTROL_LOOP (DFlash only): the scheduler wake word, or None
     # for the legacy socket polling and idle sleep.
     _wake = None
+    # DT_DRAFT_INGRESS=native (DFlash only): rows come from the native READY
+    # queue (design §5.1 DRAIN/FREEZE), not from mailbox takes.
+    _native_ingress = False
+    _ready_pending = ()
 
     # Preserve the historical transport for partially constructed test and
     # diagnostic instances that intentionally bypass ``__init__``.
@@ -1215,6 +1225,42 @@ class FlashMTPDraftEngine:
         if not self._ring_confirmation and not self._ring_dest_region:
             # Confirmation-free, the region is a v2 row's only destination.
             raise ValueError("DT_RING_CONFIRMATION=0 requires DT_RING_DEST_REGION=1")
+        # Draft redesign D7: the READY-table consumer builds on D1 (no
+        # compute-busy), D2 (no credit) and D4 (no confirmation) and has no
+        # path for their legacy modes.
+        from sglang.srt.speculative.dt_direct_ring import DRAFT_INGRESS_NATIVE
+
+        self._native_ingress = DRAFT_INGRESS_NATIVE and self._is_dflash
+        if self._native_ingress and (
+            not self._slot_decouple
+            or not DRAFT_ADMISSION_BOUND
+            or self._ring_confirmation
+        ):
+            raise ValueError(
+                "DT_DRAFT_INGRESS=native requires DT_DRAFT_SLOT_DECOUPLE=1, "
+                "DT_DRAFT_ADMISSION=bound and DT_RING_CONFIRMATION=0"
+            )
+        # READY table (scheduler-owned, native ingress): entries by READY seq
+        # modulo the queue capacity (created with the ring worker), the
+        # unselected seqs in arrival order, the decoded V1_PAYLOAD tasks
+        # (until Target item T4), per-record landing placements
+        # (ring id, record seq) -> [rows not yet released, k, gen], and
+        # ready_consumed_seq with the consumed seqs past it (#276 decision 2:
+        # reclaim per entry, the counter advances over the contiguous prefix).
+        self._ready_table = None
+        self._ready_drained_ns = None
+        self._ready_pending: list[int] = []
+        self._ready_tasks: dict[int, object] = {}
+        self._ready_records: dict[tuple[int, int], list[int]] = {}
+        self._ready_consumed = 0
+        self._ready_done: set[int] = set()
+        # Placements of rows dropped without a batch: (event, keys), released
+        # once the current stream passed their copy events.
+        self._ready_release_fenced: deque[tuple[torch.cuda.Event, tuple]] = deque()
+        # READY residence (publish -> consumed): the longest one, and a sample
+        # for its p99 in the lifecycle status.
+        self._ready_held_max_ns = 0
+        self._ready_held_ns: deque[int] = deque(maxlen=1 << 16)
         # Held results released by confirmations, sent as one batch per turn.
         self._confirmed_held_results: list = []
         self._confirmed_held_sequence = 0
@@ -2305,7 +2351,11 @@ class FlashMTPDraftEngine:
                 self._loop_stage("push_progress", self._push_transport_progress)
             if self._stop:
                 break
-            if self._ring_worker is not None or self._remote_ring_endpoints:
+            # Native ingress drains READY once, right before the freeze.
+            rings = not self._native_ingress and (
+                self._ring_worker is not None or self._remote_ring_endpoints
+            )
+            if rings:
                 self._loop_stage("poll_rings_head", self._poll_direct_rings)
             if self._ring_confirmation:
                 self._loop_stage("flush_confirmed", self._flush_confirmed_results)
@@ -2329,7 +2379,9 @@ class FlashMTPDraftEngine:
                     self._loop_stage(
                         "poll_feature_batches", self._poll_feature_batches
                     )
-                if self._ring_worker is not None or self._remote_ring_endpoints:
+                if self._native_ingress:
+                    self._loop_stage("ready_drain", self._drain_ready)
+                elif rings:
                     self._loop_stage("poll_rings_mid", self._poll_direct_rings)
                 ready = self._loop_stage(
                     "take_input_ready", self._take_input_ready_batch
@@ -2361,7 +2413,7 @@ class FlashMTPDraftEngine:
                     self._poll_dflash_completions()
             if self._pending_candidate_pushes:
                 self._loop_stage("poll_candidate_pushes", self._poll_candidate_pushes)
-            if self._ring_worker is not None or self._remote_ring_endpoints:
+            if rings:
                 self._loop_stage("poll_rings_tail", self._poll_direct_rings)
             if self._held_ring_pushes and not self._ring_confirmation:
                 self._loop_stage(
@@ -2377,6 +2429,7 @@ class FlashMTPDraftEngine:
                 and not self._input_ready_features
                 and not self._pending_feature_batches
                 and not self._ring_admission
+                and not self._ready_pending
             ):
                 if (
                     self._pending_dflash_completions
@@ -2503,10 +2556,7 @@ class FlashMTPDraftEngine:
     def _ensure_ring_worker(self):
         """The native ring worker and its landing buffers, created once."""
 
-        from sglang.srt.speculative.dt_direct_ring import (
-            DRAFT_INGRESS_NATIVE,
-            DraftRingWorker,
-        )
+        from sglang.srt.speculative.dt_direct_ring import DraftRingWorker
 
         if self._ring_worker is None:
             if self._is_feature_backed:
@@ -2556,10 +2606,14 @@ class FlashMTPDraftEngine:
                 cpu=int(os.environ.get("DT_DIRECT_RING_CPU", "-1")),
                 landing=landing,
                 row_bytes=row_bytes,
-                # D6: DFlash only; other methods keep the legacy ingress.
-                ingress=DRAFT_INGRESS_NATIVE and self._is_dflash,
+                # DFlash only; other methods keep the legacy ingress.
+                ingress=self._native_ingress,
                 wake=self._wake,
             )
+            if self._native_ingress:
+                capacity = self._ring_worker.ready_capacity
+                self._ready_table = np.zeros(capacity, dtype=self._ring_worker.ready_dtype)
+                self._ready_drained_ns = np.zeros(capacity, dtype=np.int64)
         return self._ring_worker
 
     def _open_direct_ring(self, registration) -> None:
@@ -2697,36 +2751,7 @@ class FlashMTPDraftEngine:
                 self._accept_ring_task(endpoint, entry, task, DraftTaskKind)
         for endpoint in self._ring_endpoints.values():
             if not endpoint.attached:
-                registration = endpoint.registration()
-                if registration is None:
-                    continue
-                handle, length, pool_generation, source_session_id = registration
-                self._ring_source_registration[endpoint.ring_id] = (handle, length)
-                source_base = 0
-                if self._is_feature_backed:
-                    if not length:
-                        raise RuntimeError("direct ring Target registered no source")
-                    source_base, _warm = self._feature_pull_transport._mapping_cache.map(
-                        peer_instance_id=self._ring_targets[endpoint.ring_id],
-                        peer_session_id=source_session_id,
-                        pool_generation=pool_generation,
-                        ipc_handle=handle,
-                    )
-                worker.attach(
-                    endpoint,
-                    source_base=source_base,
-                    source_length=length,
-                    ledger=(
-                        self._rid_ledger._handle
-                        if self._rid_ledger is not None
-                        else None
-                    ),
-                    target_instance_id=self._ring_targets[endpoint.ring_id],
-                )
-                endpoint.mark_serving(
-                    pool_generation=pool_generation,
-                    source_session_id=source_session_id,
-                )
+                self._attach_direct_ring(worker, endpoint)
                 continue
             for _ in range(256):
                 entry = endpoint.take_ready()
@@ -2770,7 +2795,43 @@ class FlashMTPDraftEngine:
             time.monotonic_ns() - landing_started_ns
         )
 
-    def _accept_ring_task(self, endpoint, entry, task, task_kinds) -> None:
+    def _attach_direct_ring(self, worker, endpoint) -> None:
+        """Attach a same-host ring once its Target registered its source."""
+
+        registration = endpoint.registration()
+        if registration is None:
+            return
+        handle, length, pool_generation, source_session_id = registration
+        self._ring_source_registration[endpoint.ring_id] = (handle, length)
+        source_base = 0
+        if self._is_feature_backed:
+            if not length:
+                raise RuntimeError("direct ring Target registered no source")
+            source_base, _warm = self._feature_pull_transport._mapping_cache.map(
+                peer_instance_id=self._ring_targets[endpoint.ring_id],
+                peer_session_id=source_session_id,
+                pool_generation=pool_generation,
+                ipc_handle=handle,
+            )
+        worker.attach(
+            endpoint,
+            source_base=source_base,
+            source_length=length,
+            ledger=(
+                self._rid_ledger._handle
+                if self._rid_ledger is not None
+                else None
+            ),
+            target_instance_id=self._ring_targets[endpoint.ring_id],
+        )
+        endpoint.mark_serving(
+            pool_generation=pool_generation,
+            source_session_id=source_session_id,
+        )
+
+    def _check_ring_task(self, endpoint, entry, task, task_kinds) -> None:
+        """The ring entry and its decoded v1 task name the same round."""
+
         if (
             task.direct_ring_seq != entry.seq
             or task.target_instance_id != self._ring_targets[endpoint.ring_id]
@@ -2794,6 +2855,9 @@ class FlashMTPDraftEngine:
                 raise ValueError("direct ring pull does not match its task source")
         elif task.source is not None:
             raise ValueError("direct ring task source was not pulled")
+
+    def _accept_ring_task(self, endpoint, entry, task, task_kinds) -> None:
+        self._check_ring_task(endpoint, entry, task, task_kinds)
         transfer_id = task.transfer_id
         if transfer_id in self._pending_ids:
             raise ValueError("direct ring task is already known")
@@ -2860,7 +2924,9 @@ class FlashMTPDraftEngine:
         if entry.has_pull:
             # The worker placed it in a landing buffer: count it as released
             # (no staging reference) so try_free's placed/released match holds.
-            self._landing_taken[entry.landing_index] += 1
+            # Native ingress: the caller releases the placement.
+            if not self._native_ingress:
+                self._landing_taken[entry.landing_index] += 1
             self._publish_ring_source_done(waiting or task)
         transport = self._candidate_push_transport
         if transport is not None and task.candidate_destination is not None:
@@ -3155,17 +3221,9 @@ class FlashMTPDraftEngine:
         queue = self._ring_admission
         if not queue:
             return
-        available_rows = self._draft_model_runner.req_to_token_pool.available_size()
-        available_kv = self._draft_model_runner.token_to_kv_pool_allocator.available_size()
-        for owner in self._pending_feature_batches:
-            for item in owner.pending:
-                rows, tokens = self._persistent_task_allocation(item.task)
-                available_rows -= rows
-                available_kv -= max(tokens, 0)
-        for entry in self._input_ready_features:
-            rows, tokens = self._persistent_task_allocation(entry.pending.task)
-            available_rows -= rows
-            available_kv -= max(tokens, 0)
+        available_rows, available_kv = self._unreserved_allocation(
+            self._input_ready_features
+        )
         now_ns = time.monotonic_ns()
         from dt_protocol import DraftTaskKind
 
@@ -3246,6 +3304,368 @@ class FlashMTPDraftEngine:
                 available_kv=available_kv,
             )
 
+    def _unreserved_allocation(self, input_ready) -> tuple[int, int]:
+        """Free req rows and KV pages minus what admitted work will take:
+        pending relayed pulls and the ``input_ready`` entries."""
+
+        available_rows = self._draft_model_runner.req_to_token_pool.available_size()
+        available_kv = self._draft_model_runner.token_to_kv_pool_allocator.available_size()
+        for owner in self._pending_feature_batches:
+            for item in owner.pending:
+                rows, tokens = self._persistent_task_allocation(item.task)
+                available_rows -= rows
+                available_kv -= max(tokens, 0)
+        for entry in input_ready:
+            rows, tokens = self._persistent_task_allocation(entry.pending.task)
+            available_rows -= rows
+            available_kv -= max(tokens, 0)
+        return available_rows, available_kv
+
+    def _drain_ready(self) -> None:
+        """DRAIN (design §5.1): attach newly registered rings, then move
+        every published READY entry into the READY table.  DROPPED entries
+        retire here (as the legacy take skips dropped requests); a
+        V1_PAYLOAD entry is decoded into its row (until Target item T4)."""
+
+        worker = self._ring_worker
+        if worker is None:
+            return
+        worker.check()
+        fenced = self._ready_release_fenced
+        while fenced and fenced[0][0].query():
+            self._release_ready_rows(fenced.popleft()[1])
+        for endpoint in self._ring_endpoints.values():
+            if not endpoint.attached:
+                self._attach_direct_ring(worker, endpoint)
+        entries = worker.drain_ready()
+        if not len(entries):
+            return
+        kinds = worker.ready_kinds
+        slots = (entries["seq"] - 1) % len(self._ready_table)
+        self._ready_table[slots] = entries
+        self._ready_drained_ns[slots] = time.monotonic_ns()
+        kind = entries["kind"] & ~np.uint32(kinds["DEST_KNOWN"])
+        done, dropped = [], []
+        for seq, kind, ring_id, record_seq, k, gen in zip(
+            entries["seq"].tolist(),
+            kind.tolist(),
+            entries["ring_id"].tolist(),
+            entries["record_seq"].tolist(),
+            entries["landing_k"].tolist(),
+            entries["landing_gen"].tolist(),
+        ):
+            if kind != kinds["ROW"] and kind != kinds["V1_PAYLOAD"]:
+                done.append(seq)  # DROPPED: its request was released
+                continue
+            key = (ring_id, record_seq)
+            if k >= 0:
+                record = self._ready_records.get(key)
+                if record is None:
+                    self._ready_records[key] = [1, k, gen]
+                else:
+                    record[0] += 1
+            if kind == kinds["V1_PAYLOAD"] and not self._accept_ready_v1(
+                worker, seq, ring_id, record_seq, k
+            ):
+                done.append(seq)
+                dropped.append(key)
+                continue
+            self._ready_pending.append(seq)
+        if dropped:
+            self._release_ready_rows(dropped, fence_seqs=done)
+        if done:
+            self._ready_consume(done)
+
+    def _accept_ready_v1(self, worker, seq, ring_id, record_seq, k) -> bool:
+        """Decode a V1_PAYLOAD entry's task into its READY-table row; False
+        when the round was cancelled first (it then retires here, as the
+        legacy take does)."""
+
+        from dt_protocol import DraftTask, DraftTaskKind
+
+        if self._ring_task_decoder is None:
+            self._ring_task_decoder = msgspec.msgpack.Decoder(DraftTask)
+        endpoint = worker.endpoint(ring_id)
+        entry = endpoint.v1_entry(record_seq)
+        task = self._ring_task_decoder.decode(entry.payload)
+        self._check_ring_task(endpoint, entry, task, DraftTaskKind)
+        if not entry.has_pull or k < 0:
+            raise ValueError("direct ring task source was not pulled")
+        if entry.nbytes // worker.row_bytes != int(task.feature_token_count):
+            raise ValueError("direct ring pull row count mismatch")
+        if task.transfer_id in self._cancelled_ids:
+            self._drop_ring_task(task, entry, report=True)
+            return False
+        # A cross-host round relays its read proof at take (design §8.3).
+        self._publish_ring_source_done(task)
+        self._direct_tasks_by_transfer[task.transfer_id] = task
+        self._ready_tasks[seq] = task
+        self._ready_table["token_count"][(seq - 1) % len(self._ready_table)] = (
+            task.feature_token_count
+        )
+        return True
+
+    def _freeze_ready_rows(
+        self, selected, busy_handles, proposal_mode, token_count, now_ns
+    ) -> None:
+        """FREEZE over the READY table (design §5.1): append to ``selected``,
+        in arrival order, every row that fits (owner not busy, same proposal
+        mode, batch bound, KV and req-row fit).  A row that does not fit stays
+        READY; there is no head-of-line break.  Rows of released or cancelled
+        requests and expired rows retire here.  Only a frozen row gets a
+        DraftTask: the retire and push paths still take one until D8/D9."""
+
+        if not self._ready_pending:
+            return
+        worker = self._ring_worker
+        table = self._ready_table
+        pending = np.asarray(self._ready_pending, dtype=np.int64)
+        slots = (pending - 1) % len(table)
+        fields = (
+            "ring_id", "record_seq", "position", "req_handle", "req_gen",
+            "round_id", "attempt", "seq_len", "token_count", "bonus_token",
+            "landing_k", "row_first", "token_at", "ready_ns",
+        )
+        rows = table[slots][list(fields)].tolist()
+        drained = self._ready_drained_ns[slots].tolist()
+        tokens = worker.ready_tokens
+        arena = len(tokens)
+        available_rows, available_kv = self._unreserved_allocation(
+            (*selected, *self._input_ready_features)
+        )
+        profile = self._profile_active
+        retained, done, dropped = [], [], []
+        for seq, drained_ns, (
+            ring_id, record_seq, position, cell, gen, round_id, attempt,
+            seq_len, count, bonus, k, row_first, token_at, ready_ns,
+        ) in zip(self._ready_pending, drained, rows):
+            task = self._ready_tasks.get(seq)
+            if task is not None:
+                handle, transfer_id = task.draft_kv_handle, task.transfer_id
+                requires_proposal, deadline_ns = task.requires_proposal, task.deadline_ns
+            else:
+                rid = self._rid_ledger.rid_of(cell, gen)
+                target = self._ring_targets[ring_id]
+                handle = f"{target}:{rid}:{attempt}"
+                transfer_id = f"{target}:{rid}:{round_id}:{attempt}"
+                requires_proposal = True
+                deadline_ns = ready_ns + _RING_RECORD_TIMEOUT_NS
+            # The handle's request is gone, or its release waits only on an
+            # in-flight batch: this later round must not run (as the legacy
+            # admission's released drop).
+            released = (
+                handle not in self._persistent_requests
+                or handle in self._deferred_persistent_releases
+            )
+            cancelled = released or transfer_id in self._cancelled_ids
+            if cancelled or now_ns >= deadline_ns:
+                if task is None and not cancelled:
+                    task = self._ready_row_task(
+                        target, rid, ring_id, record_seq, round_id, attempt, seq_len,
+                        tokens[token_at % arena : token_at % arena + count], bonus, ready_ns,
+                    )
+                if cancelled:
+                    if task is not None:
+                        self._retire_cancelled_transfer_identity(task)
+                    self._cancelled_ids.discard(transfer_id)
+                    self._drain_deferred_persistent_release(handle)
+                    profile_emit(
+                        "draft_ring_released_drop",
+                        draft_instance=self.instance_id,
+                        transfer_id=transfer_id,
+                        round_id=round_id,
+                    )
+                else:
+                    # A ring identity: _send_result keeps the failure local.
+                    self._pending_ids.add(transfer_id)
+                    self._ring_pending_ids.add(transfer_id)
+                    self._release_persistent_request(handle)
+                    self._publish_failures(
+                        [(task, TimeoutError("direct ring task deadline expired"))]
+                    )
+                dropped.append((ring_id, record_seq))
+                done.append(seq)
+                continue
+            if handle in busy_handles or len(selected) >= self.max_batch_size:
+                retained.append(seq)
+                continue
+            if proposal_mode is None:
+                proposal_mode = requires_proposal
+            if (
+                requires_proposal != proposal_mode
+                or token_count + count > self.feature_buffer_max_tokens
+            ):
+                retained.append(seq)
+                continue
+            if task is None:
+                task = self._ready_row_task(
+                    target, rid, ring_id, record_seq, round_id, attempt, seq_len,
+                    tokens[token_at % arena : token_at % arena + count], bonus, ready_ns,
+                )
+            row_cost, kv_cost = self._persistent_task_allocation(task)
+            if row_cost > available_rows or kv_cost > available_kv:
+                retained.append(seq)
+                continue
+            available_rows -= row_cost
+            available_kv -= max(kv_cost, 0)
+            token_count += count
+            busy_handles.add(handle)
+            self._pending_ids.add(transfer_id)
+            self._ring_pending_ids.add(transfer_id)
+            if seq not in self._ready_tasks:
+                self._ring_record_positions[transfer_id] = (
+                    worker.endpoint(ring_id),
+                    position,
+                )
+            selected.append(
+                InputReadyFeature(
+                    batch_id=f"ring:{transfer_id}",
+                    pending=PendingDraftTask(task=task, taken_ns=drained_ns),
+                    staging_slot=self._landing_slot_base + k,
+                    row_range=(row_first, row_first + count),
+                    ready_ns=drained_ns,
+                    ready_seq=seq,
+                )
+            )
+            if profile:
+                # Native ingress has no admission queue: the drain is both
+                # the take and READY of the D0 chain.
+                profile_emit(
+                    "draft_ring_take",
+                    draft_instance=self.instance_id,
+                    transfer_id=transfer_id,
+                    request_id=task.request_id,
+                    round_id=round_id,
+                    ring_id=ring_id,
+                    ring_seq=record_seq,
+                    has_pull=True,
+                    taken_ns=drained_ns,
+                )
+                profile_emit(
+                    "draft_input_ready",
+                    draft_instance=self.instance_id,
+                    transfer_id=transfer_id,
+                    request_id=task.request_id,
+                    round_id=round_id,
+                    staging_slot=self._landing_slot_base + k,
+                    ready_ns=drained_ns,
+                    direct=True,
+                )
+        self._ready_pending = retained
+        if done:
+            self._release_ready_rows(dropped, fence_seqs=done)
+            self._ready_consume(done)
+
+    def _ready_row_task(
+        self, target, rid, ring_id, record_seq, round_id, attempt, seq_len, ids,
+        bonus, ready_ns,
+    ):
+        """The DraftTask of one natively parsed v2 row: the fields the legacy
+        take built from the mailbox, without a SourceRef (the row is already
+        in its landing buffer) and without _validate_task (ingress applied
+        the record's field checks)."""
+
+        from dt_protocol import DraftTask, DraftTaskKind
+
+        ids = tuple(ids.tolist())
+        count = len(ids)
+        return DraftTask(
+            transfer_id=f"{target}:{rid}:{round_id}:{attempt}",
+            request_id=rid,
+            round_id=round_id,
+            attempt=attempt,
+            target_instance_id=target,
+            draft_profile_id=self.profile.profile_id,
+            k=self.profile.draft_k,
+            next_token_id=bonus,
+            source=None,
+            created_ns=ready_ns,
+            deadline_ns=ready_ns + _RING_RECORD_TIMEOUT_NS,
+            kind=DraftTaskKind.RECONCILE,
+            draft_kv_handle=f"{target}:{rid}:{attempt}",
+            committed_token_ids=ids,
+            feature_token_ids=ids,
+            committed_kv_len=seq_len,
+            feature_token_offset=seq_len - count,
+            feature_token_count=count,
+            requires_proposal=True,
+            direct_ring_seq=record_seq,
+            candidate_destination=None,
+        )
+
+    def _ready_consume(self, seqs) -> None:
+        """Mark READY entries consumed and pass ready_consumed_seq over the
+        contiguous consumed prefix (#276 decisions 1-2).  A submitted row is
+        consumed only after its cuStreamWaitEvent was issued (§6.5)."""
+
+        table = self._ready_table
+        held = time.monotonic_ns() - table["ready_ns"][
+            (np.asarray(seqs, dtype=np.int64) - 1) % len(table)
+        ].astype(np.int64)
+        self._ready_held_ns.extend(held.tolist())
+        self._ready_held_max_ns = max(self._ready_held_max_ns, int(held.max()))
+        done = self._ready_done
+        for seq in seqs:
+            done.add(seq)
+            self._ready_tasks.pop(seq, None)
+        consumed = self._ready_consumed
+        while consumed + 1 in done:
+            consumed += 1
+            done.remove(consumed)
+        if consumed != self._ready_consumed:
+            self._ready_consumed = consumed
+            if self._ring_worker is not None:  # shutdown: already destroyed
+                self._ring_worker.ready_consume(consumed)
+
+    def _ready_row_keys(self, seqs) -> tuple[tuple[int, int], ...]:
+        """(ring id, record seq) of each READY row, for its landing release."""
+
+        rows = self._ready_table[(np.asarray(seqs, dtype=np.int64) - 1) % len(self._ready_table)]
+        return tuple(zip(rows["ring_id"].tolist(), rows["record_seq"].tolist()))
+
+    def _wait_ready_copies(self, seqs) -> None:
+        """The current stream waits on the copy event of every READY row
+        (one cuStreamWaitEvent per distinct event; cross-host rows have
+        none), before the batch reads their landing rows (§5.1, §6.5)."""
+
+        worker = self._ring_worker
+        rows = self._ready_table[(np.asarray(seqs, dtype=np.int64) - 1) % len(self._ready_table)]
+        no_event = worker.ready_kinds["NO_EVENT"]
+        events = {
+            pair
+            for pair in zip(rows["copy_event_idx"].tolist(), rows["copy_event_gen"].tolist())
+            if pair[0] != no_event
+        }
+        if events:
+            index, gen = (np.array(column, dtype=np.uint32) for column in zip(*events))
+            worker.wait_copy_events(
+                torch.cuda.current_stream(self.device).cuda_stream, index, gen
+            )
+
+    def _release_ready_rows(self, keys, fence_seqs=()) -> None:
+        """Release READY rows' landing placements: a record's placement is
+        released with its last row (sent by the scheduler at retire until
+        D8 moves it to the send loop).  Rows released without a batch that
+        waited on their copies pass ``fence_seqs`` (their READY seqs, not yet
+        consumed): READY precedes the copy's completion (§6.5), so their
+        release waits until the current stream has passed those copies."""
+
+        worker = self._ring_worker
+        if fence_seqs and worker is not None:
+            self._wait_ready_copies(fence_seqs)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+            self._ready_release_fenced.append((event, tuple(keys)))
+            return
+        records = self._ready_records
+        for key in keys:
+            record = records[key]
+            record[0] -= 1
+            if not record[0]:
+                del records[key]
+                if worker is not None:  # shutdown: the worker already drained
+                    worker.landing_release(record[1], record[2], 1)
+
     def _profile_ring_admission_state(
         self,
         *,
@@ -3323,6 +3743,10 @@ class FlashMTPDraftEngine:
         if rc:
             raise RuntimeError(f"direct ring worker stream drain failed: {rc}")
         self._landing_free_pending.clear()
+        # Unfrozen READY rows hold no request state; their placements died
+        # with the worker.
+        self._ready_pending.clear()
+        self._ready_release_fenced.clear()
         queue = self._ring_admission
         while queue:
             task, slot, _rows = queue.popleft()
@@ -3520,6 +3944,16 @@ class FlashMTPDraftEngine:
                 for session_id, endpoint in self._remote_ring_endpoints.items()
             },
         }
+        if self._native_ingress:
+            held = sorted(self._ready_held_ns)
+            # READY residence, publish -> consumed (#276 decision 2).
+            rings["ready"] = {
+                "rows": len(self._ready_pending),
+                "consumed_seq": self._ready_consumed,
+                "held_max_ns": self._ready_held_max_ns,
+                "held_p99_ns": held[int(len(held) * 0.99)] if held else 0,
+                "held_samples": len(held),
+            }
         last_measurement_ns = getattr(self, "_last_direct_gpu_measurement_ns", 0)
         request_evidence_ready = bool(
             quiescent
@@ -5411,6 +5845,8 @@ class FlashMTPDraftEngine:
     def _release_feature_staging_entries(self, staging_slot: int, count: int) -> None:
         if count <= 0:
             raise ValueError("feature staging release count must be positive")
+        if self._native_ingress and 0 <= self._landing_slot_base <= staging_slot:
+            return  # landing placements are released per record (ready_rows)
         refcounts = getattr(self, "_feature_staging_refcounts", None)
         if refcounts is None:
             # Narrow unit fixtures predating request-granular ownership create
@@ -5665,7 +6101,10 @@ class FlashMTPDraftEngine:
         waiting_before = tuple(
             entry.pending.task.transfer_id for entry in self._input_ready_features
         )
-        if not self._input_ready_features or inflight_before >= DRAFT_COMPUTE_DEPTH:
+        if (
+            not (self._input_ready_features or self._ready_pending)
+            or inflight_before >= DRAFT_COMPUTE_DEPTH
+        ):
             self._profile_input_ready_state(
                 observed_ns=selection_started_ns,
                 waiting_transfer_ids=waiting_before,
@@ -5733,6 +6172,10 @@ class FlashMTPDraftEngine:
             if self._persistent:
                 busy_handles.add(task.draft_kv_handle)
         self._input_ready_features = retained
+        if self._native_ingress:
+            self._freeze_ready_rows(
+                selected, busy_handles, proposal_mode, token_count, now_ns
+            )
         selection_finished_ns = time.monotonic_ns() if profile_active else 0
         if not selected:
             self._profile_input_ready_state(
@@ -5829,6 +6272,7 @@ class FlashMTPDraftEngine:
                     self._ring_worker.seal(slot - landing_slot_base)
         pending = [entry.pending for entry in ready]
         row_ranges = tuple(entry.row_range for entry in ready)
+        ready_seqs = tuple(entry.ready_seq for entry in ready if entry.ready_seq)
         try:
             if not self._persistent:
                 if len(staging_slots) != 1:
@@ -5857,6 +6301,7 @@ class FlashMTPDraftEngine:
                     pending=pending,
                     staging_slots=entry_slots,
                     row_ranges=row_ranges,
+                    ready_seqs=ready_seqs,
                 )
             if profile_active:
                 submit_returned_ns = time.monotonic_ns()
@@ -5907,6 +6352,10 @@ class FlashMTPDraftEngine:
                 ):
                     self._feature_staging_compute_busy.discard(slot)
                     self._release_feature_staging_entries(slot, count)
+                if ready_seqs:
+                    self._release_ready_rows(
+                        self._ready_row_keys(ready_seqs), fence_seqs=ready_seqs
+                    )
                 if self._persistent:
                     for handle in {task.draft_kv_handle for task in tasks}:
                         self._release_persistent_request(handle)
@@ -5919,6 +6368,10 @@ class FlashMTPDraftEngine:
                     "unquiesced feature proposal/materialization failure"
                 )
             self._publish_failures([(task, exc) for task in tasks])
+        finally:
+            if ready_seqs:
+                # After the submit issued its copy-event waits (or failed).
+                self._ready_consume(ready_seqs)
 
     def _execute_eagle3_feature_batch(
         self,
@@ -6563,6 +7016,7 @@ class FlashMTPDraftEngine:
         pending: list[PendingDraftTask],
         staging_slots: tuple[int, ...],
         row_ranges: tuple[tuple[int, int], ...],
+        ready_seqs: tuple[int, ...] = (),
     ) -> None:
         if self._pending_dflash_completions and not self.dflash_submit_pipeline:
             raise RuntimeError(
@@ -6694,6 +7148,9 @@ class FlashMTPDraftEngine:
         else:
             _grouped_cache_locs, packed_cache_locs, positions = grouped_rows
         tasks_prepared_ns = time.monotonic_ns()
+        if ready_seqs:
+            # Before the first read of the landing rows (the gather below).
+            self._wait_ready_copies(ready_seqs)
         hidden_rows = [
             self._feature_staging_buffers[slot][start:end]
             for slot, (start, end) in zip(staging_slots, row_ranges, strict=True)
@@ -6852,6 +7309,7 @@ class FlashMTPDraftEngine:
             clock_slot=clock_slot,
             clock_done=clock_done,
             batch_seq=batch_seq,
+            ready_rows=self._ready_row_keys(ready_seqs) if ready_seqs else (),
         )
         self._register_dflash_completion(
             completion=completion,
@@ -7690,6 +8148,8 @@ class FlashMTPDraftEngine:
             self._complete_feature_compute(
                 completion.staging_slots, completion.staging_slot_counts
             )
+            if completion.ready_rows:
+                self._release_ready_rows(completion.ready_rows)
             for handle in {task.draft_kv_handle for task in tasks}:
                 self._drain_deferred_persistent_release(handle)
             self._loop_stage_ns["dflash_retire"] += (
@@ -10816,8 +11276,10 @@ class FlashMTPDraftEngine:
             pending_tasks = sum(
                 transfer_id not in ring_pending for transfer_id in self._pending_ids
             )
-            pending_work = len(self._pending_ids) + active_transfers
-            ring_pending_tasks = len(ring_pending)
+            # Native ingress: READY-table rows get an identity only at freeze.
+            ready_rows = len(self._ready_pending)
+            pending_work = len(self._pending_ids) + active_transfers + ready_rows
+            ring_pending_tasks = len(ring_pending) + ready_rows
         self._capacity_sequence += 1
         update = DraftCapacityUpdate(
             protocol_version=PROTOCOL_VERSION,
