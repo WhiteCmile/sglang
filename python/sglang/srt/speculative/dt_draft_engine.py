@@ -170,6 +170,11 @@ DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT = 64
 # batch bound (max_batch_size rows, feature_buffer_max_tokens) plus the KV and
 # req-row fit at ring admission are then the only proposal admission limits.
 DRAFT_ADMISSION_BOUND = os.environ.get("DT_DRAFT_ADMISSION", "") == "bound"
+# Draft redesign D7b (issue #295): DT_DRAFT_GC=managed freezes the Draft
+# process's warm heap.  A full (generation-2) collection scans the whole heap
+# with the scheduler loop stopped (0.36-0.54 s at r56); ~0.93 M of its objects
+# exist before serving starts (imported code) and serving adds only ~10 k.
+DRAFT_GC_MANAGED = os.environ.get("DT_DRAFT_GC", "") == "managed"
 
 
 def _resolve_direct_proposal_admission_limit() -> int:
@@ -12087,6 +12092,15 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    if DRAFT_GC_MANAGED:
+        import gc
+
+        from sglang.srt.utils.common import freeze_gc
+
+        # Later collections, full ones included, then scan only what serving
+        # allocated.
+        gc.collect()
+        freeze_gc("DT Draft")
     try:
         engine.run()
     finally:
