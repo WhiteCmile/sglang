@@ -182,8 +182,8 @@ struct Worker {
   std::atomic<uint64_t> done_tail{0};  // records drained (scheduler)
   std::atomic<uint64_t> done_seq{0};   // last batch seq whose GPU work is done
   std::atomic<uint64_t> outstanding{0};  // descriptors not yet completed
-  // Wall time this thread spent with a descriptor outstanding, and how many
-  // such waits: the send loop's added CPU cost (cumulative).
+  // Wall time this thread spent with a descriptor outstanding, and the
+  // number of passes over it: the send loop's added CPU cost (cumulative).
   std::atomic<uint64_t> poll_ns{0};
   std::atomic<uint64_t> polls{0};
 };
@@ -308,7 +308,15 @@ void serve(Worker* w) {
       progress = true;
     }
     if (!batches.empty()) {
-      if (poll_started_ns == 0) poll_started_ns = dt_probe::now_ns();
+      // Wall time this thread spends with a descriptor outstanding, and the
+      // number of passes it takes: accumulated per pass, so a thread that
+      // never runs dry (steady state at depth 2) still reports its cost.
+      const uint64_t pass_started_ns = dt_probe::now_ns();
+      if (poll_started_ns) {
+        w->poll_ns.fetch_add(pass_started_ns - poll_started_ns, std::memory_order_relaxed);
+        w->polls.fetch_add(1, std::memory_order_relaxed);
+      }
+      poll_started_ns = pass_started_ns;
       Job* head = batches.front();
       const CUresult rc = timed(p, dt_probe::EVENT_QUERY, [&] {
         return w->api.cuEventQuery((CUevent)head->words[1]);
@@ -333,7 +341,7 @@ void serve(Worker* w) {
         w->outstanding.fetch_sub(1, std::memory_order_release);
         progress = true;
       }
-      if (batches.empty() && poll_started_ns) {
+      if (batches.empty()) {
         w->poll_ns.fetch_add(dt_probe::now_ns() - poll_started_ns, std::memory_order_relaxed);
         w->polls.fetch_add(1, std::memory_order_relaxed);
         poll_started_ns = 0;
