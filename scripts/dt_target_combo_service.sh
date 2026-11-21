@@ -6,6 +6,7 @@ SOURCE=${DT_EXPERIMENT_SOURCE:-/data/lishuhuan/dt-v3-page}
 stamp=${1:?stamp required}
 label=${2:?label required}
 root="$W/target-combo-results/$stamp/$label"
+topology=${DT_COMBO_TOPOLOGY_FILE:-$W/topology-7t2d-page-ab.toml}
 
 mkdir -p "$root"
 
@@ -59,7 +60,7 @@ EOF
 exec timeout --signal=INT --kill-after=120s 7200s \
   "$W/ci/gpu-lease.sh" "$SOURCE/python-local" -m dt_launcher dt \
   --workspace "$W" --dt-sglang-dir "$SOURCE" --profile "$W/profile.toml" \
-  --preset generic --topology-file "$W/topology-7t2d-page-ab.toml" \
+  --preset generic --topology-file "$topology" \
   --python-executable "$SOURCE/python-local" --candidate-transport cuda-ipc \
   --run-dir "$root/run-$$" \
   --max-running-requests 384 --max-pending-tasks 512 \

@@ -6,7 +6,9 @@ SOURCE=${DT_EXPERIMENT_SOURCE:-/data/lishuhuan/dt-v3-page}
 stamp=${1:-$(date +%Y%m%d-%H%M%S)-target-combo}
 root="$W/target-combo-results/$stamp"
 arms=(control early_slots8 early_page64 early_page64_slots8)
-local_ports=(37900 37901 37902 37920 37921 38100 38101 38102 51121 51122)
+topology="$root/topology.toml"
+local_ports=()
+remote_ports=()
 
 mkdir -p "$root"
 printf '%s\n' "$stamp" >"$root/stamp.txt"
@@ -42,24 +44,106 @@ cleanup_benchmark() {
   benchmark_pid=
 }
 
-wait_for_local_ports_free() {
+load_topology_ports() {
+  mapfile -t local_ports < <("$SOURCE/python-local" - "$topology" sys-3 <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    topology = tomllib.load(f)
+host = sys.argv[2]
+coordinator = topology["coordinator"]
+if coordinator["host"] == host:
+    print(coordinator["target_port"])
+    print(coordinator["draft_port"])
+for instance in topology["instances"]:
+    if instance["host"] != host:
+        continue
+    for key in ("http_port", "nccl_port", "tcp_port"):
+        if key in instance:
+            print(instance[key])
+PY
+)
+  mapfile -t remote_ports < <("$SOURCE/python-local" - "$topology" sys-4 <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    topology = tomllib.load(f)
+host = sys.argv[2]
+for instance in topology["instances"]:
+    if instance["host"] != host:
+        continue
+    for key in ("http_port", "nccl_port", "tcp_port"):
+        if key in instance:
+            print(instance[key])
+PY
+)
+}
+
+probe_remote_ports() {
+  ssh -o BatchMode=yes -o ConnectTimeout=8 \
+      "${DT_SYS4_SSH_HOST:-h8004-lsh-target-ab}" \
+      python3 - "${remote_ports[@]}" <<'PY'
+import socket
+import sys
+
+busy = []
+for raw_port in sys.argv[1:]:
+    port = int(raw_port)
+    sock = socket.socket()
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError as exc:
+        busy.append((port, str(exc)))
+    finally:
+        sock.close()
+if busy:
+    raise SystemExit(f"remote ports unavailable: {busy}")
+PY
+}
+
+allocate_topology() {
+  local attempt
+  local base
+  for attempt in $(seq 1 64); do
+    base=$((24000 + ((RANDOM * 32768 + RANDOM) % 30000)))
+    "$SOURCE/python-local" "$SOURCE/scripts/prepare_dt_combo_topology.py" \
+      --template "$W/topology-7t2d-page-ab.toml" \
+      --output "$topology" --base-port "$base"
+    load_topology_ports
+    if "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
+        --host 0.0.0.0 --ports "${local_ports[@]}" \
+        >"$root/port-probe.log" 2>&1 \
+        && probe_remote_ports >"$root/remote-port-probe.log" 2>&1; then
+      printf '%s\n' "$base" >"$root/allocated-port-base.txt"
+      return 0
+    fi
+  done
+  echo "could not allocate a free dual-host DT port block" >&2
+  return 1
+}
+
+wait_for_ports_free() {
   local free_polls=0
   local attempt
   for attempt in $(seq 1 180); do
-    if ! "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
+    if "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
         --host 0.0.0.0 --ports "${local_ports[@]}" \
-        >"$root/port-probe.log" 2>&1; then
-      free_polls=0
-    else
+        >"$root/port-probe.log" 2>&1 \
+        && probe_remote_ports >"$root/remote-port-probe.log" 2>&1; then
       free_polls=$((free_polls + 1))
       if [ "$free_polls" -ge 3 ]; then
         return 0
       fi
+    else
+      free_polls=0
     fi
     sleep 1
   done
-  echo "local DT ports did not drain within 180 seconds" >&2
+  echo "DT ports did not drain on both hosts within 180 seconds" >&2
   cat "$root/port-probe.log" >&2 || true
+  cat "$root/remote-port-probe.log" >&2 || true
   return 1
 }
 
@@ -69,6 +153,7 @@ preflight_environment() {
       "$SOURCE/python-local" \
       "$SOURCE/scripts/dt_target_combo_service.sh" \
       "$SOURCE/scripts/dt_target_combo_benchmark.sh" \
+      "$SOURCE/scripts/prepare_dt_combo_topology.py" \
       "$W/profile.toml" \
       "$W/topology-7t2d-page-ab.toml" \
       "$W/prompts.json"; do
@@ -116,26 +201,6 @@ if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'; 
   echo "preflight: sys-4 still has active GPU compute processes" >&2
   exit 1
 fi
-python3 - <<'PY'
-import socket
-
-ports = [
-    37900, 37901, 37902, 37903,
-    38100, 38101, 38102, 38103,
-    41300, 41301, 41302, 41303,
-]
-busy = []
-for port in ports:
-    sock = socket.socket()
-    try:
-        sock.bind(("0.0.0.0", port))
-    except OSError as exc:
-        busy.append((port, str(exc)))
-    finally:
-        sock.close()
-if busy:
-    raise SystemExit(f"preflight: sys-4 ports unavailable: {busy}")
-PY
 REMOTE
 }
 
@@ -143,7 +208,17 @@ cleanup_all() {
   cleanup_benchmark
   cleanup_service
 }
-trap cleanup_all EXIT INT TERM
+on_exit() {
+  local rc=$?
+  cleanup_all
+  if [ "$rc" -ne 0 ] && [ -f "$root/status.txt" ]; then
+    case "$(cat "$root/status.txt")" in
+      waiting|running) printf 'failed-runner-rc-%s\n' "$rc" >"$root/status.txt" ;;
+    esac
+  fi
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
 
 # Hold one global lease across all arms.  This keeps the comparison contiguous
 # and makes nested gpu-lease.sh invocations validation-only via DT_LEASE_HELD=1.
@@ -152,12 +227,17 @@ printf 'waiting\n' >"$root/status.txt"
 flock 8
 printf 'acquired\n' >"$root/global-lock-acquired"
 printf 'running\n' >"$root/status.txt"
-wait_for_local_ports_free
 if ! preflight_environment >"$root/preflight.log" 2>&1; then
   printf 'preflight-failed\n' >"$root/status.txt"
   exit 3
 fi
 printf 'passed\n' >"$root/preflight-status.txt"
+if ! allocate_topology; then
+  printf 'port-allocation-failed\n' >"$root/status.txt"
+  exit 3
+fi
+export DT_COMBO_TOPOLOGY_FILE="$topology"
+wait_for_ports_free
 
 for label in "${arms[@]}"; do
   arm_root="$root/$label"
@@ -190,13 +270,14 @@ for label in "${arms[@]}"; do
   fi
   if [ "$benchmark_rc" -ne 0 ]; then
     printf 'benchmark-failed\n' >"$arm_root/status.txt"
+    printf 'failed-%s\n' "$label" >"$root/status.txt"
     cleanup_service
-    wait_for_local_ports_free || true
+    wait_for_ports_free || true
     exit 4
   fi
 
   cleanup_service
-  wait_for_local_ports_free
+  wait_for_ports_free
   printf 'complete\n' >"$arm_root/status.txt"
 done
 
