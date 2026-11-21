@@ -80,7 +80,7 @@ fi
 cleanup
 for _ in $(seq 1 180); do
   "$SOURCE/python-local" "$SOURCE/scripts/check_dt_ports_free.py" \
-    --host 192.168.1.249 --ports "${local_ports[@]}" \
+    --host 0.0.0.0 --ports "${local_ports[@]}" \
     >"$root/port-probe.log" 2>&1 && break
   sleep 1
 done
