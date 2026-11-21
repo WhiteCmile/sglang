@@ -103,6 +103,34 @@ if busy:
 PY
 }
 
+local_gpus_idle() {
+  ! nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'
+}
+
+remote_gpus_idle() {
+  ssh -o BatchMode=yes -o ConnectTimeout=8 \
+      "${DT_SYS4_SSH_HOST:-h8004-lsh-target-ab}" \
+      "! nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'"
+}
+
+wait_for_dual_host_gpu_idle() {
+  local deadline=$((SECONDS + ${DT_GPU_IDLE_WAIT_S:-21600}))
+  local idle_polls=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if local_gpus_idle && remote_gpus_idle; then
+      idle_polls=$((idle_polls + 1))
+      if [ "$idle_polls" -ge 3 ]; then
+        return 0
+      fi
+    else
+      idle_polls=0
+    fi
+    sleep 5
+  done
+  echo "both DT hosts did not become GPU-idle before the wait deadline" >&2
+  return 1
+}
+
 allocate_topology() {
   local attempt
   local base
@@ -186,21 +214,12 @@ if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
     )
 PY
 
-  if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'; then
-    echo "preflight: sys-3 still has active GPU compute processes" >&2
-    return 1
-  fi
-
   ssh -o BatchMode=yes -o ConnectTimeout=8 \
       "${DT_SYS4_SSH_HOST:-h8004-lsh-target-ab}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 test -d /home/lishuhuan/dt-v3-page-run
 test -r /share/dai-sys/models/qwen3-14b/config.json
 test "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" -eq 8
-if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'; then
-  echo "preflight: sys-4 still has active GPU compute processes" >&2
-  exit 1
-fi
 REMOTE
 }
 
@@ -213,7 +232,9 @@ on_exit() {
   cleanup_all
   if [ "$rc" -ne 0 ] && [ -f "$root/status.txt" ]; then
     case "$(cat "$root/status.txt")" in
-      waiting|running) printf 'failed-runner-rc-%s\n' "$rc" >"$root/status.txt" ;;
+      waiting|waiting-gpu-idle|preflight|running)
+        printf 'failed-runner-rc-%s\n' "$rc" >"$root/status.txt"
+        ;;
     esac
   fi
 }
@@ -226,12 +247,18 @@ exec 8</data/zhaotianlang/ci/tools/gpu.lock
 printf 'waiting\n' >"$root/status.txt"
 flock 8
 printf 'acquired\n' >"$root/global-lock-acquired"
-printf 'running\n' >"$root/status.txt"
+printf 'preflight\n' >"$root/status.txt"
 if ! preflight_environment >"$root/preflight.log" 2>&1; then
   printf 'preflight-failed\n' >"$root/status.txt"
   exit 3
 fi
 printf 'passed\n' >"$root/preflight-status.txt"
+printf 'waiting-gpu-idle\n' >"$root/status.txt"
+if ! wait_for_dual_host_gpu_idle >"$root/gpu-idle-wait.log" 2>&1; then
+  printf 'gpu-idle-wait-failed\n' >"$root/status.txt"
+  exit 3
+fi
+printf 'running\n' >"$root/status.txt"
 if ! allocate_topology; then
   printf 'port-allocation-failed\n' >"$root/status.txt"
   exit 3
