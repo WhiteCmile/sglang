@@ -8263,6 +8263,9 @@ class FlashMTPDraftEngine:
             launched_ns=completion.launched_ns,
             handoff_ns=completion.handoff_ns,
             gpu_end_clock_ns=gpu_end_clock_ns,
+            # D8: joins this batch to its draft_dflash_done_absorb record, so
+            # the per-hop table can span GPU clock end -> scheduler -1.
+            done_seq=completion.batch_seq + 1,
             **estimate,
         )
 
