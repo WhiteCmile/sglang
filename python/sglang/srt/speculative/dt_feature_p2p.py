@@ -220,6 +220,10 @@ class TargetFeatureSourcePool:
     _free_count = 0
     _reserved_count = 0
     _quarantined_count = 0
+    # Scalar defaults keep stats readable on fixtures that bypass ``__init__``
+    # without scanning slots.
+    _active_identity_high_water = 0
+    _page_allocator: TargetSourcePageAllocator | None = None
 
     def __init__(
         self,
@@ -301,6 +305,7 @@ class TargetFeatureSourcePool:
         self._free_count = self.slot_count
         self._reserved_count = 0
         self._quarantined_count = 0
+        self._active_identity_high_water = 0
         self._active: dict[str, tuple[int, int]] = {}
         # Cancelling an undelivered descriptor is not equivalent to a remote
         # read completion: the Target publication copy can still be using the
@@ -392,6 +397,58 @@ class TargetFeatureSourcePool:
         with self._lock:
             return len(self._active)
 
+    @property
+    def active_identity_high_water(self) -> int:
+        """Largest simultaneous non-free logical identities observed.
+
+        Maintained under the pool lock on the reserve success path, so reading
+        it is a single scalar load.
+        """
+
+        return self._active_identity_high_water
+
+    @property
+    def allocation_count(self) -> int:
+        """Committed page allocations, or 0 when the pool is unpaged."""
+
+        allocator = self._page_allocator
+        return 0 if allocator is None else allocator.allocation_count
+
+    @property
+    def failure_count(self) -> int:
+        """Page allocations rejected for lack of capacity, or 0 when unpaged."""
+
+        allocator = self._page_allocator
+        return 0 if allocator is None else allocator.failure_count
+
+    @property
+    def leased_page_count_high_water(self) -> int:
+        """Largest simultaneous leased page count, or 0 when unpaged."""
+
+        allocator = self._page_allocator
+        return 0 if allocator is None else allocator.leased_page_count_high_water
+
+    @property
+    def requested_rows_total(self) -> int:
+        """Rows requested by committed page allocations, or 0 when unpaged."""
+
+        allocator = self._page_allocator
+        return 0 if allocator is None else allocator.requested_rows_total
+
+    @property
+    def allocated_rows_total(self) -> int:
+        """Page-rounded rows of committed allocations, or 0 when unpaged."""
+
+        allocator = self._page_allocator
+        return 0 if allocator is None else allocator.allocated_rows_total
+
+    @property
+    def internal_fragmentation_rows_total(self) -> int:
+        """Cumulative page-rounding waste, or 0 when unpaged."""
+
+        allocator = self._page_allocator
+        return 0 if allocator is None else allocator.internal_fragmentation_rows_total
+
     def _reserve_slot_locked(
         self, token_count: int
     ) -> tuple[int, int, torch.Tensor] | None:
@@ -423,6 +480,9 @@ class TargetFeatureSourcePool:
             )
         self._free_count -= 1
         self._reserved_count += 1
+        active_identities = len(self._slots) - self._free_count
+        if active_identities > self._active_identity_high_water:
+            self._active_identity_high_water = active_identities
         slot.generation = generation
         slot.state = FeatureSlotState.RESERVED
         slot.allocation_lease_id = allocation_lease_id
