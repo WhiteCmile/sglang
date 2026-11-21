@@ -3667,7 +3667,7 @@ class FlashMTPDraftEngine:
                     direct=True,
                 )
         self._ready_pending = retained
-        if pass_handles:
+        if selected:
             self._ready_frozen_batches += 1
         if done:
             self._release_ready_rows(dropped, fence_seqs=done)
