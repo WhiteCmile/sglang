@@ -77,6 +77,12 @@ class TargetSourcePageAllocator:
             for _ in range(self.slot_count)
         ]
         self._leases: dict[str, SourceExtentLease] = {}
+        # O(1) mirrors of the arena/lease bookkeeping.  They are updated only
+        # after the corresponding arena and ``_leases`` mutation commits, so
+        # rejected or stale operations leave them untouched.
+        self._free_page_count = self.slot_count * self.pages_per_slot
+        self._active_lease_count = 0
+        self._internal_fragmentation_rows = 0
 
     def allocate(self, lease_id: str, requested_rows: int) -> SourceExtentLease:
         """Map ``lease_id`` to the smallest sufficient free page extent."""
@@ -131,6 +137,9 @@ class TargetSourcePageAllocator:
         )
         arena.leases[lease_id] = lease
         self._leases[lease_id] = lease
+        self._free_page_count -= pages
+        self._active_lease_count += 1
+        self._internal_fragmentation_rows += lease.internal_fragmentation_rows
         return lease
 
     def release(
@@ -161,6 +170,9 @@ class TargetSourcePageAllocator:
         arena.free_extents.append((lease.page_start, lease.page_count))
         arena.free_extents.sort()
         arena.free_extents = self._coalesce(arena.free_extents)
+        self._free_page_count += lease.page_count
+        self._active_lease_count -= 1
+        self._internal_fragmentation_rows -= lease.internal_fragmentation_rows
         return lease
 
     def get(self, lease_id: str) -> SourceExtentLease | None:
@@ -168,7 +180,7 @@ class TargetSourcePageAllocator:
 
     @property
     def active_lease_count(self) -> int:
-        return len(self._leases)
+        return self._active_lease_count
 
     @property
     def total_page_count(self) -> int:
@@ -176,11 +188,7 @@ class TargetSourcePageAllocator:
 
     @property
     def free_page_count(self) -> int:
-        return sum(
-            page_count
-            for arena in self._arenas
-            for _page_start, page_count in arena.free_extents
-        )
+        return self._free_page_count
 
     @property
     def largest_free_extent_pages(self) -> int:
@@ -195,9 +203,7 @@ class TargetSourcePageAllocator:
 
     @property
     def internal_fragmentation_rows(self) -> int:
-        return sum(
-            lease.internal_fragmentation_rows for lease in self._leases.values()
-        )
+        return self._internal_fragmentation_rows
 
     @staticmethod
     def _coalesce(extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
