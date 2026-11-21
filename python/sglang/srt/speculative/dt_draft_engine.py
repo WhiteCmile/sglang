@@ -180,6 +180,12 @@ def _resolve_direct_proposal_admission_limit() -> int:
 
 # Provisional deadline for a §7.1 ring-record task; its Coordinator
 # confirmation copy carries the authoritative one.
+# READY entry fields the DRAIN loop reads (dt_ring_worker.cpp ReadyEntry).
+_READY_ROW_FIELDS = (
+    "seq", "ring_id", "record_seq", "position", "req_handle", "req_gen", "round_id",
+    "attempt", "seq_len", "token_count", "bonus_token", "landing_k", "landing_gen",
+    "row_first", "token_at", "ready_ns",
+)
 _RING_RECORD_TIMEOUT_NS = (
     int(os.environ.get("DT_RING_RECORD_TIMEOUT_S", "30")) * 1_000_000_000
 )
@@ -1242,14 +1248,14 @@ class FlashMTPDraftEngine:
             )
         # READY table (scheduler-owned, native ingress): entries by READY seq
         # modulo the queue capacity (created with the ring worker), the
-        # unselected seqs in arrival order, the decoded V1_PAYLOAD tasks
-        # (until Target item T4), per-record landing placements
+        # unselected rows in arrival order (READY seq plus the identity DRAIN
+        # derived once), the decoded V1_PAYLOAD tasks (until Target item T4),
+        # per-record landing placements
         # (ring id, record seq) -> [rows not yet released, k, gen], and
         # ready_consumed_seq with the consumed seqs past it (#276 decision 2:
         # reclaim per entry, the counter advances over the contiguous prefix).
         self._ready_table = None
-        self._ready_drained_ns = None
-        self._ready_pending: list[int] = []
+        self._ready_pending: list[tuple] = []
         self._ready_tasks: dict[int, object] = {}
         self._ready_records: dict[tuple[int, int], list[int]] = {}
         self._ready_consumed = 0
@@ -1257,10 +1263,10 @@ class FlashMTPDraftEngine:
         # Placements of rows dropped without a batch: (event, keys), released
         # once the current stream passed their copy events.
         self._ready_release_fenced: deque[tuple[torch.cuda.Event, tuple]] = deque()
-        # READY residence (publish -> consumed): the longest one, and a sample
-        # for its p99 in the lifecycle status.
+        # READY residence (publish -> consumed): the longest one, and a
+        # cumulative histogram of floor(4 * log2 ns) for its p99.
         self._ready_held_max_ns = 0
-        self._ready_held_ns: deque[int] = deque(maxlen=1 << 16)
+        self._ready_held_hist = np.zeros(256, dtype=np.int64)
         # Held results released by confirmations, sent as one batch per turn.
         self._confirmed_held_results: list = []
         self._confirmed_held_sequence = 0
@@ -2613,7 +2619,6 @@ class FlashMTPDraftEngine:
             if self._native_ingress:
                 capacity = self._ring_worker.ready_capacity
                 self._ready_table = np.zeros(capacity, dtype=self._ring_worker.ready_dtype)
-                self._ready_drained_ns = np.zeros(capacity, dtype=np.int64)
         return self._ring_worker
 
     def _open_direct_ring(self, registration) -> None:
@@ -3341,19 +3346,15 @@ class FlashMTPDraftEngine:
         if not len(entries):
             return
         kinds = worker.ready_kinds
-        slots = (entries["seq"] - 1) % len(self._ready_table)
-        self._ready_table[slots] = entries
-        self._ready_drained_ns[slots] = time.monotonic_ns()
+        self._ready_table[(entries["seq"] - 1) % len(self._ready_table)] = entries
+        drained_ns = time.monotonic_ns()
         kind = entries["kind"] & ~np.uint32(kinds["DEST_KNOWN"])
+        ledger, targets = self._rid_ledger, self._ring_targets
         done, dropped = [], []
-        for seq, kind, ring_id, record_seq, k, gen in zip(
-            entries["seq"].tolist(),
-            kind.tolist(),
-            entries["ring_id"].tolist(),
-            entries["record_seq"].tolist(),
-            entries["landing_k"].tolist(),
-            entries["landing_gen"].tolist(),
-        ):
+        for kind, (
+            seq, ring_id, record_seq, position, cell, gen, round_id, attempt,
+            seq_len, count, bonus, k, landing_gen, row_first, token_at, ready_ns,
+        ) in zip(kind.tolist(), zip(*(entries[f].tolist() for f in _READY_ROW_FIELDS))):
             if kind != kinds["ROW"] and kind != kinds["V1_PAYLOAD"]:
                 done.append(seq)  # DROPPED: its request was released
                 continue
@@ -3361,23 +3362,37 @@ class FlashMTPDraftEngine:
             if k >= 0:
                 record = self._ready_records.get(key)
                 if record is None:
-                    self._ready_records[key] = [1, k, gen]
+                    self._ready_records[key] = [1, k, landing_gen]
                 else:
                     record[0] += 1
-            if kind == kinds["V1_PAYLOAD"] and not self._accept_ready_v1(
-                worker, seq, ring_id, record_seq, k
-            ):
-                done.append(seq)
-                dropped.append(key)
-                continue
-            self._ready_pending.append(seq)
+            if kind == kinds["ROW"]:
+                # The row's identity, built once (a waiting row is rescanned
+                # on every freeze pass).
+                target, rid = targets[ring_id], ledger.rid_of(cell, gen)
+                handle = f"{target}:{rid}:{attempt}"
+                transfer_id = f"{target}:{rid}:{round_id}:{attempt}"
+                deadline_ns, requires_proposal = ready_ns + _RING_RECORD_TIMEOUT_NS, True
+            else:
+                task = self._accept_ready_v1(worker, seq, ring_id, record_seq, k)
+                if task is None:
+                    done.append(seq)
+                    dropped.append(key)
+                    continue
+                rid, handle, transfer_id = task.request_id, task.draft_kv_handle, task.transfer_id
+                deadline_ns, requires_proposal = task.deadline_ns, task.requires_proposal
+                count = task.feature_token_count
+            self._ready_pending.append((
+                seq, handle, transfer_id, deadline_ns, requires_proposal, count, k,
+                row_first, drained_ns, (ring_id, record_seq, position, round_id,
+                                        attempt, seq_len, token_at, bonus, ready_ns, rid),
+            ))
         if dropped:
             self._release_ready_rows(dropped, fence_seqs=done)
         if done:
             self._ready_consume(done)
 
-    def _accept_ready_v1(self, worker, seq, ring_id, record_seq, k) -> bool:
-        """Decode a V1_PAYLOAD entry's task into its READY-table row; False
+    def _accept_ready_v1(self, worker, seq, ring_id, record_seq, k):
+        """Decode a V1_PAYLOAD entry's task for its READY-table row; None
         when the round was cancelled first (it then retires here, as the
         legacy take does)."""
 
@@ -3395,15 +3410,12 @@ class FlashMTPDraftEngine:
             raise ValueError("direct ring pull row count mismatch")
         if task.transfer_id in self._cancelled_ids:
             self._drop_ring_task(task, entry, report=True)
-            return False
+            return None
         # A cross-host round relays its read proof at take (design §8.3).
         self._publish_ring_source_done(task)
         self._direct_tasks_by_transfer[task.transfer_id] = task
         self._ready_tasks[seq] = task
-        self._ready_table["token_count"][(seq - 1) % len(self._ready_table)] = (
-            task.feature_token_count
-        )
-        return True
+        return task
 
     def _freeze_ready_rows(
         self, selected, busy_handles, proposal_mode, token_count, now_ns
@@ -3418,38 +3430,18 @@ class FlashMTPDraftEngine:
         if not self._ready_pending:
             return
         worker = self._ring_worker
-        table = self._ready_table
-        pending = np.asarray(self._ready_pending, dtype=np.int64)
-        slots = (pending - 1) % len(table)
-        fields = (
-            "ring_id", "record_seq", "position", "req_handle", "req_gen",
-            "round_id", "attempt", "seq_len", "token_count", "bonus_token",
-            "landing_k", "row_first", "token_at", "ready_ns",
-        )
-        rows = table[slots][list(fields)].tolist()
-        drained = self._ready_drained_ns[slots].tolist()
-        tokens = worker.ready_tokens
-        arena = len(tokens)
         available_rows, available_kv = self._unreserved_allocation(
             (*selected, *self._input_ready_features)
         )
         profile = self._profile_active
         retained, done, dropped = [], [], []
-        for seq, drained_ns, (
-            ring_id, record_seq, position, cell, gen, round_id, attempt,
-            seq_len, count, bonus, k, row_first, token_at, ready_ns,
-        ) in zip(self._ready_pending, drained, rows):
+        for row in self._ready_pending:
+            (
+                seq, handle, transfer_id, deadline_ns, requires_proposal, count, k,
+                row_first, drained_ns, fields,
+            ) = row
+            ring_id, record_seq, position, round_id = fields[:4]
             task = self._ready_tasks.get(seq)
-            if task is not None:
-                handle, transfer_id = task.draft_kv_handle, task.transfer_id
-                requires_proposal, deadline_ns = task.requires_proposal, task.deadline_ns
-            else:
-                rid = self._rid_ledger.rid_of(cell, gen)
-                target = self._ring_targets[ring_id]
-                handle = f"{target}:{rid}:{attempt}"
-                transfer_id = f"{target}:{rid}:{round_id}:{attempt}"
-                requires_proposal = True
-                deadline_ns = ready_ns + _RING_RECORD_TIMEOUT_NS
             # The handle's request is gone, or its release waits only on an
             # in-flight batch: this later round must not run (as the legacy
             # admission's released drop).
@@ -3460,10 +3452,7 @@ class FlashMTPDraftEngine:
             cancelled = released or transfer_id in self._cancelled_ids
             if cancelled or now_ns >= deadline_ns:
                 if task is None and not cancelled:
-                    task = self._ready_row_task(
-                        target, rid, ring_id, record_seq, round_id, attempt, seq_len,
-                        tokens[token_at % arena : token_at % arena + count], bonus, ready_ns,
-                    )
+                    task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields)
                 if cancelled:
                     if task is not None:
                         self._retire_cancelled_transfer_identity(task)
@@ -3487,7 +3476,7 @@ class FlashMTPDraftEngine:
                 done.append(seq)
                 continue
             if handle in busy_handles or len(selected) >= self.max_batch_size:
-                retained.append(seq)
+                retained.append(row)
                 continue
             if proposal_mode is None:
                 proposal_mode = requires_proposal
@@ -3495,16 +3484,13 @@ class FlashMTPDraftEngine:
                 requires_proposal != proposal_mode
                 or token_count + count > self.feature_buffer_max_tokens
             ):
-                retained.append(seq)
+                retained.append(row)
                 continue
             if task is None:
-                task = self._ready_row_task(
-                    target, rid, ring_id, record_seq, round_id, attempt, seq_len,
-                    tokens[token_at % arena : token_at % arena + count], bonus, ready_ns,
-                )
+                task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields)
             row_cost, kv_cost = self._persistent_task_allocation(task)
             if row_cost > available_rows or kv_cost > available_kv:
-                retained.append(seq)
+                retained.append(row)
                 continue
             available_rows -= row_cost
             available_kv -= max(kv_cost, 0)
@@ -3556,10 +3542,7 @@ class FlashMTPDraftEngine:
             self._release_ready_rows(dropped, fence_seqs=done)
             self._ready_consume(done)
 
-    def _ready_row_task(
-        self, target, rid, ring_id, record_seq, round_id, attempt, seq_len, ids,
-        bonus, ready_ns,
-    ):
+    def _ready_row_task(self, handle, transfer_id, deadline_ns, count, fields):
         """The DraftTask of one natively parsed v2 row: the fields the legacy
         take built from the mailbox, without a SourceRef (the row is already
         in its landing buffer) and without _validate_task (ingress applied
@@ -3567,22 +3550,24 @@ class FlashMTPDraftEngine:
 
         from dt_protocol import DraftTask, DraftTaskKind
 
-        ids = tuple(ids.tolist())
-        count = len(ids)
+        ring_id, record_seq, _, round_id, attempt, seq_len, token_at, bonus, ready_ns, rid = fields
+        tokens = self._ring_worker.ready_tokens
+        at = token_at % len(tokens)
+        ids = tuple(tokens[at : at + count].tolist())
         return DraftTask(
-            transfer_id=f"{target}:{rid}:{round_id}:{attempt}",
+            transfer_id=transfer_id,
             request_id=rid,
             round_id=round_id,
             attempt=attempt,
-            target_instance_id=target,
+            target_instance_id=self._ring_targets[ring_id],
             draft_profile_id=self.profile.profile_id,
             k=self.profile.draft_k,
             next_token_id=bonus,
             source=None,
             created_ns=ready_ns,
-            deadline_ns=ready_ns + _RING_RECORD_TIMEOUT_NS,
+            deadline_ns=deadline_ns,
             kind=DraftTaskKind.RECONCILE,
-            draft_kv_handle=f"{target}:{rid}:{attempt}",
+            draft_kv_handle=handle,
             committed_token_ids=ids,
             feature_token_ids=ids,
             committed_kv_len=seq_len,
@@ -3602,8 +3587,12 @@ class FlashMTPDraftEngine:
         held = time.monotonic_ns() - table["ready_ns"][
             (np.asarray(seqs, dtype=np.int64) - 1) % len(table)
         ].astype(np.int64)
-        self._ready_held_ns.extend(held.tolist())
         self._ready_held_max_ns = max(self._ready_held_max_ns, int(held.max()))
+        np.add.at(
+            self._ready_held_hist,
+            (4 * np.log2(np.maximum(held, 1))).astype(np.int64),
+            1,
+        )
         done = self._ready_done
         for seq in seqs:
             done.add(seq)
@@ -3945,14 +3934,17 @@ class FlashMTPDraftEngine:
             },
         }
         if self._native_ingress:
-            held = sorted(self._ready_held_ns)
-            # READY residence, publish -> consumed (#276 decision 2).
+            # READY residence, publish -> consumed (#276 decision 2); the
+            # histogram is cumulative, bucket b covers [2**(b/4), 2**((b+1)/4)) ns.
+            hist = self._ready_held_hist
+            total = int(hist.sum())
+            p99 = int(np.searchsorted(np.cumsum(hist), 0.99 * total)) if total else 0
             rings["ready"] = {
                 "rows": len(self._ready_pending),
                 "consumed_seq": self._ready_consumed,
                 "held_max_ns": self._ready_held_max_ns,
-                "held_p99_ns": held[int(len(held) * 0.99)] if held else 0,
-                "held_samples": len(held),
+                "held_p99_ns": int(2 ** ((p99 + 1) / 4)) if total else 0,
+                "held_hist": {int(b): int(hist[b]) for b in np.flatnonzero(hist)},
             }
         last_measurement_ns = getattr(self, "_last_direct_gpu_measurement_ns", 0)
         request_evidence_ready = bool(
