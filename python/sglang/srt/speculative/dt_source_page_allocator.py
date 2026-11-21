@@ -83,6 +83,16 @@ class TargetSourcePageAllocator:
         self._free_page_count = self.slot_count * self.pages_per_slot
         self._active_lease_count = 0
         self._internal_fragmentation_rows = 0
+        # Scalar history for profiling.  Cumulative counters and high-water
+        # marks only advance on a committed allocation; releases never roll
+        # them back.  Capacity failures count only a rejected best-fit search.
+        self._allocation_count = 0
+        self._capacity_failure_count = 0
+        self._requested_rows_total = 0
+        self._allocated_rows_total = 0
+        self._internal_fragmentation_rows_total = 0
+        self._active_lease_count_high_water = 0
+        self._leased_page_count_high_water = 0
 
     def allocate(self, lease_id: str, requested_rows: int) -> SourceExtentLease:
         """Map ``lease_id`` to the smallest sufficient free page extent."""
@@ -111,6 +121,10 @@ class TargetSourcePageAllocator:
                 if choice is None or candidate < choice:
                     choice = candidate
         if choice is None:
+            # The only operation that counts as a capacity failure: a valid
+            # request found no contiguous extent.  Invalid rows and duplicate
+            # lease ids fail before this point and leave the stats untouched.
+            self._capacity_failure_count += 1
             raise SourcePageAllocationError("all bounded source pages are leased")
 
         _free_count, slot_id, page_start, extent_index = choice
@@ -140,6 +154,17 @@ class TargetSourcePageAllocator:
         self._free_page_count -= pages
         self._active_lease_count += 1
         self._internal_fragmentation_rows += lease.internal_fragmentation_rows
+        self._allocation_count += 1
+        self._requested_rows_total += lease.requested_rows
+        self._allocated_rows_total += lease.row_capacity
+        self._internal_fragmentation_rows_total += lease.internal_fragmentation_rows
+        self._active_lease_count_high_water = max(
+            self._active_lease_count_high_water, self._active_lease_count
+        )
+        self._leased_page_count_high_water = max(
+            self._leased_page_count_high_water,
+            self.total_page_count - self._free_page_count,
+        )
         return lease
 
     def release(
@@ -204,6 +229,48 @@ class TargetSourcePageAllocator:
     @property
     def internal_fragmentation_rows(self) -> int:
         return self._internal_fragmentation_rows
+
+    @property
+    def allocation_count(self) -> int:
+        """Number of successfully committed allocations since construction."""
+
+        return self._allocation_count
+
+    @property
+    def failure_count(self) -> int:
+        """Number of valid allocations rejected for lack of capacity."""
+
+        return self._capacity_failure_count
+
+    @property
+    def requested_rows_total(self) -> int:
+        """Sum of ``requested_rows`` over committed allocations."""
+
+        return self._requested_rows_total
+
+    @property
+    def allocated_rows_total(self) -> int:
+        """Sum of page-rounded row capacity over committed allocations."""
+
+        return self._allocated_rows_total
+
+    @property
+    def internal_fragmentation_rows_total(self) -> int:
+        """Cumulative page-rounding waste over committed allocations."""
+
+        return self._internal_fragmentation_rows_total
+
+    @property
+    def active_lease_count_high_water(self) -> int:
+        """Largest simultaneous active lease count observed."""
+
+        return self._active_lease_count_high_water
+
+    @property
+    def leased_page_count_high_water(self) -> int:
+        """Largest simultaneous leased page count observed."""
+
+        return self._leased_page_count_high_water
 
     @staticmethod
     def _coalesce(extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
