@@ -236,7 +236,17 @@ class _PublishWorker:
     each push's precomputed job (event wait, copies, publish words, host
     post, event re-record) in FIFO order.  The scheduler thread is its only
     producer; every decision is made before the handoff.
+
+    Under DT_DRAFT_SEND_LOOP (D8) the same thread is also the send/completion
+    loop: ``enable_batches`` gives it the scheduler's wake word and the
+    ingress landing-release queue, and ``submit_batch`` hands it one
+    descriptor per compute batch, whose GPU done it turns into a DONE record
+    (``drain_done``) plus the batch's landing releases.
     """
+
+    # One DONE record: {seq, gpu_done_ns, materialize_ns, proposal_ns, error}.
+    DONE_WORDS = 5
+    DONE_BATCH = 64
 
     def __init__(self, *, device_index: int, priority: int) -> None:
         from sglang.srt.speculative.dt_direct_ring import (
@@ -277,6 +287,14 @@ class _PublishWorker:
         lib.dt_publish_worker_destroy.restype = ctypes.c_int
         lib.dt_publish_worker_set_probe.argtypes = [vp, vp]
         lib.dt_publish_worker_set_probe.restype = ctypes.c_int
+        lib.dt_publish_worker_enable_batches.argtypes = [vp, vp, vp, ctypes.c_uint32, vp, vp]
+        lib.dt_publish_worker_enable_batches.restype = ctypes.c_int
+        lib.dt_publish_worker_submit_batch.argtypes = [vp, vp, u64]
+        lib.dt_publish_worker_submit_batch.restype = u64
+        lib.dt_publish_worker_done_drain.argtypes = [vp, vp, u64]
+        lib.dt_publish_worker_done_drain.restype = u64
+        lib.dt_publish_worker_batch_stats.argtypes = [vp, vp]
+        lib.dt_publish_worker_batch_stats.restype = None
         handle = lib.dt_publish_worker_create(device_index, priority)
         if not handle:
             raise CandidateTransportError("candidate publish worker failed to start")
@@ -295,6 +313,44 @@ class _PublishWorker:
         if not ticket:
             raise CandidateTransportError("candidate publish worker is broken")
         return ticket
+
+    def enable_batches(self, wake, ring_worker) -> None:
+        """Turn the send/completion loop on (D8): the DONE wake bit and the
+        ingress landing-release queue this thread will push to."""
+
+        import numpy as np
+
+        from sglang.srt.speculative.dt_wake import WAKE_DONE
+
+        wake_set, wake_handle = wake.native_setter()
+        release, ring_handle = ring_worker.landing_release_setter()
+        if self._lib.dt_publish_worker_enable_batches(
+            self._handle, wake_set, wake_handle, WAKE_DONE, release, ring_handle
+        ):
+            raise CandidateTransportError("send/completion loop could not be enabled")
+        self._done = np.empty(self.DONE_BATCH * self.DONE_WORDS, dtype=np.uint64)
+        self._stats = np.zeros(4, dtype=np.uint64)
+
+    def submit_batch(self, descriptor: array) -> None:
+        """Hand one batch descriptor (see the .cpp layout) to the loop."""
+
+        address, count = descriptor.buffer_info()
+        if not self._lib.dt_publish_worker_submit_batch(self._handle, address, count):
+            raise CandidateTransportError("send/completion loop rejected a descriptor")
+
+    def drain_done(self):
+        """The DONE records published since the last drain, one row each."""
+
+        n = self._lib.dt_publish_worker_done_drain(
+            self._handle, self._done.ctypes.data, self.DONE_BATCH
+        )
+        return self._done[: n * self.DONE_WORDS].reshape(-1, self.DONE_WORDS)
+
+    def batch_stats(self):
+        """(done_seq, outstanding descriptors, poll waits, poll ns)."""
+
+        self._lib.dt_publish_worker_batch_stats(self._handle, self._stats.ctypes.data)
+        return self._stats
 
     def close(self) -> None:
         rc = self._lib.dt_publish_worker_destroy(self._handle)
@@ -3286,6 +3342,17 @@ class DraftCandidatePushTransport:
             cold_mapping_count=0,
             start_event=start_event,
         )
+
+    def enable_send_loop(self, wake, ring_worker):
+        """Draft redesign D8: make the publish worker the send/completion
+        loop.  Returns its handle, or None when pushes run inline
+        (DT_PUBLISH_WORKER=0), which has no loop to extend."""
+
+        worker = getattr(self, "_publish_worker", None)
+        if worker is None:
+            return None
+        worker.enable_batches(wake, ring_worker)
+        return worker
 
     def dump_native_probe(self) -> None:
         """Drain the publish worker's D0 stamps into the profile (issue #269)."""

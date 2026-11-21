@@ -1593,6 +1593,18 @@ class DraftRingWorker:
         if rc:
             raise DirectRingError(f"landing release queue rejected a release: rc={rc}")
 
+    def landing_release_setter(self) -> tuple[int, int]:
+        """(dt_ring_worker_landing_release address, worker handle), so the D8
+        send loop pushes a completed batch's releases itself, without the GIL.
+
+        The release queue has one producer (design §4.3), so the scheduler's
+        own ``landing_release`` is unused on that path."""
+
+        return (
+            ctypes.cast(self._lib.dt_ring_worker_landing_release, ctypes.c_void_p).value,
+            self._handle,
+        )
+
     def endpoint(self, ring_id: int):
         return self._endpoints[ring_id]
 

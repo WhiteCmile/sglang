@@ -37,7 +37,8 @@ namespace dt_probe {
   X(READ_COMPLETED, "read_completed")       /* its completion reaped */      \
   X(JOB_TAKEN, "job_taken")                 /* publish job dequeued; seq = ticket */ \
   X(JOB_ISSUED, "job_issued")               /* its event re-record issued */ \
-  X(READY_PUBLISHED, "ready_published")     /* D6 READY entries published; arg = count */
+  X(READY_PUBLISHED, "ready_published")     /* D6 READY entries published; arg = count */ \
+  X(BATCH_DONE, "batch_done")               /* D8 batch GPU done observed; seq = done seq, arg = descriptors outstanding */
 
 #define DT_PROBE_CALLS(X)                            \
   X(IPC_OPEN_EVENT, "cuIpcOpenEventHandle")          \
@@ -46,6 +47,8 @@ namespace dt_probe {
   X(WRITE_VALUE32, "cuStreamWriteValue32")           \
   X(EVENT_DESTROY, "cuEventDestroy")                 \
   X(EVENT_RECORD, "cuEventRecord")                   \
+  X(EVENT_QUERY, "cuEventQuery")                     \
+  X(EVENT_ELAPSED, "cuEventElapsedTime")             \
   X(LAUNCH_HOST_FUNC, "cuLaunchHostFunc")            \
   X(FLUSH_RDMA_WRITES, "cuFlushGPUDirectRDMAWrites") \
   X(RDMA_POST_READ, "ibv_post_send(READ)")          \

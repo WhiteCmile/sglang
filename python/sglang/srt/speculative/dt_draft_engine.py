@@ -152,6 +152,13 @@ DRAFT_SLOT_DECOUPLE = os.environ.get("DT_DRAFT_SLOT_DECOUPLE", "0") == "1"
 # waits on the native wake word (dt_wake) for the same poll interval, so a
 # Coordinator message ends the wait at once.
 DRAFT_CONTROL_LOOP = os.environ.get("DT_DRAFT_CONTROL_LOOP", "0") == "1"
+# Draft redesign D8 (issue #277, design §7): the native publish worker also
+# watches each submitted batch's completion event, so a batch stops counting
+# against the depth gate at its GPU done rather than when this loop reaches
+# the completion poll.  It pushes the batch's landing releases to ingress
+# itself and hands the scheduler a DONE record (CUDA elapsed included) to
+# absorb.
+DRAFT_SEND_LOOP = os.environ.get("DT_DRAFT_SEND_LOOP", "0") == "1"
 # One executing plus one submitted Draft compute batch.
 DRAFT_COMPUTE_DEPTH = 2
 RING_RETIRED_LIMIT = 65536
@@ -1264,6 +1271,23 @@ class FlashMTPDraftEngine:
                 "DT_DRAFT_INGRESS=native requires DT_DRAFT_SLOT_DECOUPLE=1, "
                 "DT_DRAFT_ADMISSION=bound and DT_RING_CONFIRMATION=0"
             )
+        # Draft redesign D8: the send loop extends the publish worker, hands
+        # its DONE wake to the control loop's wake word, and produces the
+        # landing releases the native ingress consumes.
+        self._send_loop = DRAFT_SEND_LOOP and self._is_dflash
+        if self._send_loop and not (
+            self._native_ingress
+            and DRAFT_CONTROL_LOOP
+            and self.candidate_transport == "cuda-ipc"
+        ):
+            raise ValueError(
+                "DT_DRAFT_SEND_LOOP=1 requires DT_DRAFT_INGRESS=native, "
+                "DT_DRAFT_CONTROL_LOOP=1 and the cuda-ipc candidate transport"
+            )
+        # The publish worker once it is the send loop (None until the ring
+        # worker exists); the fence events of the release-only descriptors
+        # still outstanding, in submit order, live in _ready_release_fenced.
+        self._send_loop_worker = None
         # READY table (scheduler-owned, native ingress): entries by READY seq
         # modulo the queue capacity (created with the ring worker), the
         # unselected rows in arrival order (READY seq plus the identity DRAIN
@@ -2387,6 +2411,11 @@ class FlashMTPDraftEngine:
             # Read before draining: a set after this read ends the idle wait.
             wake_epoch = wake.epoch() if wake is not None else 0
             self._loop_stage("poll_messages", self._poll_messages)
+            if self._send_loop:
+                # ABSORB before the drain and the gate (design §5.1): a batch
+                # the send loop finished stops counting here, not after this
+                # turn's submit.
+                self._absorb_dflash_done()
             if self._candidate_push_transport is not None:
                 self._loop_stage("push_progress", self._push_transport_progress)
             if self._stop:
@@ -2448,7 +2477,7 @@ class FlashMTPDraftEngine:
                 self._loop_stage("poll_eagle3", self._poll_eagle3_completions)
             if self._uses_direct_gpu_source:
                 self._loop_stage("poll_flashmtp", self._poll_flashmtp_completions)
-                if self._is_feature_backed:
+                if self._is_feature_backed and not self._send_loop:
                     # Split internally into dflash_query/publish/retire.
                     self._poll_dflash_completions()
             if self._pending_candidate_pushes:
@@ -2472,14 +2501,15 @@ class FlashMTPDraftEngine:
                 and not self._ready_pending
             ):
                 if (
-                    self._pending_dflash_completions
+                    (self._pending_dflash_completions and not self._send_loop)
                     or self._pending_eagle3_completions
                     or self._pending_flashmtp_completions
                     or self._pending_candidate_pushes
                 ):
                     # A completion or direct candidate push is still in flight
                     # on the GPU; observe it soon instead of sleeping the full
-                    # idle poll (issue #149).
+                    # idle poll (issue #149).  The send loop's DONE wake ends
+                    # the wait instead, so its batches are not polled (§4.4).
                     idle_s = INFLIGHT_POLL_S
                 else:
                     idle_s = IDLE_POLL_S
@@ -2653,6 +2683,19 @@ class FlashMTPDraftEngine:
             if self._native_ingress:
                 capacity = self._ring_worker.ready_capacity
                 self._ready_table = np.zeros(capacity, dtype=self._ring_worker.ready_dtype)
+            if self._send_loop:
+                # The send loop produces this worker's landing releases, so it
+                # can only start once the worker exists (design §4.3: one
+                # producer on that queue).
+                self._send_loop_worker = (
+                    self._candidate_push_transport.enable_send_loop(
+                        self._wake, self._ring_worker
+                    )
+                )
+                if self._send_loop_worker is None:
+                    raise RuntimeError(
+                        "DT_DRAFT_SEND_LOOP=1 requires DT_PUBLISH_WORKER=1"
+                    )
         return self._ring_worker
 
     def _open_direct_ring(self, registration) -> None:
@@ -3373,9 +3416,12 @@ class FlashMTPDraftEngine:
         if worker is None:
             return
         worker.check()
-        fenced = self._ready_release_fenced
-        while fenced and fenced[0][0].query():
-            self._release_ready_rows(fenced.popleft()[1])
+        if self._send_loop_worker is None:
+            # With the send loop the fence is a descriptor: its DONE record
+            # retires the event in ABSORB instead.
+            fenced = self._ready_release_fenced
+            while fenced and fenced[0][0].query():
+                self._release_ready_rows(fenced.popleft()[1])
         for endpoint in self._ring_endpoints.values():
             if not endpoint.attached:
                 self._attach_direct_ring(worker, endpoint)
@@ -3775,6 +3821,98 @@ class FlashMTPDraftEngine:
             if self._ring_worker is not None:  # shutdown: already destroyed
                 self._ring_worker.ready_consume(consumed)
 
+    def _submit_batch_descriptor(self, done_seq, event, releases, timing=()) -> None:
+        """Hand one descriptor to the send loop (design §5.1 HAND-OFF (ii)).
+
+        ``done_seq`` 0 is a release-only fence: it carries no timing events
+        and its DONE record only retires the fence event.  ``event`` and the
+        timing events are recorded on the one compute stream, so descriptors
+        complete in the order they are submitted."""
+
+        descriptor = array(
+            "Q",
+            (
+                done_seq,
+                event.cuda_event,
+                *(timing or (0, 0, 0)),
+                len(releases),
+            ),
+        )
+        for k, gen in releases:
+            descriptor.extend((k, gen, 1))
+        self._send_loop_worker.submit_batch(descriptor)
+
+    def _absorb_dflash_done(self) -> None:
+        """ABSORB (design §5.1): take the send loop's DONE records.
+
+        Phase one pops every completed batch off the in-flight deque, so the
+        depth gate is open as soon as the DONE wake reaches this thread;
+        phase two does their Python bookkeeping.  A record is published
+        before ``done_seq`` and the wake, so every batch the counter covers
+        has its record here."""
+
+        worker = self._send_loop_worker
+        if worker is None or self._fatal_gpu_quarantine_active():
+            return
+        stage_started_ns = time.monotonic_ns()
+        records = worker.drain_done()
+        if not len(records):
+            return
+        retired = []
+        for seq, gpu_done_ns, materialize_ns, proposal_ns, error in records.tolist():
+            if not seq:
+                # A release-only fence: the send loop has let go of its event.
+                self._ready_release_fenced.popleft()
+                continue
+            completion = self._pending_dflash_completions.popleft()
+            if completion.batch_seq + 1 != seq:
+                raise RuntimeError(
+                    "DFLASH DONE record is not the oldest in-flight batch: "
+                    f"record={seq} batch={completion.batch_seq + 1}"
+                )
+            retired.append((completion, gpu_done_ns, materialize_ns, proposal_ns, error))
+        absorbed_ns = time.monotonic_ns()
+        self._loop_stage_ns["dflash_absorb"] += absorbed_ns - stage_started_ns
+        self._loop_stage_calls["dflash_absorb"] += len(retired)
+        for completion, gpu_done_ns, materialize_ns, proposal_ns, error in retired:
+            if self._profile_active:
+                profile_emit(
+                    "draft_dflash_done_absorb",
+                    draft_instance=self.instance_id,
+                    done_seq=completion.batch_seq + 1,
+                    gpu_done_ns=gpu_done_ns,
+                    absorbed_ns=absorbed_ns,
+                )
+            if error:
+                # The send loop could not prove this batch's GPU writes have
+                # stopped (design §7.5): keep every allocation it touched.
+                tasks = [item.task for item in completion.pending]
+                self._quarantined_feature_draft_handles.update(
+                    task.draft_kv_handle for task in tasks
+                )
+                self._quarantined_dflash_completions.append(completion)
+                logger.critical(
+                    "quarantined DFlash completion after a send-loop failure "
+                    "(driver rc=%s): transfers=%s",
+                    error,
+                    [task.transfer_id for task in tasks],
+                )
+                self._enter_fatal_gpu_quarantine("unquiesced DFlash send-loop failure")
+                exc = RuntimeError(f"DFLASH send loop failed with rc={error}")
+                exc.resources_quiescent = False
+                self._publish_failures([(task, exc) for task in tasks])
+                self._publish_capacity()
+                return
+            self._retire_dflash_completion(
+                completion,
+                completed_ns=gpu_done_ns,
+                gpu_materialization_ns=materialize_ns,
+                proposal_gpu_ns=proposal_ns,
+                stage_started_ns=absorbed_ns,
+            )
+        if retired:
+            self._publish_capacity()
+
     def _ready_row_keys(self, seqs) -> tuple[tuple[int, int], ...]:
         """(ring id, record seq) of each READY row, for its landing release."""
 
@@ -3800,29 +3938,57 @@ class FlashMTPDraftEngine:
                 torch.cuda.current_stream(self.device).cuda_stream, index, gen
             )
 
-    def _release_ready_rows(self, keys, fence_seqs=()) -> None:
-        """Release READY rows' landing placements: a record's placement is
-        released with its last row (sent by the scheduler at retire until
-        D8 moves it to the send loop).  Rows released without a batch that
-        waited on their copies pass ``fence_seqs`` (their READY seqs, not yet
-        consumed): READY precedes the copy's completion (§6.5), so their
-        release waits until the current stream has passed those copies."""
+    def _resolve_ready_releases(self, keys) -> tuple[tuple[int, int], ...]:
+        """Drop one row from each named record and return the ``(k, gen)`` of
+        the records whose last row went: their landing placement is now free.
 
-        worker = self._ring_worker
-        if fence_seqs and worker is not None:
-            self._wait_ready_copies(fence_seqs)
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.device))
-            self._ready_release_fenced.append((event, tuple(keys)))
-            return
+        A record is placed once by ingress and released once, with its last
+        row, however its rows are split across batches."""
+
         records = self._ready_records
+        freed = []
         for key in keys:
             record = records[key]
             record[0] -= 1
             if not record[0]:
                 del records[key]
-                if worker is not None:  # shutdown: the worker already drained
-                    worker.landing_release(record[1], record[2], 1)
+                freed.append((record[1], record[2]))
+        return tuple(freed)
+
+    def _release_ready_rows(self, keys, fence_seqs=()) -> None:
+        """Release READY rows' landing placements.  Rows released without a
+        batch that waited on their copies pass ``fence_seqs`` (their READY
+        seqs, not yet consumed): READY precedes the copy's completion (§6.5),
+        so their release waits until the current stream has passed those
+        copies.
+
+        Under the D8 send loop the fence is a release-only descriptor, so
+        every landing release reaches ingress from the one producer thread
+        the queue allows (§4.3); otherwise the scheduler pushes them itself,
+        and polls the fence events in DRAIN."""
+
+        worker = self._ring_worker
+        if fence_seqs and worker is not None:
+            if self._send_loop_worker is not None:
+                releases = self._resolve_ready_releases(keys)
+                if not releases:
+                    return  # these records still have live rows
+                self._wait_ready_copies(fence_seqs)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(self.device))
+                # Keep the event alive until its seq-0 DONE record proves the
+                # send loop is done with it (ABSORB pops this entry then).
+                self._ready_release_fenced.append((event, ()))
+                self._submit_batch_descriptor(0, event, releases)
+                return
+            self._wait_ready_copies(fence_seqs)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+            self._ready_release_fenced.append((event, tuple(keys)))
+            return
+        for k, gen in self._resolve_ready_releases(keys):
+            if worker is not None:  # shutdown: the worker already drained
+                worker.landing_release(k, gen, 1)
 
     def _profile_ring_admission_state(
         self,
@@ -3896,6 +4062,16 @@ class FlashMTPDraftEngine:
         worker = getattr(self, "_ring_worker", None)
         if worker is None:
             return
+        if self._send_loop_worker is not None:
+            # Every outstanding descriptor still owes this worker its landing
+            # releases; the publish worker outlives it (it is closed with the
+            # push transport), so it must hold none before it is destroyed.
+            deadline_ns = time.monotonic_ns() + _RING_RECORD_TIMEOUT_NS
+            while self._send_loop_worker.batch_stats()[1]:
+                if time.monotonic_ns() > deadline_ns:
+                    raise RuntimeError("send loop still holds batch descriptors")
+                time.sleep(0)
+            self._send_loop_worker = None
         self._ring_worker = None
         rc = worker.destroy()
         if rc:
@@ -4299,7 +4475,13 @@ class FlashMTPDraftEngine:
                         item.task.draft_kv_handle for item in completion.pending
                     )
                     raise
-                self._poll_dflash_completions()
+                if self._send_loop:
+                    # The send loop observes the done event and records it;
+                    # this turn absorbs whatever has arrived, and the outer
+                    # loop comes back until the deque is empty.
+                    self._absorb_dflash_done()
+                else:
+                    self._poll_dflash_completions()
                 self._raise_if_fatal_gpu_quarantine(
                     "shutdown DFlash completion drain"
                 )
@@ -7483,6 +7665,27 @@ class FlashMTPDraftEngine:
         if self._slot_decouple:
             # A failed launch is quiesced (or fatal) and keeps its sequence.
             self._dflash_batch_seq = batch_seq + 1
+        if self._send_loop:
+            if self._send_loop_worker is None:
+                # The loop starts with the ring worker, at the first Target
+                # registration; no batch exists before one.
+                raise RuntimeError("DFLASH batch submitted before the send loop")
+            # HAND-OFF (design §5.1): frozen_seq is batch_seq + 1, and the
+            # send loop pushes this batch's landing releases once its GPU
+            # work is done.  Nothing between the registration above and this
+            # submit may raise, or the batch would have no watcher.
+            releases = self._resolve_ready_releases(completion.ready_rows)
+            completion.ready_rows = ()
+            self._submit_batch_descriptor(
+                batch_seq + 1,
+                completion.completion_event,
+                releases,
+                timing=(
+                    materialize_start.cuda_event,
+                    materialize_done.cuda_event,
+                    proposal_done.cuda_event,
+                ),
+            )
         if copy_stream is None and proposal_tasks:
             self._queue_early_candidate_push(
                 proposal_tasks, candidates, completion.completion_event
@@ -8100,37 +8303,7 @@ class FlashMTPDraftEngine:
             if not ready:
                 break
             self._pending_dflash_completions.popleft()
-            tasks = [item.task for item in completion.pending]
             completed_ns = time.monotonic_ns()
-            # A push queued at launch already published these candidates.
-            early = self._take_early_pushed(tasks)
-            expired_tasks = [
-                task
-                for task in tasks
-                if task.transfer_id not in self._cancelled_ids
-                and task.transfer_id not in early
-                and completed_ns >= task.deadline_ns
-            ]
-            expired_ids = {task.transfer_id for task in expired_tasks}
-            active_tasks = [
-                task
-                for task in tasks
-                if task.transfer_id not in self._cancelled_ids
-                and task.transfer_id not in expired_ids
-            ]
-            cancelled_tasks = [
-                task for task in tasks if task.transfer_id in self._cancelled_ids
-            ]
-            materialize_only = [
-                task for task in active_tasks if not task.requires_proposal
-            ]
-            active_proposal_indices = [
-                index
-                for index, task in enumerate(completion.proposal_tasks)
-                if task.transfer_id not in self._cancelled_ids
-                and task.transfer_id not in expired_ids
-                and task.transfer_id not in early
-            ]
             gpu_materialization_ns = int(
                 completion.materialize_start_event.elapsed_time(
                     completion.materialize_done_event
@@ -8143,186 +8316,240 @@ class FlashMTPDraftEngine:
                 )
                 * 1_000_000
             )
-            # The step's GPU service time spans both timed phases: candidate
-            # feature materialization (materialize_start -> materialize_done)
-            # and proposal execution (materialize_done -> proposal_done).
-            self._last_step_ns = gpu_materialization_ns + proposal_gpu_ns
-            stage_query_ns = time.monotonic_ns()
-            self._loop_stage_ns["dflash_query"] += stage_query_ns - stage_started_ns
-            self._loop_stage_calls["dflash_query"] += 1
-            if self._profile_active:
-                self._profile_dflash_batch(
-                    completion, tasks, gpu_materialization_ns + proposal_gpu_ns
-                )
-            profile_emit(
-                "draft_dflash_batch_complete",
-                draft_instance=self.instance_id,
-                transfer_ids=tuple(task.transfer_id for task in tasks),
-                execute_started_ns=completion.launch_started_ns,
-                tasks_prepared_ns=completion.tasks_prepared_ns,
-                metadata_ready_ns=completion.proposal_metadata_ready_ns,
-                materialize_submitted_ns=completion.materialize_submitted_ns,
-                batch_size=len(tasks),
-                active_task_count=len(active_tasks),
-                cancelled_task_count=len(cancelled_tasks),
-                expired_task_count=len(expired_tasks),
-                proposal_count=len(completion.proposal_tasks),
-                active_proposal_count=len(active_proposal_indices),
-                materialize_only_count=len(materialize_only),
-                bootstrap_count=sum(task.round_id == 0 for task in tasks),
-                reconcile_count=sum(task.round_id > 0 for task in tasks),
-                materialized_tokens=sum(task.feature_token_count for task in tasks),
-                submitted_ns=completion.launched_ns,
-                gpu_completed_ns=completed_ns,
-                host_task_prepare_ns=(
-                    completion.tasks_prepared_ns - completion.launch_started_ns
-                ),
-                host_proposal_metadata_ns=(
-                    completion.proposal_metadata_ready_ns - completion.tasks_prepared_ns
-                ),
-                host_materialize_submit_ns=(
-                    completion.materialize_submitted_ns
-                    - completion.proposal_metadata_ready_ns
-                ),
-                host_proposal_submit_ns=(
-                    completion.launched_ns - completion.materialize_submitted_ns
-                ),
-                host_total_submit_ns=(
-                    completion.launched_ns - completion.launch_started_ns
-                ),
+            self._retire_dflash_completion(
+                completion,
+                completed_ns=completed_ns,
                 gpu_materialization_ns=gpu_materialization_ns,
                 proposal_gpu_ns=proposal_gpu_ns,
-                proposal_execution=completion.proposal_execution,
-                proposal_fallback_reason=completion.proposal_fallback_reason,
-                prior_unfinished_proposal_count=(
-                    completion.prior_unfinished_proposal_count
-                ),
-                prior_candidate_copy_pending_count=(
-                    completion.prior_candidate_copy_pending_count
-                ),
-                host_reconcile_validate_ns=(
-                    completion.reconcile_prepare_phase_ns[0]
-                    if completion.reconcile_prepare_phase_ns
-                    else 0
-                ),
-                host_reconcile_free_ns=(
-                    completion.reconcile_prepare_phase_ns[1]
-                    if completion.reconcile_prepare_phase_ns
-                    else 0
-                ),
-                host_reconcile_alloc_ns=(
-                    completion.reconcile_prepare_phase_ns[2]
-                    if completion.reconcile_prepare_phase_ns
-                    else 0
-                ),
-                host_reconcile_row_write_ns=(
-                    completion.reconcile_prepare_phase_ns[3]
-                    if completion.reconcile_prepare_phase_ns
-                    else 0
-                ),
-                host_reconcile_prefix_refresh_ns=(
-                    completion.reconcile_prepare_phase_ns[4]
-                    if completion.reconcile_prepare_phase_ns
-                    else 0
-                ),
-                host_reconcile_state_refresh_ns=(
-                    completion.reconcile_prepare_phase_ns[5]
-                    if completion.reconcile_prepare_phase_ns
-                    else 0
-                ),
-            )
-            if materialize_only:
-                self._publish_materialization_successes(materialize_only)
-            if active_proposal_indices:
-                push_scope = (
-                    self._direct_push_scope(
-                        completion.completion_event, completion.candidates
-                    )
-                    if self.candidate_transport == "cuda-ipc"
-                    and completion.candidates is not None
-                    else contextlib.nullcontext()
-                )
-                with push_scope:
-                    if self.candidate_transport == "cuda-ipc":
-                        if completion.candidates is None:
-                            raise RuntimeError("DFLASH GPU candidates are unavailable")
-                        candidate_rows = _select_candidate_rows(
-                            completion.candidates, active_proposal_indices
-                        )
-                        candidate_payload = candidate_rows
-                    elif completion.candidate_rows_cpu is not None:
-                        candidate_rows = completion.candidate_rows_cpu[
-                            active_proposal_indices
-                        ]
-                        candidate_payload = candidate_rows.contiguous().numpy().tobytes()
-                    else:
-                        candidate_rows = completion.candidates[
-                            active_proposal_indices
-                        ].cpu()
-                        candidate_payload = candidate_rows.contiguous().numpy().tobytes()
-                    self._publish_successes(
-                        [
-                            completion.proposal_tasks[index]
-                            for index in active_proposal_indices
-                        ],
-                        candidate_payload,
-                    )
-            stage_publish_ns = time.monotonic_ns()
-            self._loop_stage_ns["dflash_publish"] += stage_publish_ns - stage_query_ns
-            for task in active_tasks:
-                profile_emit(
-                    "draft_kv_materialization",
-                    draft_instance=self.instance_id,
-                    transfer_id=task.transfer_id,
-                    request_id=task.request_id,
-                    round_id=task.round_id,
-                    committed_kv_len=task.committed_kv_len,
-                    materialized_tokens=task.feature_token_count,
-                    gpu_materialization_ns=gpu_materialization_ns,
-                    proposal_gpu_ns=proposal_gpu_ns,
-                    completed_ns=time.monotonic_ns(),
-                )
-                if task.requires_proposal:
-                    profile_emit(
-                        "draft_proposal",
-                        draft_instance=self.instance_id,
-                        transfer_id=task.transfer_id,
-                        request_id=task.request_id,
-                        round_id=task.round_id,
-                        submitted_ns=completion.launched_ns,
-                        gpu_completed_ns=completed_ns,
-                        proposal_gpu_ns=proposal_gpu_ns,
-                    )
-            for task in cancelled_tasks:
-                self._retire_cancelled_transfer_identity(task)
-                self._release_persistent_request(task.draft_kv_handle)
-            for task in expired_tasks:
-                self._release_persistent_request(task.draft_kv_handle)
-            if expired_tasks:
-                self._publish_failures(
-                    [
-                        (
-                            task,
-                            TimeoutError(
-                                "DFLASH materialization completed after its deadline"
-                            ),
-                        )
-                        for task in expired_tasks
-                    ]
-                )
-            self._complete_feature_compute(
-                completion.staging_slots, completion.staging_slot_counts
-            )
-            if completion.ready_rows:
-                self._release_ready_rows(completion.ready_rows)
-            for handle in {task.draft_kv_handle for task in tasks}:
-                self._drain_deferred_persistent_release(handle)
-            self._loop_stage_ns["dflash_retire"] += (
-                time.monotonic_ns() - stage_publish_ns
+                stage_started_ns=stage_started_ns,
             )
             capacity_changed = True
         if capacity_changed:
             self._publish_capacity()
+
+    def _retire_dflash_completion(
+        self,
+        completion,
+        *,
+        completed_ns: int,
+        gpu_materialization_ns: int,
+        proposal_gpu_ns: int,
+        stage_started_ns: int,
+    ) -> None:
+        """Retire one DFlash batch whose GPU work is done.
+
+        The Python-state bookkeeping of design §5.1 ABSORB, shared by the
+        legacy completion-event poll and the D8 send loop, which observes
+        the GPU done natively and passes its stamp and CUDA elapsed in.
+        """
+
+        tasks = [item.task for item in completion.pending]
+        # A push queued at launch already published these candidates.
+        early = self._take_early_pushed(tasks)
+        expired_tasks = [
+            task
+            for task in tasks
+            if task.transfer_id not in self._cancelled_ids
+            and task.transfer_id not in early
+            and completed_ns >= task.deadline_ns
+        ]
+        expired_ids = {task.transfer_id for task in expired_tasks}
+        active_tasks = [
+            task
+            for task in tasks
+            if task.transfer_id not in self._cancelled_ids
+            and task.transfer_id not in expired_ids
+        ]
+        cancelled_tasks = [
+            task for task in tasks if task.transfer_id in self._cancelled_ids
+        ]
+        materialize_only = [
+            task for task in active_tasks if not task.requires_proposal
+        ]
+        active_proposal_indices = [
+            index
+            for index, task in enumerate(completion.proposal_tasks)
+            if task.transfer_id not in self._cancelled_ids
+            and task.transfer_id not in expired_ids
+            and task.transfer_id not in early
+        ]
+        # The step's GPU service time spans both timed phases: candidate
+        # feature materialization (materialize_start -> materialize_done)
+        # and proposal execution (materialize_done -> proposal_done).
+        self._last_step_ns = gpu_materialization_ns + proposal_gpu_ns
+        stage_query_ns = time.monotonic_ns()
+        self._loop_stage_ns["dflash_query"] += stage_query_ns - stage_started_ns
+        self._loop_stage_calls["dflash_query"] += 1
+        if self._profile_active:
+            self._profile_dflash_batch(
+                completion, tasks, gpu_materialization_ns + proposal_gpu_ns
+            )
+        profile_emit(
+            "draft_dflash_batch_complete",
+            draft_instance=self.instance_id,
+            transfer_ids=tuple(task.transfer_id for task in tasks),
+            execute_started_ns=completion.launch_started_ns,
+            tasks_prepared_ns=completion.tasks_prepared_ns,
+            metadata_ready_ns=completion.proposal_metadata_ready_ns,
+            materialize_submitted_ns=completion.materialize_submitted_ns,
+            batch_size=len(tasks),
+            active_task_count=len(active_tasks),
+            cancelled_task_count=len(cancelled_tasks),
+            expired_task_count=len(expired_tasks),
+            proposal_count=len(completion.proposal_tasks),
+            active_proposal_count=len(active_proposal_indices),
+            materialize_only_count=len(materialize_only),
+            bootstrap_count=sum(task.round_id == 0 for task in tasks),
+            reconcile_count=sum(task.round_id > 0 for task in tasks),
+            materialized_tokens=sum(task.feature_token_count for task in tasks),
+            submitted_ns=completion.launched_ns,
+            gpu_completed_ns=completed_ns,
+            host_task_prepare_ns=(
+                completion.tasks_prepared_ns - completion.launch_started_ns
+            ),
+            host_proposal_metadata_ns=(
+                completion.proposal_metadata_ready_ns - completion.tasks_prepared_ns
+            ),
+            host_materialize_submit_ns=(
+                completion.materialize_submitted_ns
+                - completion.proposal_metadata_ready_ns
+            ),
+            host_proposal_submit_ns=(
+                completion.launched_ns - completion.materialize_submitted_ns
+            ),
+            host_total_submit_ns=(
+                completion.launched_ns - completion.launch_started_ns
+            ),
+            gpu_materialization_ns=gpu_materialization_ns,
+            proposal_gpu_ns=proposal_gpu_ns,
+            proposal_execution=completion.proposal_execution,
+            proposal_fallback_reason=completion.proposal_fallback_reason,
+            prior_unfinished_proposal_count=(
+                completion.prior_unfinished_proposal_count
+            ),
+            prior_candidate_copy_pending_count=(
+                completion.prior_candidate_copy_pending_count
+            ),
+            host_reconcile_validate_ns=(
+                completion.reconcile_prepare_phase_ns[0]
+                if completion.reconcile_prepare_phase_ns
+                else 0
+            ),
+            host_reconcile_free_ns=(
+                completion.reconcile_prepare_phase_ns[1]
+                if completion.reconcile_prepare_phase_ns
+                else 0
+            ),
+            host_reconcile_alloc_ns=(
+                completion.reconcile_prepare_phase_ns[2]
+                if completion.reconcile_prepare_phase_ns
+                else 0
+            ),
+            host_reconcile_row_write_ns=(
+                completion.reconcile_prepare_phase_ns[3]
+                if completion.reconcile_prepare_phase_ns
+                else 0
+            ),
+            host_reconcile_prefix_refresh_ns=(
+                completion.reconcile_prepare_phase_ns[4]
+                if completion.reconcile_prepare_phase_ns
+                else 0
+            ),
+            host_reconcile_state_refresh_ns=(
+                completion.reconcile_prepare_phase_ns[5]
+                if completion.reconcile_prepare_phase_ns
+                else 0
+            ),
+        )
+        if materialize_only:
+            self._publish_materialization_successes(materialize_only)
+        if active_proposal_indices:
+            push_scope = (
+                self._direct_push_scope(
+                    completion.completion_event, completion.candidates
+                )
+                if self.candidate_transport == "cuda-ipc"
+                and completion.candidates is not None
+                else contextlib.nullcontext()
+            )
+            with push_scope:
+                if self.candidate_transport == "cuda-ipc":
+                    if completion.candidates is None:
+                        raise RuntimeError("DFLASH GPU candidates are unavailable")
+                    candidate_rows = _select_candidate_rows(
+                        completion.candidates, active_proposal_indices
+                    )
+                    candidate_payload = candidate_rows
+                elif completion.candidate_rows_cpu is not None:
+                    candidate_rows = completion.candidate_rows_cpu[
+                        active_proposal_indices
+                    ]
+                    candidate_payload = candidate_rows.contiguous().numpy().tobytes()
+                else:
+                    candidate_rows = completion.candidates[
+                        active_proposal_indices
+                    ].cpu()
+                    candidate_payload = candidate_rows.contiguous().numpy().tobytes()
+                self._publish_successes(
+                    [
+                        completion.proposal_tasks[index]
+                        for index in active_proposal_indices
+                    ],
+                    candidate_payload,
+                )
+        stage_publish_ns = time.monotonic_ns()
+        self._loop_stage_ns["dflash_publish"] += stage_publish_ns - stage_query_ns
+        for task in active_tasks:
+            profile_emit(
+                "draft_kv_materialization",
+                draft_instance=self.instance_id,
+                transfer_id=task.transfer_id,
+                request_id=task.request_id,
+                round_id=task.round_id,
+                committed_kv_len=task.committed_kv_len,
+                materialized_tokens=task.feature_token_count,
+                gpu_materialization_ns=gpu_materialization_ns,
+                proposal_gpu_ns=proposal_gpu_ns,
+                completed_ns=time.monotonic_ns(),
+            )
+            if task.requires_proposal:
+                profile_emit(
+                    "draft_proposal",
+                    draft_instance=self.instance_id,
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    submitted_ns=completion.launched_ns,
+                    gpu_completed_ns=completed_ns,
+                    proposal_gpu_ns=proposal_gpu_ns,
+                )
+        for task in cancelled_tasks:
+            self._retire_cancelled_transfer_identity(task)
+            self._release_persistent_request(task.draft_kv_handle)
+        for task in expired_tasks:
+            self._release_persistent_request(task.draft_kv_handle)
+        if expired_tasks:
+            self._publish_failures(
+                [
+                    (
+                        task,
+                        TimeoutError(
+                            "DFLASH materialization completed after its deadline"
+                        ),
+                    )
+                    for task in expired_tasks
+                ]
+            )
+        self._complete_feature_compute(
+            completion.staging_slots, completion.staging_slot_counts
+        )
+        if completion.ready_rows:
+            self._release_ready_rows(completion.ready_rows)
+        for handle in {task.draft_kv_handle for task in tasks}:
+            self._drain_deferred_persistent_release(handle)
+        self._loop_stage_ns["dflash_retire"] += (
+            time.monotonic_ns() - stage_publish_ns
+        )
 
     def _execute_standalone_batch(self, pending: list[PendingDraftTask]) -> None:
         batch_start_ns = time.monotonic_ns()
@@ -11527,6 +11754,19 @@ class FlashMTPDraftEngine:
                         if push_transport is None
                         else dict(
                             getattr(push_transport, "submit_lane_ns", None) or {}
+                        )
+                    ),
+                    # Send loop (D8): done_seq, descriptors outstanding, and
+                    # the thread's cumulative wait on them, i.e. the CPU cost
+                    # it adds; a windowed diff gives its busy share.
+                    "send_loop": (
+                        None
+                        if self._send_loop_worker is None
+                        else dict(
+                            zip(
+                                ("done_seq", "outstanding", "polls", "poll_ns"),
+                                self._send_loop_worker.batch_stats().tolist(),
+                            )
                         )
                     ),
                 },
