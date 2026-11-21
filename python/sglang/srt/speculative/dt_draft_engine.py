@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import contextlib
+import enum
 import json
 import logging
 import os
@@ -189,6 +190,23 @@ _READY_ROW_FIELDS = (
 _RING_RECORD_TIMEOUT_NS = (
     int(os.environ.get("DT_RING_RECORD_TIMEOUT_S", "30")) * 1_000_000_000
 )
+# Why FREEZE left a READY row waiting (issue #292).  A row's time between two
+# evaluations is charged to the reason of the earlier one: "unscanned" is
+# READY publish -> first pass, "compute_depth" any part of it (after the drain)
+# the scheduler spent with DRAFT_COMPUTE_DEPTH batches in flight, when no
+# FREEZE pass runs.  The charges of a row sum to its hold, publish -> frozen.
+_ReadySkip = enum.IntEnum(
+    "_ReadySkip",
+    "unscanned compute_depth owner_inflight owner_selected proposal_mode "
+    "batch_rows batch_tokens req_rows kv",
+    start=0,
+)
+_READY_SKIP_REASONS = tuple(reason.name for reason in _ReadySkip)
+_READY_DROP_OUTCOMES = ("released", "cancelled", "expired")
+# Long holds (publish -> frozen or dropped): counted untraced above the first,
+# one draft_ready_skip record each above the second under DT_PROFILE_DIR.
+_READY_LONG_HOLD_NS = 100_000_000
+_READY_SKIP_RECORD_NS = 20_000_000
 # Initial control delivery is immediate.  Retrying every scheduler tick-scale
 # interval amplifies delayed ACKs under full-wave load; keep retries reliable
 # but slow enough that the Coordinator can drain the original transaction.
@@ -1267,6 +1285,22 @@ class FlashMTPDraftEngine:
         # cumulative histogram of floor(4 * log2 ns) for its p99.
         self._ready_held_max_ns = 0
         self._ready_held_hist = np.zeros(256, dtype=np.int64)
+        # FREEZE skip reasons (#292): per waiting row (by READY seq) its
+        # [reason, last evaluation ns, gate mark, passes, first reason, fit at
+        # the last fit skip, held ns per reason]; cumulative counters for the
+        # lifecycle status; compute-depth gate time while rows waited.
+        self._ready_skip_state: dict[int, list] = {}
+        reasons = len(_READY_SKIP_REASONS)
+        self._ready_skips = [0] * reasons
+        self._ready_skip_held_ns = [0] * reasons
+        self._ready_long_held_ns = [0] * reasons
+        self._ready_long_rows = [0] * reasons
+        self._ready_longest: dict[str, object] | None = None
+        self._ready_drops = [0] * len(_READY_DROP_OUTCOMES)
+        self._ready_passes = 0
+        self._ready_frozen_batches = 0
+        self._ready_gate_ns = 0
+        self._ready_gated_since_ns = 0
         # Held results released by confirmations, sent as one batch per turn.
         self._confirmed_held_results: list = []
         self._confirmed_held_sequence = 0
@@ -3332,6 +3366,9 @@ class FlashMTPDraftEngine:
         retire here (as the legacy take skips dropped requests); a
         V1_PAYLOAD entry is decoded into its row (until Target item T4)."""
 
+        if self._ready_gated_since_ns:  # the last take stopped at the gate
+            self._ready_gate_ns += time.monotonic_ns() - self._ready_gated_since_ns
+            self._ready_gated_since_ns = 0
         worker = self._ring_worker
         if worker is None:
             return
@@ -3350,6 +3387,7 @@ class FlashMTPDraftEngine:
         drained_ns = time.monotonic_ns()
         kind = entries["kind"] & ~np.uint32(kinds["DEST_KNOWN"])
         ledger, targets = self._rid_ledger, self._ring_targets
+        marks = (self._ready_gate_ns, self._ready_frozen_batches)
         done, dropped = [], []
         for kind, (
             seq, ring_id, record_seq, position, cell, gen, round_id, attempt,
@@ -3385,6 +3423,7 @@ class FlashMTPDraftEngine:
                 seq, handle, transfer_id, deadline_ns, requires_proposal, count, k,
                 row_first, drained_ns, (ring_id, record_seq, position, round_id,
                                         attempt, seq_len, token_at, bonus, ready_ns, rid),
+                marks,
             ))
         if dropped:
             self._release_ready_rows(dropped, fence_seqs=done)
@@ -3435,10 +3474,91 @@ class FlashMTPDraftEngine:
         )
         profile = self._profile_active
         retained, done, dropped = [], [], []
+        # Skip accounting (#292).  A waiting row's state is [reason, last
+        # evaluation ns, gate mark, passes, first reason, fit, held ns per
+        # reason]; a row frozen at its first pass gets none.
+        states, gate_ns = self._ready_skip_state, self._ready_gate_ns
+        total, skips, pass_handles = self._ready_skip_held_ns, self._ready_skips, set()
+        unscanned, gate = int(_ReadySkip.unscanned), int(_ReadySkip.compute_depth)
+        self._ready_passes += 1
+
+        def skip(row, reason, fit=None):
+            state = states.get(row[0])
+            if state is None:
+                waited = now_ns - row[9][8]
+                gated = min(gate_ns - row[10][0], waited)
+                held = [0] * len(total)
+                held[unscanned], held[gate] = waited - gated, gated
+                total[unscanned] += waited - gated
+                states[row[0]] = [reason, now_ns, gate_ns, 1, reason, fit, held]
+            else:
+                last, held = state[0], state[6]
+                waited = now_ns - state[1]
+                gated = min(gate_ns - state[2], waited)
+                held[last] += waited - gated
+                held[gate] += gated
+                total[last] += waited - gated
+                state[0], state[1], state[2] = reason, now_ns, gate_ns
+                state[3] += 1
+                if fit is not None:
+                    state[5] = fit
+            total[gate] += gated
+            skips[reason] += 1
+            retained.append(row)
+
+        def finish(row, outcome):
+            fields, marks = row[9], row[10]
+            state = states.pop(row[0], None)
+            if state is None:
+                last, since_ns, gate_mark = unscanned, fields[8], marks[0]
+            else:
+                last, since_ns, gate_mark = state[0], state[1], state[2]
+            waited = now_ns - since_ns
+            gated = min(gate_ns - gate_mark, waited)
+            total[last] += waited - gated
+            total[gate] += gated
+            if outcome != "frozen":
+                self._ready_drops[_READY_DROP_OUTCOMES.index(outcome)] += 1
+            held_ns = now_ns - fields[8]
+            if held_ns < _READY_SKIP_RECORD_NS:
+                return
+            held = [0] * len(total) if state is None else state[6]
+            held[last] += waited - gated
+            held[gate] += gated
+            summary = {
+                "outcome": outcome,
+                "held_ns": held_ns,
+                "passes": 0 if state is None else state[3],
+                "first_reason": None if state is None else _READY_SKIP_REASONS[state[4]],
+                "last_reason": None if state is None else _READY_SKIP_REASONS[state[0]],
+                "reasons_ns": {n: v for n, v in zip(_READY_SKIP_REASONS, held) if v},
+                "batches": self._ready_frozen_batches - marks[1],
+                "fit": None if state is None else state[5],
+            }
+            if held_ns >= _READY_LONG_HOLD_NS:
+                for index, value in enumerate(held):
+                    self._ready_long_held_ns[index] += value
+                self._ready_long_rows[held.index(max(held))] += 1
+                if self._ready_longest is None or held_ns > self._ready_longest["held_ns"]:
+                    self._ready_longest = summary
+            if profile:
+                profile_emit(
+                    "draft_ready_skip",
+                    draft_instance=self.instance_id,
+                    transfer_id=row[2],
+                    request_id=fields[9],
+                    round_id=fields[3],
+                    ready_ns=fields[8],
+                    drained_ns=row[8],
+                    finished_ns=now_ns,
+                    long=held_ns >= _READY_LONG_HOLD_NS,
+                    **summary,
+                )
+
         for row in self._ready_pending:
             (
                 seq, handle, transfer_id, deadline_ns, requires_proposal, count, k,
-                row_first, drained_ns, fields,
+                row_first, drained_ns, fields, _marks,
             ) = row
             ring_id, record_seq, position, round_id = fields[:4]
             task = self._ready_tasks.get(seq)
@@ -3474,28 +3594,37 @@ class FlashMTPDraftEngine:
                     )
                 dropped.append((ring_id, record_seq))
                 done.append(seq)
+                finish(row, "released" if released else "cancelled" if cancelled else "expired")
                 continue
-            if handle in busy_handles or len(selected) >= self.max_batch_size:
-                retained.append(row)
+            if handle in busy_handles:
+                skip(row, _ReadySkip.owner_selected if handle in pass_handles
+                     else _ReadySkip.owner_inflight)
+                continue
+            if len(selected) >= self.max_batch_size:
+                skip(row, _ReadySkip.batch_rows)
                 continue
             if proposal_mode is None:
                 proposal_mode = requires_proposal
-            if (
-                requires_proposal != proposal_mode
-                or token_count + count > self.feature_buffer_max_tokens
-            ):
-                retained.append(row)
+            if requires_proposal != proposal_mode:
+                skip(row, _ReadySkip.proposal_mode)
+                continue
+            if token_count + count > self.feature_buffer_max_tokens:
+                skip(row, _ReadySkip.batch_tokens)
                 continue
             if task is None:
                 task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields)
             row_cost, kv_cost = self._persistent_task_allocation(task)
             if row_cost > available_rows or kv_cost > available_kv:
-                retained.append(row)
+                fit = (available_rows, available_kv, row_cost, kv_cost)
+                skip(row, _ReadySkip.req_rows if row_cost > available_rows
+                     else _ReadySkip.kv, fit)
                 continue
             available_rows -= row_cost
             available_kv -= max(kv_cost, 0)
             token_count += count
             busy_handles.add(handle)
+            pass_handles.add(handle)
+            finish(row, "frozen")
             self._pending_ids.add(transfer_id)
             self._ring_pending_ids.add(transfer_id)
             if seq not in self._ready_tasks:
@@ -3538,9 +3667,49 @@ class FlashMTPDraftEngine:
                     direct=True,
                 )
         self._ready_pending = retained
+        if pass_handles:
+            self._ready_frozen_batches += 1
         if done:
             self._release_ready_rows(dropped, fence_seqs=done)
             self._ready_consume(done)
+
+    def _ready_freeze_status(self, observed_ns: int) -> dict[str, object]:
+        """Cumulative FREEZE skip counters (#292) for ``rings.ready``: row
+        passes skipped and row-ms charged per reason (rows still waiting are
+        charged up to their last pass), the same for rows held at least
+        _READY_LONG_HOLD_NS plus their count by largest reason, drops, and
+        the reason holding the oldest waiting row (arrival order) and the
+        breakdown of the longest hold so far."""
+
+        def by_reason(values, ms=False):
+            return {
+                name: value / 1e6 if ms else value
+                for name, value in zip(_READY_SKIP_REASONS, values)
+                if value
+            }
+
+        oldest = None
+        if self._ready_pending:
+            row = self._ready_pending[0]
+            state = self._ready_skip_state.get(row[0])
+            oldest = {
+                "held_ms": (observed_ns - row[9][8]) / 1e6,
+                "reason": _READY_SKIP_REASONS[0 if state is None else state[0]],
+                "passes": 0 if state is None else state[3],
+            }
+        return {
+            "long_hold_ns": _READY_LONG_HOLD_NS,
+            "passes": self._ready_passes,
+            "frozen_batches": self._ready_frozen_batches,
+            "gate_ms": self._ready_gate_ns / 1e6,
+            "skips": by_reason(self._ready_skips),
+            "held_ms": by_reason(self._ready_skip_held_ns, ms=True),
+            "long_held_ms": by_reason(self._ready_long_held_ns, ms=True),
+            "long_rows": by_reason(self._ready_long_rows),
+            "drops": dict(zip(_READY_DROP_OUTCOMES, self._ready_drops)),
+            "oldest": oldest,
+            "longest": self._ready_longest,
+        }
 
     def _ready_row_task(self, handle, transfer_id, deadline_ns, count, fields):
         """The DraftTask of one natively parsed v2 row: the fields the legacy
@@ -3735,6 +3904,7 @@ class FlashMTPDraftEngine:
         # Unfrozen READY rows hold no request state; their placements died
         # with the worker.
         self._ready_pending.clear()
+        self._ready_skip_state.clear()
         self._ready_release_fenced.clear()
         queue = self._ring_admission
         while queue:
@@ -3945,6 +4115,7 @@ class FlashMTPDraftEngine:
                 "held_max_ns": self._ready_held_max_ns,
                 "held_p99_ns": int(2 ** ((p99 + 1) / 4)) if total else 0,
                 "held_hist": {int(b): int(hist[b]) for b in np.flatnonzero(hist)},
+                "freeze": self._ready_freeze_status(observed_ns),
             }
         last_measurement_ns = getattr(self, "_last_direct_gpu_measurement_ns", 0)
         request_evidence_ready = bool(
@@ -6097,6 +6268,8 @@ class FlashMTPDraftEngine:
             not (self._input_ready_features or self._ready_pending)
             or inflight_before >= DRAFT_COMPUTE_DEPTH
         ):
+            if self._ready_pending:  # READY rows wait out the gate (#292)
+                self._ready_gated_since_ns = time.monotonic_ns()
             self._profile_input_ready_state(
                 observed_ns=selection_started_ns,
                 waiting_transfer_ids=waiting_before,
