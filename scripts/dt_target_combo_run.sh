@@ -63,6 +63,82 @@ wait_for_local_ports_free() {
   return 1
 }
 
+preflight_environment() {
+  local required
+  for required in \
+      "$SOURCE/python-local" \
+      "$SOURCE/scripts/dt_target_combo_service.sh" \
+      "$SOURCE/scripts/dt_target_combo_benchmark.sh" \
+      "$W/profile.toml" \
+      "$W/topology-7t2d-page-ab.toml" \
+      "$W/prompts.json"; do
+    if [ ! -r "$required" ]; then
+      echo "preflight: missing or unreadable input: $required" >&2
+      return 1
+    fi
+  done
+
+  "$SOURCE/python-local" - "$W" <<'PY'
+import json
+import pathlib
+import sys
+import tomllib
+
+import torch
+
+w = pathlib.Path(sys.argv[1])
+with (w / "prompts.json").open("rb") as f:
+    prompts = json.load(f)
+with (w / "profile.toml").open("rb") as f:
+    tomllib.load(f)
+with (w / "topology-7t2d-page-ab.toml").open("rb") as f:
+    tomllib.load(f)
+if not prompts:
+    raise SystemExit("preflight: prompts.json is empty")
+if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
+    raise SystemExit(
+        f"preflight: expected 8 local CUDA devices, got {torch.cuda.device_count()}"
+    )
+PY
+
+  if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'; then
+    echo "preflight: sys-3 still has active GPU compute processes" >&2
+    return 1
+  fi
+
+  ssh -o BatchMode=yes -o ConnectTimeout=8 \
+      "${DT_SYS4_SSH_HOST:-h8004-lsh-target-ab}" 'bash -s' <<'REMOTE'
+set -euo pipefail
+test -d /home/lishuhuan/dt-v3-page-run
+test -r /share/dai-sys/models/qwen3-14b/config.json
+test "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" -eq 8
+if nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q '[0-9]'; then
+  echo "preflight: sys-4 still has active GPU compute processes" >&2
+  exit 1
+fi
+python3 - <<'PY'
+import socket
+
+ports = [
+    37900, 37901, 37902, 37903,
+    38100, 38101, 38102, 38103,
+    41300, 41301, 41302, 41303,
+]
+busy = []
+for port in ports:
+    sock = socket.socket()
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError as exc:
+        busy.append((port, str(exc)))
+    finally:
+        sock.close()
+if busy:
+    raise SystemExit(f"preflight: sys-4 ports unavailable: {busy}")
+PY
+REMOTE
+}
+
 cleanup_all() {
   cleanup_benchmark
   cleanup_service
@@ -77,6 +153,11 @@ flock 8
 printf 'acquired\n' >"$root/global-lock-acquired"
 printf 'running\n' >"$root/status.txt"
 wait_for_local_ports_free
+if ! preflight_environment >"$root/preflight.log" 2>&1; then
+  printf 'preflight-failed\n' >"$root/status.txt"
+  exit 3
+fi
+printf 'passed\n' >"$root/preflight-status.txt"
 
 for label in "${arms[@]}"; do
   arm_root="$root/$label"
