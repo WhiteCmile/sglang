@@ -179,3 +179,66 @@ def test_failed_operations_leave_cached_counts_unchanged() -> None:
     assert _scan_truth(allocator) == before
     _assert_cache_matches_scan(allocator)
 
+
+class _CountingList(list):
+    """List wrapper that makes iteration of an extent list observable."""
+
+    iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+
+def _scalar_stats(allocator: TargetSourcePageAllocator) -> tuple[int, ...]:
+    return (
+        allocator.active_lease_count,
+        allocator.free_page_count,
+        allocator.internal_fragmentation_rows,
+        allocator.allocation_count,
+        allocator.failure_count,
+        allocator.requested_rows_total,
+        allocator.allocated_rows_total,
+        allocator.internal_fragmentation_rows_total,
+        allocator.active_lease_count_high_water,
+        allocator.leased_page_count_high_water,
+    )
+
+
+def test_scalar_stats_track_success_capacity_failure_and_release() -> None:
+    allocator = TargetSourcePageAllocator(slot_count=1, slot_rows=64, page_rows=32)
+
+    lease = allocator.allocate("kept", 48)
+    assert _scalar_stats(allocator) == (1, 0, 16, 1, 0, 48, 64, 16, 1, 2)
+
+    # Invalid, duplicate, and stale operations fail before the capacity search.
+    with pytest.raises(SourcePageAllocationError, match="is active"):
+        allocator.allocate("kept", 1)
+    with pytest.raises(SourcePageAllocationError, match="fit inside"):
+        allocator.allocate("too-big", 65)
+    with pytest.raises(SourcePageAllocationError, match="unknown"):
+        allocator.release("missing")
+    with pytest.raises(SourcePageAllocationError, match="stale source slot id"):
+        allocator.release("kept", slot_id=lease.slot_id + 1)
+    assert allocator.failure_count == 0
+
+    with pytest.raises(SourcePageAllocationError, match="all bounded"):
+        allocator.allocate("overflow", 1)
+    assert _scalar_stats(allocator) == (1, 0, 16, 1, 1, 48, 64, 16, 1, 2)
+
+    # Release restores capacity but never rewinds cumulative/high-water marks.
+    allocator.release("kept")
+    assert _scalar_stats(allocator) == (0, 2, 0, 1, 1, 48, 64, 16, 1, 2)
+
+
+def test_scalar_stats_reads_do_not_iterate_extents() -> None:
+    allocator = TargetSourcePageAllocator(slot_count=2, slot_rows=128, page_rows=32)
+    allocator.allocate("a", 48)
+    for arena in allocator._arenas:
+        arena.free_extents = _CountingList(arena.free_extents)
+    before = tuple(arena.free_extents.iterations for arena in allocator._arenas)
+
+    assert _scalar_stats(allocator) == (1, 6, 16, 1, 0, 48, 64, 16, 1, 2)
+
+    assert tuple(arena.free_extents.iterations for arena in allocator._arenas) == before
+

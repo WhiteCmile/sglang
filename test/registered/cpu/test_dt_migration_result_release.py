@@ -62,7 +62,10 @@ from sglang.srt.speculative.dt_candidate_p2p import (
     TargetCandidateArena,
     _CandidateSlot,
 )
-from sglang.srt.speculative.dt_source_page_allocator import SourcePageAllocationError
+from sglang.srt.speculative.dt_source_page_allocator import (
+    SourcePageAllocationError,
+    TargetSourcePageAllocator,
+)
 from sglang.srt.speculative.dt_target import (
     DTTargetController,
     ParkedTargetRound,
@@ -2218,6 +2221,71 @@ def test_identity_reserve_release_does_not_iterate_logical_slots(monkeypatch) ->
         pool.release_reserved(slot_id, generation)
         assert pool._slots.iterations == scans
         _assert_identity_bookkeeping(pool)
+
+
+def test_pool_page_allocator_stats_forward_and_rollback(monkeypatch) -> None:
+    pool = _identity_pool(monkeypatch, slot_count=2, max_tokens=64)
+    allocator = TargetSourcePageAllocator(slot_count=1, slot_rows=64, page_rows=32)
+    pool._page_allocator = allocator
+
+    slot_id, generation, _rows = pool.reserve(48)
+    assert (
+        pool.allocation_count,
+        pool.requested_rows_total,
+        pool.allocated_rows_total,
+        pool.internal_fragmentation_rows_total,
+        pool.leased_page_count_high_water,
+    ) == (
+        allocator.allocation_count,
+        allocator.requested_rows_total,
+        allocator.allocated_rows_total,
+        allocator.internal_fragmentation_rows_total,
+        allocator.leased_page_count_high_water,
+    ) == (1, 48, 64, 16, 2)
+
+    # A rolled-back reservation restores the identity and must not inflate history.
+    assert pool.reserve(1) is None
+    assert (pool.allocation_count, pool.failure_count) == (1, 1)
+    assert pool.active_identity_high_water == 1
+    _assert_identity_bookkeeping(pool)
+
+    _publish_reserved(pool, slot_id, generation, "transfer", token_count=48)
+    assert pool.read_done(
+        transfer_id="transfer",
+        source_slot_id=slot_id,
+        slot_generation=generation,
+        source_session_id=pool.source_session_id,
+        pool_generation=pool.pool_generation,
+    )
+    assert allocator.free_page_count == allocator.total_page_count
+    assert pool.leased_page_count_high_water == 2
+
+
+def test_pool_stats_and_high_water_reads_do_not_scan_slots(monkeypatch) -> None:
+    for slot_count in (1, 2048):
+        pool = _identity_pool(monkeypatch, slot_count=slot_count)
+        pool._slots = _CountingSlots(pool._slots)
+        scans = pool._slots.iterations
+        assert (
+            pool.active_lease_count,
+            pool.active_identity_high_water,
+            pool.free_slot_count,
+            pool.reserved_slot_count,
+            pool.quarantined_slot_count,
+            pool.allocation_count,
+            pool.failure_count,
+            pool.leased_page_count_high_water,
+            pool.requested_rows_total,
+            pool.allocated_rows_total,
+            pool.internal_fragmentation_rows_total,
+        ) == (0, 0, slot_count, 0, 0, 0, 0, 0, 0, 0, 0)
+        assert pool._slots.iterations == scans
+
+        reservations = [pool.reserve(1) for _ in range(min(2, slot_count))]
+        assert pool.active_identity_high_water == len(reservations)
+        for slot_id, generation, _rows in reservations:
+            pool.release_reserved(slot_id, generation)
+        assert pool.active_identity_high_water == len(reservations)
 
 
 def test_feature_source_cancel_defers_retirement_until_producer_completion() -> None:
