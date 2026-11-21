@@ -217,14 +217,13 @@ CUresult run_job(Worker* w, const Job& job, dt_probe::Probe* p) {
 
 // One DONE record (design 7.2 step 4).  The scheduler is its only reader; a
 // full queue is an invariant violation, not a stall, so it breaks the worker.
-void emit_done(Worker* w, uint64_t seq, uint64_t gpu_done_ns, uint64_t materialize_ns,
+// False once the queue is full, which is an invariant violation (the
+// scheduler drains it on every wake, and at most two batches plus its own
+// fences can be outstanding), so the caller breaks the worker.
+bool emit_done(Worker* w, uint64_t seq, uint64_t gpu_done_ns, uint64_t materialize_ns,
                uint64_t proposal_ns, uint64_t error) {
   const uint64_t head = w->done_head.load(std::memory_order_relaxed);
-  if (head - w->done_tail.load(std::memory_order_acquire) >= kDoneSlots) {
-    w->error.store(-1);
-    w->failed.store(head + 1);
-    return;
-  }
+  if (head - w->done_tail.load(std::memory_order_acquire) >= kDoneSlots) return false;
   uint64_t* r = w->done + (head % kDoneSlots) * kDoneWords;
   r[0] = seq;
   r[1] = gpu_done_ns;
@@ -232,6 +231,7 @@ void emit_done(Worker* w, uint64_t seq, uint64_t gpu_done_ns, uint64_t materiali
   r[3] = proposal_ns;
   r[4] = error;
   w->done_head.store(head + 1, std::memory_order_release);
+  return true;
 }
 
 // A batch descriptor whose event completed (design 7.2).  `gpu_done_ns` was
@@ -254,7 +254,13 @@ void complete_batch(Worker* w, const Job& job, uint64_t gpu_done_ns, dt_probe::P
     }
     if (rc != 0) error = (uint64_t)rc;
   }
-  emit_done(w, seq, gpu_done_ns, materialize_ns, proposal_ns, error);
+  if (!emit_done(w, seq, gpu_done_ns, materialize_ns, proposal_ns, error)) {
+    // No record: done_seq must not move past a batch the scheduler cannot
+    // see, and its landing releases stay unsent (the buffer is retained).
+    w->error.store(-1);
+    w->failed.store(job.ticket);
+    return;
+  }
   if (seq) w->done_seq.store(seq, std::memory_order_release);
   if (w->wake_set) {
     timed(p, dt_probe::WAKE_SET, [&] {
@@ -334,8 +340,9 @@ void serve(Worker* w) {
         // report it and stop watching (design 7.5; the scheduler quarantines).
         w->error.store(rc);
         w->failed.store(head->ticket);
-        emit_done(w, head->words[0], dt_probe::now_ns(), 0, 0, (uint64_t)rc);
-        if (w->wake_set) w->wake_set(w->wake_word, w->done_bit);
+        if (emit_done(w, head->words[0], dt_probe::now_ns(), 0, 0, (uint64_t)rc) &&
+            w->wake_set)
+          w->wake_set(w->wake_word, w->done_bit);
         delete head;
         batches.pop_front();
         w->outstanding.fetch_sub(1, std::memory_order_release);
@@ -423,14 +430,16 @@ uint64_t enqueue(Worker* w, uint32_t kind, const uint64_t* words, uint64_t count
     if (w->failed.load() != 0) return 0;
     sched_yield();
   }
-  Job* job = new Job{head + 1, kind, std::vector<uint64_t>(words, words + count)};
-  w->ring[head % kRingSlots] = job;
+  const uint64_t ticket = head + 1;
+  w->ring[head % kRingSlots] = new Job{ticket, kind, std::vector<uint64_t>(words, words + count)};
+  // Published: the consumer owns the job from here and may already have
+  // deleted it, so the ticket must come from this thread's own copy.
   w->head.store(head + 1, std::memory_order_seq_cst);
   if (w->sleeping.load(std::memory_order_seq_cst)) {
     std::lock_guard<std::mutex> lock(w->mutex);
     w->wake.notify_one();
   }
-  return job->ticket;
+  return ticket;
 }
 
 }  // namespace
@@ -518,10 +527,10 @@ int dt_publish_worker_status(void* handle, uint64_t ticket) {
 int dt_publish_worker_drain(void* handle) {
   Worker* w = static_cast<Worker*>(handle);
   const uint64_t head = w->head.load();
-  while (w->tail.load(std::memory_order_acquire) < head && w->failed.load() == 0)
-    sched_yield();
-  while (w->outstanding.load(std::memory_order_acquire) != 0 && w->failed.load() == 0)
-    sched_yield();
+  while (w->tail.load(std::memory_order_acquire) < head) sched_yield();
+  // A broken worker still completes descriptors (it only stops *issuing*),
+  // so this terminates for the same reason the ring drain does.
+  while (w->outstanding.load(std::memory_order_acquire) != 0) sched_yield();
   w->api.cuCtxSetCurrent(w->ctx);
   const CUresult rc = w->api.cuStreamSynchronize(w->stream);
   return w->error.load() ? w->error.load() : rc;

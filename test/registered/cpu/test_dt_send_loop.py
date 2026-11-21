@@ -11,10 +11,13 @@ a GPU (design §4.3, §5.1, §7.2):
   twice) stalls or corrupts ingress placement;
 - ABSORB takes the DONE records in FIFO order and drops the batch from the
   in-flight deque *before* its Python bookkeeping, which is what makes the
-  depth gate open at the GPU done rather than after the retire work.
+  depth gate open at the GPU done rather than after the retire work.  Phase
+  one has already popped every batch by then, so a failure record must
+  quarantine the batches behind it too: nothing else still holds them.
 """
 
 import collections
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -124,3 +127,50 @@ def test_absorb_fails_stop_on_a_done_record_out_of_order():
 
     with pytest.raises(RuntimeError, match="oldest in-flight batch"):
         engine._absorb_dflash_done()
+
+
+def test_absorb_quarantines_every_popped_batch_behind_a_failure():
+    """A failure record stops the retire, but phase one already popped the
+    batches behind it: they must be quarantined, not dropped on the floor
+    with their KV and staging still owned."""
+
+    engine = _engine()
+    engine._fatal_gpu_quarantine_reason = None
+    engine._profile_active = False
+    engine._loop_stage_ns = collections.Counter()
+    engine._loop_stage_calls = collections.Counter()
+    engine._quarantined_dflash_completions = []
+    engine._quarantined_feature_draft_handles = set()
+    engine._publish_capacity = lambda: None
+    failures = []
+    engine._publish_failures = failures.append
+    engine._enter_fatal_gpu_quarantine = lambda reason: setattr(
+        engine, "_fatal_gpu_quarantine_reason", reason
+    )
+    engine._retire_dflash_completion = lambda *a, **k: pytest.fail(
+        "a batch behind a send-loop failure was retired as if it were clean"
+    )
+
+    batches = []
+    for seq in (0, 1):
+        completion = draft_mod.PendingDFlashCompletion.__new__(
+            draft_mod.PendingDFlashCompletion
+        )
+        completion.batch_seq = seq
+        completion.pending = [
+            SimpleNamespace(task=SimpleNamespace(draft_kv_handle=f"kv{seq}",
+                                                 transfer_id=f"t{seq}"))
+        ]
+        batches.append(completion)
+    engine._pending_dflash_completions = collections.deque(batches)
+    # The failed batch, then a clean record for the batch behind it.
+    records = np.array([[1, 0, 0, 0, 999], [2, 0, 0, 0, 0]], dtype=np.uint64)
+    engine._send_loop_worker = type("W", (), {"drain_done": lambda self: records})()
+
+    engine._absorb_dflash_done()
+
+    assert not engine._pending_dflash_completions
+    assert engine._quarantined_dflash_completions == batches
+    assert engine._quarantined_feature_draft_handles == {"kv0", "kv1"}
+    assert len(failures) == 2
+    assert engine._fatal_gpu_quarantine_reason

@@ -3874,6 +3874,7 @@ class FlashMTPDraftEngine:
         absorbed_ns = time.monotonic_ns()
         self._loop_stage_ns["dflash_absorb"] += absorbed_ns - stage_started_ns
         self._loop_stage_calls["dflash_absorb"] += len(retired)
+        failed = False
         for completion, gpu_done_ns, materialize_ns, proposal_ns, error in retired:
             if self._profile_active:
                 profile_emit(
@@ -3883,9 +3884,14 @@ class FlashMTPDraftEngine:
                     gpu_done_ns=gpu_done_ns,
                     absorbed_ns=absorbed_ns,
                 )
-            if error:
+            if failed or error:
                 # The send loop could not prove this batch's GPU writes have
                 # stopped (design §7.5): keep every allocation it touched.
+                # Phase one already popped every record's batch, so the ones
+                # behind the failure are quarantined too rather than dropped:
+                # nothing else holds them, and a later batch's GPU state is
+                # no more certain than the failed one's.
+                failed = True
                 tasks = [item.task for item in completion.pending]
                 self._quarantined_feature_draft_handles.update(
                     task.draft_kv_handle for task in tasks
@@ -3901,8 +3907,7 @@ class FlashMTPDraftEngine:
                 exc = RuntimeError(f"DFLASH send loop failed with rc={error}")
                 exc.resources_quiescent = False
                 self._publish_failures([(task, exc) for task in tasks])
-                self._publish_capacity()
-                return
+                continue
             self._retire_dflash_completion(
                 completion,
                 completed_ns=gpu_done_ns,
@@ -4071,6 +4076,10 @@ class FlashMTPDraftEngine:
                 if time.monotonic_ns() > deadline_ns:
                     raise RuntimeError("send loop still holds batch descriptors")
                 time.sleep(0)
+            # Every batch has published its DONE record by now.  Absorb them
+            # before the handle goes: afterwards nothing can retire them, and
+            # the shutdown drain would spin on a deque it cannot shorten.
+            self._absorb_dflash_done()
             self._send_loop_worker = None
         self._ring_worker = None
         rc = worker.destroy()
@@ -7672,20 +7681,31 @@ class FlashMTPDraftEngine:
                 raise RuntimeError("DFLASH batch submitted before the send loop")
             # HAND-OFF (design §5.1): frozen_seq is batch_seq + 1, and the
             # send loop pushes this batch's landing releases once its GPU
-            # work is done.  Nothing between the registration above and this
-            # submit may raise, or the batch would have no watcher.
-            releases = self._resolve_ready_releases(completion.ready_rows)
-            completion.ready_rows = ()
-            self._submit_batch_descriptor(
-                batch_seq + 1,
-                completion.completion_event,
-                releases,
-                timing=(
-                    materialize_start.cuda_event,
-                    materialize_done.cuda_event,
-                    proposal_done.cuda_event,
-                ),
-            )
+            # work is done.  The batch is registered and launched: if the
+            # hand-off fails there is no watcher for GPU work that is already
+            # running, so this is fatal and nothing it touched may be reused.
+            try:
+                releases = self._resolve_ready_releases(completion.ready_rows)
+                completion.ready_rows = ()
+                self._submit_batch_descriptor(
+                    batch_seq + 1,
+                    completion.completion_event,
+                    releases,
+                    timing=(
+                        materialize_start.cuda_event,
+                        materialize_done.cuda_event,
+                        proposal_done.cuda_event,
+                    ),
+                )
+            except Exception as exc:
+                self._pending_dflash_completions.remove(completion)
+                self._quarantined_dflash_completions.append(completion)
+                self._quarantined_feature_draft_handles.update(
+                    item.task.draft_kv_handle for item in completion.pending
+                )
+                exc.resources_quiescent = False
+                self._enter_fatal_gpu_quarantine("DFLASH batch hand-off failed")
+                raise
         if copy_stream is None and proposal_tasks:
             self._queue_early_candidate_push(
                 proposal_tasks, candidates, completion.completion_event
