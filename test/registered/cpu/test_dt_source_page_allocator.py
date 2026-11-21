@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import random
+
 import pytest
 from sglang.srt.speculative.dt_source_page_allocator import (
+    SourceExtentLease,
     SourcePageAllocationError,
     TargetSourcePageAllocator,
 )
@@ -84,4 +87,95 @@ def test_one_lease_never_crosses_physical_slot_boundary() -> None:
 
     with pytest.raises(SourcePageAllocationError, match="all bounded source pages"):
         allocator.allocate("needs-contiguous-slot", 64)
+
+
+def _scan_truth(allocator: TargetSourcePageAllocator) -> tuple[int, int, int]:
+    arena_leases = [
+        lease for arena in allocator._arenas for lease in arena.leases.values()
+    ]
+    assert sorted(lease.lease_id for lease in arena_leases) == sorted(
+        allocator._leases
+    )
+    return (
+        len(allocator._leases),
+        sum(count for arena in allocator._arenas for _, count in arena.free_extents),
+        sum(lease.internal_fragmentation_rows for lease in arena_leases),
+    )
+
+
+def _assert_cache_matches_scan(allocator: TargetSourcePageAllocator) -> None:
+    cached = (
+        allocator.active_lease_count,
+        allocator.free_page_count,
+        allocator.internal_fragmentation_rows,
+    )
+    assert cached == _scan_truth(allocator)
+
+
+def test_fixed_seed_transitions_keep_cached_counts_exact() -> None:
+    allocator = TargetSourcePageAllocator(slot_count=3, slot_rows=128, page_rows=32)
+    rng = random.Random(20261121)
+    active: list[SourceExtentLease] = []
+    for step in range(70):
+        if active and (len(active) >= 6 or rng.random() < 0.45):
+            lease = active.pop(rng.randrange(len(active)))
+            allocator.release(
+                lease.lease_id,
+                slot_id=lease.slot_id,
+                slot_generation=lease.slot_generation,
+            )
+        else:
+            try:
+                active.append(
+                    allocator.allocate(
+                        f"lease-{step}", rng.choice((1, 16, 32, 48, 64))
+                    )
+                )
+            except SourcePageAllocationError:
+                pass
+        _assert_cache_matches_scan(allocator)
+
+    for lease in active:
+        allocator.release(lease.lease_id)
+    assert allocator.active_lease_count == 0
+    assert allocator.free_page_count == allocator.total_page_count
+    assert allocator.internal_fragmentation_rows == 0
+    for arena in allocator._arenas:
+        assert arena.free_extents == [(0, allocator.pages_per_slot)]
+        assert not arena.leases
+
+
+def test_failed_operations_leave_cached_counts_unchanged() -> None:
+    allocator = TargetSourcePageAllocator(slot_count=1, slot_rows=128, page_rows=32)
+    for index in range(4):
+        allocator.allocate(f"page-{index}", 32)
+    before = _scan_truth(allocator)
+    with pytest.raises(SourcePageAllocationError, match="all bounded source pages"):
+        allocator.allocate("over-full", 32)
+    assert _scan_truth(allocator) == before
+    _assert_cache_matches_scan(allocator)
+
+    allocator.release("page-1")
+    before = _scan_truth(allocator)
+    with pytest.raises(SourcePageAllocationError, match="all bounded source pages"):
+        allocator.allocate("fragmented", 64)
+    assert _scan_truth(allocator) == before
+    _assert_cache_matches_scan(allocator)
+
+    live = allocator.get("page-2")
+    assert live is not None
+    with pytest.raises(SourcePageAllocationError, match="is active"):
+        allocator.allocate("page-2", 1)
+    with pytest.raises(SourcePageAllocationError, match="unknown source lease"):
+        allocator.release("missing")
+    with pytest.raises(SourcePageAllocationError, match="stale source slot id"):
+        allocator.release("page-2", slot_id=live.slot_id + 1)
+    with pytest.raises(SourcePageAllocationError, match="stale source slot generation"):
+        allocator.release(
+            "page-2",
+            slot_id=live.slot_id,
+            slot_generation=live.slot_generation + 1,
+        )
+    assert _scan_truth(allocator) == before
+    _assert_cache_matches_scan(allocator)
 
