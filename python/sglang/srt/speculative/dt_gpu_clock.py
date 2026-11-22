@@ -110,3 +110,13 @@ class GpuClock:
             self._calibrate()
         value = int(self._slots[slot])
         return value + self._offset_ns if value else 0
+
+    def read_raw(self, slot: int) -> int:
+        """Raw %globaltimer of a completed stamp (0 if not written).
+
+        Same clock domain as the ring publish kernel's hidden_produced_ns
+        (dt_ring_publish.cu), so GPU-side hops join without the host offset
+        (issue #303).
+        """
+
+        return int(self._slots[slot])

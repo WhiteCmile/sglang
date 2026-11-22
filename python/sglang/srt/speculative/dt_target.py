@@ -421,6 +421,15 @@ class DTTargetController:
     candidate_transport = "mmap"
     _candidate_arena = None
     target_phase_profile_enabled = False
+    # P0 (issue #303) stamp state; class defaults keep object-level
+    # constructions on the untraced path.
+    _profile_active = False
+    _last_poll_broadcast_ns = 0
+    _last_poll_receive_ns = 0
+    _last_ready_snapshot_ns = 0
+    _driver_stats_dump_ns = 0
+    _capacity_gauge_emit_ns = 0
+    _arena_active_high_water = 0
 
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
 
@@ -445,6 +454,19 @@ class DTTargetController:
         self._eagle3_host_span_startup_flushed = False
         self._eagle3_host_span_flushed_health_ids: set[str] = set()
         self._profile_active = bool(os.environ.get("DT_PROFILE_DIR"))
+        # Issue #303 (P0 per-hop stamps).  All of this is inert unless
+        # _profile_active: no clock reads, no syscalls, no allocation.
+        self._last_poll_broadcast_ns = 0
+        self._last_poll_receive_ns = 0
+        self._last_ready_snapshot_ns = 0
+        self._driver_stats_dump_ns = 0
+        self._capacity_gauge_emit_ns = 0
+        self._arena_active_high_water = 0
+        self._gc_trace_events: deque = deque()
+        self._gc_gen2_collections = 0
+        self._gc_trace_started_ns = 0
+        if self._profile_active:
+            self._install_gc_probe()
         self.server_args = scheduler.server_args
         self.instance_id = self.server_args.draft_target_instance_id
         self.profile_id = self.server_args.draft_target_profile_id
@@ -1068,7 +1090,12 @@ class DTTargetController:
                     # Includes partial D2H submissions on failure. The scheduler
                     # also records copy_done after its ordinary result copies.
                     done = self.scheduler.device_module.Event()
+                    driver_t0 = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
                     done.record()
+                    if self._profile_active:
+                        self._driver_record("cuda_event_record", driver_t0)
                     batch_result.dt_deferred_feature_copy_done = done
                     if getattr(self, "_ring_publish_at_launch", False):
                         # Q15b: enqueue the wave's ring publish kernel on the
@@ -2265,7 +2292,12 @@ class DTTargetController:
                         staged_rows,
                         scalar_copy_done,
                     ) = staged_scalar_copies
+                    driver_t0 = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
                     scalar_copy_done.synchronize()
+                    if self._profile_active:
+                        self._driver_record("cuda_event_sync", driver_t0)
                     bonus_list = bonus_cpu.tolist()
                     seq_len_list = seq_lens_cpu.tolist()
                     for position, spec in enumerate(specs):
@@ -3357,6 +3389,15 @@ class DTTargetController:
         self._overlap_result_ready = result_ready
         self.hold_next_batch = bool(hold_next_batch)
         self._feature_source_free_slots = feature_source_free_slots
+        if self._profile_active:
+            # P0 (issue #303): the READY snapshot stamp carried by the packet
+            # and this loop's TP exchange cost, consumed by the per-loop and
+            # per-wave trace events.
+            self._last_poll_broadcast_ns = broadcast_ns
+            self._last_poll_receive_ns = receive_ns
+            self._last_ready_snapshot_ns = poll_now_ns
+            self._drain_gc_trace_events()
+            self._maybe_dump_driver_stats(time.monotonic_ns())
         if ring_publish_fatal:
             # A publication failure is fatal on the export rank; the other
             # ranks learn it here rather than through a per-wave broadcast.
@@ -3530,6 +3571,148 @@ class DTTargetController:
             poll_finished_ns=poll_finished_ns,
         )
 
+    def _install_gc_probe(self) -> None:
+        """Measure Python GC on the Target scheduler (issue #303, profile-only).
+
+        Same gc.callbacks method as the Coordinator's D7c probe
+        (dt_coordinator/service.py): the callback only timestamps and queues,
+        the scheduler's poll drains and emits, so no emit happens inside a
+        collection and the untraced path installs nothing.
+        """
+
+        import gc
+
+        def _gc_callback(phase: str, info: dict) -> None:
+            if phase == "start":
+                self._gc_trace_started_ns = time.monotonic_ns()
+            elif phase == "stop" and info.get("generation") == 2:
+                duration_ns = time.monotonic_ns() - self._gc_trace_started_ns
+                self._gc_gen2_collections += 1
+                gen0, gen1, gen2 = gc.get_count()
+                self._gc_trace_events.append(
+                    (
+                        duration_ns,
+                        int(info.get("collected", 0)),
+                        int(info.get("uncollectable", 0)),
+                        self._gc_gen2_collections,
+                        (gen0, gen1, gen2),
+                        len(gc.get_objects()),
+                    )
+                )
+
+        gc.callbacks.append(_gc_callback)
+        self._gc_callback = _gc_callback
+        # Proof of installation: with zero gen-2 collections in a leg this is
+        # the only evidence the probe was live (issue #303).
+        self._profile_emit("target_gc_probe", thresholds=tuple(gc.get_threshold()))
+
+    def _drain_gc_trace_events(self) -> None:
+        events = getattr(self, "_gc_trace_events", None)
+        if not events:
+            return
+        while events:
+            (
+                duration_ns,
+                collected,
+                uncollectable,
+                collections,
+                pending,
+                tracked_objects,
+            ) = events.popleft()
+            self._profile_emit(
+                "target_gc",
+                duration_ns=duration_ns,
+                collected=collected,
+                uncollectable=uncollectable,
+                collections=collections,
+                pending=pending,
+                tracked_objects=tracked_objects,
+            )
+
+    def _driver_record(self, name: str, started_ns: int) -> None:
+        from sglang.srt.speculative.dt_driver_stats import DRIVER_CALL_STATS
+
+        DRIVER_CALL_STATS.record(name, time.monotonic_ns() - started_ns)
+
+    def _maybe_dump_driver_stats(self, now_ns: int) -> None:
+        """Dump accumulated driver-call histograms about every 5 s (TP0)."""
+
+        if now_ns - self._driver_stats_dump_ns < 5_000_000_000:
+            return
+        self._driver_stats_dump_ns = now_ns
+        from sglang.srt.speculative.dt_driver_stats import DRIVER_CALL_STATS
+
+        rows = DRIVER_CALL_STATS.snapshot_and_reset()
+        if rows:
+            self._profile_emit(
+                "target_driver_call_hist",
+                sites={
+                    name: {
+                        "count": row[0],
+                        "total_ns": row[1],
+                        "max_ns": row[2],
+                        "buckets": row[3],
+                    }
+                    for name, row in sorted(rows.items())
+                },
+            )
+        # Cumulative GC counters: authoritative gen-2 counts even when no
+        # collection ran (the gc.callbacks probe sees none), plus the
+        # tracked-object series (issue #303, item 4).  Only reached on the
+        # profiled path (poll() gates the call above).
+        import gc
+
+        stats = gc.get_stats()
+        self._profile_emit(
+            "target_gc_stats",
+            gen_collections=tuple(int(s["collections"]) for s in stats),
+            gen_collected=tuple(int(s["collected"]) for s in stats),
+            gen_uncollectable=tuple(int(s["uncollectable"]) for s in stats),
+            tracked_objects=len(gc.get_objects()),
+        )
+
+    def _emit_capacity_gauge(self, now_ns: int) -> None:
+        """Per-poll arena/ring gauge: occupancy high-water and credit stalls.
+
+        Emitted at most every 200 ms (or when the arena high-water moves);
+        per-poll emission would flood the trace while the loop idles.
+        """
+
+        arena = self._candidate_arena
+        # O(1) read for the throttle; the O(slot_count) gauges below run
+        # only when this emission actually happens.
+        arena_active = arena.active_count if arena is not None else 0
+        high_water = max(self._arena_active_high_water, arena_active)
+        if (
+            high_water == self._arena_active_high_water
+            and now_ns - self._capacity_gauge_emit_ns < 200_000_000
+        ):
+            return
+        self._arena_active_high_water = high_water
+        self._capacity_gauge_emit_ns = now_ns
+        arena_free = arena_quarantined = 0
+        if arena is not None:
+            arena_free = arena.free_slot_count
+            arena_quarantined = arena.quarantined_slot_count
+        writers = getattr(self, "_ring_writers", {})
+        ring_free = (
+            min(writer.free_entries() for writer in writers.values())
+            if writers
+            else 0
+        )
+        self._profile_emit(
+            "target_capacity",
+            arena_free=arena_free,
+            arena_active=arena_active,
+            arena_quarantined=arena_quarantined,
+            arena_active_high_water=high_water,
+            ring_free_min=ring_free,
+            ring_outstanding=sum(
+                len(outstanding)
+                for outstanding in getattr(self, "_ring_outstanding", {}).values()
+            ),
+        )
+
     def _verify_gpu_clock(self):
         clock = getattr(self, "_gpu_clock", None)
         if clock is None and os.environ.get("DT_GPU_CLOCK", "0") == "1":
@@ -3552,12 +3735,16 @@ class DTTargetController:
         while pending:
             observation = pending.popleft()
             try:
+                query_started_ns = time.monotonic_ns()
                 if (
                     not observation.start_observed_ns
                     and observation.start_event.query()
                 ):
                     observation.start_observed_ns = time.monotonic_ns()
+                self._driver_record("cuda_event_query", query_started_ns)
+                query_started_ns = time.monotonic_ns()
                 end_ready = bool(observation.end_event.query())
+                self._driver_record("cuda_event_query", query_started_ns)
             except Exception as exc:
                 self._profile_emit(
                     "target_verify_cuda_observation_error",
@@ -3566,11 +3753,16 @@ class DTTargetController:
                     reason=type(exc).__name__,
                 )
                 continue
-            if not end_ready or (
-                observation.clock_done is not None and not observation.clock_done.query()
-            ):
+            if not end_ready:
                 retained.append(observation)
                 continue
+            if observation.clock_done is not None:
+                query_started_ns = time.monotonic_ns()
+                clock_done_ready = bool(observation.clock_done.query())
+                self._driver_record("cuda_event_query", query_started_ns)
+                if not clock_done_ready:
+                    retained.append(observation)
+                    continue
             end_observed_ns = time.monotonic_ns()
             if not observation.start_observed_ns:
                 observation.start_observed_ns = end_observed_ns
@@ -3605,6 +3797,13 @@ class DTTargetController:
                     if observation.clock_slot >= 0
                     else 0
                 ),
+                # Raw %globaltimer: joins the ring record's hidden_produced_ns
+                # (same GPU clock domain) without the host offset (issue #303).
+                gpu_end_clock_raw_ns=(
+                    self._gpu_clock.read_raw(observation.clock_slot)
+                    if observation.clock_slot >= 0
+                    else 0
+                ),
             )
             self._last_target_verify_end_event = observation.end_event
         self._pending_target_gpu_observations = retained
@@ -3631,6 +3830,9 @@ class DTTargetController:
             started_ns=iteration_started_ns,
             recv_ns=receive_finished_ns - iteration_started_ns,
             poll_ns=poll_finished_ns - receive_finished_ns,
+            poll_receive_ns=self._last_poll_receive_ns,
+            tp_broadcast_ns=self._last_poll_broadcast_ns,
+            ready_snapshot_ns=self._last_ready_snapshot_ns,
             select_ns=(
                 selection_finished_ns - poll_finished_ns
                 if selection_finished_ns >= poll_finished_ns
@@ -4279,9 +4481,15 @@ class DTTargetController:
             self._freeze_inflight.popleft()
         self._freeze_inflight.popleft()
         copy_done = result.copy_done
+        driver_t0 = time.monotonic_ns() if self._profile_active else 0
         exact = not copy_done.query()
+        if self._profile_active:
+            self._driver_record("cuda_event_query", driver_t0)
         if exact:
+            driver_t0 = time.monotonic_ns() if self._profile_active else 0
             copy_done.synchronize()
+            if self._profile_active:
+                self._driver_record("cuda_event_sync", driver_t0)
         done_ns = record[3] or time.monotonic_ns()
         exact = exact or bool(record[3])
         busy_ns = done_ns - max(record[1], self._freeze_last_done_ns)
@@ -4446,6 +4654,11 @@ class DTTargetController:
             return None
 
         started_ns = time.monotonic_ns()
+        missed_freeze_rows = (
+            self._candidate_arena.ready_pending_count()
+            if trace_build and self._candidate_arena is not None
+            else 0
+        )
 
         for state in ready:
             self._parked.pop(state.transfer_id)
@@ -4526,6 +4739,7 @@ class DTTargetController:
             time.monotonic_ns() if breakdown_active else seq_lens_derived_ns
         )
 
+        wire_broadcast_ns = 0
         direct_candidates = any(
             state.candidate_completion is not None for state in ready
         )
@@ -4548,8 +4762,16 @@ class DTTargetController:
             candidate_cpu_ns = (
                 time.monotonic_ns() if breakdown_active else bonus_tokens_ns
             )
+            wire_broadcast_started_ns = (
+                time.monotonic_ns() if breakdown_active else 0
+            )
             if self.scheduler.ps.tp_size > 1:
                 self.scheduler.tp_group.broadcast(wire_tokens, src=0)
+            wire_broadcast_ns = (
+                time.monotonic_ns() - wire_broadcast_started_ns
+                if breakdown_active
+                else 0
+            )
             draft_tokens = wire_tokens.to(dtype=torch.int64)
             if self.is_export_rank:
                 self._candidate_arena.finish_read(completions)
@@ -4664,6 +4886,10 @@ class DTTargetController:
                 selection_finished_ns=started_ns,
                 build_started_ns=started_ns,
                 build_finished_ns=finished_ns,
+                ready_snapshot_ns=self._last_ready_snapshot_ns,
+                tp_broadcast_ns=self._last_poll_broadcast_ns,
+                missed_freeze_rows=missed_freeze_rows,
+                wire_broadcast_ns=wire_broadcast_ns,
                 result_batch_ids=result_batch_ids,
                 oldest_result_age_ns=(
                     finished_ns - min(result_received_ns)
@@ -5501,6 +5727,13 @@ class DTTargetController:
                     ),
                 )
             self._ledger.begin(dispatch_batch)
+            if self._profile_active:
+                self._profile_emit(
+                    "target_ledger_begin",
+                    batch_id=dispatch_batch.batch_id,
+                    entries=len(dispatch_batch.entries),
+                    ledger_begin_ns=time.monotonic_ns(),
+                )
             lease_marks = getattr(self, "_lease_marks", None)
             if lease_marks:
                 # A ring copy written before a submit that did not go out is
@@ -5777,6 +6010,8 @@ class DTTargetController:
         mark("expire_leases_ns")
         self._maybe_emit_lifecycle_status()
         mark("lifecycle_ns")
+        if profile_receive:
+            self._emit_capacity_gauge(time.monotonic_ns())
         return events, receive_parts
 
     def _lifecycle_status(self) -> dict[str, object]:
@@ -7111,9 +7346,13 @@ class DTTargetController:
         batch_result.dt_ring_publish_launch = launch
         batch_result.dt_ring_publish_launch_error = launch_error
 
-    def _launch_fallback(self, reason: str):
+    def _launch_fallback(self, batch, reason: str):
         if self._profile_active:
-            self._profile_emit("target_ring_publish_launch_fallback", reason=reason)
+            self._profile_emit(
+                "target_ring_publish_launch_fallback",
+                reason=reason,
+                wave_id=getattr(batch, "dt_full_wave_id", None),
+            )
         return None
 
     def _dflash_ring_publish_at_launch_impl(
@@ -7130,9 +7369,9 @@ class DTTargetController:
         if self.is_eagle3:
             return None
         if getattr(batch_result, "dt_deferred_feature_error", None) is not None:
-            return self._launch_fallback("deferred_error")
+            return self._launch_fallback(batch, "deferred_error")
         if getattr(batch_result, "dt_deferred_prefill_feature_stage", False):
-            return self._launch_fallback("prefill")
+            return self._launch_fallback(batch, "prefill")
         pool = self._feature_source_pool
         if (
             pool is None
@@ -7148,17 +7387,17 @@ class DTTargetController:
             return None
         feature_offsets = draft_input.dt_feature_offsets
         if feature_offsets is None or len(feature_offsets) != len(batch.reqs):
-            return self._launch_fallback("feature_offsets")
+            return self._launch_fallback(batch, "feature_offsets")
         accept_lens = getattr(batch_result, "accept_lens", None)
         if accept_lens is None or not accept_lens.is_cuda:
-            return self._launch_fallback("accept_lens")
+            return self._launch_fallback(batch, "accept_lens")
         if (
             getattr(draft_input, "bonus_tokens", None) is None
             or not draft_input.bonus_tokens.is_cuda
             or getattr(draft_input, "new_seq_lens", None) is None
             or not draft_input.new_seq_lens.is_cuda
         ):
-            return self._launch_fallback("scalars")
+            return self._launch_fallback(batch, "scalars")
         candidates_gpu = getattr(batch_result, "dt_dflash_candidate_tokens", None)
         packed = getattr(batch_result, "dt_dflash_packed_hidden", None)
         if (
@@ -7169,15 +7408,15 @@ class DTTargetController:
             or not packed.is_cuda
             or int(packed.shape[0]) != len(batch.reqs) * self.block_size
         ):
-            return self._launch_fallback("tensors")
+            return self._launch_fallback(batch, "tensors")
         reservation = getattr(self, "_inplace_hidden", {}).get(packed.data_ptr())
         if reservation is None:
             # No in-place slot lease from the forward: the park path owns the
             # fresh reserve + pack fallback.
-            return self._launch_fallback("no_inplace")
+            return self._launch_fallback(batch, "no_inplace")
         slot_id, generation, ready_event = reservation
         if not batch.reqs or len(batch.reqs) > V2_MAX_REQ:
-            return self._launch_fallback("geometry")
+            return self._launch_fallback(batch, "geometry")
         publish_started_ns = time.monotonic_ns()
         _marks = []
         _mark_last = publish_started_ns
@@ -7210,7 +7449,7 @@ class DTTargetController:
                 # Attempts are assigned by an earlier wave's park; a verify
                 # wave always carries one.  Never invent one at launch: the
                 # assignment must stay on the TP-consistent park path.
-                return self._launch_fallback("attempt")
+                return self._launch_fallback(batch, "attempt")
             if round_id == 0:
                 if offset != 0 or previous_committed is not None:
                     raise RuntimeError("DFLASH bootstrap must begin at offset zero")
@@ -7224,15 +7463,15 @@ class DTTargetController:
             binding = self._draft_binding.get(req.rid)
             if binding is None:
                 # Round-0/bootstrap rounds have no owner lease yet; Python path.
-                return self._launch_fallback("binding")
+                return self._launch_fallback(batch, "binding")
             if session_id is None:
                 session_id = binding[1]
                 publisher = self._ring_publish_publisher(session_id)
                 if publisher is None:
-                    return self._launch_fallback("publisher")
+                    return self._launch_fallback(batch, "publisher")
             elif binding[1] != session_id:
                 # One ring record describes one wave to one owner Draft session.
-                return self._launch_fallback("sessions")
+                return self._launch_fallback(batch, "sessions")
             if (
                 req is chunked_req
                 or getattr(req, "inflight_middle_chunks", 0) > 0
@@ -7242,7 +7481,7 @@ class DTTargetController:
                 # the record carries no requires_proposal bit.  At launch the
                 # count cannot yet include this wave's own registration, so a
                 # nonzero value is a genuine second in-flight batch.
-                return self._launch_fallback("inflight")
+                return self._launch_fallback(batch, "inflight")
             staged_meta.append(
                 (index, req, offset, round_id, attempt, draft_kv_handle)
             )
@@ -7257,12 +7496,12 @@ class DTTargetController:
                 )
             )
         if not staged_meta:
-            return self._launch_fallback("empty")
+            return self._launch_fallback(batch, "empty")
         if session_id in getattr(self, "_ring_publish_backpressure", ()):
             # An earlier wave of this Draft session is arena-retained; its
             # ring slots must not be reused until its cleanup lands, so no
             # new record publishes on this ring in the meantime.
-            return self._launch_fallback("backpressure")
+            return self._launch_fallback(batch, "backpressure")
         _mark("eligibility")
         # The exact token total lands in the record from the device counts;
         # only the record-geometry bound is decided here, so use the wave's
@@ -7270,9 +7509,9 @@ class DTTargetController:
         token_bound = len(staged_meta) * self.block_size
         row_count = int(packed.shape[0])
         if token_bound > V2_MAX_TOK or publisher.free_entries() <= 0:
-            return self._launch_fallback("credit")
+            return self._launch_fallback(batch, "credit")
         if row_count * self.pivot_width * 2 > publisher.writer.max_entry_bytes:
-            return self._launch_fallback("landing")
+            return self._launch_fallback(batch, "landing")
         # Ring credit is claimed before the kernel goes on the stream (the
         # free-entries check above); candidate destinations are deliberately
         # NOT reserved here.  A launch reservation holds its arena slot from
@@ -7316,7 +7555,7 @@ class DTTargetController:
             # the wave to the park path, exactly as for any other
             # ineligibility, instead of quarantining a healthy slot.
             self._inplace_hidden[packed.data_ptr()] = reservation
-            return self._launch_fallback("publish")
+            return self._launch_fallback(batch, "publish")
         except Exception:
             # The kernel never went out: restore the in-place lease so the
             # park path sees this wave exactly as if launch staging had not
@@ -7381,7 +7620,8 @@ class DTTargetController:
         publisher.stage_requests(entries, staging_slot=staging_slot)
         source_byte_offset = pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
         try:
-            return publisher.publish(
+            driver_t0 = time.monotonic_ns() if self._profile_active else 0
+            wave_seq = publisher.publish(
                 stream=int(self.scheduler.forward_stream.cuda_stream),
                 active_slots=[index for index, *_ in staged_meta],
                 slot_id=slot_id,
@@ -7397,6 +7637,9 @@ class DTTargetController:
                 token_total=token_bound,
                 staging_slot=staging_slot,
             )
+            if self._profile_active:
+                self._driver_record("ring_publish_kernel", driver_t0)
+            return wave_seq
         except DirectRingError:
             # publish() raises DirectRingError only from validation that runs
             # before the kernel is enqueued and before any ring state
@@ -7445,6 +7688,15 @@ class DTTargetController:
             ),
         )
         self._ring_publish_pending.append(wave)
+        if self._profile_active:
+            self._profile_emit(
+                "target_ring_wave",
+                wave_id=getattr(batch, "dt_full_wave_id", None),
+                path="launch",
+                records=tuple(
+                    (record.session_id, record.wave_seq) for record in wave.records
+                ),
+            )
         batch_result.dt_ring_publish_wave = wave
         batch_result.dt_ring_publish_breakdown = launch.marks
         batch_result.dt_dflash_feature_publish_ns = launch.publish_ns
@@ -7687,7 +7939,12 @@ class DTTargetController:
                     ready_event = events.get(slot_id)
                     if ready_event is None:
                         ready_event = events[slot_id] = torch.cuda.Event(interprocess=True)
+                    driver_t0 = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
                     ready_event.record()
+                    if self._profile_active:
+                        self._driver_record("cuda_event_record", driver_t0)
                 except Exception:
                     pool.release_reserved(slot_id, generation)
                     raise
@@ -7700,7 +7957,10 @@ class DTTargetController:
                     self._slot_event_handles[slot_id] = event_handle
                 # Same WAR edge as the Python publication: a later graph replay on
                 # the forward stream may not overwrite the rows before the pull.
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 self.scheduler.forward_stream.wait_event(ready_event)
+                if self._profile_active:
+                    self._driver_record("cuda_stream_wait_event", driver_t0)
                 _mark("handle_war")
                 publisher.stage_requests(entries)
                 _mark("entries")
@@ -7722,6 +7982,7 @@ class DTTargetController:
                     stream_ptr = self._ring_publish_stream_ptr = (
                         torch.cuda.current_stream().cuda_stream
                     )
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 wave_seq = publisher.publish(
                     stream=stream_ptr,
                     active_slots=[index for _p, index, _e in group_rows],
@@ -7737,6 +7998,8 @@ class DTTargetController:
                     offset_stride=offset_stride,
                     token_total=token_total,
                 )
+                if self._profile_active:
+                    self._driver_record("ring_publish_kernel", driver_t0)
                 published_wave = True
                 # The kernel also reads the verify's GPU scalars and candidate
                 # tokens; hold the next graph replay off those buffers until it
@@ -7746,8 +8009,14 @@ class DTTargetController:
                 kernel_done = getattr(self, "_ring_publish_done_event", None)
                 if kernel_done is None:
                     kernel_done = self._ring_publish_done_event = torch.cuda.Event()
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 kernel_done.record()
+                if self._profile_active:
+                    self._driver_record("cuda_event_record", driver_t0)
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 self.scheduler.forward_stream.wait_event(kernel_done)
+                if self._profile_active:
+                    self._driver_record("cuda_stream_wait_event", driver_t0)
                 _mark("stage_launch")
             except Exception as exc:
                 if published_wave:
@@ -7807,7 +8076,10 @@ class DTTargetController:
                 ready_event = events.get(slot_id)
                 if ready_event is None:
                     ready_event = events[slot_id] = torch.cuda.Event(interprocess=True)
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 ready_event.record()
+                if self._profile_active:
+                    self._driver_record("cuda_event_record", driver_t0)
             except Exception:
                 pool.release_reserved(slot_id, generation)
                 raise
@@ -7818,7 +8090,10 @@ class DTTargetController:
                 if event_handle is None:
                     event_handle = ready_event.ipc_handle()
                     self._slot_event_handles[slot_id] = event_handle
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 self.scheduler.forward_stream.wait_event(ready_event)
+                if self._profile_active:
+                    self._driver_record("cuda_stream_wait_event", driver_t0)
                 _mark("handle_war")
                 # The kernels read the per-slot accept counts straight from the
                 # verify's GPU tensor (same int32 layout as the staged copy);
@@ -7858,6 +8133,9 @@ class DTTargetController:
                         + slot_id * pool._slot_nbytes
                         + row_cursor * self.pivot_width * 2
                     )
+                    driver_t0 = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
                     wave_seq = publisher.publish(
                         stream=stream_ptr,
                         active_slots=[index for _p, index, _e in group_rows],
@@ -7874,6 +8152,8 @@ class DTTargetController:
                         token_total=token_total,
                         staging_slot=staging_slot,
                     )
+                    if self._profile_active:
+                        self._driver_record("ring_publish_kernel", driver_t0)
                     published_wave = True
                     records.append(
                         RingPublishRecord(
@@ -7895,8 +8175,14 @@ class DTTargetController:
                 kernel_done = getattr(self, "_ring_publish_done_event", None)
                 if kernel_done is None:
                     kernel_done = self._ring_publish_done_event = torch.cuda.Event()
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 kernel_done.record()
+                if self._profile_active:
+                    self._driver_record("cuda_event_record", driver_t0)
+                driver_t0 = time.monotonic_ns() if self._profile_active else 0
                 self.scheduler.forward_stream.wait_event(kernel_done)
+                if self._profile_active:
+                    self._driver_record("cuda_stream_wait_event", driver_t0)
                 _mark("stage_launch")
             except Exception as exc:
                 if published_wave:
@@ -7924,6 +8210,15 @@ class DTTargetController:
             records=records,
         )
         self._ring_publish_pending.append(wave)
+        if self._profile_active:
+            self._profile_emit(
+                "target_ring_wave",
+                wave_id=getattr(batch, "dt_full_wave_id", None),
+                path="park",
+                records=tuple(
+                    (record.session_id, record.wave_seq) for record in wave.records
+                ),
+            )
         _mark("wave_build")
         batch_result.dt_ring_publish_wave = wave
         batch_result.dt_ring_publish_breakdown = tuple(_marks)
@@ -8058,6 +8353,17 @@ class DTTargetController:
                         hidden_produced_ns,
                         slot_seq,
                     ]
+                    if self._profile_active:
+                        # H3 (issue #303): the kernel's %globaltimer stamp joins
+                        # the wave's gpu_end_clock_raw_ns; first_visible_ns is
+                        # the host sighting at this poll.
+                        self._profile_emit(
+                            "target_ring_record",
+                            ring_seq=record.wave_seq,
+                            draft_session_id=record.session_id,
+                            hidden_produced_ns=hidden_produced_ns,
+                            first_visible_ns=time.monotonic_ns(),
+                        )
                 else:
                     # Snapshotted records proceed from the snapshot even if
                     # the producer has wrapped (the Drafts consume records
@@ -8173,6 +8479,14 @@ class DTTargetController:
                             self._candidate_arena._metadata_buffer.allocation_offset
                         ),
                     )
+                    if self._profile_active:
+                        self._profile_emit(
+                            "target_dest_write",
+                            ring_seq=record.wave_seq,
+                            draft_session_id=record.session_id,
+                            rows=len(specs),
+                            dest_written_ns=time.monotonic_ns(),
+                        )
             # Publish the source slot exactly once, now that every record is
             # visible: all records name disjoint ranges of its rows.
             hidden_produced_ns = max(record.record[5] for record in wave.records)
@@ -8419,6 +8733,16 @@ class DTTargetController:
                                 owner_epoch=rp_binding[2],
                             )
                         )
+                        if self._profile_active:
+                            self._profile_emit(
+                                "target_authorize",
+                                transfer_id=task.transfer_id,
+                                request_id=task.request_id,
+                                round_id=task.round_id,
+                                draft_session_id=rp_binding[1],
+                                ring_seq=int(task.direct_ring_seq or 0),
+                                authorized_ns=time.monotonic_ns(),
+                            )
                     except CandidateTransportError:
                         logger.warning(
                             "owner lease cannot authorize %s; confirmation only",
@@ -8476,6 +8800,16 @@ class DTTargetController:
                         owner_epoch=epoch,
                     )
                 )
+                if self._profile_active:
+                    self._profile_emit(
+                        "target_authorize",
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        draft_session_id=session_id,
+                        ring_seq=int(ring_task.direct_ring_seq or 0),
+                        authorized_ns=time.monotonic_ns(),
+                    )
             except CandidateTransportError:
                 logger.warning(
                     "owner lease cannot authorize %s; using the Coordinator path",
@@ -8501,6 +8835,9 @@ class DTTargetController:
                     self._remote_ring_sessions[task.transfer_id] = session_id
                     self._direct_sent.add(task.transfer_id)
                 try:
+                    write_started_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
                     if source is None:
                         seq = writer.write(payload=payload, has_pull=False)
                     else:
@@ -8513,6 +8850,8 @@ class DTTargetController:
                             slot_generation=source.slot_generation,
                             event_handle=source.producer_event_handle,
                         )
+                    if self._profile_active:
+                        self._driver_record("rdma_ring_write", write_started_ns)
                 except RdmaTransportError:
                     seq = None
                 except BaseException:
@@ -8707,6 +9046,16 @@ class DTTargetController:
                 blocked_since.pop(draft_session_id, None)
                 outstanding.popleft()
                 self._ring_unproven.pop(transfer_id, None)
+                if self._profile_active:
+                    # H5, same-host (issue #303): the Draft worker's
+                    # INPUT_READY read proof was first seen by this poll.
+                    self._profile_emit(
+                        "target_ring_read_proven",
+                        ring_seq=seq,
+                        transfer_id=transfer_id,
+                        draft_session_id=draft_session_id,
+                        read_proven_ns=now_ns,
+                    )
                 if pull is None or pool is None:
                     continue
                 proven = self._ring_proven

@@ -69,6 +69,11 @@ from sglang.srt.speculative.dt_cuda_ipc import (
     CudaIpcRuntime,
     register_buffers,
 )
+from sglang.srt.speculative.dt_driver_stats import DRIVER_CALL_STATS
+
+# Issue #303 (Q8): with tracing on, time the scheduler thread's CUDA event
+# queries for the driver-call histogram; with it off there is no extra work.
+_PROFILE_DRIVER_CALLS = bool(os.environ.get("DT_PROFILE_DIR"))
 
 METADATA_WORDS = 5
 GENERATION_WORD = 0
@@ -498,6 +503,8 @@ class _RecordObserver:
         lib.dt_record_observer_kick.restype = ctypes.c_int
         lib.dt_record_observer_ready_snapshot.argtypes = [vp, vp, u64]
         lib.dt_record_observer_ready_snapshot.restype = u64
+        lib.dt_record_observer_ready_pending.argtypes = [vp]
+        lib.dt_record_observer_ready_pending.restype = u64
         lib.dt_record_observer_drain.argtypes = [vp, u64, vp, u64]
         lib.dt_record_observer_drain.restype = u64
         lib.dt_record_observer_dropped.argtypes = [vp]
@@ -584,6 +591,14 @@ class _RecordObserver:
 
         if self._handle:
             self._lib.dt_record_observer_kick(self._handle)
+
+    @property
+    def ready_pending(self) -> int:
+        """Published READY-table rows no snapshot has returned yet (issue #303)."""
+
+        if not self._handle:
+            return 0
+        return int(self._lib.dt_record_observer_ready_pending(self._handle))
 
     def drain(self, kind: int) -> list[tuple[int, int, int, int]]:
         """Pop up to ``_capacity`` legacy READY-record arrivals."""
@@ -1699,7 +1714,14 @@ class TargetCandidateArena:
             if event is None:
                 continue
             try:
-                ready = bool(event.query())
+                if _PROFILE_DRIVER_CALLS:
+                    query_started_ns = time.monotonic_ns()
+                    ready = bool(event.query())
+                    DRIVER_CALL_STATS.record(
+                        "cuda_event_query", time.monotonic_ns() - query_started_ns
+                    )
+                else:
+                    ready = bool(event.query())
             except Exception as exc:
                 with self._lock:
                     slot.state = CandidateSlotState.QUARANTINED
@@ -1997,6 +2019,18 @@ class TargetCandidateArena:
                 except Exception:  # noqa: BLE001 - the lease stays fenced
                     logger.exception("remote record listener failed for %s", proof[0])
         return accepted
+
+    def ready_pending_count(self) -> int:
+        """Rows the observer marked READY that no snapshot has returned yet.
+
+        Issue #303's missed-freeze gauge: a wave frozen now cannot include
+        them even though their completion records already landed.  Called
+        only from profiled freeze stamps, so the untraced path never pays
+        for the native call.
+        """
+
+        observer = getattr(self, "_observer", None)
+        return observer.ready_pending if observer is not None else 0
 
     def _observer_overflowed(self, observer: _RecordObserver) -> bool:
         """Report once whether the observer ring overflowed since last drain.
@@ -2335,7 +2369,14 @@ class TargetCandidateArena:
             if event is None:
                 continue
             try:
-                ready = bool(event.query())
+                if _PROFILE_DRIVER_CALLS:
+                    query_started_ns = time.monotonic_ns()
+                    ready = bool(event.query())
+                    DRIVER_CALL_STATS.record(
+                        "cuda_event_query", time.monotonic_ns() - query_started_ns
+                    )
+                else:
+                    ready = bool(event.query())
             except Exception as exc:
                 with self._lock:
                     self._slots[slot_id].state = CandidateSlotState.QUARANTINED

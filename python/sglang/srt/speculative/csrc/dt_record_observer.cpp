@@ -133,9 +133,14 @@ struct Observer {
   uint64_t* reported_seq = nullptr;
   uint32_t* reported_gen = nullptr;
   // Native READY table (observer publishes) and the snapshot thread's
-  // per-slot high-water mark of what it has already returned.
+  // per-slot high-water mark of what it has already returned.  The two
+  // monotonic counters let the scheduler ask how many published rows no
+  // snapshot has returned yet (issue #303's missed-freeze gauge) without
+  // scanning the table.
   ReadyEntry* ready_entries = nullptr;
   uint64_t* snapshot_seq = nullptr;
+  std::atomic<uint64_t> ready_published{0};
+  std::atomic<uint64_t> ready_snapshotted{0};
   Entry* rings[1] = {nullptr};
   uint64_t ring_capacity = 0;
   // head: read cursor (Python drain), tail: write cursor (this thread).
@@ -188,6 +193,7 @@ void publish_ready(Observer* o, uint32_t slot, uint64_t seq, uint64_t kind,
   e.kind = kind;
   std::atomic_thread_fence(std::memory_order_release);
   e.seq.store(seq, std::memory_order_relaxed);
+  o->ready_published.fetch_add(1, std::memory_order_relaxed);
 }
 
 void run(Observer* o) {
@@ -421,7 +427,18 @@ uint64_t dt_record_observer_ready_snapshot(void* handle, uint64_t* out,
       break;
     }
   }
+  o->ready_snapshotted.fetch_add(n, std::memory_order_relaxed);
   return n;
+}
+
+// Rows published into the READY table that no snapshot has returned yet.
+// A wave frozen now cannot include them (issue #303's missed-freeze gauge).
+uint64_t dt_record_observer_ready_pending(void* handle) {
+  Observer* o = static_cast<Observer*>(handle);
+  if (!o) return 0;
+  uint64_t published = o->ready_published.load(std::memory_order_relaxed);
+  uint64_t snapshotted = o->ready_snapshotted.load(std::memory_order_relaxed);
+  return published > snapshotted ? published - snapshotted : 0;
 }
 
 // Copies up to `out_entries` pending legacy READY-record arrivals into
