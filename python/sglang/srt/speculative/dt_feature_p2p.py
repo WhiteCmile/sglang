@@ -504,7 +504,9 @@ class TargetFeatureSourcePool:
         slot.state = FeatureSlotState.RESERVED
         slot.allocation_lease_id = allocation_lease_id
         slot.allocation_row_offset = allocation_row_offset
-        slot.reserved_ns = time.monotonic_ns() if self._profile_timing else 0
+        slot.reserved_ns = (
+            time.monotonic_ns() if getattr(self, "_profile_timing", False) else 0
+        )
         rows = (
             self._storage[slot_id][:token_count]
             if page_allocator is None
