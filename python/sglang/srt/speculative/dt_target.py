@@ -61,6 +61,11 @@ _EXPIRE_SCAN_INTERVAL_NS = 2_000_000
 # underestimates the tail and lands the next launch after the in-flight
 # wave's GPU end; see issue #108.
 _FREEZE_LEAD_WINDOW = 64
+# DT_FLASHMTP_PRE_RESERVE_DEST (issue #281 P2) keeps this many arena slots
+# untouched when deciding whether one staged FlashMTP wave fits.  A wave that
+# exactly fills the arena would leave the ordinary park-time path no slot for
+# a row that becomes eligible only after launch.
+_FLASHMTP_PRE_RESERVE_SAFETY_SLOTS = 1
 
 
 class _PendingTaskPayloadMismatch(ValueError):
@@ -399,6 +404,11 @@ class StagedFlashMTPTask:
 class StagedFlashMTPPivotBatch:
     tasks: tuple[StagedFlashMTPTask, ...]
     descriptors_by_transfer: dict[str, object]
+    # DT_FLASHMTP_PRE_RESERVE_DEST only: transfer_id -> (destination,
+    # reserve_ns).  Launch staging knows the source but not the authoritative
+    # park scalars, so it only arms export-rank arena rows.  None in the
+    # default path, which allocates no container.
+    pre_reserved_destinations: dict[str, tuple[object, int]] | None = None
 
 
 @dataclass(slots=True)
@@ -423,6 +433,7 @@ class DTTargetController:
     # ``__init__``.  Their established behavior is the mmap A/B baseline.
     candidate_transport = "mmap"
     _candidate_arena = None
+    flashmtp_pre_reserve_dest = False
     target_phase_profile_enabled = False
 
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
@@ -484,6 +495,13 @@ class DTTargetController:
         )
         self.whole_batch_task_fifo_ablation = (
             os.environ.get("SGLANG_DT_WHOLE_BATCH_TASK_FIFO_ABLATION", "0") == "1"
+        )
+        # Issue #281 P2 ablation: reserve each staged FlashMTP wave's candidate
+        # destinations at launch staging, while all final park scalars stay
+        # authoritative at the ordinary park/flush boundary.  Read once here so
+        # the default-off path adds no per-poll lookup.
+        self.flashmtp_pre_reserve_dest = (
+            os.environ.get("DT_FLASHMTP_PRE_RESERVE_DEST", "0") == "1"
         )
         self.continuous_batching = not getattr(
             self.server_args, "draft_target_disable_continuous_batching", False
@@ -1442,19 +1460,155 @@ class DTTargetController:
         if error is not None:
             raise RuntimeError(f"FlashMTP pivot publication failed: {error}")
 
-        staged_tasks = []
-        for values in specs:
-            staged = StagedFlashMTPTask(*values)
-            if self.is_export_rank:
-                descriptor = descriptors[staged.source_lease_id]
-                if self._source_slot_by_transfer.get(staged.source_lease_id) != (
-                    descriptor.source_slot_id,
-                    descriptor.slot_generation,
-                ):
-                    raise RuntimeError("FlashMTP staged source lease was lost")
-            staged_tasks.append(staged)
-        batch_result.dt_staged_flashmtp_pivots = StagedFlashMTPPivotBatch(
-            tasks=tuple(staged_tasks), descriptors_by_transfer=descriptors
+        pre_reserved = None
+        try:
+            staged_tasks = []
+            for values in specs:
+                staged = StagedFlashMTPTask(*values)
+                if self.is_export_rank:
+                    descriptor = descriptors[staged.source_lease_id]
+                    if self._source_slot_by_transfer.get(staged.source_lease_id) != (
+                        descriptor.source_slot_id,
+                        descriptor.slot_generation,
+                    ):
+                        raise RuntimeError("FlashMTP staged source lease was lost")
+                staged_tasks.append(staged)
+            # Every descriptor, transfer id and the TP packet are stable here.
+            # Only the export rank owns candidate destinations, and it arms
+            # them all-or-nothing; the ordinary park/flush path still performs
+            # authorization, ledger begin and Coordinator submission.
+            if self.flashmtp_pre_reserve_dest and self.is_export_rank:
+                pre_reserved = self._pre_reserve_flashmtp_destinations(specs)
+            batch_result.dt_staged_flashmtp_pivots = StagedFlashMTPPivotBatch(
+                tasks=tuple(staged_tasks),
+                descriptors_by_transfer=descriptors,
+                pre_reserved_destinations=pre_reserved,
+            )
+        except Exception:
+            if pre_reserved:
+                self._cancel_flashmtp_pre_reserved_destinations(
+                    pre_reserved, reason="stage_failure"
+                )
+            raise
+
+    def _pre_reserve_flashmtp_destinations(self, specs) -> dict | None:
+        """Arm one local destination per staged row, all-or-nothing.
+
+        Launch staging has no authoritative bonus token, sequence length,
+        round ownership or eligibility, so it can only reserve the export
+        rank's own arena rows.  Any failure cancels what this attempt created
+        and returns None, leaving the ordinary park-time reserve untouched.
+        """
+        arena = self._candidate_arena
+        num_attempt_rows = len(specs)
+        if arena is None or num_attempt_rows <= 0:
+            return None
+        started_ns = time.monotonic_ns()
+        free_before = -1
+        reservations: dict[str, tuple[object, int]] = {}
+        try:
+            free_before = arena.free_slot_count
+            if free_before < num_attempt_rows + _FLASHMTP_PRE_RESERVE_SAFETY_SLOTS:
+                self._emit_flashmtp_pre_reserve(
+                    num_attempt_rows=num_attempt_rows,
+                    num_reserved_rows=0,
+                    num_fallback_rows=num_attempt_rows,
+                    rollback_reason="capacity",
+                    free_slots_before=free_before,
+                    free_slots_after=free_before,
+                    reserve_ns=time.monotonic_ns() - started_ns,
+                )
+                return None
+            for values in specs:
+                transfer_id = values[2]
+                destination = arena.reserve(transfer_id)
+                reservations[transfer_id] = (destination, time.monotonic_ns())
+            self._emit_flashmtp_pre_reserve(
+                num_attempt_rows=num_attempt_rows,
+                num_reserved_rows=len(reservations),
+                num_fallback_rows=0,
+                rollback_reason=None,
+                free_slots_before=free_before,
+                free_slots_after=free_before - len(reservations),
+                reserve_ns=time.monotonic_ns() - started_ns,
+            )
+            return reservations
+        except Exception as exc:
+            rollback_reason = f"{type(exc).__name__}: {exc}"
+            self._cancel_flashmtp_pre_reserved_destinations(
+                reservations, reason="reserve_failure"
+            )
+            try:
+                free_after = arena.free_slot_count
+            except Exception:
+                free_after = free_before
+            try:
+                self._emit_flashmtp_pre_reserve(
+                    num_attempt_rows=num_attempt_rows,
+                    num_reserved_rows=0,
+                    num_fallback_rows=num_attempt_rows,
+                    rollback_reason=rollback_reason,
+                    free_slots_before=free_before,
+                    free_slots_after=free_after,
+                    reserve_ns=time.monotonic_ns() - started_ns,
+                )
+            except Exception:
+                pass
+            return None
+
+    def _cancel_flashmtp_pre_reserved_destinations(
+        self, reservations: dict, *, reason: str
+    ) -> None:
+        """Cancel every destination still owned by one pre-reserve attempt."""
+
+        for transfer_id in tuple(reservations):
+            entry = reservations.pop(transfer_id)
+            self._cancel_flashmtp_pre_reserved_destination(
+                transfer_id, entry, reason=reason
+            )
+
+    def _cancel_flashmtp_pre_reserved_destination(
+        self, transfer_id: str, entry: tuple[object, int], *, reason: str
+    ) -> bool:
+        """Cancel one unused destination exactly once and record its hold."""
+
+        if self._candidate_arena is None:
+            return False
+        _destination, reserved_ns = entry
+        self._candidate_arena.cancel(transfer_id, remote_quiescent=True)
+        if self._profile_active:
+            self._profile_emit(
+                "target_flashmtp_pre_reserve_row",
+                target_instance=self.instance_id,
+                transfer_id=transfer_id,
+                outcome=reason,
+                hold_ns=time.monotonic_ns() - reserved_ns,
+            )
+        return True
+
+    def _emit_flashmtp_pre_reserve(
+        self,
+        *,
+        num_attempt_rows: int,
+        num_reserved_rows: int,
+        num_fallback_rows: int,
+        rollback_reason: str | None,
+        free_slots_before: int,
+        free_slots_after: int,
+        reserve_ns: int,
+    ) -> None:
+        if not self._profile_active:
+            return
+        self._profile_emit(
+            "target_flashmtp_pre_reserve",
+            target_instance=self.instance_id,
+            num_attempt_rows=num_attempt_rows,
+            num_reserved_rows=num_reserved_rows,
+            num_fallback_rows=num_fallback_rows,
+            rollback_reason=rollback_reason,
+            free_slots_before=free_slots_before,
+            free_slots_after=free_slots_after,
+            reserve_ns=reserve_ns,
         )
 
     def _cancel_staged_flashmtp_pivots(
@@ -1462,9 +1616,16 @@ class DTTargetController:
     ) -> None:
         """Release FlashMTP source leases that never reached control routing."""
 
+        reservations = staged.pre_reserved_destinations
         for task in staged.tasks:
             self._parked.pop(task.source_lease_id, None)
             if self.is_export_rank:
+                if reservations is not None:
+                    entry = reservations.pop(task.source_lease_id, None)
+                    if entry is not None:
+                        self._cancel_flashmtp_pre_reserved_destination(
+                            task.source_lease_id, entry, reason="staged_cancel"
+                        )
                 self._release_source_slot(task.source_lease_id)
         batch_result.dt_staged_flashmtp_pivots = None
 
@@ -3058,6 +3219,9 @@ class DTTargetController:
         # the counter additionally fences older queued results.  Exporting
         # either kind here would give one request two concurrent Draft rounds.
         chunked_req = getattr(batch, "chunked_req", None)
+        pre_reserved = None
+        num_pre_reserve_cancel_rows = 0
+        num_reused_rows = 0
         if self.is_token_only:
             active_indices = [
                 index
@@ -3070,6 +3234,10 @@ class DTTargetController:
             ]
             active_flash_tasks = ()
         else:
+            # Launch-time reservations are still unowned: only a row that
+            # passes the final eligibility checks below may carry one into an
+            # ordinary DraftTask.  All others are cancelled exactly once.
+            pre_reserved = staged_flash.pre_reserved_destinations
             req_by_id = {req.rid: req for req in batch.reqs}
             active_flash = []
             for staged_task in staged_flash.tasks:
@@ -3095,6 +3263,18 @@ class DTTargetController:
                 )
                 if not eligible:
                     if self.is_export_rank:
+                        if pre_reserved is not None:
+                            entry = pre_reserved.pop(
+                                staged_task.source_lease_id, None
+                            )
+                            if entry is not None and (
+                                self._cancel_flashmtp_pre_reserved_destination(
+                                    staged_task.source_lease_id,
+                                    entry,
+                                    reason="ineligible",
+                                )
+                            ):
+                                num_pre_reserve_cancel_rows += 1
                         self._release_source_slot(staged_task.source_lease_id)
                     continue
                 active_flash.append(staged_task)
@@ -3136,6 +3316,7 @@ class DTTargetController:
         try:
             for active_index, index in enumerate(active_indices):
                 req = batch.reqs[index]
+                candidate_destination = None
                 if self.is_token_only:
                     round_id = self._next_round.get(req.rid, 0)
                     attempt = self._ensure_lifecycle_attempt(req.rid)
@@ -3147,6 +3328,10 @@ class DTTargetController:
                     attempt = self._ensure_lifecycle_attempt(req.rid)
                     transfer_id = staged_task.source_lease_id
                     self._next_round[req.rid] = round_id + 1
+                    if pre_reserved is not None:
+                        entry = pre_reserved.get(transfer_id)
+                        if entry is not None:
+                            candidate_destination = entry[0]
                 previous_transfer_id = None
                 if self.is_token_only and round_id > 0:
                     previous_transfer_id = self._verify_transfer_by_request.pop(
@@ -3180,6 +3365,7 @@ class DTTargetController:
                             bonus_token=bonus_token,
                             previous_transfer_id=previous_transfer_id,
                             feature_descriptor=descriptors_by_transfer.get(transfer_id),
+                            candidate_destination=candidate_destination,
                         )
                     )
             if flashmtp_profile_active:
@@ -3193,6 +3379,23 @@ class DTTargetController:
                     task.transfer_id for task in tasks
                 )
                 control_committed = True
+                if pre_reserved is not None:
+                    # Queued tasks now own their destinations through the
+                    # ordinary pending-send/arena lifecycle; staging cleanup
+                    # must no longer cancel them.
+                    queued_ns = time.monotonic_ns()
+                    for task in tasks:
+                        entry = pre_reserved.pop(task.transfer_id, None)
+                        if entry is not None:
+                            num_reused_rows += 1
+                            if self._profile_active:
+                                self._profile_emit(
+                                    "target_flashmtp_pre_reserve_row",
+                                    target_instance=self.instance_id,
+                                    transfer_id=task.transfer_id,
+                                    outcome="reused",
+                                    hold_ns=queued_ns - entry[1],
+                                )
                 # Source slots are committed at this point, so publish the control
                 # message in the same scheduler turn. Waiting for the next poll
                 # adds a fixed idle bubble before Draft can start the round.
@@ -3212,6 +3415,19 @@ class DTTargetController:
             raise
         if not self.is_token_only:
             batch_result.dt_staged_flashmtp_pivots = None
+            if (
+                self.flashmtp_pre_reserve_dest
+                and self.is_export_rank
+                and self._profile_active
+            ):
+                self._profile_emit(
+                    "target_flashmtp_pre_reserve_park",
+                    target_instance=self.instance_id,
+                    num_eligible_rows=len(active_flash_tasks),
+                    num_reused_rows=num_reused_rows,
+                    num_fallback_rows=len(active_flash_tasks) - num_reused_rows,
+                    num_cancel_rows=num_pre_reserve_cancel_rows,
+                )
         if parked_reqs:
             parked_by_lane = Counter(state.lane_id for state in self._parked.values())
             for lane_id, parked_count in parked_by_lane.items():
@@ -5372,6 +5588,7 @@ class DTTargetController:
         committed_token_ids: tuple[int, ...] = (),
         feature_token_offset: int = 0,
         requires_proposal: bool = True,
+        candidate_destination=None,
     ):
         now_ns = time.monotonic_ns()
         if self.is_token_only:
@@ -5510,6 +5727,7 @@ class DTTargetController:
             source=SourceRef(**feature_descriptor.source_ref_kwargs()),
             created_ns=now_ns,
             deadline_ns=now_ns + self.round_timeout_ns,
+            candidate_destination=candidate_destination,
         )
 
     def _queue_task_batch(self, tasks: tuple) -> None:
