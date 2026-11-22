@@ -159,6 +159,17 @@ DRAFT_CONTROL_LOOP = os.environ.get("DT_DRAFT_CONTROL_LOOP", "0") == "1"
 # itself and hands the scheduler a DONE record (CUDA elapsed included) to
 # absorb.
 DRAFT_SEND_LOOP = os.environ.get("DT_DRAFT_SEND_LOOP", "0") == "1"
+# Draft redesign D10 (issue #279, design §5.1-5.2): DT_DRAFT_SCHEDULER=v2 runs
+# DFlash on a wake-driven state machine (_run_scheduler_v2) instead of run()'s
+# staged loop: the depth gate reads frozen_seq - done_seq, and with one batch
+# in flight the next one freezes late, when the running batch's estimated GPU
+# end minus the estimated CPU work of the next is reached.  Other methods keep
+# run().
+DRAFT_SCHEDULER_V2 = os.environ.get("DT_DRAFT_SCHEDULER", "") == "v2"
+# Subtracted from the late-freeze deadline (design §5.2; 0 as the Target's).
+DRAFT_LATE_FREEZE_MARGIN_NS = (
+    int(os.environ.get("DT_DRAFT_LATE_FREEZE_MARGIN_US", "0")) * 1000
+)
 # One executing plus one submitted Draft compute batch.
 DRAFT_COMPUTE_DEPTH = 2
 RING_RETIRED_LIMIT = 65536
@@ -206,11 +217,13 @@ _RING_RECORD_TIMEOUT_NS = (
 # evaluations is charged to the reason of the earlier one: "unscanned" is
 # READY publish -> first pass, "compute_depth" any part of it (after the drain)
 # the scheduler spent with DRAFT_COMPUTE_DEPTH batches in flight, when no
-# FREEZE pass runs.  The charges of a row sum to its hold, publish -> frozen.
+# FREEZE pass runs, and "late_freeze" (D10) any part it spent holding the
+# next freeze for the late-freeze deadline (design §5.2).  The charges of a
+# row sum to its hold, publish -> frozen.
 _ReadySkip = enum.IntEnum(
     "_ReadySkip",
     "unscanned compute_depth owner_inflight owner_selected proposal_mode "
-    "batch_rows batch_tokens req_rows kv",
+    "batch_rows batch_tokens req_rows kv late_freeze",
     start=0,
 )
 _READY_SKIP_REASONS = tuple(reason.name for reason in _ReadySkip)
@@ -237,7 +250,8 @@ BATCH_ESTIMATE_EMA_WEIGHT = 0.125
 
 
 class DraftBatchEstimator:
-    """Shadow G(n)/C(n) of the late-freeze design (§5.2), logged, never read.
+    """G(n)/C(n) of the late-freeze design (§5.2): logged under D0, read by
+    the v2 scheduler's late freeze (D10, ``predict``).
 
     G is a DFlash batch's GPU span (materialize_start -> proposal_done, CUDA
     elapsed) and C the scheduler CPU work that formed and launched it
@@ -249,10 +263,19 @@ class DraftBatchEstimator:
     def __init__(self) -> None:
         self._ema: dict[tuple[str, int, str], float] = {}
 
+    @staticmethod
+    def bucket(size: int) -> int:
+        return max(size, 1).bit_length()  # sizes [2**(b-1), 2**b)
+
+    def predict(self, key: str, size: int, name: str) -> float | None:
+        """The EMA of ``name`` ("g" or "c") for the ``key`` bucket of ``size``."""
+
+        return self._ema.get((key, self.bucket(size), name))
+
     def observe(self, *, rows: int, tokens: int, gpu_ns: int, cpu_ns: int) -> dict:
         fields = {}
         for key, size in (("rows", rows), ("tokens", tokens)):
-            bucket = max(size, 1).bit_length()  # sizes [2**(b-1), 2**b)
+            bucket = self.bucket(size)
             fields[f"{key}_bucket"] = bucket
             for name, actual in (("g", gpu_ns), ("c", cpu_ns)):
                 predicted = self._ema.get((key, bucket, name))
@@ -930,6 +953,11 @@ class FlashMTPDraftEngine:
     # queue (design §5.1 DRAIN/FREEZE), not from mailbox takes.
     _native_ingress = False
     _ready_pending = ()
+    # DT_DRAFT_SCHEDULER=v2 (DFlash only, D10): the GPU done stamp of the
+    # last absorbed DONE record, and this pass's wait (profile stamps).
+    _scheduler_v2 = False
+    _dflash_last_done_ns = 0
+    _scheduler_wait_ns = (0, 0)
 
     # Preserve the historical transport for partially constructed test and
     # diagnostic instances that intentionally bypass ``__init__``.
@@ -1289,6 +1317,15 @@ class FlashMTPDraftEngine:
                 "DT_DRAFT_SEND_LOOP=1 requires DT_DRAFT_INGRESS=native, "
                 "DT_DRAFT_CONTROL_LOOP=1 and the cuda-ipc candidate transport"
             )
+        # Draft redesign D10: the v2 scheduler gates on the send loop's
+        # done_seq, waits on its DONE wake, and times its late freeze with
+        # the G(n)/C(n) estimator (always on under the flag).
+        self._scheduler_v2 = DRAFT_SCHEDULER_V2 and self._is_dflash
+        if self._scheduler_v2:
+            if not self._send_loop:
+                raise ValueError("DT_DRAFT_SCHEDULER=v2 requires DT_DRAFT_SEND_LOOP=1")
+            if self._batch_estimator is None:
+                self._batch_estimator = DraftBatchEstimator()
         # The publish worker once it is the send loop (None until the ring
         # worker exists); the fence events of the release-only descriptors
         # still outstanding, in submit order, live in _ready_release_fenced.
@@ -1342,6 +1379,9 @@ class FlashMTPDraftEngine:
         self._ready_frozen_batches = 0
         self._ready_gate_ns = 0
         self._ready_gated_since_ns = 0
+        # D10: the same for the v2 scheduler's late-freeze holds.
+        self._ready_late_ns = 0
+        self._ready_late_since_ns = 0
         # Held results released by confirmations, sent as one batch per turn.
         self._confirmed_held_results: list = []
         self._confirmed_held_sequence = 0
@@ -2414,6 +2454,9 @@ class FlashMTPDraftEngine:
 
     def run(self) -> None:
         logger.info("DT Draft engine serving")
+        if self._scheduler_v2:
+            self._run_scheduler_v2()
+            return
         observer = None
         if os.environ.get("DT_OVERLAP_FIX_OBSERVER_DIR"):
             from overlap_observer import create
@@ -2541,6 +2584,141 @@ class FlashMTPDraftEngine:
             self._loop_stage("lifecycle", self._maybe_emit_lifecycle_status)
             self._loop_wall_ns += time.monotonic_ns() - iter_started_ns
             self._loop_iters += 1
+
+    def _run_scheduler_v2(self) -> None:
+        """The DFlash scheduler state machine (design §5.1, D10).
+
+        One pass is ABSORB -> DRAIN -> GATE -> [LATE] -> FREEZE -> CPU WORK
+        -> LAUNCH -> HAND-OFF, then WAIT:
+
+        - ABSORB: the send loop's DONE and PUSH_DONE records, the control
+          queue, and round-0 relayed pulls (run()'s mechanics);
+        - DRAIN: the native READY queue into the READY table;
+        - GATE/LATE: ``_dflash_gate``;
+        - FREEZE .. HAND-OFF: the same take and submit as run(); the batch
+          bound (§5.3) is the FREEZE fit of D2/D7;
+        - WAIT: on the wake word (GIL released) for a READY, DONE or CONTROL
+          bit, the late-freeze deadline, or the poll cap; never after a
+          launch, since the next batch may freeze at once.  The cap is
+          run()'s idle poll, shortened for work nothing wakes (relayed
+          pulls, cross-host CQs, held pushes).
+        """
+
+        if not self._uses_direct_gpu_source:
+            raise RuntimeError("DT_DRAFT_SCHEDULER=v2 requires the direct GPU source")
+        wake = self._wake
+        while not self._stop:
+            iter_started_ns = time.monotonic_ns()
+            # Read before draining: a set after this read ends the wait.
+            wake_epoch = wake.epoch()
+            # ABSORB in §5.1's order: the DONE records first (the -1).
+            self._absorb_dflash_done()
+            self._absorb_push_done()
+            self._loop_stage("poll_messages", self._poll_messages)
+            if self._candidate_push_transport is not None:
+                self._loop_stage("push_progress", self._push_transport_progress)
+            if self._stop:
+                break
+            self._loop_stage("poll_feature_batches", self._poll_feature_batches)
+            if self._stop:
+                break
+            preparation = self._loop_stage("take_batch", self._take_batch)
+            if preparation:
+                self._loop_stage("execute_batch", self._execute_batch, preparation)
+                self._loop_stage("poll_feature_batches", self._poll_feature_batches)
+            self._loop_stage("ready_drain", self._drain_ready)
+            if self._held_ring_pushes:
+                self._loop_stage(
+                    "resolve_held_pushes", self._resolve_held_ring_destinations
+                )
+            now_ns = time.monotonic_ns()
+            deadline_ns = self._loop_stage("gate", self._dflash_gate, now_ns)
+            if deadline_ns == 0:
+                launched, frozen_ns = self._dflash_batch_seq, time.monotonic_ns()
+                ready = self._loop_stage("take_input_ready", self._take_input_ready_batch)
+                if ready:
+                    self._loop_stage("host_submit", self._execute_input_ready_batch, ready)
+                if self._dflash_batch_seq != launched:
+                    completion = self._pending_dflash_completions[-1]
+                    if not completion.handoff_ns:  # profiling stamps it itself
+                        # C(n) is freeze -> hand-off end (§5.2).
+                        completion.select_started_ns = frozen_ns
+                        completion.handoff_ns = time.monotonic_ns()
+                    self._loop_stage("lifecycle", self._maybe_emit_lifecycle_status)
+                    self._loop_wall_ns += time.monotonic_ns() - iter_started_ns
+                    self._loop_iters += 1
+                    continue
+            elif self._ready_pending:
+                # The rows wait out the gate or the late freeze (#292).
+                if deadline_ns is None:
+                    self._ready_gated_since_ns = now_ns
+                else:
+                    self._ready_late_since_ns = now_ns
+            self._loop_stage("lifecycle", self._maybe_emit_lifecycle_status)
+            timeout_s = (
+                INFLIGHT_POLL_S
+                if self._pending
+                or self._pending_feature_batches
+                or self._send_loop_remote
+                or self._held_ring_pushes
+                else IDLE_POLL_S
+            )
+            if deadline_ns:
+                timeout_s = min(timeout_s, max(deadline_ns - time.monotonic_ns(), 0) / 1e9)
+            wait_started_ns = time.monotonic_ns()
+            self._loop_stage("idle_sleep", wake.wait, wake_epoch, timeout_s)
+            self._scheduler_wait_ns = (wait_started_ns, time.monotonic_ns())
+            self._loop_wall_ns += time.monotonic_ns() - iter_started_ns
+            self._loop_iters += 1
+
+    def _dflash_gate(self, now_ns: int) -> int | None:
+        """GATE and LATE of the v2 scheduler (design §5.1-5.2).
+
+        In-flight is frozen_seq - done_seq: the send loop's counter moves at
+        the GPU done, so a batch that finished since ABSORB is absorbed here
+        (its record precedes the counter), and its owners and scratch are
+        free for this freeze.  Returns None to wait for a DONE (DRAFT_COMPUTE_
+        DEPTH in flight, or nothing READY), 0 to freeze now, or the
+        late-freeze deadline (monotonic ns): with one batch running, the next
+        freezes at its estimated GPU end minus the estimated CPU work of the
+        next batch minus the margin.  It freezes at once without a G or C
+        estimate for the buckets, or once the running batch has run past
+        twice its estimate."""
+
+        if self._fatal_gpu_quarantine_active() or not (
+            self._ready_pending or self._input_ready_features
+        ):
+            return None
+        worker = self._send_loop_worker
+        in_flight = len(self._pending_dflash_completions)
+        if worker is not None:
+            in_flight = self._dflash_batch_seq - worker.done_seq()
+            if in_flight < len(self._pending_dflash_completions):
+                self._absorb_dflash_done()
+        if in_flight >= DRAFT_COMPUTE_DEPTH:
+            return None
+        if in_flight == 0:
+            return 0
+        running = self._pending_dflash_completions[0]
+        estimator = self._batch_estimator
+        gpu_ns = estimator.predict(
+            "tokens", sum(item.task.feature_token_count for item in running.pending), "g"
+        )
+        ready_tokens = sum(row[5] for row in self._ready_pending) + sum(
+            entry.row_range[1] - entry.row_range[0] for entry in self._input_ready_features
+        )
+        cpu_ns = estimator.predict(
+            "tokens", min(ready_tokens, self.feature_buffer_max_tokens), "c"
+        )
+        if gpu_ns is None or cpu_ns is None:
+            return 0
+        # Its GPU start: its hand-off, or the GPU done of the batch it was
+        # queued behind.
+        start_ns = max(running.handoff_ns, self._dflash_last_done_ns)
+        deadline_ns = int(start_ns + gpu_ns - cpu_ns) - DRAFT_LATE_FREEZE_MARGIN_NS
+        if now_ns >= deadline_ns or now_ns - start_ns > 2 * gpu_ns:
+            return 0
+        return deadline_ns
 
     @contextlib.contextmanager
     def _direct_push_scope(self, ready_event, *sources: torch.Tensor):
@@ -3437,6 +3615,9 @@ class FlashMTPDraftEngine:
         if self._ready_gated_since_ns:  # the last take stopped at the gate
             self._ready_gate_ns += time.monotonic_ns() - self._ready_gated_since_ns
             self._ready_gated_since_ns = 0
+        if self._ready_late_since_ns:  # the v2 scheduler held a late freeze
+            self._ready_late_ns += time.monotonic_ns() - self._ready_late_since_ns
+            self._ready_late_since_ns = 0
         worker = self._ring_worker
         if worker is None:
             return
@@ -3458,7 +3639,7 @@ class FlashMTPDraftEngine:
         drained_ns = time.monotonic_ns()
         kind = entries["kind"] & ~np.uint32(kinds["DEST_KNOWN"])
         ledger, targets = self._rid_ledger, self._ring_targets
-        marks = (self._ready_gate_ns, self._ready_frozen_batches)
+        marks = (self._ready_gate_ns, self._ready_frozen_batches, self._ready_late_ns)
         done, dropped = [], []
         for kind, (
             seq, ring_id, record_seq, position, cell, gen, round_id, attempt,
@@ -3547,33 +3728,37 @@ class FlashMTPDraftEngine:
         retained, done, dropped = [], [], []
         # Skip accounting (#292).  A waiting row's state is [reason, last
         # evaluation ns, gate mark, passes, first reason, fit, held ns per
-        # reason]; a row frozen at its first pass gets none.
+        # reason, late-freeze mark]; a row frozen at its first pass gets none.
         states, gate_ns = self._ready_skip_state, self._ready_gate_ns
+        late_ns = self._ready_late_ns
         total, skips, pass_handles = self._ready_skip_held_ns, self._ready_skips, set()
         unscanned, gate = int(_ReadySkip.unscanned), int(_ReadySkip.compute_depth)
+        late = int(_ReadySkip.late_freeze)
         self._ready_passes += 1
+
+        def charge(held, last, waited, gate_mark, late_mark):
+            # The gate and late-freeze time since the marks, then the rest
+            # to the reason of the earlier evaluation.
+            gated = min(gate_ns - gate_mark, waited)
+            held_late = min(late_ns - late_mark, waited - gated)
+            for index, value in (
+                (last, waited - gated - held_late), (gate, gated), (late, held_late)
+            ):
+                held[index] += value
+                total[index] += value
 
         def skip(row, reason, fit=None):
             state = states.get(row[0])
             if state is None:
-                waited = now_ns - row[9][8]
-                gated = min(gate_ns - row[10][0], waited)
                 held = [0] * len(total)
-                held[unscanned], held[gate] = waited - gated, gated
-                total[unscanned] += waited - gated
-                states[row[0]] = [reason, now_ns, gate_ns, 1, reason, fit, held]
+                charge(held, unscanned, now_ns - row[9][8], row[10][0], row[10][2])
+                states[row[0]] = [reason, now_ns, gate_ns, 1, reason, fit, held, late_ns]
             else:
-                last, held = state[0], state[6]
-                waited = now_ns - state[1]
-                gated = min(gate_ns - state[2], waited)
-                held[last] += waited - gated
-                held[gate] += gated
-                total[last] += waited - gated
-                state[0], state[1], state[2] = reason, now_ns, gate_ns
+                charge(state[6], state[0], now_ns - state[1], state[2], state[7])
+                state[0], state[1], state[2], state[7] = reason, now_ns, gate_ns, late_ns
                 state[3] += 1
                 if fit is not None:
                     state[5] = fit
-            total[gate] += gated
             skips[reason] += 1
             retained.append(row)
 
@@ -3581,21 +3766,17 @@ class FlashMTPDraftEngine:
             fields, marks = row[9], row[10]
             state = states.pop(row[0], None)
             if state is None:
-                last, since_ns, gate_mark = unscanned, fields[8], marks[0]
+                held = [0] * len(total)
+                charge(held, unscanned, now_ns - fields[8], marks[0], marks[2])
+                last = unscanned
             else:
-                last, since_ns, gate_mark = state[0], state[1], state[2]
-            waited = now_ns - since_ns
-            gated = min(gate_ns - gate_mark, waited)
-            total[last] += waited - gated
-            total[gate] += gated
+                held, last = state[6], state[0]
+                charge(held, last, now_ns - state[1], state[2], state[7])
             if outcome != "frozen":
                 self._ready_drops[_READY_DROP_OUTCOMES.index(outcome)] += 1
             held_ns = now_ns - fields[8]
             if held_ns < _READY_SKIP_RECORD_NS:
                 return
-            held = [0] * len(total) if state is None else state[6]
-            held[last] += waited - gated
-            held[gate] += gated
             summary = {
                 "outcome": outcome,
                 "held_ns": held_ns,
@@ -3773,6 +3954,7 @@ class FlashMTPDraftEngine:
             "passes": self._ready_passes,
             "frozen_batches": self._ready_frozen_batches,
             "gate_ms": self._ready_gate_ns / 1e6,
+            "late_freeze_ms": self._ready_late_ns / 1e6,
             "skips": by_reason(self._ready_skips),
             "held_ms": by_reason(self._ready_skip_held_ns, ms=True),
             "long_held_ms": by_reason(self._ready_long_held_ns, ms=True),
@@ -3960,6 +4142,7 @@ class FlashMTPDraftEngine:
                     "DFLASH DONE record is not the oldest in-flight batch: "
                     f"record={seq} batch={completion.batch_seq + 1}"
                 )
+            self._dflash_last_done_ns = gpu_done_ns
             retired.append((completion, gpu_done_ns, materialize_ns, proposal_ns, error))
         absorbed_ns = time.monotonic_ns()
         self._loop_stage_ns["dflash_absorb"] += absorbed_ns - stage_started_ns
@@ -3973,6 +4156,10 @@ class FlashMTPDraftEngine:
                     done_seq=completion.batch_seq + 1,
                     gpu_done_ns=gpu_done_ns,
                     absorbed_ns=absorbed_ns,
+                    # v2: the scheduler's last wait (start, return), so a
+                    # done that arrived while it waited can be told apart
+                    # from one that arrived during its other work.
+                    wait_ns=self._scheduler_wait_ns,
                 )
             if failed or error:
                 # The send loop could not prove this batch's GPU writes have
@@ -8492,21 +8679,13 @@ class FlashMTPDraftEngine:
                 state.proposal_base_len = state.valid_committed_len
             raise
 
-    def _profile_dflash_batch(self, completion, tasks, gpu_ns: int) -> None:
-        """D0 per-batch stamps (issue #269): absolute GPU end, the shadow
-        G(n)/C(n) estimate against the measured values."""
+    def _profile_dflash_batch(self, completion, tasks, gpu_ns: int, estimate) -> None:
+        """D0 per-batch stamps (issue #269): absolute GPU end, the G(n)/C(n)
+        estimate against the measured values."""
 
         gpu_end_clock_ns = 0
         if completion.clock_done is not None and completion.clock_done.query():
             gpu_end_clock_ns = self._gpu_clock.read(completion.clock_slot)
-        estimate = {}
-        if self._batch_estimator is not None and completion.handoff_ns:
-            estimate = self._batch_estimator.observe(
-                rows=len(tasks),
-                tokens=sum(task.feature_token_count for task in tasks),
-                gpu_ns=gpu_ns,
-                cpu_ns=completion.handoff_ns - completion.select_started_ns,
-            )
         profile_emit(
             "draft_batch_estimate",
             draft_instance=self.instance_id,
@@ -8646,9 +8825,17 @@ class FlashMTPDraftEngine:
         stage_query_ns = time.monotonic_ns()
         self._loop_stage_ns["dflash_query"] += stage_query_ns - stage_started_ns
         self._loop_stage_calls["dflash_query"] += 1
+        estimate = {}
+        if self._batch_estimator is not None and completion.handoff_ns:
+            estimate = self._batch_estimator.observe(
+                rows=len(tasks),
+                tokens=sum(task.feature_token_count for task in tasks),
+                gpu_ns=gpu_materialization_ns + proposal_gpu_ns,
+                cpu_ns=completion.handoff_ns - completion.select_started_ns,
+            )
         if self._profile_active:
             self._profile_dflash_batch(
-                completion, tasks, gpu_materialization_ns + proposal_gpu_ns
+                completion, tasks, gpu_materialization_ns + proposal_gpu_ns, estimate
             )
         profile_emit(
             "draft_dflash_batch_complete",

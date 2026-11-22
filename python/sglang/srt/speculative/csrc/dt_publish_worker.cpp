@@ -931,6 +931,12 @@ void dt_publish_worker_expire_held(void* handle) {
   static_cast<Worker*>(handle)->expire_held.store(true);
 }
 
+// D10: the last batch seq whose GPU work is done (acquire), for the v2
+// scheduler's depth gate (in-flight = frozen_seq - done_seq).
+uint64_t dt_publish_worker_done_seq(void* handle) {
+  return static_cast<Worker*>(handle)->done_seq.load(std::memory_order_acquire);
+}
+
 // {done_seq, descriptors outstanding, poll waits, cumulative poll ns, thread
 //  CPU ns, rows held now, most held at once, rows ever held, held rows that
 //  were pushed / cancelled / expired, LATE_LOCAL rows, CROSS_HOST rows, push

@@ -320,6 +320,8 @@ class _PublishWorker:
         lib.dt_publish_worker_done_drain.restype = u64
         lib.dt_publish_worker_batch_stats.argtypes = [vp, vp]
         lib.dt_publish_worker_batch_stats.restype = None
+        lib.dt_publish_worker_done_seq.argtypes = [vp]
+        lib.dt_publish_worker_done_seq.restype = u64
         lib.dt_publish_worker_push_done_drain.argtypes = [vp, vp, u64]
         lib.dt_publish_worker_push_done_drain.restype = u64
         lib.dt_publish_worker_expire_held.argtypes = [vp]
@@ -410,6 +412,11 @@ class _PublishWorker:
         """Shutdown: the loop gives up every held late row at its next pass."""
 
         self._lib.dt_publish_worker_expire_held(self._handle)
+
+    def done_seq(self) -> int:
+        """The last batch seq whose GPU work the loop has seen done."""
+
+        return self._lib.dt_publish_worker_done_seq(self._handle)
 
     def batch_stats(self):
         """The STATS counters (done_seq and outstanding descriptors first)."""
