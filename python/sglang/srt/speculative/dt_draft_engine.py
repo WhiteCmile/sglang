@@ -1301,6 +1301,10 @@ class FlashMTPDraftEngine:
         # done seq: [tasks by descriptor row (None once retired), the batch's
         # candidates (the loop reads them), rows not yet retired, groups].
         self._send_loop_rows: dict[int, list] = {}
+        # D9: send-loop pushes with cross-host rows whose WRITEs are posted
+        # but not yet acknowledged (design §7.2 step 5: complete = push
+        # event + RDMA CQ): [groups, issued_ns, candidates, tasks].
+        self._send_loop_remote: list[list] = []
         # READY table (scheduler-owned, native ingress): entries by READY seq
         # modulo the queue capacity (created with the ring worker), the
         # unselected rows in arrival order (READY seq plus the identity DRAIN
@@ -4014,23 +4018,26 @@ class FlashMTPDraftEngine:
         a completed push, a row the Target tombstoned or whose destination
         never appeared as a cancelled identity (as the legacy held release
         does).  The cross-host legs' completion queues stay with this thread
-        and are reaped here, without waiting."""
+        and are reaped here, without waiting: a batch's pushed rows with a
+        cross-host group retire only once every group's WRITEs are
+        acknowledged (§7.2 step 5), which is their push_complete."""
 
         worker = self._push_done_worker
         if worker is None or self._fatal_gpu_quarantine_active():
             return
         records = worker.drain_push_done()
         try:
-            if self._send_loop_rows or self._pending_candidate_pushes:
+            if self._send_loop_rows or self._send_loop_remote or self._pending_candidate_pushes:
                 self._candidate_push_transport.reap_remote()
+            retired = self._retire_acknowledged_remote()
         except Exception:
             logger.critical("cross-host candidate push failed", exc_info=True)
             self._enter_fatal_gpu_quarantine("unquiesced cross-host candidate push failure")
             return
         if not len(records):
+            if retired:
+                self._publish_capacity()
             return
-        from sglang.srt.speculative.dt_candidate_p2p import CandidatePush
-
         stage_started_ns = time.monotonic_ns()
         pushed: dict[tuple[int, int], list] = {}
         for kind, ident, row, outcome, issued_ns, done_ns in records.tolist():
@@ -4057,7 +4064,7 @@ class FlashMTPDraftEngine:
             if kind == worker.PUSH_DONE_JOB:
                 self._retire_candidate_push(pending, done_ns)
             elif outcome == worker.PUSHED:
-                group = pushed.setdefault((ident, issued_ns), [done_ns, entry[1], []])
+                group = pushed.setdefault((ident, issued_ns), [done_ns, entry[1], [], entry[3]])
                 group[0] = max(group[0], done_ns)
                 group[2].append(task)
             else:  # CANCELLED by the Target, or EXPIRED without a destination
@@ -4067,36 +4074,68 @@ class FlashMTPDraftEngine:
                         task.transfer_id,
                     )
                 self._retire_cancelled_transfer_identity(task)
-        for (_seq, issued_ns), (done_ns, candidates, tasks) in pushed.items():
-            push = CandidatePush(
-                event=None,
-                transfer_ids=tuple(task.transfer_id for task in tasks),
-                submitted_ns=issued_ns,
-                candidate_bytes=len(tasks) * candidates.shape[1] * candidates.element_size(),
-                cold_mapping_count=0,
-            )
-            if self._profile_active:
-                # The send loop issued these at the GPU done (D0 chain:
-                # push_submit is that issue, push_complete its observation).
-                profile_emit(
-                    "draft_candidate_push_submit",
-                    draft_instance=self.instance_id,
-                    transfer_ids=push.transfer_ids,
-                    entries=len(tasks),
-                    candidate_bytes=push.candidate_bytes,
-                    cold_mapping_count=0,
-                    submitted_ns=issued_ns,
-                    ticket=0,
-                    send_loop=True,
-                )
-            self._retire_candidate_push(
-                PendingCandidatePush(push=push, tasks=tasks, result_slot=None, candidates=None),
-                done_ns,
-                notice=False,
-            )
+        for (_seq, issued_ns), (done_ns, candidates, tasks, groups) in pushed.items():
+            if groups:
+                # Posted, not yet acknowledged: retired by the CQ (above).
+                self._send_loop_remote.append([groups, issued_ns, candidates, tasks])
+            else:
+                self._retire_send_loop_push(issued_ns, done_ns, candidates, tasks)
+        try:
+            self._retire_acknowledged_remote()
+        except Exception:
+            logger.critical("cross-host candidate push failed", exc_info=True)
+            self._enter_fatal_gpu_quarantine("unquiesced cross-host candidate push failure")
+            return
         self._loop_stage_ns["push_absorb"] += time.monotonic_ns() - stage_started_ns
         self._loop_stage_calls["push_absorb"] += len(records)
         self._publish_capacity()
+
+    def _retire_acknowledged_remote(self) -> int:
+        """Retire the send-loop pushes whose cross-host groups are all
+        acknowledged; a failed group raises (fail stop, as a failed push
+        event does on the legacy path)."""
+
+        done, waiting = [], []
+        for item in self._send_loop_remote:
+            (done if all(group.poll() for group in item[0]) else waiting).append(item)
+        if done:
+            observed_ns = time.monotonic_ns()
+            self._send_loop_remote = waiting
+            for _groups, issued_ns, candidates, tasks in done:
+                self._retire_send_loop_push(issued_ns, observed_ns, candidates, tasks)
+        return len(done)
+
+    def _retire_send_loop_push(self, issued_ns, done_ns, candidates, tasks) -> None:
+        """Retire rows the send loop pushed (one late job of one batch)."""
+
+        from sglang.srt.speculative.dt_candidate_p2p import CandidatePush
+
+        push = CandidatePush(
+            event=None,
+            transfer_ids=tuple(task.transfer_id for task in tasks),
+            submitted_ns=issued_ns,
+            candidate_bytes=len(tasks) * candidates.shape[1] * candidates.element_size(),
+            cold_mapping_count=0,
+        )
+        if self._profile_active:
+            # The send loop issued these at the GPU done (D0 chain:
+            # push_submit is that issue, push_complete its observation).
+            profile_emit(
+                "draft_candidate_push_submit",
+                draft_instance=self.instance_id,
+                transfer_ids=push.transfer_ids,
+                entries=len(tasks),
+                candidate_bytes=push.candidate_bytes,
+                cold_mapping_count=0,
+                submitted_ns=issued_ns,
+                ticket=0,
+                send_loop=True,
+            )
+        self._retire_candidate_push(
+            PendingCandidatePush(push=push, tasks=tasks, result_slot=None, candidates=None),
+            done_ns,
+            notice=False,
+        )
 
     def _ready_row_keys(self, seqs) -> tuple[tuple[int, int], ...]:
         """(ring id, record seq) of each READY row, for its landing release."""
@@ -4631,6 +4670,7 @@ class FlashMTPDraftEngine:
             or self._pending_eagle3_completions
             or getattr(self, "_pending_candidate_pushes", ())
             or getattr(self, "_send_loop_rows", None)
+            or getattr(self, "_send_loop_remote", None)
         ):
             self._poll_feature_batches()
             self._raise_if_fatal_gpu_quarantine("shutdown feature-batch drain")
@@ -11486,6 +11526,10 @@ class FlashMTPDraftEngine:
             for entry in getattr(self, "_send_loop_rows", {}).values()
             for task in entry[0]
             if task is not None
+        } | {
+            task.transfer_id
+            for item in getattr(self, "_send_loop_remote", ())
+            for task in item[3]
         }
         tasks_by_id = {
             transfer_id: task
