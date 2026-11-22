@@ -4092,6 +4092,7 @@ class FlashMTPDraftEngine:
             self._retire_candidate_push(
                 PendingCandidatePush(push=push, tasks=tasks, result_slot=None, candidates=None),
                 done_ns,
+                notice=False,
             )
         self._loop_stage_ns["push_absorb"] += time.monotonic_ns() - stage_started_ns
         self._loop_stage_calls["push_absorb"] += len(records)
@@ -11247,11 +11248,15 @@ class FlashMTPDraftEngine:
         if capacity_changed:
             self._publish_capacity()
 
-    def _retire_candidate_push(self, pending, producer_completion_observed_ns: int) -> None:
+    def _retire_candidate_push(
+        self, pending, producer_completion_observed_ns: int, *, notice: bool = True
+    ) -> None:
         """The bookkeeping of one completed direct push: notices, the
         Coordinator result, credit and identity retirement.  Shared by the
         legacy event poll and the D9 PUSH_DONE absorb, which passes the send
-        loop's own observation of the completion."""
+        loop's own observation of the completion.  ``notice`` False: rows the
+        send loop pushed, which always wrote a completion record (and whose
+        late destination only the loop knows)."""
 
         from dt_protocol import (
             PROTOCOL_VERSION,
@@ -11261,9 +11266,10 @@ class FlashMTPDraftEngine:
 
         # Target READY is driven by this direct, payload-free notice.  The
         # Coordinator result below is independent retirement/accounting.
-        self._candidate_push_transport.publish_completion(
-            pending.tasks, cancelled=pending.cancelled
-        )
+        if notice:
+            self._candidate_push_transport.publish_completion(
+                pending.tasks, cancelled=pending.cancelled
+            )
         if self._profile_active:
             notice_publish_returned_ns = time.monotonic_ns()
             profile_emit(

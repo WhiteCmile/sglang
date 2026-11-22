@@ -413,8 +413,8 @@ struct LateWork {
   std::vector<uint32_t> rows;
 };
 
-// Issue `work` on the late stream and track it; false once the worker broke
-// (its rows are then reported FAILED).
+// Issue `work` on the late stream and track it; on a broken worker (or a
+// failed driver call) its rows are reported FAILED instead.
 void issue_late(Worker* w, PushState& s, dt_probe::Probe* p, uint64_t seq, LateWork& work,
                 uint64_t post_fn, uint64_t post_arg) {
   if (work.rows.empty()) return;
