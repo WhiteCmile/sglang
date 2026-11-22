@@ -379,6 +379,17 @@ class TargetFeatureSourcePool:
     @property
     def free_slot_count(self) -> int:
         self.poll_cancelled_producers()
+        return self.free_slot_count_snapshot
+
+    @property
+    def free_slot_count_snapshot(self) -> int:
+        """Read current reusable capacity without polling producer events.
+
+        Profiling must not advance cancellation retirement or otherwise change
+        allocator timing.  Scheduler admission keeps using ``free_slot_count``;
+        trace-only snapshots use this side-effect-free scalar view.
+        """
+
         with self._lock:
             self._ensure_identity_bookkeeping_locked()
             logical_free = self._free_count

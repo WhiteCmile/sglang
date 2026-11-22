@@ -3131,7 +3131,7 @@ class DTTargetController:
             return {}
         allocator = getattr(pool, "_page_allocator", None)
         return {
-            "source_slots_free": int(pool.free_slot_count),
+            "source_slots_free": int(pool.free_slot_count_snapshot),
             "source_slots_total": int(pool.slot_count),
             "source_active_leases": int(pool.active_lease_count),
             "source_identity_high_water": int(pool.active_identity_high_water),
@@ -3167,7 +3167,7 @@ class DTTargetController:
         if pool is None:
             return
         now_ns = time.monotonic_ns() if observed_ns is None else observed_ns
-        free_slots = int(pool.free_slot_count)
+        free_slots = int(pool.free_slot_count_snapshot)
         deferred = int(getattr(self, "_deferred_dflash_feature_stages", 0))
         effective = free_slots - deferred
         started_ns = int(getattr(self, "_source_low_free_started_ns", 0))
@@ -3374,6 +3374,8 @@ class DTTargetController:
     ) -> None:
         """Record one launch opportunity rejected by the hard source gate."""
 
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
         self._source_buffer_emit(
             "blocked_launch_opportunity",
             observed_ns=time.monotonic_ns(),
