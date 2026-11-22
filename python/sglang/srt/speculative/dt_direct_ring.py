@@ -1107,6 +1107,16 @@ class DraftRingEndpoint(MailboxConsumer):
                 return (slot_id, generation, nonce, data_offset, metadata_offset)
         return None
 
+    def destination_entry(self, seq: int) -> int:
+        """Host address of the region entry ``destination`` reads for
+        ``seq``; the D9 send loop does the same seqlock read natively."""
+
+        return (
+            self._ring.host_address
+            + self._ring.dest_offset
+            + (seq % self.capacity) * V2_DEST_STRIDE
+        )
+
     def mark_serving(self, *, pool_generation: str, source_session_id: str) -> None:
         self.pool_generation = pool_generation
         self.source_session_id = source_session_id

@@ -241,21 +241,39 @@ class _PublishWorker:
     loop: ``enable_batches`` gives it the scheduler's wake word and the
     ingress landing-release queue, and ``submit_batch`` hands it one
     descriptor per compute batch, whose GPU done it turns into a DONE record
-    (``drain_done``) plus the batch's landing releases.
+    (``drain_done``) plus the batch's landing releases.  D9: the descriptor
+    also carries the batch's late and cross-host push rows, which the loop
+    issues at the GPU done, and every push job's completion comes back as a
+    PUSH_DONE record (``drain_push_done``).
     """
 
     # One DONE record: {seq, gpu_done_ns, materialize_ns, proposal_ns, error}.
     DONE_WORDS = 5
     DONE_BATCH = 64
+    # One PUSH_DONE record: {kind, id, row, outcome, issued_ns, done_ns}
+    # (csrc PushDoneKind / PushOutcome).
+    PUSH_DONE_WORDS = 6
+    PUSH_DONE_BATCH = 512
+    PUSH_DONE_JOB, PUSH_DONE_ROW = 1, 2
+    PUSHED, CANCELLED, EXPIRED, FAILED = 0, 1, 2, 3
+    # Descriptor push rows (csrc kPushRowWords, PushClass).
+    PUSH_ROW_WORDS = 15
+    PUSH_LATE_LOCAL, PUSH_CROSS_HOST = 1, 2
+    # batch_stats() fields, in the csrc order.
+    STATS = (
+        "done_seq", "outstanding", "polls", "poll_ns", "cpu_ns", "held_now",
+        "held_max", "held_total", "held_pushed", "held_cancelled", "held_expired",
+        "late_rows", "cross_rows", "pushes_outstanding",
+    )
 
-    def __init__(self, *, device_index: int, priority: int) -> None:
-        from sglang.srt.speculative.dt_direct_ring import (
-            _build_native_library,
-            native_probe,
-        )
+    @staticmethod
+    def library() -> ctypes.CDLL:
+        """The built csrc/dt_publish_worker.cpp (no CUDA until create)."""
+
+        from sglang.srt.speculative.dt_direct_ring import _build_native_library
 
         source = Path(__file__).with_name("csrc") / "dt_publish_worker.cpp"
-        lib = ctypes.CDLL(
+        return ctypes.CDLL(
             str(
                 _build_native_library(
                     "dt_publish_worker",
@@ -274,6 +292,11 @@ class _PublishWorker:
                 )
             )
         )
+
+    def __init__(self, *, device_index: int, priority: int) -> None:
+        from sglang.srt.speculative.dt_direct_ring import native_probe
+
+        lib = self.library()
         u64, vp = ctypes.c_uint64, ctypes.c_void_p
         lib.dt_publish_worker_create.argtypes = [ctypes.c_int, ctypes.c_int]
         lib.dt_publish_worker_create.restype = vp
@@ -287,7 +310,9 @@ class _PublishWorker:
         lib.dt_publish_worker_destroy.restype = ctypes.c_int
         lib.dt_publish_worker_set_probe.argtypes = [vp, vp]
         lib.dt_publish_worker_set_probe.restype = ctypes.c_int
-        lib.dt_publish_worker_enable_batches.argtypes = [vp, vp, vp, ctypes.c_uint32, vp, vp]
+        lib.dt_publish_worker_enable_batches.argtypes = [
+            vp, vp, vp, ctypes.c_uint32, vp, vp, vp, ctypes.c_int
+        ]
         lib.dt_publish_worker_enable_batches.restype = ctypes.c_int
         lib.dt_publish_worker_submit_batch.argtypes = [vp, vp, u64]
         lib.dt_publish_worker_submit_batch.restype = u64
@@ -295,6 +320,12 @@ class _PublishWorker:
         lib.dt_publish_worker_done_drain.restype = u64
         lib.dt_publish_worker_batch_stats.argtypes = [vp, vp]
         lib.dt_publish_worker_batch_stats.restype = None
+        lib.dt_publish_worker_push_done_drain.argtypes = [vp, vp, u64]
+        lib.dt_publish_worker_push_done_drain.restype = u64
+        lib.dt_publish_worker_expire_held.argtypes = [vp]
+        lib.dt_publish_worker_expire_held.restype = None
+        self._priority = priority
+        self.batches_enabled = False
         handle = lib.dt_publish_worker_create(device_index, priority)
         if not handle:
             raise CandidateTransportError("candidate publish worker failed to start")
@@ -314,22 +345,43 @@ class _PublishWorker:
             raise CandidateTransportError("candidate publish worker is broken")
         return ticket
 
-    def enable_batches(self, wake, ring_worker) -> None:
+    def enable_batches(self, wake, ring_worker, producer_tag_value: int) -> None:
         """Turn the send/completion loop on (D8): the DONE wake bit and the
-        ingress landing-release queue this thread will push to."""
+        ingress landing-release queue this thread will push to.  D9: the
+        destination-region and arena layout its late pushes read (csrc
+        PushConst order)."""
 
         import numpy as np
 
+        from sglang.srt.speculative.dt_direct_ring import (
+            V2_DEST_DATA_OFFSET,
+            V2_DEST_ENTRY_BYTES,
+            V2_DEST_META_OFFSET,
+            V2_DEST_SEQ_OFFSET,
+        )
         from sglang.srt.speculative.dt_wake import WAKE_DONE
 
         wake_set, wake_handle = wake.native_setter()
         release, ring_handle = ring_worker.landing_release_setter()
+        constants = np.array(
+            (
+                V2_DEST_SEQ_OFFSET, V2_DEST_DATA_OFFSET, V2_DEST_META_OFFSET,
+                V2_DEST_ENTRY_BYTES, METADATA_WORDS, COMPLETION_RECORD_BYTES,
+                producer_tag_value,
+            ),
+            dtype=np.uint64,
+        )
         if self._lib.dt_publish_worker_enable_batches(
-            self._handle, wake_set, wake_handle, WAKE_DONE, release, ring_handle
+            self._handle, wake_set, wake_handle, WAKE_DONE, release, ring_handle,
+            constants.ctypes.data, self._priority,
         ):
             raise CandidateTransportError("send/completion loop could not be enabled")
         self._done = np.empty(self.DONE_BATCH * self.DONE_WORDS, dtype=np.uint64)
-        self._stats = np.zeros(4, dtype=np.uint64)
+        self._push_done = np.empty(
+            self.PUSH_DONE_BATCH * self.PUSH_DONE_WORDS, dtype=np.uint64
+        )
+        self._stats = np.zeros(len(self.STATS), dtype=np.uint64)
+        self.batches_enabled = True
 
     def submit_batch(self, descriptor: array) -> None:
         """Hand one batch descriptor (see the .cpp layout) to the loop."""
@@ -346,8 +398,21 @@ class _PublishWorker:
         )
         return self._done[: n * self.DONE_WORDS].reshape(-1, self.DONE_WORDS)
 
+    def drain_push_done(self):
+        """The PUSH_DONE records published since the last drain, one row each."""
+
+        n = self._lib.dt_publish_worker_push_done_drain(
+            self._handle, self._push_done.ctypes.data, self.PUSH_DONE_BATCH
+        )
+        return self._push_done[: n * self.PUSH_DONE_WORDS].reshape(-1, self.PUSH_DONE_WORDS)
+
+    def expire_held(self) -> None:
+        """Shutdown: the loop gives up every held late row at its next pass."""
+
+        self._lib.dt_publish_worker_expire_held(self._handle)
+
     def batch_stats(self):
-        """(done_seq, outstanding descriptors, poll waits, poll ns)."""
+        """The STATS counters (done_seq and outstanding descriptors first)."""
 
         self._lib.dt_publish_worker_batch_stats(self._handle, self._stats.ctypes.data)
         return self._stats
@@ -3161,7 +3226,7 @@ class DraftCandidatePushTransport:
             groups = self._remote_groups(remote_rows) if remote_rows else []
             cross_host_ns += time.monotonic_ns() - remote_started_ns
             event = self._submit_to_worker(
-                stream, segments, publications, groups,
+                stream, segments, self._publication_words(publications), groups,
                 enable_timing=start_event is not None,
             )
         else:
@@ -3195,7 +3260,7 @@ class DraftCandidatePushTransport:
         )
 
     def _submit_to_worker(
-        self, stream, segments, publications, groups, *, enable_timing: bool
+        self, stream, segments, words, groups, *, enable_timing: bool
     ) -> _WorkerPushEvent:
         """Hand one push's stream work to the publish worker (issue #244).
 
@@ -3211,7 +3276,6 @@ class DraftCandidatePushTransport:
         event.watch(groups)
         event.record(stream)
         host_fn, host_arg = CandidatePost(groups).host_call()
-        words = self._publication_words(publications)
         job = array(
             "Q", (event.cuda_event, len(segments), len(words) // 2, host_fn, host_arg)
         )
@@ -3294,6 +3358,11 @@ class DraftCandidatePushTransport:
         if start_event is not None:
             start_event.record(stream)
         remote_rows: dict[str, list] = {}
+        worker = getattr(self, "_publish_worker", None)
+        # D9: under the send loop the same-host words go to the publish
+        # worker, whose PUSH_DONE record is this push's completion.
+        via_worker = worker is not None and worker.batches_enabled
+        words: list[int] = []
         for task in tasks:
             destination = task.candidate_destination
             self._validate_destination(task, destination, destination.nbytes)
@@ -3318,6 +3387,9 @@ class DraftCandidatePushTransport:
                 (ROOT_TOKEN_WORD, int(task.next_token_id) & 0xFFFFFFFF),
                 (GENERATION_WORD, destination.generation),
             ):
+                if via_worker:
+                    words += (address + word * 4, value)
+                    continue
                 self._runtime.stream_write_value32(
                     address=address + word * 4,
                     value=value,
@@ -3328,12 +3400,18 @@ class DraftCandidatePushTransport:
             from sglang.srt.speculative.dt_rdma import CandidatePost
 
             CandidatePost(groups).post()
-        if remote_rows:
+        if via_worker:
+            event = self._submit_to_worker(
+                stream, [], words, [], enable_timing=start_event is not None
+            )
+            event.watch(groups)
+        elif remote_rows:
             event = _RemotePushEvent(enable_timing=start_event is not None)
             event.watch(groups)
         else:
             event = torch.cuda.Event(enable_timing=start_event is not None)
-        event.record(stream)
+        if not via_worker:
+            event.record(stream)
         return CandidatePush(
             event=event,
             transfer_ids=tuple(task.transfer_id for task in tasks),
@@ -3341,6 +3419,7 @@ class DraftCandidatePushTransport:
             candidate_bytes=0,
             cold_mapping_count=0,
             start_event=start_event,
+            ticket=getattr(event, "_ticket", 0),
         )
 
     def enable_send_loop(self, wake, ring_worker):
@@ -3351,8 +3430,79 @@ class DraftCandidatePushTransport:
         worker = getattr(self, "_publish_worker", None)
         if worker is None:
             return None
-        worker.enable_batches(wake, ring_worker)
+        worker.enable_batches(wake, ring_worker, self._producer_tag)
         return worker
+
+    def late_push_row(self, task, source: int, row_bytes: int, region_entry: int,
+                      position: int) -> list[int] | None:
+        """D9: the LATE_LOCAL descriptor row of one same-host v2 row whose
+        destination is not in the region yet (csrc kPushRowWords): the send
+        loop reads the region at the GPU done and pushes natively.  None when
+        the Target has no completion record (the row keeps the retire path)."""
+
+        for key, (registration, data_base, metadata_base, _socket) in self._registered.items():
+            if registration.target_instance_id == task.target_instance_id:
+                break
+        else:
+            return None
+        records = self._completion_records.get(key)
+        if records is None:
+            return None
+        if registration.row_width * 4 != row_bytes:
+            raise CandidateTransportError("candidate rows do not match the arena width")
+        record_file, record_base = records
+        return [
+            _PublishWorker.PUSH_LATE_LOCAL, source, row_bytes, region_entry,
+            task.direct_ring_seq, position,
+            data_base, registration.data_allocation_length,
+            metadata_base, registration.metadata_allocation_length,
+            record_base, record_file.slot_capacity,
+            transfer_id_hash(task.transfer_id), int(task.next_token_id) & 0xFFFFFFFF,
+            task.deadline_ns,
+        ]
+
+    def cross_host_rows(self, rows):
+        """D9: the CROSS_HOST descriptor rows of ``rows`` ((task, source
+        address, row bytes) each), and the native post of their groups as
+        (fn, arg, groups).  The send loop copies each row into its push leg's
+        mirror at the GPU done and then posts the groups; the groups' CQ stays
+        with this thread (``reap_remote``)."""
+
+        from sglang.srt.speculative.dt_rdma import CandidatePost
+
+        words: list[int] = []
+        remote_rows: dict[str, list] = {}
+        for task, source, row_bytes in rows:
+            destination = task.candidate_destination
+            self._validate_destination(task, destination, row_bytes)
+            pusher = self._remote_pusher(destination.target_instance_id)
+            if pusher is None:
+                raise CandidateTransportError(
+                    f"remote candidate push to {destination.target_instance_id} has no leg"
+                ) from self._remote_errors.get(destination.target_instance_id)
+            remote_rows.setdefault(destination.target_instance_id, []).append(
+                (destination.slot_id, True, self._remote_record(task, destination.row_width))
+            )
+            words += (
+                _PublishWorker.PUSH_CROSS_HOST, source, row_bytes,
+                pusher.mirror_row(destination.slot_id),
+                *(0,) * (_PublishWorker.PUSH_ROW_WORDS - 4),
+            )
+        groups = self._remote_groups(remote_rows)
+        post_fn, post_arg = CandidatePost(groups).host_call()
+        return words, post_fn, post_arg, groups
+
+    def reap_remote(self) -> None:
+        """Reap the cross-host push legs' completions (non-blocking); a failed
+        WRITE raises, as the push event's query does on the legacy path."""
+
+        for pusher in self._remote_pushers.values():
+            if pusher._groups:
+                pusher.reap()
+            if pusher._broken is not None:
+                raise CandidateTransportError("cross-host candidate push failed") from (
+                    pusher._broken
+                )
 
     def dump_native_probe(self) -> None:
         """Drain the publish worker's D0 stamps into the profile (issue #269)."""

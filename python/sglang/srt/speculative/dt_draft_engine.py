@@ -1293,6 +1293,14 @@ class FlashMTPDraftEngine:
         # worker exists); the fence events of the release-only descriptors
         # still outstanding, in submit order, live in _ready_release_fenced.
         self._send_loop_worker = None
+        # D9: the same worker as the source of PUSH_DONE records; unlike
+        # _send_loop_worker it outlives the ring worker (shutdown drains
+        # pushes after the rings close).
+        self._push_done_worker = None
+        # D9: rows handed to the send loop for a late or cross-host push, by
+        # done seq: [tasks by descriptor row (None once retired), the batch's
+        # candidates (the loop reads them), rows not yet retired, groups].
+        self._send_loop_rows: dict[int, list] = {}
         # READY table (scheduler-owned, native ingress): entries by READY seq
         # modulo the queue capacity (created with the ring worker), the
         # unselected rows in arrival order (READY seq plus the identity DRAIN
@@ -2421,6 +2429,9 @@ class FlashMTPDraftEngine:
                 # the send loop finished stops counting here, not after this
                 # turn's submit.
                 self._absorb_dflash_done()
+                # D9: push completions arrive as PUSH_DONE records, so no
+                # push event is polled on this path.
+                self._absorb_push_done()
             if self._candidate_push_transport is not None:
                 self._loop_stage("push_progress", self._push_transport_progress)
             if self._stop:
@@ -2485,7 +2496,7 @@ class FlashMTPDraftEngine:
                 if self._is_feature_backed and not self._send_loop:
                     # Split internally into dflash_query/publish/retire.
                     self._poll_dflash_completions()
-            if self._pending_candidate_pushes:
+            if self._pending_candidate_pushes and self._push_done_worker is None:
                 self._loop_stage("poll_candidate_pushes", self._poll_candidate_pushes)
             if rings:
                 self._loop_stage("poll_rings_tail", self._poll_direct_rings)
@@ -2509,12 +2520,13 @@ class FlashMTPDraftEngine:
                     (self._pending_dflash_completions and not self._send_loop)
                     or self._pending_eagle3_completions
                     or self._pending_flashmtp_completions
-                    or self._pending_candidate_pushes
+                    or (self._pending_candidate_pushes and self._push_done_worker is None)
                 ):
                     # A completion or direct candidate push is still in flight
                     # on the GPU; observe it soon instead of sleeping the full
                     # idle poll (issue #149).  The send loop's DONE wake ends
-                    # the wait instead, so its batches are not polled (§4.4).
+                    # the wait instead, so its batches and (D9) its pushes
+                    # are not polled (§4.4).
                     idle_s = INFLIGHT_POLL_S
                 else:
                     idle_s = IDLE_POLL_S
@@ -2545,6 +2557,8 @@ class FlashMTPDraftEngine:
         before = len(self._pending_candidate_pushes)
         with torch.cuda.stream(stream):
             yield
+        if self._push_done_worker is not None:
+            return  # D9: the push's PUSH_DONE record retires it; no spin
         if len(self._pending_candidate_pushes) > before:
             event = self._pending_candidate_pushes[-1].push.event
             deadline_ns = time.monotonic_ns() + DIRECT_PUSH_SPIN_NS
@@ -2553,7 +2567,7 @@ class FlashMTPDraftEngine:
             self._poll_candidate_pushes()
 
     def _queue_early_candidate_push(
-        self, tasks, candidates: torch.Tensor | None, ready_event
+        self, tasks, candidates: torch.Tensor | None, ready_event, indices=None
     ) -> None:
         """Queue the candidate push behind the proposal at launch time.
 
@@ -2572,12 +2586,13 @@ class FlashMTPDraftEngine:
         if self.candidate_transport != "cuda-ipc" or transport is None:
             return
         tasks = list(tasks)
-        indices = [
-            index
-            for index, task in enumerate(tasks)
-            if task.candidate_destination is not None
-            and task.transfer_id not in self._cancelled_ids
-        ]
+        if indices is None:  # D9 passes the rows it pre-queues
+            indices = [
+                index
+                for index, task in enumerate(tasks)
+                if task.candidate_destination is not None
+                and task.transfer_id not in self._cancelled_ids
+            ]
         selected = [tasks[index] for index in indices]
         if not selected or not (
             transport.has_ready_records(selected)
@@ -2701,6 +2716,7 @@ class FlashMTPDraftEngine:
                     raise RuntimeError(
                         "DT_DRAFT_SEND_LOOP=1 requires DT_PUBLISH_WORKER=1"
                     )
+                self._push_done_worker = self._send_loop_worker
         return self._ring_worker
 
     def _open_direct_ring(self, registration) -> None:
@@ -3826,13 +3842,14 @@ class FlashMTPDraftEngine:
             if self._ring_worker is not None:  # shutdown: already destroyed
                 self._ring_worker.ready_consume(consumed)
 
-    def _submit_batch_descriptor(self, done_seq, event, releases, timing=()) -> None:
+    def _submit_batch_descriptor(self, done_seq, event, releases, timing=(), push=()) -> None:
         """Hand one descriptor to the send loop (design §5.1 HAND-OFF (ii)).
 
         ``done_seq`` 0 is a release-only fence: it carries no timing events
         and its DONE record only retires the fence event.  ``event`` and the
         timing events are recorded on the one compute stream, so descriptors
-        complete in the order they are submitted."""
+        complete in the order they are submitted.  ``push`` is the D9 push
+        section from _hand_off_pushes (empty: no rows)."""
 
         descriptor = array(
             "Q",
@@ -3845,7 +3862,71 @@ class FlashMTPDraftEngine:
         )
         for k, gen in releases:
             descriptor.extend((k, gen, 1))
+        descriptor.extend(push or (0, 0, 0))
         self._send_loop_worker.submit_batch(descriptor)
+
+    def _hand_off_pushes(self, done_seq, proposal_tasks, candidates):
+        """HAND-OFF (i) of D9 (design §5.1, §7.3-7.4): sort a batch's
+        proposal rows by how their candidates reach the Target.
+
+        - destination known, same host: pre-queued behind the proposal now
+          (``_queue_early_candidate_push``).  A v2 row's destination is read
+          from the region here, so a row whose Target already wrote it is
+          pre-queued rather than pushed late;
+        - same-host v2 row, destination not in the region yet: LATE_LOCAL,
+          resolved by the send loop at the GPU done (held until it appears);
+        - cross-host: CROSS_HOST, copied and posted by the send loop at the
+          GPU done.
+
+        Returns (descriptor push section, the proposal tasks with the
+        destinations read here, pre-queue indices).  Every row
+        handed to the loop counts as pushed at launch for the retire path, and
+        its PUSH_DONE record retires it (``_absorb_push_done``)."""
+
+        from msgspec.structs import replace
+
+        transport = self._candidate_push_transport
+        row_bytes = int(candidates.shape[1]) * candidates.element_size()
+        base = candidates.data_ptr()
+        prequeue, rows, owned, cross = [], [], [], []
+        proposal_tasks = list(proposal_tasks)
+        for index, task in enumerate(proposal_tasks):
+            if task.transfer_id in self._cancelled_ids:
+                continue  # as the pre-queue skips it: the retire path owns it
+            destination = task.candidate_destination
+            if destination is None and task.direct_ring_seq:
+                destination = self._resolve_ring_destination(task)
+                if destination is not None:
+                    task = replace(task, candidate_destination=destination)
+                    proposal_tasks[index] = task
+            source = base + index * row_bytes
+            if destination is None:
+                location = self._ring_record_positions.get(task.transfer_id)
+                row = (
+                    None
+                    if location is None
+                    else transport.late_push_row(
+                        task, source, row_bytes,
+                        location[0].destination_entry(task.direct_ring_seq), location[1],
+                    )
+                )
+                if row is not None:
+                    rows += row
+                    owned.append(task)
+            elif destination.target_instance_id in transport._remote:
+                cross.append((task, source, row_bytes))
+            else:
+                prequeue.append(index)
+        post_fn = post_arg = 0
+        groups = ()
+        if cross:
+            words, post_fn, post_arg, groups = transport.cross_host_rows(cross)
+            rows += words
+            owned += [task for task, _source, _bytes in cross]
+        if owned:
+            self._send_loop_rows[done_seq] = [owned, candidates, len(owned), groups]
+            self._early_pushed_ids.update(task.transfer_id for task in owned)
+        return (len(owned), post_fn, post_arg, *rows), proposal_tasks, prequeue
 
     def _absorb_dflash_done(self) -> None:
         """ABSORB (design §5.1): take the send loop's DONE records.
@@ -3922,6 +4003,99 @@ class FlashMTPDraftEngine:
             )
         if retired:
             self._publish_capacity()
+
+    def _absorb_push_done(self) -> None:
+        """ABSORB of D9 (design §5.1, §7.2 step 5): take the send loop's
+        PUSH_DONE records instead of polling push events.
+
+        A job record retires the oldest queued push: the publish worker runs
+        jobs in order on one stream and reports them in that order.  A row
+        record retires one late or cross-host row of a batch: pushed rows as
+        a completed push, a row the Target tombstoned or whose destination
+        never appeared as a cancelled identity (as the legacy held release
+        does).  The cross-host legs' completion queues stay with this thread
+        and are reaped here, without waiting."""
+
+        worker = self._push_done_worker
+        if worker is None or self._fatal_gpu_quarantine_active():
+            return
+        records = worker.drain_push_done()
+        try:
+            if self._send_loop_rows or self._pending_candidate_pushes:
+                self._candidate_push_transport.reap_remote()
+        except Exception:
+            logger.critical("cross-host candidate push failed", exc_info=True)
+            self._enter_fatal_gpu_quarantine("unquiesced cross-host candidate push failure")
+            return
+        if not len(records):
+            return
+        from sglang.srt.speculative.dt_candidate_p2p import CandidatePush
+
+        stage_started_ns = time.monotonic_ns()
+        pushed: dict[tuple[int, int], list] = {}
+        for kind, ident, row, outcome, issued_ns, done_ns in records.tolist():
+            if kind == worker.PUSH_DONE_JOB:
+                pending = self._pending_candidate_pushes.popleft()
+                if pending.push.ticket != ident:
+                    raise RuntimeError(
+                        f"PUSH_DONE record {ident} is not the oldest push {pending.push.ticket}"
+                    )
+                tasks = pending.tasks
+            else:
+                entry = self._send_loop_rows[ident]
+                task, entry[0][row] = entry[0][row], None
+                entry[2] -= 1
+                if not entry[2]:
+                    del self._send_loop_rows[ident]
+                tasks = [task]
+            if outcome == worker.FAILED:
+                exc = RuntimeError("send-loop candidate push failed")
+                exc.resources_quiescent = False
+                self._enter_fatal_gpu_quarantine("unquiesced send-loop candidate push failure")
+                self._publish_failures([(task, exc) for task in tasks])
+                return
+            if kind == worker.PUSH_DONE_JOB:
+                self._retire_candidate_push(pending, done_ns)
+            elif outcome == worker.PUSHED:
+                group = pushed.setdefault((ident, issued_ns), [done_ns, entry[1], []])
+                group[0] = max(group[0], done_ns)
+                group[2].append(task)
+            else:  # CANCELLED by the Target, or EXPIRED without a destination
+                if outcome == worker.EXPIRED:
+                    logger.warning(
+                        "late push row has no destination at its deadline: %s",
+                        task.transfer_id,
+                    )
+                self._retire_cancelled_transfer_identity(task)
+        for (_seq, issued_ns), (done_ns, candidates, tasks) in pushed.items():
+            push = CandidatePush(
+                event=None,
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                submitted_ns=issued_ns,
+                candidate_bytes=len(tasks) * candidates.shape[1] * candidates.element_size(),
+                cold_mapping_count=0,
+            )
+            if self._profile_active:
+                # The send loop issued these at the GPU done (D0 chain:
+                # push_submit is that issue, push_complete its observation).
+                profile_emit(
+                    "draft_candidate_push_submit",
+                    draft_instance=self.instance_id,
+                    transfer_ids=push.transfer_ids,
+                    entries=len(tasks),
+                    candidate_bytes=push.candidate_bytes,
+                    cold_mapping_count=0,
+                    submitted_ns=issued_ns,
+                    ticket=0,
+                    send_loop=True,
+                )
+            self._retire_candidate_push(
+                PendingCandidatePush(push=push, tasks=tasks, result_slot=None, candidates=None),
+                done_ns,
+            )
+        self._loop_stage_ns["push_absorb"] += time.monotonic_ns() - stage_started_ns
+        self._loop_stage_calls["push_absorb"] += len(records)
+        self._publish_capacity()
 
     def _ready_row_keys(self, seqs) -> tuple[tuple[int, int], ...]:
         """(ring id, record seq) of each READY row, for its landing release."""
@@ -4455,6 +4629,7 @@ class FlashMTPDraftEngine:
             or self._pending_dflash_completions
             or self._pending_eagle3_completions
             or getattr(self, "_pending_candidate_pushes", ())
+            or getattr(self, "_send_loop_rows", None)
         ):
             self._poll_feature_batches()
             self._raise_if_fatal_gpu_quarantine("shutdown feature-batch drain")
@@ -4526,7 +4701,18 @@ class FlashMTPDraftEngine:
                         "feature-backed Draft shutdown requires process teardown "
                         "after an EAGLE3 completion fence failure"
                     )
-            if getattr(self, "_pending_candidate_pushes", ()):
+            if getattr(self, "_push_done_worker", None) is not None and not (
+                self._pending_dflash_completions
+            ):
+                # D9: every batch is absorbed, so no row can join the held
+                # list; give up the held ones and take the records.
+                self._push_done_worker.expire_held()
+                self._absorb_push_done()
+                self._raise_if_fatal_gpu_quarantine(
+                    "shutdown send-loop push drain"
+                )
+                time.sleep(0)
+            elif getattr(self, "_pending_candidate_pushes", ()):
                 push = self._pending_candidate_pushes[0]
                 try:
                     push.push.event.synchronize()
@@ -7686,12 +7872,18 @@ class FlashMTPDraftEngine:
                 raise RuntimeError("DFLASH batch submitted before the send loop")
             # HAND-OFF (design §5.1): frozen_seq is batch_seq + 1, and the
             # send loop pushes this batch's landing releases once its GPU
-            # work is done.  The batch is registered and launched: if the
-            # hand-off fails there is no watcher for GPU work that is already
-            # running, so this is fatal and nothing it touched may be reused.
+            # work is done, and its late and cross-host rows (D9).  The batch
+            # is registered and launched: if the hand-off fails there is no
+            # watcher for GPU work that is already running, so this is fatal
+            # and nothing it touched may be reused.
             try:
                 releases = self._resolve_ready_releases(completion.ready_rows)
                 completion.ready_rows = ()
+                push, push_tasks, prequeue = (), proposal_tasks, None
+                if copy_stream is None and proposal_tasks and candidates is not None:
+                    push, push_tasks, prequeue = self._hand_off_pushes(
+                        batch_seq + 1, proposal_tasks, candidates
+                    )
                 self._submit_batch_descriptor(
                     batch_seq + 1,
                     completion.completion_event,
@@ -7701,6 +7893,7 @@ class FlashMTPDraftEngine:
                         materialize_done.cuda_event,
                         proposal_done.cuda_event,
                     ),
+                    push=push,
                 )
             except Exception as exc:
                 self._pending_dflash_completions.remove(completion)
@@ -7711,7 +7904,11 @@ class FlashMTPDraftEngine:
                 exc.resources_quiescent = False
                 self._enter_fatal_gpu_quarantine("DFLASH batch hand-off failed")
                 raise
-        if copy_stream is None and proposal_tasks:
+            if prequeue:
+                self._queue_early_candidate_push(
+                    push_tasks, candidates, completion.completion_event, prequeue
+                )
+        elif copy_stream is None and proposal_tasks:
             self._queue_early_candidate_push(
                 proposal_tasks, candidates, completion.completion_event
             )
@@ -11028,12 +11225,6 @@ class FlashMTPDraftEngine:
         if self._fatal_gpu_quarantine_active():
             return
 
-        from dt_protocol import (
-            PROTOCOL_VERSION,
-            DraftExecutionResultBatch,
-            DraftResultEntry,
-        )
-
         capacity_changed = False
         while self._pending_candidate_pushes:
             pending = self._pending_candidate_pushes[0]
@@ -11048,100 +11239,113 @@ class FlashMTPDraftEngine:
                 break
             if not ready:
                 break
-            producer_completion_observed_ns = (
-                time.monotonic_ns() if self._profile_active else 0
-            )
             self._pending_candidate_pushes.popleft()
-            # Target READY is driven by this direct, payload-free notice.  The
-            # Coordinator result below is independent retirement/accounting.
-            self._candidate_push_transport.publish_completion(
-                pending.tasks, cancelled=pending.cancelled
+            self._retire_candidate_push(
+                pending, time.monotonic_ns() if self._profile_active else 0
             )
-            if self._profile_active:
-                notice_publish_returned_ns = time.monotonic_ns()
-                profile_emit(
-                    "draft_candidate_producer_completion_observed",
-                    draft_instance=self.instance_id,
-                    transfer_ids=tuple(
-                        task.transfer_id for task in pending.tasks
-                    ),
-                    entries=len(pending.tasks),
-                    submitted_ns=pending.push.submitted_ns,
-                    completion_observed_ns=producer_completion_observed_ns,
-                    notice_publish_returned_ns=notice_publish_returned_ns,
-                )
-            self._result_sequence += 1
-            result_sent_ns = time.monotonic_ns()
-            report = getattr(pending, "coordinator_result", True)
-            message = DraftExecutionResultBatch(
-                protocol_version=PROTOCOL_VERSION,
-                batch_id=f"{self.instance_id}:direct-result:{self._result_sequence}",
-                draft_instance_id=self.instance_id,
-                entries=tuple(
-                    DraftResultEntry(
-                        transfer_id=task.transfer_id,
-                        request_id=task.request_id,
-                        round_id=task.round_id,
-                        attempt=task.attempt,
-                        target_instance_id=task.target_instance_id,
-                        status=(
-                            self.EntryStatus.CANCELLED
-                            if pending.cancelled
-                            else self.EntryStatus.OK
-                        ),
-                        source_read_quiescent=pending.cancelled,
-                    )
-                    for task in pending.tasks
-                ),
-                sent_ns=result_sent_ns,
-            )
-            if report:
-                self._send_result(message)
-            if pending.result_slot is not None:
-                self._free_result_slots.append(pending.result_slot)
-            elif getattr(pending, "admission_credit", False):
-                # The wave's admission credit returns only when its GPU push
-                # completion retires here.
-                self._release_direct_proposal_admission()
-            early = getattr(self, "_early_pushed_ids", ())
-            for task in pending.tasks:
-                # A push queued at launch can retire before its completion
-                # handler runs; that handler still needs the cancel mark.
-                if task.transfer_id not in early and (
-                    not pending.cancelled
-                    or not self._has_local_execution_owner(task.transfer_id)
-                ):
-                    self._cancelled_ids.discard(task.transfer_id)
-                self._direct_tasks_by_transfer.pop(task.transfer_id, None)
             capacity_changed = True
-            if self._profile_active:
-                profile_emit(
-                    "draft_candidate_push_complete",
-                    draft_instance=self.instance_id,
-                    batch_id=message.batch_id,
-                    transfer_ids=tuple(task.transfer_id for task in pending.tasks),
-                    entries=len(pending.tasks),
-                    candidate_bytes=pending.push.candidate_bytes,
-                    submitted_ns=pending.push.submitted_ns,
-                    completed_ns=producer_completion_observed_ns,
-                    completion_ns=(
-                        producer_completion_observed_ns
-                        - pending.push.submitted_ns
-                    ),
-                    coordinator_result_sent_ns=result_sent_ns,
-                    cuda_copy_publish_ns=(
-                        int(
-                            pending.push.start_event.elapsed_time(
-                                pending.push.event
-                            )
-                            * 1_000_000
-                        )
-                        if pending.push.start_event is not None
-                        else 0
-                    ),
-                )
         if capacity_changed:
             self._publish_capacity()
+
+    def _retire_candidate_push(self, pending, producer_completion_observed_ns: int) -> None:
+        """The bookkeeping of one completed direct push: notices, the
+        Coordinator result, credit and identity retirement.  Shared by the
+        legacy event poll and the D9 PUSH_DONE absorb, which passes the send
+        loop's own observation of the completion."""
+
+        from dt_protocol import (
+            PROTOCOL_VERSION,
+            DraftExecutionResultBatch,
+            DraftResultEntry,
+        )
+
+        # Target READY is driven by this direct, payload-free notice.  The
+        # Coordinator result below is independent retirement/accounting.
+        self._candidate_push_transport.publish_completion(
+            pending.tasks, cancelled=pending.cancelled
+        )
+        if self._profile_active:
+            notice_publish_returned_ns = time.monotonic_ns()
+            profile_emit(
+                "draft_candidate_producer_completion_observed",
+                draft_instance=self.instance_id,
+                transfer_ids=tuple(
+                    task.transfer_id for task in pending.tasks
+                ),
+                entries=len(pending.tasks),
+                submitted_ns=pending.push.submitted_ns,
+                completion_observed_ns=producer_completion_observed_ns,
+                notice_publish_returned_ns=notice_publish_returned_ns,
+            )
+        self._result_sequence += 1
+        result_sent_ns = time.monotonic_ns()
+        report = getattr(pending, "coordinator_result", True)
+        message = DraftExecutionResultBatch(
+            protocol_version=PROTOCOL_VERSION,
+            batch_id=f"{self.instance_id}:direct-result:{self._result_sequence}",
+            draft_instance_id=self.instance_id,
+            entries=tuple(
+                DraftResultEntry(
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    attempt=task.attempt,
+                    target_instance_id=task.target_instance_id,
+                    status=(
+                        self.EntryStatus.CANCELLED
+                        if pending.cancelled
+                        else self.EntryStatus.OK
+                    ),
+                    source_read_quiescent=pending.cancelled,
+                )
+                for task in pending.tasks
+            ),
+            sent_ns=result_sent_ns,
+        )
+        if report:
+            self._send_result(message)
+        if pending.result_slot is not None:
+            self._free_result_slots.append(pending.result_slot)
+        elif getattr(pending, "admission_credit", False):
+            # The wave's admission credit returns only when its GPU push
+            # completion retires here.
+            self._release_direct_proposal_admission()
+        early = getattr(self, "_early_pushed_ids", ())
+        for task in pending.tasks:
+            # A push queued at launch can retire before its completion
+            # handler runs; that handler still needs the cancel mark.
+            if task.transfer_id not in early and (
+                not pending.cancelled
+                or not self._has_local_execution_owner(task.transfer_id)
+            ):
+                self._cancelled_ids.discard(task.transfer_id)
+            self._direct_tasks_by_transfer.pop(task.transfer_id, None)
+        if self._profile_active:
+            profile_emit(
+                "draft_candidate_push_complete",
+                draft_instance=self.instance_id,
+                batch_id=message.batch_id,
+                transfer_ids=tuple(task.transfer_id for task in pending.tasks),
+                entries=len(pending.tasks),
+                candidate_bytes=pending.push.candidate_bytes,
+                submitted_ns=pending.push.submitted_ns,
+                completed_ns=producer_completion_observed_ns,
+                completion_ns=(
+                    producer_completion_observed_ns
+                    - pending.push.submitted_ns
+                ),
+                coordinator_result_sent_ns=result_sent_ns,
+                cuda_copy_publish_ns=(
+                    int(
+                        pending.push.start_event.elapsed_time(
+                            pending.push.event
+                        )
+                        * 1_000_000
+                    )
+                    if pending.push.start_event is not None
+                    else 0
+                ),
+            )
 
     def _has_local_execution_owner(self, transfer_id: str) -> bool:
         """Return whether cancelled work still has a local queue/GPU owner."""
@@ -11270,7 +11474,13 @@ class FlashMTPDraftEngine:
             task.transfer_id
             for pending in self._pending_candidate_pushes
             for task in pending.tasks
-        } | getattr(self, "_early_pushed_ids", set())
+        } | getattr(self, "_early_pushed_ids", set()) | {
+            # D9: rows the send loop still owes a push (their PUSH_DONE).
+            task.transfer_id
+            for entry in getattr(self, "_send_loop_rows", {}).values()
+            for task in entry[0]
+            if task is not None
+        }
         tasks_by_id = {
             transfer_id: task
             for transfer_id, task in self._direct_tasks_by_transfer.items()
@@ -11785,14 +11995,15 @@ class FlashMTPDraftEngine:
                         )
                     ),
                     # Send loop (D8): done_seq, descriptors outstanding, and
-                    # the thread's cumulative wait on them, i.e. the CPU cost
-                    # it adds; a windowed diff gives its busy share.
+                    # the thread's cumulative wait on them; D9: its own CPU
+                    # time (a windowed diff gives its core share) and the
+                    # held list of late push rows.
                     "send_loop": (
                         None
                         if self._send_loop_worker is None
                         else dict(
                             zip(
-                                ("done_seq", "outstanding", "polls", "poll_ns"),
+                                self._send_loop_worker.STATS,
                                 self._send_loop_worker.batch_stats().tolist(),
                             )
                         )
