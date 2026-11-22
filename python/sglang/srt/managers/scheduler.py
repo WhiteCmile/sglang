@@ -3251,6 +3251,19 @@ class Scheduler(
             # feature rows. Keep the selected work in running_batch until TP0
             # observes a reusable registered source slot; this is ordinary
             # scheduler backpressure, not a per-round allocation fallback.
+            work_kind = "selection"
+            if not running_batch.is_empty():
+                work_kind = (
+                    "prefill"
+                    if running_batch.forward_mode.is_extend()
+                    else "verify"
+                )
+            self.dt_target_controller.profile_source_capacity_blocked(
+                work_kind=work_kind,
+                batch_size=running_batch.batch_size(),
+                waiting_requests=len(self.waiting_queue),
+                parked_rounds=len(self.dt_target_controller),
+            )
             if dt_arbitration_profile_enabled:
                 self.dt_target_controller.profile_empty_prefill_arbitration(
                     decision_started_ns=dt_arbitration_decision_started_ns,

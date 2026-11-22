@@ -151,8 +151,11 @@ class FeaturePublish:
     descriptors: tuple[FeatureSourceDescriptor, ...]
     hidden_produced_ns: int
     descriptor_published_ns: int
+    reserved_ns: int
     pack_strategy: str
     pack_chunk_count: int
+    requested_rows: int
+    allocated_rows: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +202,7 @@ class _FeatureSlot:
     producer_event: torch.cuda.Event | None = None
     allocation_lease_id: str | None = None
     allocation_row_offset: int = 0
+    reserved_ns: int = 0
 
     def __post_init__(self) -> None:
         if self.active_transfers is None:
@@ -235,6 +239,7 @@ class TargetFeatureSourcePool:
         max_tokens: int,
         feature_width: int,
         page_rows: int = 0,
+        profile_timing: bool = False,
     ) -> None:
         if not target_instance_id or not source_session_id:
             raise ValueError("Target identity and source session must not be empty")
@@ -255,6 +260,7 @@ class TargetFeatureSourcePool:
         self.max_tokens = int(max_tokens)
         self.feature_width = int(feature_width)
         self.page_rows = int(page_rows)
+        self._profile_timing = bool(profile_timing)
         if self.page_rows < 0:
             raise ValueError("feature source page rows must not be negative")
         if self.page_rows and self.max_tokens % self.page_rows:
@@ -487,6 +493,7 @@ class TargetFeatureSourcePool:
         slot.state = FeatureSlotState.RESERVED
         slot.allocation_lease_id = allocation_lease_id
         slot.allocation_row_offset = allocation_row_offset
+        slot.reserved_ns = time.monotonic_ns() if self._profile_timing else 0
         rows = (
             self._storage[slot_id][:token_count]
             if page_allocator is None
@@ -529,6 +536,7 @@ class TargetFeatureSourcePool:
         slot.producer_event = None
         slot.allocation_lease_id = None
         slot.allocation_row_offset = 0
+        slot.reserved_ns = 0
         free_identities.append(slot_id)
         self._free_count += 1
 
@@ -808,6 +816,23 @@ class TargetFeatureSourcePool:
             if current.generation != generation or current.state is not FeatureSlotState.PUBLISHED:
                 raise FeatureTransportError("published source slot was invalidated")
             current.producer_event = producer_event
+            reserved_ns = int(getattr(current, "reserved_ns", 0))
+            page_allocator = getattr(self, "_page_allocator", None)
+            if page_allocator is None:
+                allocated_rows = self.max_tokens
+            else:
+                allocation_lease_id = current.allocation_lease_id
+                lease = (
+                    None
+                    if allocation_lease_id is None
+                    else page_allocator.get(allocation_lease_id)
+                )
+                if lease is None:
+                    raise FeatureTransportError("published source page lease is missing")
+                allocated_rows = lease.row_capacity
+            requested_rows = max(
+                item.row_offset + item.row_count for item in slices
+            )
         listener = getattr(self, "_ready_listener", None)
         if listener is not None:
             listener((slot_id, generation, producer_event))
@@ -820,8 +845,11 @@ class TargetFeatureSourcePool:
                 time.monotonic_ns() if hidden_produced_ns is None else hidden_produced_ns
             ),
             descriptor_published_ns=descriptor_published_ns,
+            reserved_ns=reserved_ns,
             pack_strategy=pack_strategy,
             pack_chunk_count=pack_chunk_count,
+            requested_rows=requested_rows,
+            allocated_rows=allocated_rows,
         )
 
     def read_done(

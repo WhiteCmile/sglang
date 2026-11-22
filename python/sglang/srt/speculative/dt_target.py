@@ -55,6 +55,7 @@ DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
 DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
 TARGET_P0_HOP_PROFILE_EVENT = "target_p0_hop"
+TARGET_SOURCE_BUFFER_PROFILE_EVENT = "target_source_buffer"
 # Target round-expiry scan cadence (issue #193): expiry is failure detection
 # with second-scale timeouts, so the O(parked) scan runs at most every 2 ms
 # instead of inside every scheduler poll.
@@ -655,6 +656,20 @@ class DTTargetController:
             self.is_export_rank
             and profile_event_explicitly_enabled(TARGET_P0_HOP_PROFILE_EVENT)
         )
+        # Source-buffer measurements are explicit-only because they keep one
+        # small record per live publication.  They never change admission,
+        # ownership, release order, or the wire protocol.
+        self.target_source_buffer_profile_enabled = bool(
+            self.is_export_rank
+            and profile_event_explicitly_enabled(
+                TARGET_SOURCE_BUFFER_PROFILE_EVENT
+            )
+        )
+        self._source_buffer_profile_leases: dict[tuple[int, int], dict] = {}
+        self._source_low_free_started_ns = 0
+        self._source_low_free_last_effective = None
+        self._source_gate_profile_started_ns: dict[str, int] = {}
+        self._source_gate_profile_decisions: Counter[str] = Counter()
         if (
             self.eagle3_host_span_profile_enabled
             and not self.server_args.draft_target_overlap_schedule
@@ -965,6 +980,7 @@ class DTTargetController:
                         max_tokens=max_source_rows,
                         feature_width=self.pivot_width,
                         page_rows=feature_source_page_rows,
+                        profile_timing=self.target_source_buffer_profile_enabled,
                     )
                     self._profile_emit(
                         "target_feature_pool_registration",
@@ -1344,6 +1360,7 @@ class DTTargetController:
                             batch_result, "dt_hidden_produced_ns", publish_started_ns
                         ),
                     )
+                    self._profile_register_source_publication(published)
                     publish_done_ns = (
                         time.monotonic_ns() if self._profile_active else 0
                     )
@@ -2415,6 +2432,7 @@ class DTTargetController:
                                 time.monotonic_ns(),
                             ),
                         )
+                    self._profile_register_source_publication(published)
                     batch_result.dt_dflash_feature_publish_strategy = (
                         published.pack_strategy
                     )
@@ -3096,6 +3114,275 @@ class DTTargetController:
 
         if getattr(self, "target_p0_hop_profile_enabled", False):
             self._profile_emit(TARGET_P0_HOP_PROFILE_EVENT, hop=hop, **fields)
+
+    def _source_buffer_emit(self, stage: str, **fields) -> None:
+        """Emit one opt-in source-buffer record without changing ownership."""
+
+        if getattr(self, "target_source_buffer_profile_enabled", False):
+            self._profile_emit(
+                TARGET_SOURCE_BUFFER_PROFILE_EVENT, stage=stage, **fields
+            )
+
+    def _source_buffer_pool_stats(self) -> dict[str, int]:
+        """Return scalar pool state used by the source-buffer experiment."""
+
+        pool = getattr(self, "_feature_source_pool", None)
+        if pool is None:
+            return {}
+        allocator = getattr(pool, "_page_allocator", None)
+        return {
+            "source_slots_free": int(pool.free_slot_count),
+            "source_slots_total": int(pool.slot_count),
+            "source_active_leases": int(pool.active_lease_count),
+            "source_identity_high_water": int(pool.active_identity_high_water),
+            "source_allocation_count": int(pool.allocation_count),
+            "source_failure_count": int(pool.failure_count),
+            "source_requested_rows_total": int(pool.requested_rows_total),
+            "source_allocated_rows_total": int(pool.allocated_rows_total),
+            "source_internal_fragmentation_rows_total": int(
+                pool.internal_fragmentation_rows_total
+            ),
+            "source_leased_pages_high_water": int(
+                pool.leased_page_count_high_water
+            ),
+            "source_pages_free": int(
+                allocator.free_page_count if allocator is not None else 0
+            ),
+            "source_pages_total": int(
+                allocator.total_page_count if allocator is not None else 0
+            ),
+            "source_largest_extent_pages": int(
+                allocator.largest_free_extent_pages
+                if allocator is not None
+                else 0
+            ),
+        }
+
+    def _profile_update_source_low_free(self, *, observed_ns: int | None = None) -> None:
+        """Track wall time for which effective reusable source slots are <= 1."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        pool = getattr(self, "_feature_source_pool", None)
+        if pool is None:
+            return
+        now_ns = time.monotonic_ns() if observed_ns is None else observed_ns
+        free_slots = int(pool.free_slot_count)
+        deferred = int(getattr(self, "_deferred_dflash_feature_stages", 0))
+        effective = free_slots - deferred
+        started_ns = int(getattr(self, "_source_low_free_started_ns", 0))
+        if effective <= 1 and not started_ns:
+            self._source_low_free_started_ns = now_ns
+            self._source_buffer_emit(
+                "effective_free_low",
+                phase="start",
+                observed_ns=now_ns,
+                effective_free_slots=effective,
+                deferred_feature_stages=deferred,
+                **self._source_buffer_pool_stats(),
+            )
+        elif effective > 1 and started_ns:
+            self._source_low_free_started_ns = 0
+            self._source_buffer_emit(
+                "effective_free_low",
+                phase="end",
+                started_ns=started_ns,
+                observed_ns=now_ns,
+                duration_ns=now_ns - started_ns,
+                effective_free_slots=effective,
+                deferred_feature_stages=deferred,
+                **self._source_buffer_pool_stats(),
+            )
+        self._source_low_free_last_effective = effective
+
+    def _profile_source_gate_transition(
+        self, gate: str, *, blocked: bool, reason: str
+    ) -> None:
+        """Track a scheduler gate episode and its blocked decision count."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        now_ns = time.monotonic_ns()
+        started = self._source_gate_profile_started_ns.get(gate, 0)
+        if blocked:
+            self._source_gate_profile_decisions[gate] += 1
+            if not started:
+                self._source_gate_profile_started_ns[gate] = now_ns
+                self._source_gate_profile_decisions[gate] = 1
+                self._source_buffer_emit(
+                    "source_gate",
+                    phase="start",
+                    gate=gate,
+                    reason=reason,
+                    observed_ns=now_ns,
+                    **self._source_buffer_pool_stats(),
+                )
+            return
+        if not started:
+            return
+        decisions = int(self._source_gate_profile_decisions.pop(gate, 0))
+        self._source_gate_profile_started_ns.pop(gate, None)
+        self._source_buffer_emit(
+            "source_gate",
+            phase="end",
+            gate=gate,
+            reason=reason,
+            started_ns=started,
+            observed_ns=now_ns,
+            duration_ns=now_ns - started,
+            blocked_decisions=decisions,
+            **self._source_buffer_pool_stats(),
+        )
+
+    def _profile_register_source_publication(self, published) -> None:
+        """Register one publication for lifetime and slowest-reader accounting."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        key = (int(published.source_slot_id), int(published.slot_generation))
+        transfer_ids = tuple(
+            descriptor.transfer_id for descriptor in published.descriptors
+        )
+        published_ns = int(published.descriptor_published_ns)
+        reserved_ns = int(getattr(published, "reserved_ns", 0))
+        leases = self._source_buffer_profile_leases
+        if key in leases:
+            raise RuntimeError("source-buffer profile identity was reused while active")
+        leases[key] = {
+            "published_ns": published_ns,
+            "reserved_ns": reserved_ns,
+            "requested_rows": int(published.requested_rows),
+            "allocated_rows": int(published.allocated_rows),
+            "transfer_count": len(transfer_ids),
+            "remaining": set(transfer_ids),
+            "first_done_ns": 0,
+            "last_done_owner": "",
+            "last_done_channel": "",
+        }
+        self._source_buffer_emit(
+            "publication",
+            source_slot_id=key[0],
+            slot_generation=key[1],
+            transfer_ids=transfer_ids,
+            transfer_count=len(transfer_ids),
+            requested_rows=int(published.requested_rows),
+            allocated_rows=int(published.allocated_rows),
+            internal_fragmentation_rows=(
+                int(published.allocated_rows) - int(published.requested_rows)
+            ),
+            descriptor_published_ns=published_ns,
+            reserved_ns=reserved_ns,
+            reserve_to_publish_ns=(
+                published_ns - reserved_ns if reserved_ns else None
+            ),
+            **self._source_buffer_pool_stats(),
+        )
+        self._profile_update_source_low_free(observed_ns=published_ns)
+
+    def _profile_note_source_read_done(
+        self,
+        *,
+        transfer_id: str,
+        source_slot_id: int,
+        slot_generation: int,
+        owner: str,
+        channel: str,
+        observed_ns: int,
+        freed_publication: bool,
+    ) -> None:
+        """Retire one measured transfer and summarize the publication at drain."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        key = (int(source_slot_id), int(slot_generation))
+        lease = self._source_buffer_profile_leases.get(key)
+        if lease is None:
+            self._source_buffer_emit(
+                "read_done_untracked",
+                transfer_id=transfer_id,
+                source_slot_id=key[0],
+                slot_generation=key[1],
+                owner=owner,
+                channel=channel,
+                observed_ns=observed_ns,
+                freed_publication=bool(freed_publication),
+            )
+            self._profile_update_source_low_free(observed_ns=observed_ns)
+            return
+        remaining = lease["remaining"]
+        if transfer_id not in remaining:
+            return
+        remaining.remove(transfer_id)
+        if not lease["first_done_ns"]:
+            lease["first_done_ns"] = observed_ns
+        lease["last_done_owner"] = owner
+        lease["last_done_channel"] = channel
+        self._source_buffer_emit(
+            "read_done",
+            transfer_id=transfer_id,
+            source_slot_id=key[0],
+            slot_generation=key[1],
+            owner=owner,
+            channel=channel,
+            observed_ns=observed_ns,
+            remaining_transfers=len(remaining),
+            freed_publication=bool(freed_publication),
+        )
+        if not remaining:
+            published_ns = int(lease["published_ns"])
+            reserved_ns = int(lease["reserved_ns"])
+            first_done_ns = int(lease["first_done_ns"])
+            self._source_buffer_emit(
+                "publication_complete",
+                source_slot_id=key[0],
+                slot_generation=key[1],
+                published_ns=published_ns,
+                reserved_ns=reserved_ns,
+                first_done_ns=first_done_ns,
+                completed_ns=observed_ns,
+                reserve_to_first_read_ns=(
+                    first_done_ns - reserved_ns if reserved_ns else None
+                ),
+                reserve_to_release_ns=(
+                    observed_ns - reserved_ns if reserved_ns else None
+                ),
+                lease_lifetime_ns=observed_ns - published_ns,
+                first_reader_delay_ns=first_done_ns - published_ns,
+                slowest_reader_pin_ns=observed_ns - first_done_ns,
+                requested_rows=int(lease["requested_rows"]),
+                allocated_rows=int(lease["allocated_rows"]),
+                internal_fragmentation_rows=(
+                    int(lease["allocated_rows"])
+                    - int(lease["requested_rows"])
+                ),
+                transfer_count=int(lease["transfer_count"]),
+                slowest_owner=str(lease["last_done_owner"]),
+                slowest_channel=str(lease["last_done_channel"]),
+                freed_publication=bool(freed_publication),
+                **self._source_buffer_pool_stats(),
+            )
+            self._source_buffer_profile_leases.pop(key, None)
+        self._profile_update_source_low_free(observed_ns=observed_ns)
+
+    def profile_source_capacity_blocked(
+        self,
+        *,
+        work_kind: str,
+        batch_size: int,
+        waiting_requests: int,
+        parked_rounds: int,
+    ) -> None:
+        """Record one launch opportunity rejected by the hard source gate."""
+
+        self._source_buffer_emit(
+            "blocked_launch_opportunity",
+            observed_ns=time.monotonic_ns(),
+            work_kind=work_kind,
+            batch_size=int(batch_size),
+            waiting_requests=int(waiting_requests),
+            parked_rounds=int(parked_rounds),
+            **self._source_buffer_pool_stats(),
+        )
 
     def _record_full_wave_completion(
         self, batch: ScheduleBatch, *, batch_result, batch_size: int
@@ -4229,6 +4516,13 @@ class DTTargetController:
         has_capacity = not self.uses_direct_gpu_source or self._feature_source_free_slots > (
             self._deferred_dflash_feature_stages
         )
+        if getattr(self, "target_source_buffer_profile_enabled", False):
+            self._profile_update_source_low_free()
+            self._profile_source_gate_transition(
+                "launch",
+                blocked=not has_capacity,
+                reason="no_effective_source_slot",
+            )
         if self.is_export_rank and self.uses_direct_gpu_source:
             now_ns = time.monotonic_ns()
             if not has_capacity and not self._feature_source_stall_started_ns:
@@ -5361,14 +5655,23 @@ class DTTargetController:
         # Bootstrap features may retain slots while Draft owner admission is
         # full. Keep one slot for existing owners to verify or finish a chunk.
         # A locally staged KV handle is not evidence of Draft admission.
-        if self.is_feature_backed and (
+        source_blocked = self.is_feature_backed and (
             self._feature_source_free_slots - self._deferred_dflash_feature_stages
             <= 1
-        ):
-            if chunked_req is None or self._draft_admitted_attempts.get(
-                chunked_req.rid
-            ) != self._lifecycle_attempt_by_request.get(chunked_req.rid, -1):
-                return True
+        ) and (
+            chunked_req is None
+            or self._draft_admitted_attempts.get(chunked_req.rid)
+            != self._lifecycle_attempt_by_request.get(chunked_req.rid, -1)
+        )
+        if getattr(self, "target_source_buffer_profile_enabled", False):
+            self._profile_update_source_low_free()
+            self._profile_source_gate_transition(
+                "prefill",
+                blocked=source_blocked,
+                reason="preserve_one_source_slot",
+            )
+        if source_blocked:
+            return True
         # Once a frozen wave is ready, run it before admitting replacement
         # prefills.  Otherwise get_new_batch_prefill wins scheduler priority,
         # the replacement becomes the next frozen wave by itself, and the
@@ -7063,13 +7366,31 @@ class DTTargetController:
             pass
         elif self.uses_direct_gpu_source:
             assert self._feature_source_pool is not None
-            self._feature_source_pool.read_done(
+            observed_ns = (
+                time.monotonic_ns()
+                if getattr(self, "target_source_buffer_profile_enabled", False)
+                else 0
+            )
+            freed_publication = self._feature_source_pool.read_done(
                 transfer_id=message.transfer_id,
                 source_slot_id=message.source_slot_id,
                 slot_generation=message.slot_generation,
                 source_session_id=message.source_session_id,
                 pool_generation=message.pool_generation,
             )
+            if observed_ns:
+                self._profile_note_source_read_done(
+                    transfer_id=message.transfer_id,
+                    source_slot_id=message.source_slot_id,
+                    slot_generation=message.slot_generation,
+                    owner=(
+                        getattr(message, "instance_session_id", "")
+                        or getattr(message, "draft_instance_id", "")
+                    ),
+                    channel="relayed_source_read_done",
+                    observed_ns=observed_ns,
+                    freed_publication=freed_publication,
+                )
             self._source_slot_by_transfer.pop(message.transfer_id, None)
             self._source_deadline_by_transfer.pop(message.transfer_id, None)
             staged_leases = getattr(
@@ -7649,7 +7970,7 @@ class DTTargetController:
                     if landed is not None:
                         landed.add(transfer_id)
                 return
-            retirement.pop(transfer_id)
+            draft_session_id = retirement.pop(transfer_id)
         source_ref = self._source_slot_by_transfer.get(transfer_id)
         if source_ref is None:
             return
@@ -7657,13 +7978,28 @@ class DTTargetController:
         if not self.uses_direct_gpu_source or pool is None:
             return
         try:
-            pool.read_done(
+            observed_ns = (
+                time.monotonic_ns()
+                if getattr(self, "target_source_buffer_profile_enabled", False)
+                else 0
+            )
+            freed_publication = pool.read_done(
                 transfer_id=transfer_id,
                 source_slot_id=source_ref[0],
                 slot_generation=source_ref[1],
                 source_session_id=pool.source_session_id,
                 pool_generation=pool.pool_generation,
             )
+            if observed_ns:
+                self._profile_note_source_read_done(
+                    transfer_id=transfer_id,
+                    source_slot_id=source_ref[0],
+                    slot_generation=source_ref[1],
+                    owner=draft_session_id or "",
+                    channel="remote_candidate_proof",
+                    observed_ns=observed_ns,
+                    freed_publication=freed_publication,
+                )
         except Exception:
             logger.exception(
                 "remote source retirement proof failed for %s; "
@@ -9048,6 +9384,7 @@ class DTTargetController:
                 producer_event=wave.ready_event,
                 hidden_produced_ns=hidden_produced_ns,
             )
+            self._profile_register_source_publication(published)
             descriptors_by_transfer = {
                 descriptor.transfer_id: descriptor
                 for descriptor in published.descriptors
@@ -9590,13 +9927,38 @@ class DTTargetController:
                     proven.popitem(last=False)
                 if self._source_slot_by_transfer.get(transfer_id) != pull:
                     continue
-                pool.read_done(
+                profile_read = self._profile_active
+                observed_ns = time.monotonic_ns() if profile_read else 0
+                free_slots_before = pool.free_slot_count if profile_read else 0
+                freed_publication = pool.read_done(
                     transfer_id=transfer_id,
                     source_slot_id=pull[0],
                     slot_generation=pull[1],
                     source_session_id=pool.source_session_id,
                     pool_generation=pool.pool_generation,
                 )
+                if getattr(self, "target_source_buffer_profile_enabled", False):
+                    self._profile_note_source_read_done(
+                        transfer_id=transfer_id,
+                        source_slot_id=pull[0],
+                        slot_generation=pull[1],
+                        owner=draft_session_id,
+                        channel="same_host_ring_read_proof",
+                        observed_ns=observed_ns,
+                        freed_publication=freed_publication,
+                    )
+                if profile_read:
+                    self._profile_emit(
+                        "target_feature_read_proof",
+                        transfer_id=transfer_id,
+                        draft_session_id=draft_session_id,
+                        seq=seq,
+                        slot_id=pull[0],
+                        generation=pull[1],
+                        observed_ns=observed_ns,
+                        free_slots_before=free_slots_before,
+                        free_slots_after=pool.free_slot_count,
+                    )
                 self._source_slot_by_transfer.pop(transfer_id, None)
                 self._source_deadline_by_transfer.pop(transfer_id, None)
                 self._staged_flashmtp_source_leases.discard(transfer_id)
