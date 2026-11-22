@@ -2,6 +2,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import sglang.srt
+
 
 def _module():
     path = Path(__file__).parents[3] / "scripts" / "analyze_dt_target_p0.py"
@@ -108,3 +110,29 @@ def test_p0_join_and_recommendation(tmp_path):
     assert summary["counters"]["candidate_slots_high_water"] == 3
     assert summary["counters"]["source_pages_high_water"] == 12
     assert summary["counters"]["rows_missing_at_least_one_freeze"] == 1
+
+
+def test_flashmtp_runtime_wires_the_send_side_p0_boundary():
+    """Prevent a DFlash-only P0 trace from passing on FlashMTP CI again."""
+
+    root = Path(next(iter(sglang.srt.__path__)))
+    target = (root / "speculative" / "dt_target.py").read_text(encoding="utf-8")
+    worker = (root / "speculative" / "flashmtp_worker_v2.py").read_text(
+        encoding="utf-8"
+    )
+    target_worker = (
+        root / "speculative" / "flashmtp_target_worker_v2.py"
+    ).read_text(encoding="utf-8")
+
+    pivot_start = target.index("    def _stage_flashmtp_pivot_copy(")
+    pivot_end = target.index("\n    def ", pivot_start + 1)
+    pivot = target[pivot_start:pivot_end]
+    assert 'self._p0_emit(\n                                "feature_published"' in pivot
+    assert 'source_kind="flashmtp_pivot"' in pivot
+
+    # Decode and prefill must both stamp the producer boundary for FlashMTP,
+    # not only for DFlash.
+    assert worker.count("batch_result.dt_hidden_produced_ns = target_done_ns") == 1
+    assert 'if not getattr(self, "_is_token_only", False):' in worker
+    assert "if not self._is_token_only:" in target_worker
+    assert "batch_output.dt_hidden_produced_ns = time.monotonic_ns()" in target_worker

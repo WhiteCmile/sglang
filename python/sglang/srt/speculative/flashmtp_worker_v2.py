@@ -869,8 +869,14 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             batch, "dt_full_wave_ready_ns", None
         )
         batch_result.dt_pipeline_lane_id = getattr(batch, "dt_pipeline_lane_id", None)
-        if getattr(self, "_is_dflash", False):
+        # P0 hop tracing needs the producer-side boundary for both DFlash
+        # feature rows and FlashMTP pivots.  FlashMTP publishes the pivot via
+        # ``_stage_flashmtp_pivot_copy`` below the scheduler, so without this
+        # stamp its Target send corridor starts at publication and silently
+        # drops the verify-to-publish portion.
+        if not getattr(self, "_is_token_only", False):
             batch_result.dt_hidden_produced_ns = target_done_ns
+        if getattr(self, "_is_dflash", False):
             if getattr(
                 self, "_defer_dflash_feature_stage",
                 self.server_args.draft_target_defer_dflash_feature_stage,

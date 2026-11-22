@@ -323,7 +323,9 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=capture_mode
         )
-        if self._is_dflash:
+        # The P0 Target-hop trace uses this host timestamp as the producer
+        # boundary for both DFlash rows and the one-row FlashMTP pivot.
+        if not self._is_token_only:
             batch_output.dt_hidden_produced_ns = time.monotonic_ns()
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids

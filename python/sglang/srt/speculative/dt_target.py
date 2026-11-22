@@ -1256,6 +1256,34 @@ class DTTargetController:
                         descriptor.transfer_id: descriptor
                         for descriptor in published.descriptors
                     }
+                    # Issue #281 P0 originally covered only the DFlash
+                    # feature publication path.  The production experiment
+                    # uses FlashMTP, whose one-row pivots are published here,
+                    # so the analyzer saw dispatch/candidate/freeze but no
+                    # producer or descriptor boundary.  Emit the same stable
+                    # hop schema used by DFlash while the request index and
+                    # next round are still unambiguous.
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        spec_by_transfer = {values[2]: values for values in specs}
+                        for descriptor in published.descriptors:
+                            request_id, request_index, _transfer_id = (
+                                spec_by_transfer[descriptor.transfer_id]
+                            )
+                            self._p0_emit(
+                                "feature_published",
+                                transfer_id=descriptor.transfer_id,
+                                request_id=request_id,
+                                round_id=self._next_round.get(request_id, 0),
+                                hidden_produced_ns=published.hidden_produced_ns,
+                                descriptor_published_ns=(
+                                    published.descriptor_published_ns
+                                ),
+                                source_slot_id=descriptor.source_slot_id,
+                                slot_generation=descriptor.slot_generation,
+                                feature_rows=1,
+                                request_index=request_index,
+                                source_kind="flashmtp_pivot",
+                            )
                     # The source may be a stable CUDA Graph output buffer.  The
                     # copy stream already waits for the producing forward; add
                     # the reverse edge after the pool copy so the next replay
