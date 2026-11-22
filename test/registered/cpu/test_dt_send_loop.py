@@ -13,7 +13,10 @@ a GPU (design §4.3, §5.1, §7.2):
   in-flight deque *before* its Python bookkeeping, which is what makes the
   depth gate open at the GPU done rather than after the retire work.  Phase
   one has already popped every batch by then, so a failure record must
-  quarantine the batches behind it too: nothing else still holds them.
+  quarantine the batches behind it too: nothing else still holds them;
+- under DT_DRAFT_SCHEDULER=v2 (D10) the gate counts frozen_seq - done_seq
+  and absorbs a batch done since ABSORB before FREEZE, and the late freeze
+  waits for the running batch's GPU start + G - C (design §5.2).
 """
 
 import collections
@@ -174,3 +177,62 @@ def test_absorb_quarantines_every_popped_batch_behind_a_failure():
     assert engine._quarantined_feature_draft_handles == {"kv0", "kv1"}
     assert len(failures) == 2
     assert engine._fatal_gpu_quarantine_reason
+
+
+def _gate_engine(done_seq, frozen_seq, batches, last_done_ns=0):
+    engine = _engine()
+    engine._fatal_gpu_quarantine_reason = None
+    engine._ready_pending = [(1, "h", "t", 0, True, 40, 0, 0, 0, (), ())]  # 40 tokens READY
+    engine._input_ready_features = collections.deque()
+    engine.feature_buffer_max_tokens = 8192
+    engine._batch_estimator = draft_mod.DraftBatchEstimator()
+    engine._dflash_batch_seq = frozen_seq
+    engine._dflash_last_done_ns = last_done_ns
+    engine._send_loop_worker = type("W", (), {"done_seq": lambda self: done_seq})()
+    engine._pending_dflash_completions = collections.deque(
+        SimpleNamespace(
+            batch_seq=seq, handoff_ns=handoff_ns,
+            pending=[SimpleNamespace(task=SimpleNamespace(feature_token_count=40))],
+        )
+        for seq, handoff_ns in batches
+    )
+    return engine
+
+
+def test_v2_gate_counts_in_flight_by_done_seq_and_absorbs_before_a_freeze():
+    """DT_DRAFT_SCHEDULER=v2 (D10): in-flight is frozen_seq - done_seq.  A
+    batch the send loop finished since ABSORB still sits in the deque; the
+    gate must absorb it before letting FREEZE run, or FREEZE sees its owners
+    as busy and the launch finds its per-batch scratch still owned."""
+
+    engine = _gate_engine(done_seq=1, frozen_seq=3, batches=[(1, 0), (2, 0)])
+    assert engine._dflash_gate(0) is None  # two in flight: wait for a DONE
+
+    engine = _gate_engine(done_seq=3, frozen_seq=3, batches=[(1, 0), (2, 0)])
+    absorbed = []
+    engine._absorb_dflash_done = lambda: absorbed.append(
+        engine._pending_dflash_completions.clear()
+    )
+    assert engine._dflash_gate(0) == 0  # none in flight: freeze now
+    assert absorbed and not engine._pending_dflash_completions
+
+
+def test_v2_late_freeze_deadline():
+    """With one batch running, the next freezes at its GPU start + G(its
+    tokens) - C(READY tokens) (design §5.2).  Its GPU start is its hand-off,
+    or the GPU done of the batch it queued behind; without an estimate, or
+    once it ran past 2 G, the freeze is immediate."""
+
+    # Queued behind a batch that finished at 1.0 ms: start is that done.
+    engine = _gate_engine(2, 3, [(2, 200)], last_done_ns=1_000_000)
+    assert engine._dflash_gate(1_200_000) == 0  # no estimate yet
+    engine._batch_estimator.observe(rows=1, tokens=40, gpu_ns=3_000_000, cpu_ns=1_500_000)
+    assert engine._dflash_gate(1_200_000) == 2_500_000
+    assert engine._dflash_gate(2_500_000) == 0
+    # Not queued: start is its own hand-off.
+    engine = _gate_engine(2, 3, [(2, 5_000_000)], last_done_ns=1_000_000)
+    engine._batch_estimator.observe(rows=1, tokens=40, gpu_ns=3_000_000, cpu_ns=1_000_000)
+    assert engine._dflash_gate(5_100_000) == 7_000_000
+    # The 2 G guard holds even when C would push the deadline past it.
+    engine._batch_estimator._ema[("tokens", engine._batch_estimator.bucket(40), "c")] = -9e6
+    assert engine._dflash_gate(5_000_000 + 6_000_001) == 0
