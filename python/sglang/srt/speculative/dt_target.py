@@ -1559,13 +1559,25 @@ class DTTargetController:
     def _cancel_flashmtp_pre_reserved_destinations(
         self, reservations: dict, *, reason: str
     ) -> None:
-        """Cancel every destination still owned by one pre-reserve attempt."""
+        """Cancel every destination still owned by one pre-reserve attempt.
+
+        Rollback is best-effort: each entry is popped before the cancel attempt
+        so ownership stays exactly-once, and one failed cancel is logged and
+        must not stop the remaining cleanup or mask the caller's exception.
+        """
 
         for transfer_id in tuple(reservations):
             entry = reservations.pop(transfer_id)
-            self._cancel_flashmtp_pre_reserved_destination(
-                transfer_id, entry, reason=reason
-            )
+            try:
+                self._cancel_flashmtp_pre_reserved_destination(
+                    transfer_id, entry, reason=reason
+                )
+            except Exception:
+                logger.exception(
+                    "FlashMTP pre-reserve rollback failed for %s (%s); continuing",
+                    transfer_id,
+                    reason,
+                )
 
     def _cancel_flashmtp_pre_reserved_destination(
         self, transfer_id: str, entry: tuple[object, int], *, reason: str
@@ -1623,9 +1635,15 @@ class DTTargetController:
                 if reservations is not None:
                     entry = reservations.pop(task.source_lease_id, None)
                     if entry is not None:
-                        self._cancel_flashmtp_pre_reserved_destination(
-                            task.source_lease_id, entry, reason="staged_cancel"
-                        )
+                        try:
+                            self._cancel_flashmtp_pre_reserved_destination(
+                                task.source_lease_id, entry, reason="staged_cancel"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "FlashMTP staged rollback failed for %s; continuing",
+                                task.source_lease_id,
+                            )
                 self._release_source_slot(task.source_lease_id)
         batch_result.dt_staged_flashmtp_pivots = None
 
@@ -3267,14 +3285,20 @@ class DTTargetController:
                             entry = pre_reserved.pop(
                                 staged_task.source_lease_id, None
                             )
-                            if entry is not None and (
-                                self._cancel_flashmtp_pre_reserved_destination(
-                                    staged_task.source_lease_id,
-                                    entry,
-                                    reason="ineligible",
-                                )
-                            ):
-                                num_pre_reserve_cancel_rows += 1
+                            if entry is not None:
+                                try:
+                                    if self._cancel_flashmtp_pre_reserved_destination(
+                                        staged_task.source_lease_id,
+                                        entry,
+                                        reason="ineligible",
+                                    ):
+                                        num_pre_reserve_cancel_rows += 1
+                                except Exception:
+                                    logger.exception(
+                                        "FlashMTP ineligible pre-reserve cleanup "
+                                        "failed for %s; continuing",
+                                        staged_task.source_lease_id,
+                                    )
                         self._release_source_slot(staged_task.source_lease_id)
                     continue
                 active_flash.append(staged_task)
