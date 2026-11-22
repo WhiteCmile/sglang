@@ -216,6 +216,12 @@ def test_v2_gate_counts_in_flight_by_done_seq_and_absorbs_before_a_freeze():
     assert engine._dflash_gate(0) == 0  # none in flight: freeze now
     assert absorbed and not engine._pending_dflash_completions
 
+    # The record of batch 3 was absorbed before the loop stored done_seq 3
+    # (it publishes the record first): the counter still says one in
+    # flight, the deque says none.  Seen on 7T2D r64 as an IndexError.
+    engine = _gate_engine(done_seq=2, frozen_seq=3, batches=[])
+    assert engine._dflash_gate(0) == 0
+
 
 def test_v2_late_freeze_deadline():
     """With one batch running, the next freezes at its GPU start + G(its

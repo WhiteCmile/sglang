@@ -2695,6 +2695,10 @@ class FlashMTPDraftEngine:
             in_flight = self._dflash_batch_seq - worker.done_seq()
             if in_flight < len(self._pending_dflash_completions):
                 self._absorb_dflash_done()
+            # The loop publishes a DONE record before it stores done_seq, so
+            # ABSORB may already hold a batch the counter still counts: its
+            # GPU work is done, and the deque is the in-flight set.
+            in_flight = min(in_flight, len(self._pending_dflash_completions))
         if in_flight >= DRAFT_COMPUTE_DEPTH:
             return None
         if in_flight == 0:
