@@ -103,8 +103,11 @@ constexpr uint64_t kReadyRingDepth = 1024;  // READY_RING_DEPTH
 constexpr uint32_t kReadyRecordBytes = 32;  // READY_RECORD_BYTES
 constexpr uint32_t kRingSlots = 1024;       // queued ready jobs
 constexpr uint32_t kPollBatch = 64;
-// Idle wakeup period: completions must keep reaping with no jobs arriving.
+// Idle wakeup period: completions must keep reaping with no jobs arriving;
+// with sends in flight the wait shortens so the reaped wire time is the
+// wire's, not the sleep quantum's.
 constexpr auto kIdleWait = std::chrono::milliseconds(1);
+constexpr auto kBusyWait = std::chrono::microseconds(100);
 
 // <QQQII little-endian: seq, pool-generation tag, source-session tag, slot
 // id, slot generation (dt_rdma.py _READY_RECORD).
@@ -170,6 +173,7 @@ struct Sender {
   void* error_arg = nullptr;
 
   std::atomic<uint64_t> jobs{0}, posts{0}, cqes{0};
+  std::atomic<int64_t> outstanding{0};  // signaled sends not yet reaped
   std::atomic<uint64_t> post_errors{0}, cqe_errors{0}, event_errors{0};
 };
 
@@ -229,6 +233,7 @@ void serve(Sender* s) {
             failures.push_back({session.tag, 1, prc});
           } else {
             s->posts.fetch_add(1, std::memory_order_relaxed);
+            s->outstanding.fetch_add(1, std::memory_order_relaxed);
             dt_probe::stamp(p, dt_probe::SENDER_POSTED, -1, key,
                             (session.tag << 32) | index);
           }
@@ -246,6 +251,7 @@ void serve(Sender* s) {
     }
     for (int i = 0; i < n; ++i) {
       s->cqes.fetch_add(1, std::memory_order_relaxed);
+      s->outstanding.fetch_sub(1, std::memory_order_relaxed);
       dt_probe::stamp(p, dt_probe::SENDER_CQE, -1, wr_id[i],
                       ((uint64_t)status[i] << 32) | imm[i]);
       if (status[i] != 0) {  // != IBV_WC_SUCCESS
@@ -268,7 +274,9 @@ void serve(Sender* s) {
     if (progress) continue;
     std::unique_lock<std::mutex> lock(s->mutex);
     s->sleeping.store(true);
-    s->wake.wait_for(lock, kIdleWait, [&] {
+    s->wake.wait_for(
+        lock, s->outstanding.load(std::memory_order_relaxed) > 0 ? kBusyWait : kIdleWait,
+        [&] {
       return s->stop.load() || tail != s->head.load();
     });
     s->sleeping.store(false);
