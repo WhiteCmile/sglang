@@ -247,6 +247,12 @@ DT_DRAFT_STATS_INTERVAL_NS = 2_000_000_000
 # Shadow late-freeze estimator (design §5.2; D0 only logs it, issue #269):
 # weight of the newest batch in the per-bucket EMA.
 BATCH_ESTIMATE_EMA_WEIGHT = 0.125
+# Parts timed inside a submit stage (issue #306, profile only): the FREEZE
+# DraftTask build and KV/req-row fit per frozen row, the proposal metadata's
+# three H2D enqueues, and the D9 hand-off's destination-region reads.
+SUBMIT_SUB_STAGES = (
+    "freeze_task_build", "freeze_fit", "metadata_h2d", "handoff_region_read"
+)
 
 
 class DraftBatchEstimator:
@@ -550,6 +556,9 @@ class PendingDFlashCompletion:
     clock_done: torch.cuda.Event | None = None
     # DT_DRAFT_SLOT_DECOUPLE: owns per-batch scratch batch_seq % depth (-1: off).
     batch_seq: int = -1
+    # Profile-only submit stage marks and nested parts (issue #306).
+    submit_marks: dict[str, int] | None = None
+    submit_sub_ns: list[int] | None = None
 
 
 @dataclass(slots=True)
@@ -1040,6 +1049,12 @@ class FlashMTPDraftEngine:
             self._profile_active and os.environ.get("DT_GPU_CLOCK", "0") == "1"
         )
         self._input_ready_select_ns = (0, 0)
+        # Profile-only stage marks of the batch being selected and submitted
+        # (issue #306): stage name -> monotonic ns at the stage's end, from
+        # selection start; None with profiling off.  _submit_sub_ns times
+        # the SUBMIT_SUB_STAGES parts nested inside a stage.
+        self._submit_marks = None
+        self._submit_sub_ns = None
         self.profile = load_draft_profile(profile_path)
         if self.profile.method not in {
             "flashmtp",
@@ -3729,6 +3744,7 @@ class FlashMTPDraftEngine:
             (*selected, *self._input_ready_features)
         )
         profile = self._profile_active
+        sub_ns = self._submit_sub_ns if profile else None  # SUBMIT_SUB_STAGES
         retained, done, dropped = [], [], []
         # Skip accounting (#292).  A waiting row's state is [reason, last
         # evaluation ns, gate mark, passes, first reason, fit, held ns per
@@ -3867,9 +3883,16 @@ class FlashMTPDraftEngine:
             if token_count + count > self.feature_buffer_max_tokens:
                 skip(row, _ReadySkip.batch_tokens)
                 continue
+            if profile:
+                part_ns = time.monotonic_ns()
             if task is None:
                 task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields)
+            if profile:
+                built_ns = time.monotonic_ns()
+                sub_ns[0] += built_ns - part_ns
             row_cost, kv_cost = self._persistent_task_allocation(task)
+            if profile:
+                sub_ns[1] += time.monotonic_ns() - built_ns
             if row_cost > available_rows or kv_cost > available_kv:
                 fit = (available_rows, available_kv, row_cost, kv_cost)
                 skip(row, _ReadySkip.req_rows if row_cost > available_rows
@@ -4080,12 +4103,17 @@ class FlashMTPDraftEngine:
         base = candidates.data_ptr()
         prequeue, rows, owned, cross = [], [], [], []
         proposal_tasks = list(proposal_tasks)
+        sub_ns = self._submit_sub_ns if self._profile_active else None
         for index, task in enumerate(proposal_tasks):
             if task.transfer_id in self._cancelled_ids:
                 continue  # as the pre-queue skips it: the retire path owns it
             destination = task.candidate_destination
             if destination is None and task.direct_ring_seq:
+                if sub_ns is not None:
+                    read_ns = time.monotonic_ns()
                 destination = self._resolve_ring_destination(task)
+                if sub_ns is not None:
+                    sub_ns[3] += time.monotonic_ns() - read_ns
                 if destination is not None:
                     task = replace(task, candidate_destination=destination)
                     proposal_tasks[index] = task
@@ -4159,6 +4187,7 @@ class FlashMTPDraftEngine:
                     draft_instance=self.instance_id,
                     done_seq=completion.batch_seq + 1,
                     gpu_done_ns=gpu_done_ns,
+                    absorb_started_ns=stage_started_ns,
                     absorbed_ns=absorbed_ns,
                     # v2: the scheduler's last wait (start, return), so a
                     # done that arrived while it waited can be told apart
@@ -6874,6 +6903,9 @@ class FlashMTPDraftEngine:
 
         profile_active = getattr(self, "_profile_active", False)
         selection_started_ns = time.monotonic_ns() if profile_active else 0
+        if profile_active:
+            self._submit_marks = {"select_started": selection_started_ns}
+            self._submit_sub_ns = [0] * len(SUBMIT_SUB_STAGES)
         inflight_before = self._draft_compute_batches_inflight()
         waiting_before = tuple(
             entry.pending.task.transfer_id for entry in self._input_ready_features
@@ -6951,11 +6983,15 @@ class FlashMTPDraftEngine:
             if self._persistent:
                 busy_handles.add(task.draft_kv_handle)
         self._input_ready_features = retained
+        if profile_active:
+            self._submit_marks["select_scan"] = time.monotonic_ns()
         if self._native_ingress:
             self._freeze_ready_rows(
                 selected, busy_handles, proposal_mode, token_count, now_ns
             )
         selection_finished_ns = time.monotonic_ns() if profile_active else 0
+        if profile_active:
+            self._submit_marks["freeze"] = selection_finished_ns
         if not selected:
             self._profile_input_ready_state(
                 observed_ns=selection_finished_ns,
@@ -6997,6 +7033,8 @@ class FlashMTPDraftEngine:
             inflight=inflight_before,
         )
         self._input_ready_select_ns = (selection_started_ns, selection_finished_ns)
+        if profile_active:  # the selection's own profile records above
+            self._submit_marks["select_profile"] = time.monotonic_ns()
         return selected
 
     def _profile_input_ready_state(
@@ -7029,6 +7067,9 @@ class FlashMTPDraftEngine:
             return
         profile_active = getattr(self, "_profile_active", False)
         submit_started_ns = time.monotonic_ns() if profile_active else 0
+        marks = self._submit_marks if profile_active else None
+        if marks is not None:
+            marks["select_return"] = submit_started_ns
         inflight_before = self._draft_compute_batches_inflight()
         entry_slots = tuple(entry.staging_slot for entry in ready)
         staging_slots = tuple(dict.fromkeys(entry_slots))
@@ -7084,6 +7125,7 @@ class FlashMTPDraftEngine:
                 )
             if profile_active:
                 submit_returned_ns = time.monotonic_ns()
+                marks["submit_tail"] = submit_returned_ns
                 select_started_ns, frozen_ns = self._input_ready_select_ns
                 if self._persistent and not self._is_eagle3:  # the DFlash launch
                     completion = self._pending_dflash_completions[-1]
@@ -7150,7 +7192,11 @@ class FlashMTPDraftEngine:
         finally:
             if ready_seqs:
                 # After the submit issued its copy-event waits (or failed).
+                if marks is not None:  # past the hand-off: C has ended
+                    marks["submit_profile"] = time.monotonic_ns()
                 self._ready_consume(ready_seqs)
+                if marks is not None:
+                    marks["ready_consume"] = time.monotonic_ns()
 
     def _execute_eagle3_feature_batch(
         self,
@@ -7829,6 +7875,9 @@ class FlashMTPDraftEngine:
             elif not completion.completion_event.query():
                 prior_candidate_copy_pending_count += 1
         launch_started_ns = time.monotonic_ns()
+        marks = self._submit_marks if getattr(self, "_profile_active", False) else None
+        if marks is not None:
+            marks["submit_entry"] = launch_started_ns
         tasks = [item.task for item in pending]
         if getattr(self, "continuous_batching", False) and len({bool(task.requires_proposal) for task in tasks}) > 1:
             raise RuntimeError("DFLASH frozen batch mixed proposal boundaries")
@@ -7927,9 +7976,13 @@ class FlashMTPDraftEngine:
         else:
             _grouped_cache_locs, packed_cache_locs, positions = grouped_rows
         tasks_prepared_ns = time.monotonic_ns()
+        if marks is not None:
+            marks["task_prepare"] = tasks_prepared_ns
         if ready_seqs:
             # Before the first read of the landing rows (the gather below).
             self._wait_ready_copies(ready_seqs)
+        if marks is not None:
+            marks["copy_waits"] = time.monotonic_ns()
         hidden_rows = [
             self._feature_staging_buffers[slot][start:end]
             for slot, (start, end) in zip(staging_slots, row_ranges, strict=True)
@@ -7956,6 +8009,9 @@ class FlashMTPDraftEngine:
         proposal_prefix_lens = None
         proposal_seq_lens_cpu = None
         proposal_bonus_tokens = None
+        if marks is not None:
+            marks["hidden_view"] = time.monotonic_ns()
+            h2d = self._submit_sub_ns
         if proposal_indices:
             # Stage CPU-derived proposal metadata through per-slot pinned host
             # buffers.  The corresponding nonblocking H2D copies may be queued
@@ -7978,7 +8034,11 @@ class FlashMTPDraftEngine:
             proposal_req_pool_indices = self._proposal_req_pool_indices_buffers[
                 metadata_slot
             ][:proposal_count]
+            if marks is not None:
+                h2d_started_ns = time.monotonic_ns()
             proposal_req_pool_indices.copy_(req_pool_indices_host, non_blocking=True)
+            if marks is not None:
+                h2d[2] += time.monotonic_ns() - h2d_started_ns
             prefix_lens_host = self._proposal_prefix_lens_host_buffers[metadata_slot][
                 :proposal_count
             ]
@@ -7988,7 +8048,11 @@ class FlashMTPDraftEngine:
             proposal_prefix_lens = self._proposal_prefix_lens_buffers[metadata_slot][
                 :proposal_count
             ]
+            if marks is not None:
+                h2d_started_ns = time.monotonic_ns()
             proposal_prefix_lens.copy_(prefix_lens_host, non_blocking=True)
+            if marks is not None:
+                h2d[2] += time.monotonic_ns() - h2d_started_ns
             proposal_seq_lens_cpu = torch.tensor(
                 [length + int(self.profile.block_size) for length in committed_lens],
                 dtype=torch.int32,
@@ -8007,8 +8071,14 @@ class FlashMTPDraftEngine:
             proposal_bonus_tokens = self._proposal_bonus_tokens_buffers[metadata_slot][
                 :proposal_count
             ]
+            if marks is not None:
+                h2d_started_ns = time.monotonic_ns()
             proposal_bonus_tokens.copy_(bonus_tokens_host, non_blocking=True)
+            if marks is not None:
+                h2d[2] += time.monotonic_ns() - h2d_started_ns
         proposal_metadata_ready_ns = time.monotonic_ns()
+        if marks is not None:
+            marks["metadata"] = proposal_metadata_ready_ns
 
         materialize_start.record(torch.cuda.current_stream(self.device))
         self._dflash_materializer.append(
@@ -8018,6 +8088,8 @@ class FlashMTPDraftEngine:
         )
         materialize_done.record(torch.cuda.current_stream(self.device))
         materialize_submitted_ns = time.monotonic_ns()
+        if marks is not None:
+            marks["materialize_launch"] = materialize_submitted_ns
 
         candidates = None
         proposal_execution = None
@@ -8039,6 +8111,8 @@ class FlashMTPDraftEngine:
             # event which makes this completion eligible for another replay.
             candidates = candidates.clone()
         proposal_done.record(torch.cuda.current_stream(self.device))
+        if marks is not None:
+            marks["proposal_tail"] = time.monotonic_ns()
         clock_slot, clock_done = -1, None
         if self._gpu_clock_enabled:
             if self._gpu_clock is None:
@@ -8094,6 +8168,10 @@ class FlashMTPDraftEngine:
             completion=completion,
             copy_stream=copy_stream,
         )
+        if marks is not None:
+            marks["register"] = completion.launched_ns
+            completion.submit_marks = marks
+            completion.submit_sub_ns = self._submit_sub_ns
         if self._slot_decouple:
             # A failed launch is quiesced (or fatal) and keeps its sequence.
             self._dflash_batch_seq = batch_seq + 1
@@ -8111,11 +8189,15 @@ class FlashMTPDraftEngine:
             try:
                 releases = self._resolve_ready_releases(completion.ready_rows)
                 completion.ready_rows = ()
+                if marks is not None:
+                    marks["handoff_releases"] = time.monotonic_ns()
                 push, push_tasks, prequeue = (), proposal_tasks, None
                 if copy_stream is None and proposal_tasks and candidates is not None:
                     push, push_tasks, prequeue = self._hand_off_pushes(
                         batch_seq + 1, proposal_tasks, candidates
                     )
+                if marks is not None:
+                    marks["handoff_classify"] = time.monotonic_ns()
                 self._submit_batch_descriptor(
                     batch_seq + 1,
                     completion.completion_event,
@@ -8127,6 +8209,8 @@ class FlashMTPDraftEngine:
                     ),
                     push=push,
                 )
+                if marks is not None:
+                    marks["handoff_descriptor"] = time.monotonic_ns()
             except Exception as exc:
                 self._pending_dflash_completions.remove(completion)
                 self._quarantined_dflash_completions.append(completion)
@@ -8140,6 +8224,8 @@ class FlashMTPDraftEngine:
                 self._queue_early_candidate_push(
                     push_tasks, candidates, completion.completion_event, prequeue
                 )
+            if marks is not None:
+                marks["handoff_prequeue"] = time.monotonic_ns()
         elif copy_stream is None and proposal_tasks:
             self._queue_early_candidate_push(
                 proposal_tasks, candidates, completion.completion_event
@@ -8577,6 +8663,7 @@ class FlashMTPDraftEngine:
         block_size = int(self.profile.block_size)
         req_pool = self._draft_model_runner.req_to_token_pool
         allocator = self._draft_model_runner.token_to_kv_pool_allocator
+        marks = self._submit_marks if getattr(self, "_profile_active", False) else None
         out_cache_loc = allocator.alloc(batch_size * block_size)
         if out_cache_loc is None:
             raise RuntimeError("DFLASH proposal KV-page OOM")
@@ -8592,6 +8679,8 @@ class FlashMTPDraftEngine:
                 state.req.kv.kv_allocated_len = end
                 state.req.kv_committed_len = state.valid_committed_len
                 state.proposal_base_len = state.valid_committed_len
+            if marks is not None:
+                marks["proposal_kv"] = time.monotonic_ns()
 
             block_ids = torch.full(
                 (batch_size, block_size),
@@ -8620,6 +8709,8 @@ class FlashMTPDraftEngine:
                 device_timer_category="draft_proposal",
                 rids=[state.request_id for state in states],
             )
+            if marks is not None:
+                marks["proposal_inputs"] = time.monotonic_ns()
             draft_out = self._draft_model_runner.forward(forward_batch)
             proposal_execution = "graph" if draft_out.can_run_graph else "eager"
             proposal_fallback_reason = (
@@ -8632,6 +8723,8 @@ class FlashMTPDraftEngine:
                 if hidden_states is None:
                     raise RuntimeError("DFLASH Draft forward returned no hidden states")
                 self._dflash_sampler(hidden_states)
+            if marks is not None:
+                marks["proposal_forward"] = time.monotonic_ns()
             proposals = self._dflash_sampler.out[: batch_size * (block_size - 1)].view(
                 batch_size, block_size - 1
             )
@@ -8712,6 +8805,20 @@ class FlashMTPDraftEngine:
             # D8: joins this batch to its draft_dflash_done_absorb record, so
             # the per-hop table can span GPU clock end -> scheduler -1.
             done_seq=completion.batch_seq + 1,
+            # #306: the stage split of C as [stage, end ns] in execution
+            # order (C ends at submit_tail), its nested parts, and the
+            # reconcile phases.
+            submit_marks=(
+                None
+                if completion.submit_marks is None
+                else list(completion.submit_marks.items())
+            ),
+            submit_sub_ns=(
+                None
+                if completion.submit_sub_ns is None
+                else dict(zip(SUBMIT_SUB_STAGES, completion.submit_sub_ns))
+            ),
+            reconcile_phase_ns=completion.reconcile_prepare_phase_ns,
             **estimate,
         )
 
