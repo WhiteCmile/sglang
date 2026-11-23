@@ -60,6 +60,9 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         )
         self._is_token_only = server_args.speculative_algorithm == "STANDALONE_DT"
         self._is_dflash = server_args.speculative_algorithm == "DFLASH"
+        # Per-wave verify CUDA events (DT_PROFILE_DIR only) are recorded for both
+        # disaggregated verify paths; FlashMTP previously had no GPU timing at all.
+        self._is_flashmtp = server_args.speculative_algorithm == "FLASHMTP"
         self._defer_dflash_feature_stage = self._is_dflash and (
             server_args.draft_target_defer_dflash_feature_stage
             or (

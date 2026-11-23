@@ -582,8 +582,8 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             sync_profile = cuda_sync_enabled()
         started_ns = time.monotonic_ns()
         gpu_profile_events = None
-        if bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
-            self, "_is_dflash", False
+        if bool(os.environ.get("DT_PROFILE_DIR")) and (
+            getattr(self, "_is_dflash", False) or getattr(self, "_is_flashmtp", False)
         ):
             event_type = torch.get_device_module(self.device).Event
             gpu_profile_events = tuple(
@@ -886,9 +886,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 batch_result.dt_dflash_candidate_tokens = deferred_feature_tokens
                 if deferred_feature_error is not None:
                     batch_result.dt_deferred_feature_error = deferred_feature_error
-            if gpu_profile_events is not None:
-                gpu_profile_events[3].record()
-                batch_result.dt_target_verify_gpu_events = gpu_profile_events
+        if gpu_profile_events is not None:
+            gpu_profile_events[3].record()
+            batch_result.dt_target_verify_gpu_events = gpu_profile_events
         return batch_result
 
     def _prepare_draft_block_eager(
