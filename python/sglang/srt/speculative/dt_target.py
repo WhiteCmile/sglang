@@ -66,6 +66,11 @@ _FREEZE_LEAD_WINDOW = 64
 # exactly fills the arena would leave the ordinary park-time path no slot for
 # a row that becomes eligible only after launch.
 _FLASHMTP_PRE_RESERVE_SAFETY_SLOTS = 1
+# DT_TARGET_P3_CONTROL_SPLIT (issue #281) bounds the deferred control-event
+# FIFO at one whole control phase's worth of events per scheduler iteration.
+# It is a safety net, not a capacity policy: overflow means the READY phase
+# stopped draining the queue, which must fail loudly rather than drop events.
+_P3_CONTROL_EVENT_FIFO_LIMIT = 65536
 
 
 class _PendingTaskPayloadMismatch(ValueError):
@@ -435,6 +440,12 @@ class DTTargetController:
     _candidate_arena = None
     flashmtp_pre_reserve_dest = False
     target_phase_profile_enabled = False
+    # Issue #281 P3 ablation: when set in __init__ (DT_TARGET_P3_CONTROL_SPLIT),
+    # the export rank's READY snapshot and its post-launch control work run as
+    # two phases.  Class-level defaults keep object.__new__ diagnostics on the
+    # legacy monolithic path.
+    p3_control_split = False
+    _deferred_control_events = None
 
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
 
@@ -502,6 +513,25 @@ class DTTargetController:
         # the default-off path adds no per-poll lookup.
         self.flashmtp_pre_reserve_dest = (
             os.environ.get("DT_FLASHMTP_PRE_RESERVE_DEST", "0") == "1"
+        )
+        # Issue #281 P3 ablation: cache the switch once.  The split attaches
+        # the control phase to the overlap launch boundary, so without
+        # Draft-Target overlap scheduling it is disabled harmlessly rather
+        # than silently behaving like the legacy path under a different name.
+        p3_control_split_requested = (
+            os.environ.get("DT_TARGET_P3_CONTROL_SPLIT", "0") == "1"
+        )
+        self.p3_control_split = bool(
+            p3_control_split_requested
+            and self.server_args.draft_target_overlap_schedule
+        )
+        if p3_control_split_requested and not self.p3_control_split:
+            logger.warning(
+                "DT_TARGET_P3_CONTROL_SPLIT ignored: requires Draft-Target "
+                "overlap scheduling"
+            )
+        self._deferred_control_events = (
+            deque() if self.p3_control_split else None
         )
         self.continuous_batching = not getattr(
             self.server_args, "draft_target_disable_continuous_batching", False
@@ -6068,38 +6098,16 @@ class DTTargetController:
             if blocked is None:
                 self._last_pending_send_block = None
 
-    def _poll_export_rank(self) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
-        profile_receive = bool(getattr(self, "_profile_active", False))
-        receive_parts: dict[str, int] = {}
-        mark_ns = time.monotonic_ns()
+    def _consume_control_messages(
+        self, events: list[tuple[str, str, object]]
+    ) -> None:
+        """Apply one non-blocking Coordinator receive batch.
 
-        def mark(name: str) -> None:
-            nonlocal mark_ns
-            if not profile_receive:
-                return
-            now_ns = time.monotonic_ns()
-            receive_parts[name] = now_ns - mark_ns
-            mark_ns = now_ns
+        Extracted unchanged from the legacy ``_poll_export_rank`` so the P3
+        split's control phase preserves the original per-message order.  The
+        legacy path still calls this at the exact former position.
+        """
 
-        if getattr(self, "_ring_publish_pending", None):
-            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
-            # kernel-published waves, off the park critical path.
-            self._ring_publish_cleanup()
-        mark("ring_cleanup_ns")
-        self._flush_pending_send()
-        mark("flush_send_ns")
-
-        events: list[tuple[str, str, object]] = []
-        if self._candidate_arena is not None:
-            # Direct Draft completion is intentionally observed before the
-            # independent Coordinator retirement channel.
-            self._candidate_arena.poll_completion_notices()
-            self._candidate_arena.poll_completion_records()
-            if self._ring_outstanding:
-                self._poll_direct_ring_reads()
-                if self._ring_lease:
-                    self._fence_dead_ring_owners()
-        mark("arena_notice_ns")
         for message in self._client.recv_nowait():
             if isinstance(message, TaskBatchAck):
                 if not self._ledger.has_submitted_batch(message.batch_id):
@@ -6240,80 +6248,212 @@ class DTTargetController:
                 raise TypeError(
                     f"unexpected Target Coordinator message {type(message).__name__}"
                 )
+    def _observe_ready_direct_completions(
+        self,
+    ) -> list[tuple[str, str, object]]:
+        """Drain native candidate completions into ``ready_direct`` events."""
+
+        events: list[tuple[str, str, object]] = []
+        arena = self._candidate_arena
+        completions = arena.poll()
+        unparked = self._unparked_completions
+        if unparked:
+            # Keep an early completion only while its arena slot still holds it.
+            held = {t: c for t, c in unparked.items() if arena.holds(c)}
+            unparked.clear()
+            held.update((c.transfer_id, c) for c in completions)
+            completions = held.values()
+        for completion in completions:
+            state = self._ledger.get(completion.transfer_id)
+            parked = self._parked.get(completion.transfer_id)
+            if state is None or parked is None:
+                # The push landed before this round parked (a destination
+                # known at launch, issue #330). poll() returns it once, so
+                # retain it until the round parks.
+                unparked[completion.transfer_id] = completion
+                continue
+            if parked.candidate_completion is not None:
+                continue
+            if completion.root_token != parked.bonus_token:
+                raise ValueError(
+                    "direct candidate root does not match Target bonus token"
+                )
+            self._ledger.mark_direct_ready(
+                completion.transfer_id,
+                draft_instance_id=completion.draft_instance_id,
+            )
+            self._note_draft_progress(completion.draft_instance_id)
+            parked.result_received_ns = completion.observed_ns
+            self._p0_emit(
+                "candidate_observed",
+                transfer_id=completion.transfer_id,
+                request_id=parked.req.rid,
+                round_id=parked.round_id,
+                completion_observed_ns=completion.observed_ns,
+                producer_globaltimer_ns=getattr(
+                    completion, "producer_globaltimer_ns", 0
+                ),
+                ready_source=getattr(completion, "ready_source", "notice"),
+            )
+            if self._profile_active:
+                export_ledger_ready_ns = time.monotonic_ns()
+                self._profile_emit(
+                    "target_direct_completion",
+                    transfer_id=completion.transfer_id,
+                    request_id=parked.req.rid,
+                    round_id=parked.round_id,
+                    slot_id=completion.slot_id,
+                    generation=completion.generation,
+                    notice_queued_ns=completion.notice_queued_ns,
+                    notice_received_ns=completion.notice_received_ns,
+                    metadata_submitted_ns=completion.metadata_submitted_ns,
+                    metadata_gpu_ns=completion.metadata_gpu_ns,
+                    completion_observed_ns=completion.observed_ns,
+                    ready_source=getattr(completion, "ready_source", "notice"),
+                    producer_globaltimer_ns=getattr(
+                        completion, "producer_globaltimer_ns", 0
+                    ),
+                    delivery_ns=getattr(completion, "delivery_ns", 0),
+                    export_ledger_ready_ns=export_ledger_ready_ns,
+                    target_compute_batches_inflight=self._target_compute_batches_inflight,
+                )
+            events.append(
+                (
+                    "ready_direct",
+                    completion.transfer_id,
+                    (completion, parked.bonus_token, parked.seq_len),
+                )
+            )
+        return events
+
+    def _poll_ready_phase(
+        self,
+    ) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
+        """READY-only export-rank poll for the P3 split (issue #281).
+
+        Only native completion observation and the deferred control events
+        feed the packet.  No Coordinator I/O, pending-send flush, ring
+        cleanup, release/cancel scan, timeout/lease scan or lifecycle status
+        runs here, so the broadcast follows observation directly.
+        """
+
+        profile_receive = bool(getattr(self, "_profile_active", False))
+        receive_parts: dict[str, int] = {}
+        mark_ns = time.monotonic_ns()
+
+        def mark(name: str) -> None:
+            nonlocal mark_ns
+            if not profile_receive:
+                return
+            now_ns = time.monotonic_ns()
+            receive_parts[name] = now_ns - mark_ns
+            mark_ns = now_ns
+
+        events: list[tuple[str, str, object]] = []
+        deferred = self._deferred_control_events
+        if deferred:
+            # Exactly one drain per READY packet.  A second refresh in the
+            # same scheduler iteration sees an empty FIFO and only new native
+            # completions, so older control events are never replayed.
+            while deferred:
+                events.append(deferred.popleft())
+        mark("deferred_events_ns")
+        if self._candidate_arena is not None:
+            # Direct Draft completion is intentionally observed before the
+            # independent Coordinator retirement channel.
+            self._candidate_arena.poll_completion_notices()
+            self._candidate_arena.poll_completion_records()
+            events.extend(self._observe_ready_direct_completions())
+        mark("arena_complete_ns")
+        return events, receive_parts
+
+    def run_control_phase(self) -> None:
+        """TP0 post-launch control work for the P3 split (issue #281).
+
+        Called from ``event_loop_overlap`` after the current batch launch (or
+        once in an idle iteration) and before the previous result is consumed.
+        Non-export ranks return immediately, so every rank keeps the same
+        scheduler control flow.  Produced events are queued for the next READY
+        packet in production order; no collective is issued.
+        """
+
+        if not self.p3_control_split or not self.is_export_rank:
+            return
+        events: list[tuple[str, str, object]] = []
+        if getattr(self, "_ring_publish_pending", None):
+            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
+            # kernel-published waves, off the READY critical path.
+            self._ring_publish_cleanup()
+        self._flush_pending_send()
+        if self._candidate_arena is not None and self._ring_outstanding:
+            self._poll_direct_ring_reads()
+            if self._ring_lease:
+                self._fence_dead_ring_owners()
+        self._consume_control_messages(events)
+        if self._candidate_arena is not None:
+            self._candidate_arena.poll_releases()
+            self._candidate_arena.poll_cancelled()
+        events.extend(self._expire_local_rounds())
+        self._expire_source_leases(now_ns=time.monotonic_ns())
+        self._maybe_emit_lifecycle_status()
+        self._defer_control_events(events)
+
+    def _defer_control_events(
+        self, events: list[tuple[str, str, object]]
+    ) -> None:
+        if not events:
+            return
+        fifo = self._deferred_control_events
+        if len(fifo) + len(events) > _P3_CONTROL_EVENT_FIFO_LIMIT:
+            raise RuntimeError(
+                "DT P3 control event FIFO overflow: READY phase stopped "
+                "draining deferred events"
+            )
+        fifo.extend(events)
+
+    def _poll_export_rank(self) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
+        if self.p3_control_split:
+            # Issue #281 P3 (default off): the READY snapshot is the only
+            # export-rank work on the pre-broadcast path.  The control half
+            # runs from event_loop_overlap after launch.
+            return self._poll_ready_phase()
+        profile_receive = bool(getattr(self, "_profile_active", False))
+        receive_parts: dict[str, int] = {}
+        mark_ns = time.monotonic_ns()
+
+        def mark(name: str) -> None:
+            nonlocal mark_ns
+            if not profile_receive:
+                return
+            now_ns = time.monotonic_ns()
+            receive_parts[name] = now_ns - mark_ns
+            mark_ns = now_ns
+
+        if getattr(self, "_ring_publish_pending", None):
+            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
+            # kernel-published waves, off the park critical path.
+            self._ring_publish_cleanup()
+        mark("ring_cleanup_ns")
+        self._flush_pending_send()
+        mark("flush_send_ns")
+
+        events: list[tuple[str, str, object]] = []
+        if self._candidate_arena is not None:
+            # Direct Draft completion is intentionally observed before the
+            # independent Coordinator retirement channel.
+            self._candidate_arena.poll_completion_notices()
+            self._candidate_arena.poll_completion_records()
+            if self._ring_outstanding:
+                self._poll_direct_ring_reads()
+                if self._ring_lease:
+                    self._fence_dead_ring_owners()
+        mark("arena_notice_ns")
+        self._consume_control_messages(events)
         mark("zmq_recv_ns")
         if self._candidate_arena is not None:
             self._candidate_arena.poll_releases()
             self._candidate_arena.poll_cancelled()
-            arena = self._candidate_arena
-            completions = arena.poll()
-            unparked = self._unparked_completions
-            if unparked:
-                # Kept only while its slot still holds it (not let go since).
-                held = {t: c for t, c in unparked.items() if arena.holds(c)}
-                unparked.clear()
-                held.update((c.transfer_id, c) for c in completions)
-                completions = held.values()
-            for completion in completions:
-                state = self._ledger.get(completion.transfer_id)
-                parked = self._parked.get(completion.transfer_id)
-                if state is None or parked is None:
-                    # The push landed before this round parked (a destination
-                    # known at launch, issue #330).  poll() returns a
-                    # completion once, so keep it until the round parks.
-                    unparked[completion.transfer_id] = completion
-                    continue
-                if parked.candidate_completion is not None:
-                    continue
-                if completion.root_token != parked.bonus_token:
-                    raise ValueError(
-                        "direct candidate root does not match Target bonus token"
-                    )
-                self._ledger.mark_direct_ready(
-                    completion.transfer_id,
-                    draft_instance_id=completion.draft_instance_id,
-                )
-                self._note_draft_progress(completion.draft_instance_id)
-                parked.result_received_ns = completion.observed_ns
-                self._p0_emit(
-                    "candidate_observed",
-                    transfer_id=completion.transfer_id,
-                    request_id=parked.req.rid,
-                    round_id=parked.round_id,
-                    completion_observed_ns=completion.observed_ns,
-                    producer_globaltimer_ns=getattr(
-                        completion, "producer_globaltimer_ns", 0
-                    ),
-                    ready_source=getattr(completion, "ready_source", "notice"),
-                )
-                if self._profile_active:
-                    export_ledger_ready_ns = time.monotonic_ns()
-                    self._profile_emit(
-                        "target_direct_completion",
-                        transfer_id=completion.transfer_id,
-                        request_id=parked.req.rid,
-                        round_id=parked.round_id,
-                        slot_id=completion.slot_id,
-                        generation=completion.generation,
-                        notice_queued_ns=completion.notice_queued_ns,
-                        notice_received_ns=completion.notice_received_ns,
-                        metadata_submitted_ns=completion.metadata_submitted_ns,
-                        metadata_gpu_ns=completion.metadata_gpu_ns,
-                        completion_observed_ns=completion.observed_ns,
-                        ready_source=getattr(completion, "ready_source", "notice"),
-                        producer_globaltimer_ns=getattr(
-                            completion, "producer_globaltimer_ns", 0
-                        ),
-                        delivery_ns=getattr(completion, "delivery_ns", 0),
-                        export_ledger_ready_ns=export_ledger_ready_ns,
-                        target_compute_batches_inflight=self._target_compute_batches_inflight,
-                    )
-                events.append(
-                    (
-                        "ready_direct",
-                        completion.transfer_id,
-                        (completion, parked.bonus_token, parked.seq_len),
-                    )
-                )
+            events.extend(self._observe_ready_direct_completions())
         mark("arena_complete_ns")
         events.extend(self._expire_local_rounds())
         mark("expire_rounds_ns")
