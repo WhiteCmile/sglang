@@ -907,6 +907,11 @@ class TargetRdmaEndpoint:
                 status,
             )
             return
+        if tag == 0:
+            logger.error(
+                "native ready sender: completion poll failed (%d)", status
+            )
+            return
         with self._lock:
             session = self._by_tag.get(tag)
         if session is None:

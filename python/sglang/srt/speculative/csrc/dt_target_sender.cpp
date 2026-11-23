@@ -240,6 +240,10 @@ void serve(Sender* s) {
       progress = true;
     }
     const int n = s->poll(s->cq, kPollBatch, 0, wr_id, status, opcode, imm, qpn);
+    if (n < 0) {
+      s->cqe_errors.fetch_add(1, std::memory_order_relaxed);
+      failures.push_back({0, 2, n});
+    }
     for (int i = 0; i < n; ++i) {
       s->cqes.fetch_add(1, std::memory_order_relaxed);
       dt_probe::stamp(p, dt_probe::SENDER_CQE, -1, wr_id[i],
