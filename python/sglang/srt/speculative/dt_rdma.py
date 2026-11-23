@@ -877,7 +877,10 @@ class TargetRdmaEndpoint:
                 kinds[len(kinds) + 1] = label.decode()
             self._sender_probe_kinds = kinds
             self._sender_pending = None  # publish record being assembled
-            self._sender_posted = {}  # (tag, ring index) -> posted_ns
+            # Per pull QP tag, the posted_ns of each ready record, matched
+            # FIFO against its send completion (an RC QP completes in post
+            # order; a send-side CQE carries no immediate to join on).
+            self._sender_posted = {}
         pool.set_ready_listener(self._publish_native)
 
     def _publish_native(self, item) -> None:
@@ -968,16 +971,16 @@ class TargetRdmaEndpoint:
                     if self._sender_pending is not None:
                         self._sender_pending["posted_ns"] = t_ns
                         self._sender_pending["posts"] += 1
-                    self._sender_posted[(arg >> 32, arg & 0xFFFFFFFF)] = t_ns
+                    self._sender_posted.setdefault(arg >> 32, deque()).append(t_ns)
                 elif name == "sender_cqe":
+                    posted_log = self._sender_posted.get(seq)
+                    posted_ns = posted_log.popleft() if posted_log else 0
                     emit(
                         "target_ready_cqe",
                         tag=seq,
                         imm=arg & 0xFFFFFFFF,
                         status=arg >> 32,
-                        posted_ns=self._sender_posted.pop(
-                            (seq, arg & 0xFFFFFFFF), 0
-                        ),
+                        posted_ns=posted_ns,
                         reaped_ns=t_ns,
                         sender="native",
                     )
