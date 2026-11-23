@@ -63,6 +63,7 @@ import secrets
 import struct
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -198,6 +199,16 @@ _IBV_WC_RECV_RDMA_WITH_IMM = 1 << 7 | 1  # IBV_WC_RECV_RDMA_WITH_IMM
 _POLL_BATCH = 64
 _CU_FLUSH_TARGET_CURRENT_CTX = 0
 _CU_FLUSH_TO_OWNER = 100
+
+# Issue #313 (redesign P5a): the cross-host slot-ready publisher is a Python
+# thread by default; "native" sends the byte-identical records from
+# csrc/dt_target_sender.cpp instead (no GIL on the send path).
+READY_SENDER = os.environ.get("DT_TARGET_READY_SENDER", "python")
+# Stamps the native sender buffers between two scheduler drains.
+_SENDER_PROBE_CAPACITY = 1 << 16
+_SENDER_ERROR_CB = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32
+)
 
 
 class RdmaTransportError(RuntimeError):
@@ -343,6 +354,71 @@ def _lib() -> ctypes.CDLL:
         if _LIB is None:
             _LIB = _verbs_library()
         return _LIB
+
+
+def _sender_library() -> ctypes.CDLL:
+    """The native slot-ready sender (csrc/dt_target_sender.cpp, issue #313).
+
+    Verbs stay in dt_rdma_verbs.cpp: the sender receives its post/poll entry
+    points at create (the dt_ring_worker.cpp pattern), so this library builds
+    without the InfiniBand headers.  The probe reader symbols (dt_probe_*)
+    come from the shared csrc/dt_native_probe.h and are bound per library,
+    so equal names in dt_rdma_verbs never collide with these.
+    """
+
+    source = Path(__file__).with_name("csrc") / "dt_target_sender.cpp"
+    path = _build_native_library(
+        "dt_target_sender",
+        source,
+        [
+            os.environ.get("CXX", "g++"),
+            "-O2",
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            "-ldl",
+            "-lpthread",
+        ],
+        ["--version"],
+        "DT_TARGET_SENDER_BUILD_DIR",
+    )
+    lib = ctypes.CDLL(str(path))
+    vp, i32, u32, u64 = ctypes.c_void_p, ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint64
+    signatures = {
+        "dt_target_sender_create": ([i32, vp, vp, vp, vp, u64, u64, u64], vp),
+        "dt_target_sender_set_probe": ([vp, vp], i32),
+        "dt_target_sender_set_error_callback": ([vp, _SENDER_ERROR_CB, vp], None),
+        "dt_target_sender_add_session": ([vp, u64, vp, u64, u32], i32),
+        "dt_target_sender_set_active": ([vp, u64, i32], None),
+        "dt_target_sender_remove_session": ([vp, u64], None),
+        "dt_target_sender_submit": ([vp, u32, u32, u64, u64], u64),
+        "dt_target_sender_done": ([vp], u64),
+        "dt_target_sender_stats": ([vp, ctypes.POINTER(u64)], None),
+        "dt_target_sender_destroy": ([vp], i32),
+        "dt_target_sender_encode_record": ([vp, u64, u64, u64, u32, u32], u64),
+        "dt_probe_create": ([u64], vp),
+        "dt_probe_destroy": ([vp], None),
+        "dt_probe_drain": ([vp, vp, u64], u64),
+        "dt_probe_dropped": ([vp], u64),
+        "dt_probe_kind_name": ([u32], ctypes.c_char_p),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        fn = getattr(lib, name)
+        fn.argtypes = argtypes
+        fn.restype = restype
+    return lib
+
+
+_SENDER_LIB: ctypes.CDLL | None = None
+_SENDER_LIB_LOCK = threading.Lock()
+
+
+def _sender_lib() -> ctypes.CDLL:
+    global _SENDER_LIB
+    with _SENDER_LIB_LOCK:
+        if _SENDER_LIB is None:
+            _SENDER_LIB = _sender_library()
+        return _SENDER_LIB
 
 
 def _cuda_driver() -> ctypes.CDLL:
@@ -684,6 +760,13 @@ class TargetRdmaEndpoint:
     server, and publishes ready records.  Candidate pushes need no thread
     here: the arena's record observer consumes them (issue #223)."""
 
+    # Class defaults keep object-level constructions (tests that bypass
+    # __init__) off the native-sender and profiling paths.
+    _profile_active = False
+    _sender = None
+    _sender_events: deque | None = None
+    _posted_log: dict | None = None
+
     def __init__(self, *, pool, arena, device_index: int, on_landed_push=None) -> None:
         self._pool = pool
         self._arena = arena
@@ -706,6 +789,8 @@ class TargetRdmaEndpoint:
         self._push_cq: CompletionQueue | None = None
         self._threads: list[threading.Thread] = []
         if pool is not None:
+            from dt_profile import enabled as profile_enabled
+
             storage = pool._storage
             self._pool_mr = self.device.register(
                 storage.data_ptr(), storage.nbytes, remote=_IBV_ACCESS_REMOTE_READ
@@ -714,8 +799,20 @@ class TargetRdmaEndpoint:
             self._session_tag = pool_generation_tag(pool.source_session_id)
             self._ready_generation = np.zeros(pool.slot_count, dtype=np.uint32)
             self._ready_cq = self.device.completion_queue(4 * READY_SEND_DEPTH)
-            pool.set_ready_listener(self._publications.put)
-            self._start(self._publisher_loop, "dt-rdma-ready-publisher")
+            self._profile_active = profile_enabled()
+            if self._profile_active:
+                # Per pull QP tag, the monotonic ns of each posted ready
+                # record, matched FIFO against its completion (issue #313).
+                self._posted_log = {}
+            if READY_SENDER == "native":
+                self._start_native_sender(pool)
+            elif READY_SENDER == "python":
+                pool.set_ready_listener(self._publication_arrived)
+                self._start(self._publisher_loop, "dt-rdma-ready-publisher")
+            else:
+                raise RdmaTransportError(
+                    f"unknown DT_TARGET_READY_SENDER {READY_SENDER!r}"
+                )
         if arena is not None:
             records = arena._completion_records
             if records is None:
@@ -735,6 +832,150 @@ class TargetRdmaEndpoint:
         thread = threading.Thread(target=target, name=name, daemon=True)
         self._threads.append(thread)
         thread.start()
+
+    # -- native slot-ready sender (issue #313, P5a) -------------------------
+
+    def _start_native_sender(self, pool) -> None:
+        """Replace the publisher thread with csrc/dt_target_sender.cpp: the
+        ready records on the wire stay byte-identical, but the event wait,
+        the posts and the completion reaping run without the GIL."""
+
+        lib = _sender_lib()
+        self._sender_lib = lib
+        verbs = _lib()
+        sender = lib.dt_target_sender_create(
+            self._device_index,
+            self._ready_cq.handle,
+            ctypes.cast(verbs.dt_rdma_post_write_imm_inline, ctypes.c_void_p),
+            ctypes.cast(verbs.dt_rdma_poll, ctypes.c_void_p),
+            self._ready_generation.ctypes.data,
+            pool.slot_count,
+            self._pool_tag,
+            self._session_tag,
+        )
+        if not sender:
+            raise RdmaTransportError("native ready sender failed to start")
+        self._sender = sender
+        # (ticket, event) until the sender reports the ticket done: the
+        # native side holds only the raw event handle, so the torch Event
+        # must stay referenced at least that long.
+        self._sender_events = deque()
+        self._sender_error_cb = _SENDER_ERROR_CB(self._sender_failed)
+        lib.dt_target_sender_set_error_callback(
+            sender, self._sender_error_cb, None
+        )
+        if self._profile_active:
+            self._sender_probe = lib.dt_probe_create(_SENDER_PROBE_CAPACITY)
+            lib.dt_target_sender_set_probe(sender, self._sender_probe)
+            self._sender_probe_buffer = np.empty(
+                (_SENDER_PROBE_CAPACITY, 4), dtype=np.uint64
+            )
+            kinds = {}
+            while (
+                label := lib.dt_probe_kind_name(len(kinds) + 1)
+            ) is not None:
+                kinds[len(kinds) + 1] = label.decode()
+            self._sender_probe_kinds = kinds
+            self._sender_pending = None  # publish record being assembled
+            self._sender_posted = {}  # (tag, ring index) -> posted_ns
+        pool.set_ready_listener(self._publish_native)
+
+    def _publish_native(self, item) -> None:
+        slot_id, generation, producer_event = item
+        if self._sender is None:
+            return  # closed between the listener read and this call
+        lib = self._sender_lib
+        enqueued_ns = time.monotonic_ns() if self._profile_active else 0
+        ticket = lib.dt_target_sender_submit(
+            self._sender, slot_id, generation, producer_event.cuda_event, enqueued_ns
+        )
+        if not ticket:
+            raise RdmaTransportError("native ready sender is stopped")
+        events = self._sender_events
+        events.append((ticket, producer_event))
+        done = lib.dt_target_sender_done(self._sender)
+        while events and events[0][0] <= done:
+            events.popleft()
+
+    def _sender_failed(self, tag: int, code: int, status: int) -> None:
+        """Native sender failure report (invoked from the sender thread)."""
+
+        if code == 3:
+            logger.error(
+                "native ready sender: producer event wait failed (%d); "
+                "the slot stays unready",
+                status,
+            )
+            return
+        with self._lock:
+            session = self._by_tag.get(tag)
+        if session is None:
+            return
+        logger.error(
+            "native ready sender: ready record to draft session %s failed "
+            "(code %d, status %d); fencing it",
+            session.draft_session_id,
+            code,
+            status,
+        )
+        self.fence(session.draft_instance_id, session.draft_session_id)
+
+    def dump_sender_trace(self) -> None:
+        """Drain the native sender's stamps into target_ready_publish /
+        target_ready_cqe events; the Target scheduler calls this from its
+        poll while profiling (issue #313)."""
+
+        if getattr(self, "_sender_probe", None) is None:
+            return
+        from dt_profile import emit
+
+        lib = self._sender_lib
+        kinds = self._sender_probe_kinds
+        buffer = self._sender_probe_buffer
+        while True:
+            count = int(
+                lib.dt_probe_drain(
+                    self._sender_probe, buffer.ctypes.data, _SENDER_PROBE_CAPACITY
+                )
+            )
+            if not count:
+                return
+            for row in buffer[:count]:
+                t_ns, kind_ring, seq, arg = (int(v) for v in row)
+                name = kinds.get(kind_ring & 0xFFFFFFFF)
+                if name == "sender_taken":
+                    pending = self._sender_pending
+                    if pending is not None:
+                        emit("target_ready_publish", sender="native", **pending)
+                    self._sender_pending = {
+                        "slot_id": seq >> 32,
+                        "generation": seq & 0xFFFFFFFF,
+                        "enqueued_ns": arg,
+                        "dequeued_ns": t_ns,
+                        "event_done_ns": 0,
+                        "posted_ns": 0,
+                        "posts": 0,
+                    }
+                elif name == "sender_event_done":
+                    if self._sender_pending is not None:
+                        self._sender_pending["event_done_ns"] = t_ns
+                elif name == "sender_posted":
+                    if self._sender_pending is not None:
+                        self._sender_pending["posted_ns"] = t_ns
+                        self._sender_pending["posts"] += 1
+                    self._sender_posted[(arg >> 32, arg & 0xFFFFFFFF)] = t_ns
+                elif name == "sender_cqe":
+                    emit(
+                        "target_ready_cqe",
+                        tag=seq,
+                        imm=arg & 0xFFFFFFFF,
+                        status=arg >> 32,
+                        posted_ns=self._sender_posted.pop(
+                            (seq, arg & 0xFFFFFFFF), 0
+                        ),
+                        reaped_ns=t_ns,
+                        sender="native",
+                    )
 
     # -- bootstrap handlers (HostTcpServer threads) -------------------------
 
@@ -858,6 +1099,14 @@ class TargetRdmaEndpoint:
                 session.table_staging_np = table_staging_np
                 session.table_mr = table_mr
             self._by_tag[qp.tag] = session
+            if leg == LEG_PULL and self._sender is not None:
+                _sender_lib().dt_target_sender_add_session(
+                    self._sender,
+                    qp.tag,
+                    qp.handle,
+                    session.ready_addr,
+                    session.ready_rkey,
+                )
         response = qp.endpoint(self.device.lid)
         if leg == LEG_PULL:
             pool = self._pool
@@ -909,6 +1158,10 @@ class TargetRdmaEndpoint:
             if session is None or session.pull_qp is None:
                 raise RdmaTransportError("draft session has no pull leg")
             session.active = True
+            if self._sender is not None:
+                _sender_lib().dt_target_sender_set_active(
+                    self._sender, session.pull_qp.tag, 1
+                )
             snapshot = self._ready_generation.tolist()
         return {"ready_generation": snapshot}, b""
 
@@ -945,6 +1198,13 @@ class TargetRdmaEndpoint:
 
     # -- ready records ------------------------------------------------------
 
+    def _publication_arrived(self, item) -> None:
+        # The stamp costs one clock read per publication, and only while
+        # profiling (issue #313: the H5 publisher-queue decomposition).
+        self._publications.put(
+            (item, time.monotonic_ns() if self._profile_active else 0)
+        )
+
     def _publisher_loop(self) -> None:
         torch.cuda.set_device(self._device_index)
         while not self._closed:
@@ -957,17 +1217,49 @@ class TargetRdmaEndpoint:
             except queue.Empty:
                 item = None
             if item is not None:
-                slot_id, generation, producer_event = item
+                (slot_id, generation, producer_event), enqueued_ns = item
+                dequeued_ns = time.monotonic_ns() if self._profile_active else 0
                 try:
                     producer_event.synchronize()
                 except Exception:  # noqa: BLE001 - the slot stays unready
                     logger.exception("feature producer event failed; slot %d not ready", slot_id)
+                    if self._profile_active:
+                        self._emit_ready_publish(
+                            slot_id, generation, enqueued_ns, dequeued_ns, 0, 0, 0
+                        )
                 else:
-                    self._publish_ready(slot_id, generation)
+                    event_done_ns = (
+                        time.monotonic_ns() if self._profile_active else 0
+                    )
+                    posts = self._publish_ready(slot_id, generation)
+                    if self._profile_active:
+                        self._emit_ready_publish(
+                            slot_id, generation, enqueued_ns, dequeued_ns,
+                            event_done_ns, time.monotonic_ns(), posts,
+                        )
             self._reap_ready_sends()
 
-    def _publish_ready(self, slot_id: int, generation: int) -> None:
+    def _emit_ready_publish(
+        self, slot_id, generation, enqueued_ns, dequeued_ns, event_done_ns,
+        posted_ns, posts,
+    ) -> None:
+        from dt_profile import emit
+
+        emit(
+            "target_ready_publish",
+            slot_id=slot_id,
+            generation=generation,
+            enqueued_ns=enqueued_ns,
+            dequeued_ns=dequeued_ns,
+            event_done_ns=event_done_ns,
+            posted_ns=posted_ns,
+            posts=posts,
+            sender="python",
+        )
+
+    def _publish_ready(self, slot_id: int, generation: int) -> int:
         broken = []
+        posts = 0
         with self._lock:
             self._ready_generation[slot_id] = generation
             for session in self._sessions.values():
@@ -991,21 +1283,44 @@ class TargetRdmaEndpoint:
                 else:
                     tag = session.pull_qp.tag
                     self._outstanding[tag] = self._outstanding.get(tag, 0) + 1
+                    posts += 1
+                    if self._profile_active:
+                        self._posted_log.setdefault(tag, deque()).append(
+                            time.monotonic_ns()
+                        )
         for session in broken:
             logger.error(
                 "ready record post failed for draft session %s; fencing it",
                 session.draft_session_id,
             )
             self.fence(session.draft_instance_id, session.draft_session_id)
+        return posts
 
     def _reap_ready_sends(self) -> None:
         if not any(self._outstanding.values()):
             return
-        for tag, status, _opcode, _imm, _qpn in self._ready_cq.poll(0):
+        for tag, status, _opcode, imm, _qpn in self._ready_cq.poll(0):
             with self._lock:
                 if tag in self._outstanding:
                     self._outstanding[tag] -= 1
                 session = self._by_tag.get(tag)
+            if self._profile_active:
+                posted_ns = 0
+                if self._posted_log is not None:
+                    posted_log = self._posted_log.get(tag)
+                    if posted_log:
+                        posted_ns = posted_log.popleft()
+                from dt_profile import emit
+
+                emit(
+                    "target_ready_cqe",
+                    tag=tag,
+                    imm=imm,
+                    status=status,
+                    posted_ns=posted_ns,
+                    reaped_ns=time.monotonic_ns(),
+                    sender="python",
+                )
             if status == _IBV_WC_SUCCESS:
                 continue
             if session is not None:
@@ -1034,6 +1349,12 @@ class TargetRdmaEndpoint:
                 session.fenced = True
                 for qp in session.queue_pairs():
                     tag = qp.tag
+                    if self._sender is not None and qp is session.pull_qp:
+                        # Before the destroy: the native sender must never
+                        # post into a destroyed queue pair.
+                        _sender_lib().dt_target_sender_remove_session(
+                            self._sender, tag
+                        )
                     try:
                         qp.close()
                     except RdmaTransportError:
@@ -1089,6 +1410,13 @@ class TargetRdmaEndpoint:
             self.fence(instance_id, session_id)
         if self._pool is not None:
             self._pool.set_ready_listener(None)
+        if self._sender is not None:
+            lib = _sender_lib()
+            lib.dt_target_sender_destroy(self._sender)
+            self._sender = None
+            if getattr(self, "_sender_probe", None) is not None:
+                lib.dt_probe_destroy(self._sender_probe)
+                self._sender_probe = None
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:

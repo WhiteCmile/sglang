@@ -38,7 +38,11 @@ namespace dt_probe {
   X(JOB_TAKEN, "job_taken")                 /* publish job dequeued; seq = ticket */ \
   X(JOB_ISSUED, "job_issued")               /* its event re-record issued */ \
   X(READY_PUBLISHED, "ready_published")     /* D6 READY entries published; arg = count */ \
-  X(BATCH_DONE, "batch_done")               /* D8 batch GPU done observed; seq = done seq, arg = descriptors outstanding */
+  X(BATCH_DONE, "batch_done")               /* D8 batch GPU done observed; seq = done seq, arg = descriptors outstanding */ \
+  X(SENDER_TAKEN, "sender_taken")           /* P5a ready job dequeued; seq = ticket, arg = enqueued_ns */ \
+  X(SENDER_EVENT_DONE, "sender_event_done") /* its producer event completed; seq = ticket, arg = enqueued_ns */ \
+  X(SENDER_POSTED, "sender_posted")         /* ready record posted; seq = ticket, arg = qp tag << 32 | ring index */ \
+  X(SENDER_CQE, "sender_cqe")               /* ready send completion reaped; seq = qp tag, arg = status << 32 | ring index */
 
 #define DT_PROBE_CALLS(X)                            \
   X(IPC_OPEN_EVENT, "cuIpcOpenEventHandle")          \

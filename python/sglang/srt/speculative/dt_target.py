@@ -3402,6 +3402,11 @@ class DTTargetController:
             self._last_ready_snapshot_ns = poll_now_ns
             self._drain_gc_trace_events()
             self._maybe_dump_driver_stats(time.monotonic_ns())
+            rdma = getattr(self, "_rdma_endpoint", None)
+            if rdma is not None:
+                # P5a (issue #313): the native slot-ready sender's stamps,
+                # as target_ready_publish / target_ready_cqe events.
+                rdma.dump_sender_trace()
         if ring_publish_fatal:
             # A publication failure is fatal on the export rank; the other
             # ranks learn it here rather than through a per-wave broadcast.
@@ -8973,6 +8978,14 @@ class DTTargetController:
                         ring_seq=seq,
                         written_ns=written_ns,
                         remote=True,
+                        # P5a (issue #313): join key to the slot's ready
+                        # publication (target_ready_publish) for the H5 split.
+                        source_slot_id=(
+                            source.source_slot_id if source is not None else -1
+                        ),
+                        slot_generation=(
+                            source.slot_generation if source is not None else 0
+                        ),
                     )
                 stamped.append(ring_task)
                 continue
