@@ -183,7 +183,9 @@ def test_launch_publish_stages_record_and_finalize():
     c._stage_dflash_ring_publish_at_launch(batch, result)
     launch = result.dt_ring_publish_launch
     assert result.dt_ring_publish_launch_error is None
-    assert launch is not None and launch.wave_seq == 41
+    assert launch is not None
+    # One owner session, one geometry chunk: one record naming both rows.
+    assert launch.records == (("session", 41, (0, 1), 8),)
     assert [item[0] for item in launch.staged_meta] == [0, 1]
     # The launch never touches the candidate arena; the cleanup reserves
     # and writes destinations exactly as on the park path.
@@ -216,8 +218,98 @@ def test_launch_publish_stages_record_and_finalize():
     wave = c._ring_publish_pending[0]
     assert len(wave.records) == 1
     assert wave.records[0].wave_seq == 41
+    assert len(wave.records[0].specs) == 2
     assert wave.slot_id == 3 and wave.generation == 11
     assert result.dt_ring_publish_wave is wave
+
+
+def test_launch_multi_owner_wave_splits_one_record_per_owner():
+    """P1: a wave mixing two owner Draft sessions publishes one record per
+    owner at launch (the park path's split shape) instead of falling back;
+    each record stages into its own rotating launch slot and the finalize
+    splits the commit specs by the records' staged positions."""
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    other = FakePublisher()
+    publishers = {"session": publisher, "session-b": other}
+    c._ring_publish_publisher = lambda session: publishers.get(session)
+    c._draft_binding = {"a": ("di", "session", 9), "b": ("di", "session-b", 9)}
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch = result.dt_ring_publish_launch
+    assert result.dt_ring_publish_launch_error is None
+    assert launch is not None
+    # Row a names rows [0, 4) of the slot, row b rows [0, 8): each record's
+    # window reaches from the slot base through its own last strided row.
+    assert launch.records == (
+        ("session", 41, (0,), 4),
+        ("session-b", 41, (1,), 8),
+    )
+    pa = publisher.calls[0]
+    pb = other.calls[0]
+    assert pa[0] == "stage" and pb[0] == "stage"
+    # Each record stages into its own publisher's launch-slot rotation.
+    assert pa[2] == 1 and pb[2] == 1
+    assert publisher.calls[1][1]["row_count"] == 4
+    assert other.calls[1][1]["row_count"] == 8
+    assert not c._inplace_hidden  # the lease is consumed exactly once
+    specs = c._dflash_commit_specs(
+        list(launch.staged_meta),
+        result.accept_lens.numpy(),
+        result.next_draft_input.bonus_tokens.numpy(),
+        result.next_draft_input.new_seq_lens.numpy(),
+    )
+    assert c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
+    wave = c._ring_publish_pending[0]
+    assert [r.session_id for r in wave.records] == ["session", "session-b"]
+    assert [r.specs[0][1] for r in wave.records] == ["target:a:1:5", "target:b:1:7"]
+    assert all(r.row_start == 0 for r in wave.records)
+
+
+def test_launch_geometry_chunk_shares_staging_rotation():
+    """P1: a wave past one record's geometry publishes multiple chunks on the
+    same owner ring; every chunk gets its own rotating staging slot and the
+    ring credit claim covers all chunks up front."""
+    import sglang.srt.speculative.dt_direct_ring as direct_ring
+
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    slots = iter((1, 2))
+    publisher.next_launch_slot = lambda: next(slots)
+    original = direct_ring.V2_MAX_REQ
+    direct_ring.V2_MAX_REQ = 1  # force one request per chunk
+    try:
+        c._stage_dflash_ring_publish_at_launch(batch, result)
+    finally:
+        direct_ring.V2_MAX_REQ = original
+    launch = result.dt_ring_publish_launch
+    assert launch is not None
+    assert launch.records == (("session", 41, (0,), 4), ("session", 42, (1,), 8))
+    stages = [call for call in publisher.calls if call[0] == "stage"]
+    publishes = [call for call in publisher.calls if call[0] == "publish"]
+    assert [call[2] for call in stages] == [1, 2]
+    assert len(publishes) == 2
+
+
+def test_launch_second_chunk_direct_error_fails_closed():
+    """A DirectRingError after an earlier chunk's kernel went out is a
+    partial wave on the ring: fail closed (quarantine + committed error),
+    never restore the lease for a park re-publish."""
+    from sglang.srt.speculative.dt_direct_ring import DirectRingError
+
+    c, batch, result, publisher, arena, packed = make_wave(make_controller())
+    other = FakePublisher()
+
+    def not_serving(**_kwargs):
+        raise DirectRingError("ring is not serving")
+
+    other.publish = not_serving
+    publishers = {"session": publisher, "session-b": other}
+    c._ring_publish_publisher = lambda session: publishers.get(session)
+    c._draft_binding = {"a": ("di", "session", 9), "b": ("di", "session-b", 9)}
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    assert result.dt_ring_publish_launch is None
+    assert result.dt_ring_publish_launch_error.startswith("RingPublishCommittedError")
+    assert c._quarantined == (3, 11)
+    assert not c._inplace_hidden
+    assert len(c._ring_publish_orphaned_events) == 1
 
 
 def test_launch_kernel_failure_restores_lease():

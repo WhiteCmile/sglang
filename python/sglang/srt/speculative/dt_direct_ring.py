@@ -97,9 +97,10 @@ RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "1") == "1"
 # slots rotate: the host stages wave k+1 while the GPU may still hold wave
 # k-1's kernel queued behind its forward, so a single staging buffer could be
 # overwritten before the queued kernel reads it.  Slot 0 remains the
-# single-record park path's staging; a multi-record park wave (one record per
-# owner Draft group) rotates the remaining slots so its later records never
-# overwrite an earlier record's staging before that kernel has run.
+# single-record park path's staging; a multi-record wave (one record per
+# owner Draft group and geometry chunk, at park or at launch) rotates the
+# remaining slots so its later records never overwrite an earlier record's
+# staging before that kernel has run.
 RING_PUBLISH_AT_LAUNCH = os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "0") == "1"
 LAUNCH_STAGING_SLOTS = 8
 V2_VERSION = 2

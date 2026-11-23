@@ -315,19 +315,23 @@ class RingPublishCommittedError(RuntimeError):
 
 @dataclass(slots=True)
 class RingPublishLaunch:
-    """A verify wave whose publish kernel was enqueued at launch (Q15b).
+    """A verify wave whose publish kernels were enqueued at launch (Q15b).
 
     Carried on the batch result from stage_overlap_pivot_copy (launch) to
     the ordered result boundary (park), which rebuilds the commit specs with
     the wave's CPU scalar copies and queues the wave for the deferred
     cleanup.  staged_meta holds the launch-time request table in record
     order: rows that finish or retract in this wave stay in the record and
-    are retired by the tombstone/cancel path at park.
+    are retired by the tombstone/cancel path at park.  records holds one
+    (session_id, wave_seq, positions, window_rows) tuple per ring record the
+    wave was split into — one per (owner Draft session, geometry chunk), the
+    same split shape as the park path; positions are the record's request
+    rows as indices into staged_meta and window_rows the block-strided
+    source span the record names from the slot base.
     """
 
     staged_meta: tuple  # (index, req, offset, round_id, attempt, kv_handle)
-    session_id: str
-    wave_seq: int
+    records: tuple  # (session_id, wave_seq, staged_meta positions, window_rows)
     slot_id: int
     generation: int
     row_count: int
@@ -7415,7 +7419,7 @@ class DTTargetController:
             # fresh reserve + pack fallback.
             return self._launch_fallback(batch, "no_inplace")
         slot_id, generation, ready_event = reservation
-        if not batch.reqs or len(batch.reqs) > V2_MAX_REQ:
+        if not batch.reqs:
             return self._launch_fallback(batch, "geometry")
         publish_started_ns = time.monotonic_ns()
         _marks = []
@@ -7432,10 +7436,18 @@ class DTTargetController:
         # commit count is >= 1 by construction) and the tombstone/cancel path
         # retires them at park; membership in a launched wave freezes every
         # per-request scalar the table reads between launch and park.
+        #
+        # One ring record describes one wave to one owner Draft session and
+        # at most V2_MAX_REQ requests / V2_MAX_TOK committed rows, so the
+        # wave is grouped by owner session and split into record-sized
+        # chunks — the park path's split shape.  The accept counts are
+        # GPU-only at launch, so the chunk bound is the structural one
+        # (every row commits at most one block) instead of the park path's
+        # exact counts.
         staged_meta = []
-        entries = []
-        session_id = None
-        publisher = None
+        groups: dict[str, list] = {}
+        group_order: list[str] = []
+        publishers = {}
         chunked_req = getattr(batch, "chunked_req", None)
         candidates_base = int(candidates_gpu.data_ptr())
         for index, req in enumerate(batch.reqs):
@@ -7464,14 +7476,6 @@ class DTTargetController:
             if binding is None:
                 # Round-0/bootstrap rounds have no owner lease yet; Python path.
                 return self._launch_fallback(batch, "binding")
-            if session_id is None:
-                session_id = binding[1]
-                publisher = self._ring_publish_publisher(session_id)
-                if publisher is None:
-                    return self._launch_fallback(batch, "publisher")
-            elif binding[1] != session_id:
-                # One ring record describes one wave to one owner Draft session.
-                return self._launch_fallback(batch, "sessions")
             if (
                 req is chunked_req
                 or getattr(req, "inflight_middle_chunks", 0) > 0
@@ -7482,44 +7486,73 @@ class DTTargetController:
                 # count cannot yet include this wave's own registration, so a
                 # nonzero value is a genuine second in-flight batch.
                 return self._launch_fallback(batch, "inflight")
+            session_id = binding[1]
+            publisher = publishers.get(session_id)
+            if publisher is None:
+                publisher = self._ring_publish_publisher(session_id)
+                if publisher is None:
+                    return self._launch_fallback(batch, "publisher")
+                publishers[session_id] = publisher
+            position = len(staged_meta)
             staged_meta.append(
                 (index, req, offset, round_id, attempt, draft_kv_handle)
             )
-            entries.append(
-                (
-                    publisher.rid_hash_for(req.rid),
-                    round_id,
-                    attempt,
-                    binding[2],
-                    candidates_base
-                    + index * self.block_size * candidates_gpu.element_size(),
-                )
+            entry = (
+                publisher.rid_hash_for(req.rid),
+                round_id,
+                attempt,
+                binding[2],
+                candidates_base
+                + index * self.block_size * candidates_gpu.element_size(),
             )
+            if session_id not in groups:
+                groups[session_id] = []
+                group_order.append(session_id)
+            groups[session_id].append((position, index, entry))
         if not staged_meta:
             return self._launch_fallback(batch, "empty")
-        if session_id in getattr(self, "_ring_publish_backpressure", ()):
-            # An earlier wave of this Draft session is arena-retained; its
-            # ring slots must not be reused until its cleanup lands, so no
-            # new record publishes on this ring in the meantime.
-            return self._launch_fallback(batch, "backpressure")
-        _mark("eligibility")
-        # The exact token total lands in the record from the device counts;
-        # only the record-geometry bound is decided here, so use the wave's
-        # structural maximum (every row commits at most one block).
-        token_bound = len(staged_meta) * self.block_size
+
+        # Split each owner group into record-sized chunks on the structural
+        # token bound (the exact accept counts land in the record from the
+        # device counts; only the record geometry is decided here).
+        chunk_rows = min(V2_MAX_REQ, max(1, V2_MAX_TOK // self.block_size))
+        chunks = []
+        for session_id in group_order:
+            publisher = publishers[session_id]
+            rows = groups[session_id]
+            for start in range(0, len(rows), chunk_rows):
+                chunks.append((session_id, publisher, rows[start : start + chunk_rows]))
+
+        # Validate every chunk before the first kernel goes out: a failure
+        # found only mid-wave would leave a partial wave on a ring, which
+        # must fail closed instead of falling back.  Ring credit is claimed
+        # per owner ring (free entries), and each record's block-strided
+        # source window must fit the Draft landing buffer; the window reaches
+        # from the slot base through the chunk's last row because the
+        # record's token offsets are absolute within the slot.
         row_count = int(packed.shape[0])
-        if token_bound > V2_MAX_TOK or publisher.free_entries() <= 0:
-            return self._launch_fallback(batch, "credit")
-        if row_count * self.pivot_width * 2 > publisher.writer.max_entry_bytes:
-            return self._launch_fallback(batch, "landing")
-        # Ring credit is claimed before the kernel goes on the stream (the
-        # free-entries check above); candidate destinations are deliberately
-        # NOT reserved here.  A launch reservation holds its arena slot from
-        # launch until the Draft's completion is read — roughly two scheduler
-        # iterations longer than the cleanup-time reservation — and the
-        # aggregate occupancy tipped the 256-slot arena into backpressure at
-        # r24 (TPOT p90 +8.9%, attainment 0.80 vs 0.91; issue-39 trace-2).
-        # The completion round-trip is confirmation-bound either way, so the
+        claim: dict[str, int] = {}
+        for session_id, publisher, rows in chunks:
+            if session_id in getattr(self, "_ring_publish_backpressure", ()):
+                # An earlier wave of this Draft session is arena-retained;
+                # its ring slots must not be reused until its cleanup lands,
+                # so no new record publishes on this ring in the meantime.
+                return self._launch_fallback(batch, "backpressure")
+            claim[session_id] = claim.get(session_id, 0) + 1
+            window_rows = (max(index for _p, index, _e in rows) + 1) * self.block_size
+            if window_rows * self.pivot_width * 2 > publisher.writer.max_entry_bytes:
+                return self._launch_fallback(batch, "landing")
+        for session_id, count in claim.items():
+            if publishers[session_id].free_entries() < count:
+                return self._launch_fallback(batch, "credit")
+        _mark("eligibility")
+        # Candidate destinations are deliberately NOT reserved here.  A
+        # launch reservation holds its arena slot from launch until the
+        # Draft's completion is read — roughly two scheduler iterations
+        # longer than the cleanup-time reservation — and the aggregate
+        # occupancy tipped the 256-slot arena into backpressure at r24 (TPOT
+        # p90 +8.9%, attainment 0.80 vs 0.91; issue-39 trace-2).  The
+        # completion round-trip is confirmation-bound either way, so the
         # cleanup reserves and writes destinations exactly as on the park
         # path while the record itself is already visible at GPU end.
         _mark("reserve")
@@ -7528,18 +7561,14 @@ class DTTargetController:
             event_handle = ready_event.ipc_handle()
             self._slot_event_handles[slot_id] = event_handle
         try:
-            wave_seq = self._publish_at_launch_kernel(
+            records = self._publish_at_launch_kernel(
                 batch_result,
-                publisher,
                 pool,
-                staged_meta=staged_meta,
-                entries=entries,
+                chunks=chunks,
                 slot_id=slot_id,
                 generation=generation,
                 ready_event=ready_event,
                 event_handle=event_handle,
-                row_count=row_count,
-                token_bound=token_bound,
                 accept_lens=accept_lens,
                 draft_input=draft_input,
             )
@@ -7549,10 +7578,10 @@ class DTTargetController:
             self._inplace_hidden.pop(packed.data_ptr(), None)
             raise
         except DirectRingError:
-            # publish()'s pre-launch validation failed (e.g. the ring stopped
-            # serving in an owner-revocation race): the kernel never went out
-            # and no record can appear.  Restore the in-place lease and leave
-            # the wave to the park path, exactly as for any other
+            # publish()'s pre-launch validation failed before any kernel went
+            # out (e.g. the ring stopped serving in an owner-revocation
+            # race): no record can appear.  Restore the in-place lease and
+            # leave the wave to the park path, exactly as for any other
             # ineligibility, instead of quarantining a healthy slot.
             self._inplace_hidden[packed.data_ptr()] = reservation
             return self._launch_fallback(batch, "publish")
@@ -7562,13 +7591,12 @@ class DTTargetController:
             # run.
             self._inplace_hidden[packed.data_ptr()] = reservation
             raise
-        # The reservation is consumed only once the kernel is enqueued.
+        # The reservation is consumed only once the kernels are enqueued.
         self._inplace_hidden.pop(packed.data_ptr(), None)
         _mark("stage_launch")
         launch = RingPublishLaunch(
             staged_meta=tuple(staged_meta),
-            session_id=session_id,
-            wave_seq=wave_seq,
+            records=records,
             slot_id=slot_id,
             generation=generation,
             row_count=row_count,
@@ -7577,98 +7605,152 @@ class DTTargetController:
             publish_ns=time.monotonic_ns() - publish_started_ns,
         )
         if self._profile_active:
-            self._profile_emit(
-                "target_ring_publish_launch",
-                ring_seq=wave_seq,
-                draft_session_id=session_id,
-                publication_rows=row_count,
-                publication_requests=len(staged_meta),
-                publication_bytes=row_count * self.pivot_width * 2,
-                wave_id=getattr(batch, "dt_full_wave_id", None),
-                lane_id=getattr(batch, "dt_pipeline_lane_id", None),
-            )
+            for session_id, wave_seq, positions, window_rows in records:
+                self._profile_emit(
+                    "target_ring_publish_launch",
+                    ring_seq=wave_seq,
+                    draft_session_id=session_id,
+                    publication_rows=window_rows,
+                    publication_requests=len(positions),
+                    publication_bytes=window_rows * self.pivot_width * 2,
+                    wave_id=getattr(batch, "dt_full_wave_id", None),
+                    lane_id=getattr(batch, "dt_pipeline_lane_id", None),
+                )
         return launch
 
     def _publish_at_launch_kernel(
         self,
         batch_result,
-        publisher,
         pool,
         *,
-        staged_meta,
-        entries,
+        chunks,
         slot_id,
         generation,
         ready_event,
         event_handle,
-        row_count,
-        token_bound,
         accept_lens,
         draft_input,
-    ) -> int:
-        """Stage the request table and enqueue publish_k on the verify stream.
+    ) -> tuple:
+        """Stage the request tables and enqueue publish_k on the verify stream.
 
-        Stream order does all the fencing the park path buys explicitly: the
-        kernel runs after this wave's forward wrote the scalars and the slot
-        rows, and the next wave's forward on the same stream cannot overwrite
-        the graph-owned buffers before the kernel has read them.
+        One kernel per (owner session, geometry chunk); every record names
+        the same in-place slot, its request rows by their block-strided
+        batch-slot offsets.  Stream order does all the fencing the park path
+        buys explicitly: the kernels run after this wave's forward wrote the
+        scalars and the slot rows, and the next wave's forward on the same
+        stream cannot overwrite the graph-owned buffers before the kernels
+        have read them.  Returns one (session_id, wave_seq, positions,
+        window_rows) tuple per published record.
         """
 
         from sglang.srt.speculative.dt_direct_ring import DirectRingError
 
-        staging_slot = publisher.next_launch_slot()
-        publisher.stage_requests(entries, staging_slot=staging_slot)
+        published = False
+        records = []
         source_byte_offset = pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
-        try:
-            driver_t0 = time.monotonic_ns() if self._profile_active else 0
-            wave_seq = publisher.publish(
-                stream=int(self.scheduler.forward_stream.cuda_stream),
-                active_slots=[index for index, *_ in staged_meta],
-                slot_id=slot_id,
-                generation=generation,
-                source_byte_offset=source_byte_offset,
-                nbytes=row_count * self.pivot_width * 2,
-                row_count=row_count,
-                event_handle=event_handle,
-                accept_dev=int(accept_lens.data_ptr()),
-                bonus_dev=int(draft_input.bonus_tokens.data_ptr()),
-                seq_lens_dev=int(draft_input.new_seq_lens.data_ptr()),
-                offset_stride=self.block_size,
-                token_total=token_bound,
-                staging_slot=staging_slot,
-            )
-            if self._profile_active:
-                self._driver_record("ring_publish_kernel", driver_t0)
-            return wave_seq
-        except DirectRingError:
-            # publish() raises DirectRingError only from validation that runs
-            # before the kernel is enqueued and before any ring state
-            # advances (ring not serving, geometry, credit).  No record can
-            # appear, so the caller restores the in-place lease and the wave
-            # falls back to the park path — an ordinary owner-revocation race
-            # must not quarantine a healthy slot.
-            raise
-        except Exception as exc:
-            # The kernel may already be on the ring: fail closed rather than
-            # let the park path double-publish the wave.
+
+        def _fail_closed(exc):
+            # A record may already be on a ring: the slot must never recycle,
+            # the producer event must stay alive for the Draft's wait, and
+            # the wave must fail closed rather than re-publish.
             pool.quarantine_reserved(slot_id, generation)
             orphaned = getattr(self, "_ring_publish_orphaned_events", None)
             if orphaned is None:
                 orphaned = self._ring_publish_orphaned_events = deque(maxlen=1024)
             orphaned.append(ready_event)
-            raise RingPublishCommittedError(str(exc)) from exc
+            return RingPublishCommittedError(str(exc))
+
+        try:
+            for session_id, publisher, rows in chunks:
+                # Each record stages into its own rotating slot: a later
+                # chunk's host staging must not overwrite an earlier chunk's
+                # entries before that kernel has read them.
+                staging_slot = publisher.next_launch_slot()
+                publisher.stage_requests(
+                    [entry for _p, _i, entry in rows],
+                    staging_slot=staging_slot,
+                )
+                # The record's token offsets are absolute within the slot
+                # (batch_slot * block_size), so the record's source window
+                # reaches from the slot base through the chunk's last row.
+                window_rows = (
+                    max(index for _p, index, _e in rows) + 1
+                ) * self.block_size
+                try:
+                    driver_t0 = time.monotonic_ns() if self._profile_active else 0
+                    wave_seq = publisher.publish(
+                        stream=int(self.scheduler.forward_stream.cuda_stream),
+                        active_slots=[index for _p, index, _e in rows],
+                        slot_id=slot_id,
+                        generation=generation,
+                        source_byte_offset=source_byte_offset,
+                        nbytes=window_rows * self.pivot_width * 2,
+                        row_count=window_rows,
+                        event_handle=event_handle,
+                        accept_dev=int(accept_lens.data_ptr()),
+                        bonus_dev=int(draft_input.bonus_tokens.data_ptr()),
+                        seq_lens_dev=int(draft_input.new_seq_lens.data_ptr()),
+                        offset_stride=self.block_size,
+                        token_total=len(rows) * self.block_size,
+                        staging_slot=staging_slot,
+                    )
+                except DirectRingError:
+                    if published:
+                        # An earlier chunk's kernel is already on its ring:
+                        # the wave may not be re-published, so fail closed
+                        # rather than restore the lease for the park path.
+                        raise _fail_closed(
+                            DirectRingError("partial multi-record launch publish")
+                        )
+                    # publish() raises DirectRingError only from validation
+                    # that runs before the kernel is enqueued and before any
+                    # ring state advances (ring not serving, geometry,
+                    # credit).  No record can appear, so the caller restores
+                    # the in-place lease and the wave falls back to the park
+                    # path — an ordinary owner-revocation race must not
+                    # quarantine a healthy slot.
+                    raise
+                except Exception as exc:
+                    # This publish's kernel may already be on the ring (and
+                    # any earlier chunk's kernel is): fail closed rather than
+                    # let the park path double-publish the wave.
+                    raise _fail_closed(exc)
+                if self._profile_active:
+                    self._driver_record("ring_publish_kernel", driver_t0)
+                published = True
+                records.append(
+                    (
+                        session_id,
+                        wave_seq,
+                        tuple(position for position, _i, _e in rows),
+                        window_rows,
+                    )
+                )
+            return tuple(records)
+        except RingPublishCommittedError:
+            raise
+        except DirectRingError:
+            raise
+        except Exception as exc:
+            if not published:
+                # Staging or window arithmetic failed before any kernel went
+                # out: the caller restores the in-place lease and the park
+                # path sees this wave exactly as if launch staging had not
+                # run.
+                raise
+            raise _fail_closed(exc)
 
     def _finalize_dflash_ring_publish_at_launch(
         self, batch: ScheduleBatch, batch_result, launch: RingPublishLaunch, commit_specs
     ):
         """Queue a launch-published wave for the deferred cleanup.
 
-        The record is already on the ring; what remains is exactly the park
-        path's wave bookkeeping (candidate destinations included — the
+        The records are already on the rings; what remains is exactly the
+        park path's wave bookkeeping (candidate destinations included — the
         cleanup reserves and writes them as on the park path).  The specs
         were rebuilt from the launch-time request table and this result's
-        CPU scalars, so the cleanup's read-back geometry checks see a record
-        identical in shape to a park-published one.
+        CPU scalars, so the cleanup's read-back geometry checks see records
+        identical in shape to park-published ones.
         """
 
         wave = RingPublishWave(
@@ -7678,13 +7760,14 @@ class DTTargetController:
             ready_event=launch.ready_event,
             reqs={req.rid: req for req in batch.reqs},
             proposals={},
-            records=(
+            records=tuple(
                 RingPublishRecord(
-                    session_id=launch.session_id,
-                    wave_seq=launch.wave_seq,
-                    specs=tuple(commit_specs),
+                    session_id=session_id,
+                    wave_seq=wave_seq,
+                    specs=tuple(commit_specs[p] for p in positions),
                     row_start=0,
-                ),
+                )
+                for session_id, wave_seq, positions, _window_rows in launch.records
             ),
         )
         self._ring_publish_pending.append(wave)
