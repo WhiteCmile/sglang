@@ -15,7 +15,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.speculative import dt_draft_engine
 from sglang.srt.speculative.dt_draft_engine import FlashMTPDraftEngine
+
+
+@pytest.fixture(autouse=True)
+def _credit_admission(monkeypatch):
+    # The credit is the legacy admission (DT_DRAFT_ADMISSION unset), no
+    # longer the default since D11 (DT_DRAFT_ADMISSION=bound): pin it.
+    monkeypatch.setattr(dt_draft_engine, "DRAFT_ADMISSION_BOUND", False)
 
 
 def _task(transfer_id, *, destination="dest", ring_seq=0, requires_proposal=True):
