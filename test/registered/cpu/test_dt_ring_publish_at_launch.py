@@ -78,6 +78,7 @@ class FakeArena:
     def __init__(self, fail_at=None, free_slots=256):
         self.reserved = []
         self.cancelled = []
+        self.authorized = []
         self.fail_at = fail_at
         self.fail_exc = RuntimeError("arena full")
         self.free_slots = free_slots
@@ -96,6 +97,9 @@ class FakeArena:
             slot_id=len(self.reserved), generation=1, authorization_nonce=7
         )
 
+    def authorize(self, assignment):
+        self.authorized.append(assignment)
+
     def cancel(self, transfer_id, *, remote_quiescent=False):
         self.cancelled.append((transfer_id, remote_quiescent))
 
@@ -112,6 +116,7 @@ def make_controller():
     c._direct_ring = True
     c._ring_publish = True
     c._ring_publish_at_launch = True
+    c._target_dest_at_launch = False
     c._ledger = object()
     c._feature_source_pool = SimpleNamespace(
         _buffer=SimpleNamespace(allocation_offset=1 << 20),
@@ -906,3 +911,282 @@ def test_held_ring_push_expires_after_record_deadline():
     assert not engine._held_direct_source_done
     assert not engine._cancelled_ids
     assert not engine._ring_record_positions
+
+
+# ---------------------------------------------------------------------------
+# P2 (DT_TARGET_DEST_AT_LAUNCH, issue #321): launch-time reserve + authorize
+# + destination write, park-time local ledger begin, shrunk cleanup.
+# ---------------------------------------------------------------------------
+
+
+def make_controller_p2():
+    c = make_controller()
+    c._target_dest_at_launch = True
+    return c
+
+
+def make_dest_ref(transfer_id, slot_id=1):
+    from dt_protocol import CandidateDestinationRef
+
+    return CandidateDestinationRef(
+        target_instance_id="target",
+        target_session_id="session",
+        pool_generation="pool",
+        transport_session="transport",
+        transfer_id=transfer_id,
+        target_device_id=0,
+        device_uuid="uuid",
+        slot_id=slot_id,
+        generation=1,
+        authorization_nonce=7,
+        dtype="int32",
+        row_width=3,
+        nbytes=12,
+        data_allocation_length=1 << 20,
+        data_allocation_offset=4096,
+        data_ipc_handle=b"",
+        metadata_allocation_length=1 << 16,
+        metadata_allocation_offset=8192,
+        metadata_ipc_handle=b"",
+    )
+
+
+def test_launch_p2_reserves_authorizes_and_writes_destinations():
+    """With the P2 flag on the launch reserves and authorizes every staged
+    row's destination, writes the destination region for the seq the publish
+    claims BEFORE the kernel goes out, and carries the reservations to the
+    wave for the cleanup."""
+    c, batch, result, publisher, arena, packed = make_wave(make_controller_p2())
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch = result.dt_ring_publish_launch
+    assert result.dt_ring_publish_launch_error is None
+    assert launch is not None
+    # Every staged row is reserved and authorized to its owner binding.
+    assert arena.reserved == ["target:a:1:5", "target:b:1:7"]
+    assert [a.draft_instance_id for a in arena.authorized] == ["di", "di"]
+    assert [a.draft_session_id for a in arena.authorized] == ["session"] * 2
+    assert [a.authorization_nonce for a in arena.authorized] == [7, 7]
+    assert [a.owner_epoch for a in arena.authorized] == [9, 9]
+    # The region write names the seq the publish claims and lands first.
+    order = [call[0] for call in publisher.calls]
+    assert order == ["stage", "destinations", "publish"]
+    dest_call = publisher.calls[1]
+    assert dest_call[1][0] == 41  # the seq publish() then claims
+    assert dest_call[1][1] == [(1, 1, 7), (2, 1, 7)]
+    assert dest_call[2]["data_buffer_offset"] == 4096
+    assert dest_call[2]["metadata_buffer_offset"] == 8192
+    assert set(launch.destinations) == {"target:a:1:5", "target:b:1:7"}
+    # The finalize carries the reservations to the wave's cleanup.
+    specs = c._dflash_commit_specs(
+        list(launch.staged_meta),
+        result.accept_lens.numpy(),
+        result.next_draft_input.bonus_tokens.numpy(),
+        result.next_draft_input.new_seq_lens.numpy(),
+    )
+    assert c._finalize_dflash_ring_publish_at_launch(batch, result, launch, specs)
+    wave = c._ring_publish_pending[0]
+    assert wave.launch_destinations is launch.destinations
+
+
+def test_launch_p2_arena_full_falls_back_without_a_record():
+    """An arena that cannot place every row publishes nothing at launch:
+    the wave falls back to park whole (design §5.3 item 3)."""
+    c, batch, result, publisher, arena, packed = make_wave(make_controller_p2())
+    arena.free_slots = 0
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    assert result.dt_ring_publish_launch is None
+    assert result.dt_ring_publish_launch_error is None
+    assert not publisher.calls
+    assert not arena.reserved and not arena.cancelled
+    assert c._inplace_hidden  # the lease waits for the park path
+
+
+def test_launch_p2_mid_reserve_arena_full_cancels_partials():
+    from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
+
+    c, batch, result, publisher, arena, packed = make_wave(make_controller_p2())
+    arena.fail_at = 1
+    arena.fail_exc = CandidateTransportError("all candidate arena slots are active")
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    assert result.dt_ring_publish_launch is None
+    assert result.dt_ring_publish_launch_error is None
+    # The partial reservation is rolled back; nothing was published.
+    assert arena.reserved == ["target:a:1:5"]
+    assert arena.cancelled == [("target:a:1:5", True)]
+    assert not publisher.calls
+    assert c._inplace_hidden
+
+
+def test_launch_p2_pre_kernel_failure_cancels_destinations():
+    """A pre-enqueue DirectRingError restores the lease AND rolls the
+    launch reservations back, so the park path can reserve them again."""
+    from sglang.srt.speculative.dt_direct_ring import DirectRingError
+
+    c, batch, result, publisher, arena, packed = make_wave(make_controller_p2())
+
+    def not_serving(**_kwargs):
+        raise DirectRingError("ring is not serving")
+
+    publisher.publish = not_serving
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    assert result.dt_ring_publish_launch is None
+    assert result.dt_ring_publish_launch_error is None
+    assert sorted(arena.cancelled) == [
+        ("target:a:1:5", True),
+        ("target:b:1:7", True),
+    ]
+    assert c._inplace_hidden[int(packed.data_ptr())][0] == 3
+
+
+def test_cleanup_p2_stamps_launch_destinations_without_reserving():
+    """The P2 cleanup reserves nothing and writes no region: it stamps the
+    launch reservations into the confirmation copies and retires ended rows
+    from the same reservations."""
+    c, batch, result, publisher, arena, packed = make_wave(make_controller_p2())
+    c._stage_dflash_ring_publish_at_launch(batch, result)
+    launch, _specs = _finalize_launch_wave(c, batch, result)
+    # The first row ended in the wave: park's finished branch cancelled it.
+    c._cancelled_transfers.add("target:a:1:5")
+    published, made = _setup_cleanup_doubles(c)
+    reserved_before = list(arena.reserved)
+    writes = []
+    c._ring_writers["session"].write_destinations = (
+        lambda *args, **kwargs: writes.append(args)
+    )
+    c._ring_publish_cleanup()
+    assert arena.reserved == reserved_before  # no cleanup reservation
+    assert not writes  # no cleanup region write
+    # The live row's confirmation copy carries the launch reservation.
+    assert len(made) == 1
+    assert made[0].transfer_id == "target:b:1:7"
+    assert made[0].direct_ring_seq == 41
+    assert made[0].candidate_destination is launch.destinations["target:b:1:7"]
+    # The ended row retires its launch reservation through the cancel path.
+    assert ("target:a:1:5", True) in arena.cancelled
+    assert "target:a:1:5" not in c._cancelled_transfers
+    assert not c._ring_publish_pending
+
+
+def test_park_p2_begins_launch_rounds_in_the_local_ledger():
+    """P2: a launch-published wave's rounds enter the ledger on the same
+    park pass that parks them — READY must not wait for the confirmation
+    copy's submit — and the copy's submit adopts the full task."""
+    import msgspec
+    from dt_client import TargetRoundLedger, TargetRoundPhase
+    from dt_protocol import DraftTask, DraftTaskKind, TargetTaskBatch, PROTOCOL_VERSION
+
+    c = make_controller()
+    c._target_dest_at_launch = True
+    c.round_timeout_ns = 10**12
+    c.profile_id = "p"
+    ledger = c._ledger = TargetRoundLedger(target_instance_id="target")
+    c._verify_transfer_by_request = {"a": "old-a"}
+    c._parked = {}
+    c._feature_control_rounds = {}
+    import collections
+
+    c._lane_target_sizes = collections.defaultdict(int)
+    c._lane_for_request = lambda _req: 0
+    c._target_inflight_count = lambda _rid: 0
+    c._retire_dflash_rounds_for_request = lambda *_args, **_kwargs: None
+    c._forget_request_lane = lambda *_args: None
+    c._release_draft_request = lambda *_args: None
+    c._source_slot_by_transfer = {}
+    # The round this wave verified is mid-lifecycle in the ledger.
+    ledger.begin_local(
+        DraftTask(
+            transfer_id="old-a",
+            request_id="a",
+            round_id=0,
+            attempt=5,
+            target_instance_id="target",
+            draft_profile_id="p",
+            k=3,
+            next_token_id=1,
+            source=None,
+            created_ns=0,
+            deadline_ns=10**13,
+            kind=DraftTaskKind.BOOTSTRAP,
+            candidate_destination=make_dest_ref("old-a", slot_id=9),
+        )
+    )
+    ledger.mark_lease_dispatched("old-a", draft_instance_id="di")
+    ledger.mark_direct_ready("old-a", draft_instance_id="di")
+
+    destination = make_dest_ref("target:a:1:5")
+    req = SimpleNamespace(
+        rid="a", finished=lambda: False, is_retracted=False,
+        inflight_middle_chunks=0,
+    )
+    staged = target.StagedDFlashFeatureBatch(
+        tasks=(
+            target.StagedDFlashTask(
+                request_id="a",
+                transfer_id="target:a:1:5",
+                round_id=1,
+                attempt=5,
+                draft_kv_handle="kv-a",
+                feature_token_offset=10,
+                feature_token_count=3,
+                feature_token_ids=(),
+                committed_token_ids=(),
+                previous_transfer_id="old-a",
+                bonus_token=77,
+                seq_len=13,
+            ),
+        ),
+        descriptors_by_transfer={},
+        ring_publish=True,
+    )
+    wave = target.RingPublishWave(
+        slot_id=3,
+        generation=11,
+        row_count=4,
+        ready_event=None,
+        reqs={"a": req},
+        proposals={},
+        records=(),
+        launch_destinations={"target:a:1:5": destination},
+    )
+    batch = SimpleNamespace(reqs=[req], chunked_req=None)
+    result = SimpleNamespace(dt_staged_dflash_features=staged, dt_ring_publish_wave=wave)
+
+    c._park_dflash_completed_batch(batch, None, batch_result=result)
+
+    # The verified round is finished; the new round is parked AND in the
+    # ledger from local state, lease-dispatched, before any submit exists.
+    assert ledger.get("old-a") is None
+    assert "target:a:1:5" in c._parked
+    state = ledger.get("target:a:1:5")
+    assert state is not None and state.local_only
+    assert state.phase == TargetRoundPhase.WAIT_DRAFT
+    assert state.dispatch_accepted and state.lease_dispatched
+    assert state.draft_instance_id == "di"
+    task = state.task
+    assert task.next_token_id == 77
+    assert task.draft_kv_handle == "kv-a"
+    assert task.feature_token_offset == 10
+    assert task.feature_token_count == 3
+    assert task.committed_kv_len == 13
+    assert task.candidate_destination is destination
+    assert wave.proposals["target:a:1:5"] == (True, "old-a")
+    # READY can land now, before the confirmation copy's submit.
+    ledger.mark_direct_ready("target:a:1:5", draft_instance_id="di")
+    assert state.phase == TargetRoundPhase.VERIFY_READY
+    # The confirmation copy's submit adopts the full task in place.
+    full = msgspec.structs.replace(
+        task, committed_token_ids=(1, 2, 3), feature_token_ids=(1, 2, 3),
+        direct_ring_seq=41,
+    )
+    ledger.begin(
+        TargetTaskBatch(
+            protocol_version=PROTOCOL_VERSION,
+            batch_id="target:tasks:9",
+            target_instance_id="target",
+            entries=(full,),
+            sent_ns=0,
+        )
+    )
+    assert state.task is full
+    assert not state.local_only
+    assert state.phase == TargetRoundPhase.VERIFY_READY

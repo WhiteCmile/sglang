@@ -102,6 +102,17 @@ RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "1") == "1"
 # remaining slots so its later records never overwrite an earlier record's
 # staging before that kernel has run.
 RING_PUBLISH_AT_LAUNCH = os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "0") == "1"
+# Target redesign P2 (DT_TARGET_DEST_AT_LAUNCH=1, issue #321): an at-launch
+# published wave also reserves and authorizes every row's candidate
+# destination at launch and CPU-writes the ring's destination region before
+# the publish kernel is enqueued, so the record's seq never becomes visible
+# without its destinations (Draft T1).  Meaningless without the at-launch
+# publish itself, so the combination is refused outright.
+TARGET_DEST_AT_LAUNCH = os.environ.get("DT_TARGET_DEST_AT_LAUNCH", "0") == "1"
+if TARGET_DEST_AT_LAUNCH and not RING_PUBLISH_AT_LAUNCH:
+    raise RuntimeError(
+        "DT_TARGET_DEST_AT_LAUNCH=1 requires DT_RING_PUBLISH_AT_LAUNCH=1"
+    )
 LAUNCH_STAGING_SLOTS = 8
 V2_VERSION = 2
 V2_HEADER_BYTES = 128

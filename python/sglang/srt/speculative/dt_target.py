@@ -338,6 +338,12 @@ class RingPublishLaunch:
     ready_event: object
     marks: tuple  # launch staging breakdown ((name, ns), ...)
     publish_ns: int
+    # P2 (DT_TARGET_DEST_AT_LAUNCH): transfer_id -> CandidateDestinationRef
+    # reserved and authorized at launch and written into the record's
+    # destination region before its kernel was enqueued; None when the flag
+    # is off (the cleanup reserves and writes destinations as on the park
+    # path).
+    destinations: object = None
 
 
 @dataclass(slots=True)
@@ -387,6 +393,10 @@ class RingPublishWave:
     # (requires_proposal, previous_transfer_id).
     proposals: dict
     records: tuple  # RingPublishRecord, one per ring record
+    # P2: launch-reserved destinations (RingPublishLaunch.destinations);
+    # the cleanup stamps them into the confirmation copies instead of
+    # reserving and writing the destination region itself.
+    launch_destinations: object = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,9 +770,16 @@ class DTTargetController:
         # behind the verify forward, instead of from host park.  The park
         # path stays as the fallback whenever launch staging is ineligible.
         # The env default is parsed once in dt_direct_ring (SSOT).
-        from sglang.srt.speculative.dt_direct_ring import RING_PUBLISH_AT_LAUNCH
+        from sglang.srt.speculative.dt_direct_ring import (
+            RING_PUBLISH_AT_LAUNCH,
+            TARGET_DEST_AT_LAUNCH,
+        )
 
         self._ring_publish_at_launch = RING_PUBLISH_AT_LAUNCH
+        # P2 (DT_TARGET_DEST_AT_LAUNCH): launch-published waves reserve and
+        # authorize their candidate destinations at launch and the cleanup
+        # shrinks to source accounting and read-proof registration.
+        self._target_dest_at_launch = TARGET_DEST_AT_LAUNCH
         self._ring_publishers: dict[str, object] = {}  # session -> RingGpuPublisher
         self._ring_publish_pending: deque = deque()
         self._ring_publish_transfers: set[str] = set()
@@ -3311,6 +3328,65 @@ class DTTargetController:
                     )
                 if previous_transfer_id is not None:
                     self._ledger.finish(previous_transfer_id)
+                if staged.ring_publish:
+                    launch_destinations = getattr(wave, "launch_destinations", None)
+                    if launch_destinations is not None:
+                        # P2: this row's destination was reserved and
+                        # authorized at launch, so the round enters the
+                        # ledger here, on the same park pass that registers
+                        # its parked round — READY never waits for the
+                        # confirmation copy's submit.  The copy adopts the
+                        # full task when its submit lands (ledger.begin).
+                        destination = launch_destinations.get(spec.transfer_id)
+                        if destination is None:
+                            raise RuntimeError(
+                                "launch-published wave lost a row's destination"
+                            )
+                        binding = self._draft_binding.get(req.rid)
+                        if binding is not None:
+                            self._ledger.begin_local(
+                                DraftTask(
+                                    transfer_id=spec.transfer_id,
+                                    request_id=req.rid,
+                                    round_id=spec.round_id,
+                                    attempt=spec.attempt,
+                                    target_instance_id=self.instance_id,
+                                    draft_profile_id=self.profile_id,
+                                    k=self.block_size - 1,
+                                    next_token_id=spec.bonus_token,
+                                    source=None,
+                                    created_ns=time.monotonic_ns(),
+                                    deadline_ns=(
+                                        time.monotonic_ns() + self.round_timeout_ns
+                                    ),
+                                    kind=(
+                                        DraftTaskKind.BOOTSTRAP
+                                        if spec.round_id == 0
+                                        else DraftTaskKind.RECONCILE
+                                    ),
+                                    draft_kv_handle=spec.draft_kv_handle,
+                                    committed_kv_len=(
+                                        spec.feature_token_offset
+                                        + spec.feature_token_count
+                                    ),
+                                    feature_token_offset=spec.feature_token_offset,
+                                    feature_token_count=spec.feature_token_count,
+                                    requires_proposal=True,
+                                    candidate_destination=destination,
+                                )
+                            )
+                            self._ledger.mark_lease_dispatched(
+                                spec.transfer_id,
+                                draft_instance_id=binding[0],
+                            )
+                            if self._profile_active:
+                                self._profile_emit(
+                                    "target_ledger_local_begin",
+                                    transfer_id=spec.transfer_id,
+                                    request_id=req.rid,
+                                    round_id=spec.round_id,
+                                    ledger_local_begin_ns=time.monotonic_ns(),
+                                )
         batch_result.dt_dflash_task_build_ns = time.monotonic_ns() - phase_started_ns
 
         phase_started_ns = time.monotonic_ns()
@@ -7335,10 +7411,9 @@ class DTTargetController:
         committed counts, bonus and seq-lens from the verify's device
         tensors, so the record lands at the wave's GPU end instead of one
         result boundary later at park.  Candidate destinations stay with the
-        cleanup (reserving them at launch holds each arena slot about two
-        scheduler iterations longer, which measurably regresses TPOT p90 at
-        high load while the completion round-trip is confirmation-bound
-        either way).  Any ineligibility leaves no trace and the wave falls
+        cleanup unless DT_TARGET_DEST_AT_LAUNCH=1 (P2), which reserves,
+        authorizes and writes them at launch so the record is never visible
+        without them.  Any ineligibility leaves no trace and the wave falls
         back to the ordinary park path; a failure after the kernel went out
         is carried to park and fails closed there like a park-time
         RingPublishCommittedError.
@@ -7551,15 +7626,68 @@ class DTTargetController:
             if publishers[session_id].free_entries() < count:
                 return self._launch_fallback(batch, "credit")
         _mark("eligibility")
-        # Candidate destinations are deliberately NOT reserved here.  A
-        # launch reservation holds its arena slot from launch until the
-        # Draft's completion is read — roughly two scheduler iterations
-        # longer than the cleanup-time reservation — and the aggregate
-        # occupancy tipped the 256-slot arena into backpressure at r24 (TPOT
-        # p90 +8.9%, attainment 0.80 vs 0.91; issue-39 trace-2).  The
-        # completion round-trip is confirmation-bound either way, so the
-        # cleanup reserves and writes destinations exactly as on the park
-        # path while the record itself is already visible at GPU end.
+        launch_destinations = None
+        chunk_destinations = None
+        if self._target_dest_at_launch:
+            from dt_protocol import DraftAssignment
+
+            from sglang.srt.speculative.dt_candidate_p2p import (
+                CandidateTransportError,
+            )
+
+            # P2 (issue #321, design §5.3 item 2): reserve and authorize
+            # every staged row's candidate destination now, so the record's
+            # seq never becomes visible without its destinations (Draft T1).
+            # Every reservation lands before the first kernel: a wave that
+            # cannot place all of its rows publishes nothing at launch and
+            # falls back to park whole.  The #39 scheme-A note that kept
+            # reservations off the launch path predates the doubled default
+            # arena (TOPO: max(256, 2*max_running_requests)); this step's
+            # A/B re-measures the occupancy cost.
+            launch_destinations = {}
+            chunk_destinations = []
+            if self._candidate_arena.free_slot_count < len(staged_meta):
+                return self._launch_fallback(batch, "arena")
+            try:
+                for session_id, publisher, rows in chunks:
+                    dest_rows = []
+                    for position, _index, _entry in rows:
+                        _i, req, _offset, round_id, attempt, _h = staged_meta[
+                            position
+                        ]
+                        transfer_id = (
+                            f"{self.instance_id}:{req.rid}:{round_id}:{attempt}"
+                        )
+                        destination = self._candidate_arena.reserve(transfer_id)
+                        launch_destinations[transfer_id] = destination
+                        binding = self._draft_binding[req.rid]
+                        self._candidate_arena.authorize(
+                            DraftAssignment(
+                                transfer_id=transfer_id,
+                                draft_instance_id=binding[0],
+                                draft_session_id=binding[1],
+                                authorization_nonce=(
+                                    destination.authorization_nonce
+                                ),
+                                owner_epoch=binding[2],
+                            )
+                        )
+                        dest_rows.append(
+                            (transfer_id, req.rid, round_id, destination)
+                        )
+                    chunk_destinations.append(dest_rows)
+            except Exception as exc:
+                for transfer_id in launch_destinations:
+                    self._candidate_arena.cancel(
+                        transfer_id, remote_quiescent=True
+                    )
+                if isinstance(exc, CandidateTransportError) and (
+                    "slots are active" in str(exc)
+                ):
+                    # A full arena is backpressure, not a failure: this wave
+                    # does not publish at launch; the park path owns it.
+                    return self._launch_fallback(batch, "arena")
+                raise
         _mark("reserve")
         event_handle = getattr(self, "_slot_event_handles", {}).get(slot_id)
         if event_handle is None:
@@ -7570,6 +7698,7 @@ class DTTargetController:
                 batch_result,
                 pool,
                 chunks=chunks,
+                chunk_destinations=chunk_destinations,
                 slot_id=slot_id,
                 generation=generation,
                 ready_event=ready_event,
@@ -7589,12 +7718,14 @@ class DTTargetController:
             # leave the wave to the park path, exactly as for any other
             # ineligibility, instead of quarantining a healthy slot.
             self._inplace_hidden[packed.data_ptr()] = reservation
+            self._cancel_launch_destinations(launch_destinations)
             return self._launch_fallback(batch, "publish")
         except Exception:
             # The kernel never went out: restore the in-place lease so the
             # park path sees this wave exactly as if launch staging had not
             # run.
             self._inplace_hidden[packed.data_ptr()] = reservation
+            self._cancel_launch_destinations(launch_destinations)
             raise
         # The reservation is consumed only once the kernels are enqueued.
         self._inplace_hidden.pop(packed.data_ptr(), None)
@@ -7608,6 +7739,7 @@ class DTTargetController:
             ready_event=ready_event,
             marks=tuple(_marks),
             publish_ns=time.monotonic_ns() - publish_started_ns,
+            destinations=launch_destinations,
         )
         if self._profile_active:
             for session_id, wave_seq, positions, window_rows in records:
@@ -7623,12 +7755,21 @@ class DTTargetController:
                 )
         return launch
 
+    def _cancel_launch_destinations(self, destinations) -> None:
+        """Roll back launch-time arena reservations after a pre-kernel failure."""
+
+        if not destinations:
+            return
+        for transfer_id in destinations:
+            self._candidate_arena.cancel(transfer_id, remote_quiescent=True)
+
     def _publish_at_launch_kernel(
         self,
         batch_result,
         pool,
         *,
         chunks,
+        chunk_destinations=None,
         slot_id,
         generation,
         ready_event,
@@ -7646,6 +7787,11 @@ class DTTargetController:
         stream cannot overwrite the graph-owned buffers before the kernels
         have read them.  Returns one (session_id, wave_seq, positions,
         window_rows) tuple per published record.
+
+        With chunk_destinations (P2), each chunk's destination region is
+        CPU-written for the seq its publish() will claim, immediately before
+        the kernel goes out; the seq the kernel claims must equal the seq
+        the destinations were written for (design §5.3 item 2(d)).
         """
 
         from sglang.srt.speculative.dt_direct_ring import DirectRingError
@@ -7666,7 +7812,7 @@ class DTTargetController:
             return RingPublishCommittedError(str(exc))
 
         try:
-            for session_id, publisher, rows in chunks:
+            for chunk_index, (session_id, publisher, rows) in enumerate(chunks):
                 # Each record stages into its own rotating slot: a later
                 # chunk's host staging must not overwrite an earlier chunk's
                 # entries before that kernel has read them.
@@ -7681,8 +7827,52 @@ class DTTargetController:
                 window_rows = (
                     max(index for _p, index, _e in rows) + 1
                 ) * self.block_size
+                dest_rows = (
+                    chunk_destinations[chunk_index]
+                    if chunk_destinations is not None
+                    else None
+                )
                 try:
                     driver_t0 = time.monotonic_ns() if self._profile_active else 0
+                    if dest_rows is not None:
+                        writer = publisher.writer
+                        expected_seq = writer.next_seq
+                        writer.write_destinations(
+                            expected_seq,
+                            [
+                                (
+                                    destination.slot_id,
+                                    destination.generation,
+                                    destination.authorization_nonce,
+                                )
+                                for _tid, _rid, _round, destination in dest_rows
+                            ],
+                            data_buffer_offset=(
+                                self._candidate_arena._data_buffer.allocation_offset
+                            ),
+                            metadata_buffer_offset=(
+                                self._candidate_arena._metadata_buffer.allocation_offset
+                            ),
+                        )
+                        if self._profile_active:
+                            dest_ns = time.monotonic_ns()
+                            self._profile_emit(
+                                "target_dest_write",
+                                ring_seq=expected_seq,
+                                draft_session_id=session_id,
+                                rows=len(dest_rows),
+                                dest_written_ns=dest_ns,
+                            )
+                            for tid, rid, round_id, _dest in dest_rows:
+                                self._profile_emit(
+                                    "target_authorize",
+                                    transfer_id=tid,
+                                    request_id=rid,
+                                    round_id=round_id,
+                                    draft_session_id=session_id,
+                                    ring_seq=expected_seq,
+                                    authorized_ns=dest_ns,
+                                )
                     wave_seq = publisher.publish(
                         stream=int(self.scheduler.forward_stream.cuda_stream),
                         active_slots=[index for _p, index, _e in rows],
@@ -7699,6 +7889,14 @@ class DTTargetController:
                         token_total=len(rows) * self.block_size,
                         staging_slot=staging_slot,
                     )
+                    if dest_rows is not None and wave_seq != expected_seq:
+                        # The record's destinations were written for a
+                        # different seq than the kernel claimed: a record
+                        # without its destinations may never become visible.
+                        raise RuntimeError(
+                            f"ring publish seq {wave_seq} diverged from its "
+                            f"destination write {expected_seq}"
+                        )
                 except DirectRingError:
                     if published:
                         # An earlier chunk's kernel is already on its ring:
@@ -7750,12 +7948,14 @@ class DTTargetController:
     ):
         """Queue a launch-published wave for the deferred cleanup.
 
-        The records are already on the rings; what remains is exactly the
-        park path's wave bookkeeping (candidate destinations included — the
-        cleanup reserves and writes them as on the park path).  The specs
-        were rebuilt from the launch-time request table and this result's
-        CPU scalars, so the cleanup's read-back geometry checks see records
-        identical in shape to park-published ones.
+        The records are already on the rings; what remains is the park
+        path's wave bookkeeping (with DT_TARGET_DEST_AT_LAUNCH the
+        destinations are already reserved and written, so the cleanup only
+        stamps them into the confirmation copies; otherwise it reserves and
+        writes them as on the park path).  The specs were rebuilt from the
+        launch-time request table and this result's CPU scalars, so the
+        cleanup's read-back geometry checks see records identical in shape
+        to park-published ones.
         """
 
         wave = RingPublishWave(
@@ -7774,6 +7974,7 @@ class DTTargetController:
                 )
                 for session_id, wave_seq, positions, _window_rows in launch.records
             ),
+            launch_destinations=launch.destinations,
         )
         self._ring_publish_pending.append(wave)
         if self._profile_active:
@@ -8484,11 +8685,12 @@ class DTTargetController:
                     )
                 ):
                     raise RuntimeError("ring publish record geometry diverged")
-            # Reserve each live request's arena destination now and publish
-            # it in the record's ring: the owning Draft's candidate push
-            # reads it from the destination region instead of waiting for
-            # this cleanup's Coordinator copy to arrive.  The cancel path
-            # below still retires rows that ended in the wave.
+            # Reserve each live request's arena destination and publish it
+            # in the record's ring — at launch for a P2 wave, here for any
+            # other: the owning Draft's candidate push reads it from the
+            # destination region instead of waiting for this cleanup's
+            # Coordinator copy to arrive.  The cancel path below still
+            # retires rows that ended in the wave.
             all_specs = [spec for record in wave.records for spec in record.specs]
             live_transfer_ids = [
                 spec[1]
@@ -8497,11 +8699,19 @@ class DTTargetController:
             ]
             live_set = set(live_transfer_ids)
             destinations = {}
+            launch_destinations = getattr(wave, "launch_destinations", None)
+            if launch_destinations is not None:
+                # P2: every row's destination was reserved, authorized and
+                # written into the record's destination region at launch.
+                # The cleanup only stamps them into the confirmation copies
+                # below; ended rows are retired from the same reservations
+                # by the cancel path.
+                destinations = launch_destinations
             # The destination region is written for every record — with
             # zeros for cancelled rows — even when every row ended.  An
             # all-cancelled record otherwise leaves the region stale, and the
             # Draft could not tell its held push that every row is retired.
-            if self._candidate_arena is not None:
+            elif self._candidate_arena is not None:
                 try:
                     for transfer_id in live_transfer_ids:
                         destinations[transfer_id] = self._candidate_arena.reserve(
