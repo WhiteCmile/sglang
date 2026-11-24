@@ -3963,6 +3963,7 @@ class DTTargetController:
             submission_returned_ns=submission_returned_ns,
             submission_wall_ns=submission_returned_ns - submission_started_ns,
             update_running_ns=getattr(batch, "dt_update_running_ns", 0),
+            hostpath_marks=getattr(batch, "dt_hostpath_marks", None),
             result_queue_depth_before=result_queue_depth_before,
             target_compute_batches_inflight=self._target_compute_batches_inflight,
             iteration_started_ns=iteration_started_ns,

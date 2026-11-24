@@ -631,6 +631,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         batch.seq_lens_sum = seq_lens_sum_backup
         if gpu_profile_events is not None:
             gpu_profile_events[0].record()
+        hostpath_marks = getattr(batch, "dt_hostpath_worker_marks", None)
+        if hostpath_marks is not None:
+            hostpath_marks.append(("verify_entry", started_ns))
+            hostpath_marks.append(("prepare_for_verify", prepared_ns))
+            hostpath_marks.append(("event0_recorded", time.monotonic_ns()))
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

@@ -3407,6 +3407,10 @@ class Scheduler(
                     )
                     else 0
                 )
+                if update_running_started_ns:
+                    running_batch.dt_hostpath_marks = [
+                        ("update_running_start", update_running_started_ns)
+                    ]
                 running_batch = self.update_running_batch(running_batch)
                 if update_running_started_ns:
                     running_batch.dt_update_running_ns = (
@@ -3779,7 +3783,10 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        hostpath_marks = getattr(batch, "dt_hostpath_marks", None)
         batch.filter_batch()
+        if hostpath_marks is not None:
+            hostpath_marks.append(("filter", time.monotonic_ns()))
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -3792,6 +3799,8 @@ class Scheduler(
         if kv_full_retract_flag and self.dt_target_controller is not None:
             self._retract_dt_owned_for_oom()
             kv_full_retract_flag = not batch.check_decode_mem()
+        if hostpath_marks is not None:
+            hostpath_marks.append(("check_decode_mem", time.monotonic_ns()))
 
         # Check if decode out of memory
         if kv_full_retract_flag or (
@@ -3870,8 +3879,12 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
+        if hostpath_marks is not None:
+            hostpath_marks.append(("retract_or_decay", time.monotonic_ns()))
         # Update batch tensors
         batch.prepare_for_decode()
+        if hostpath_marks is not None:
+            hostpath_marks.append(("prepare_for_decode", time.monotonic_ns()))
         return batch
 
     def _retract_dt_owned_for_oom(self) -> None:
