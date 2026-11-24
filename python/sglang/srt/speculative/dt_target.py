@@ -31,7 +31,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.model_runner import (
     DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
 )
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.sampling import penaltylib
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import is_pin_memory_available
@@ -217,6 +220,10 @@ def _flashmtp_park_scalar_values(
         [int(value) for value in seq_len_values.detach().cpu().tolist()],
         staged_bonus is not None,
     )
+
+
+# Experiment flag: lean READY-wave construction for uniform greedy batches.
+_LEAN_READY = os.environ.get("DT_TARGET_LEAN_READY", "0") == "1"
 
 
 def _ready_batch_h2d(
@@ -583,6 +590,7 @@ class DTTargetController:
         # Optional same-host shared-memory channel for the per-poll TP packet.
         # It replaces the two gloo broadcasts without changing packet semantics.
         self._tp_control_channel = None
+        self._lean_sampling_tensors: dict[tuple, tuple] = {}
         if (
             scheduler.ps.tp_size > 1
             and os.environ.get("DT_TARGET_SHM_CONTROL", "0") == "1"
@@ -4907,6 +4915,76 @@ class DTTargetController:
                 ready_count=ready_count,
             )
 
+    def _lean_ready_sampling_info(self, batch: ScheduleBatch):
+        """Build uniform greedy sampling metadata from cached device tensors."""
+        reqs = batch.reqs
+        first = reqs[0].sampling_params
+        key = (first.temperature, first.top_p, first.top_k, first.min_p)
+        if first.top_k > 1 or get_server_args().enable_deterministic_inference:
+            return None
+        for req in reqs:
+            params = req.sampling_params
+            if (
+                (params.temperature, params.top_p, params.top_k, params.min_p) != key
+                or params.logit_bias is not None
+                or params.frequency_penalty != 0.0
+                or params.presence_penalty != 0.0
+                or params.repetition_penalty != 1.0
+                or params.min_new_tokens != 0
+                or req.custom_logit_processor
+                or req.return_sampling_mask
+                or req.grammar is not None
+            ):
+                return None
+        device = batch.device
+        n = len(reqs)
+        cached = self._lean_sampling_tensors.get(key)
+        if cached is None or cached[0] < n:
+            capacity = max(int(self.scheduler.max_running_requests), n)
+            temperature, top_p, top_k, min_p = key
+            cached = (
+                capacity,
+                torch.full((capacity, 1), temperature, dtype=torch.float, device=device),
+                torch.full((capacity,), top_p, dtype=torch.float, device=device),
+                torch.full((capacity,), top_k, dtype=torch.int32, device=device),
+                torch.full((capacity,), min_p, dtype=torch.float, device=device),
+            )
+            self._lean_sampling_tensors[key] = cached
+        _, temperatures, top_ps, top_ks, min_ps = cached
+        vocab_size = self.scheduler.model_config.vocab_size
+        info = SamplingBatchInfo(
+            temperatures=temperatures[:n],
+            top_ps=top_ps[:n],
+            top_ks=top_ks[:n],
+            min_ps=min_ps[:n],
+            sampling_seed=None,
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=first.top_p != 1.0,
+            need_top_k_sampling=first.top_k != TOP_K_ALL,
+            need_min_p_sampling=first.min_p > 0,
+            vocab_size=vocab_size,
+            penalizer_orchestrator=penaltylib.BatchedPenalizerOrchestrator(
+                vocab_size=vocab_size,
+                batch=batch,
+                penalizers={
+                    penaltylib.BatchedFrequencyPenalizer,
+                    penaltylib.BatchedMinNewTokensPenalizer,
+                    penaltylib.BatchedPresencePenalizer,
+                    penaltylib.BatchedRepetitionPenalizer,
+                },
+            ),
+            has_custom_logit_processor=False,
+            custom_params=None,
+            custom_logit_processor=None,
+            device=device,
+            logit_bias=None,
+            return_sampling_masks=[False] * n,
+            sampling_mask_max_top_k=0,
+        )
+        info.adjusted_from_schedule_batch(batch, vocab_size)
+        return info
+
     def build_ready_batch(self) -> ScheduleBatch | None:
         observer = getattr(self, "_overlap_fix_observer", None)
         observe_build = observer is not None and observer.enabled()
@@ -5139,7 +5217,9 @@ class DTTargetController:
             ),
         )
         relay_ready_ns = time.monotonic_ns()
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+        batch.sampling_info = (
+            self._lean_ready_sampling_info(batch) if _LEAN_READY else None
+        ) or SamplingBatchInfo.from_schedule_batch(
             batch, self.scheduler.model_config.vocab_size
         )
         finished_ns = time.monotonic_ns()
