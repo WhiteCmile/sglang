@@ -3516,6 +3516,24 @@ class ServerArgs:
                 )
             self.quantization = method
             logger.info("DT_TARGET_QUANTIZATION: Target quantization=%s", method)
+        # Experiment (verify GEMM shapes): DT_TARGET_CUDA_GRAPH_BS=1,2,...
+        # replaces the Target decode CUDA-graph request buckets so verify waves
+        # pad to row counts whose GEMM shapes are fast (cuBLAS gate_up is slow
+        # at M=320/216/192 tokens). The topology-file launcher only offers
+        # --target-cuda-graph-config, which also turns on Target metrics.
+        buckets = os.environ.get("DT_TARGET_CUDA_GRAPH_BS", "")
+        if buckets and self.draft_target_disaggregation_role == "target":
+            values = [int(v) for v in buckets.split(",")]
+            if values != sorted(set(values)) or values[0] <= 0:
+                raise ValueError(
+                    "DT_TARGET_CUDA_GRAPH_BS must be strictly increasing positive ints"
+                )
+            if self.cuda_graph_bs_decode is not None:
+                raise ValueError(
+                    "DT_TARGET_CUDA_GRAPH_BS conflicts with --cuda-graph-bs-decode"
+                )
+            self.cuda_graph_bs_decode = values
+            logger.info("DT_TARGET_CUDA_GRAPH_BS: Target decode buckets=%s", values)
 
     def __post_init__(self):
         """
