@@ -63,7 +63,7 @@ DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
 # Draft redesign D6/D7 (design §6, §5.1): the ring worker parses served
 # entries into READY entries and acks its own mailbox; the DFlash scheduler
 # drains them into its READY table instead of taking mailbox entries.
-DRAFT_INGRESS_NATIVE = os.environ.get("DT_DRAFT_INGRESS", "") == "native"
+DRAFT_INGRESS_NATIVE = os.environ.get("DT_DRAFT_INGRESS", "native") == "native"
 RING_CAPACITY = int(os.environ.get("DT_DIRECT_RING_CAPACITY", "256"))
 if RING_CAPACITY <= 0 or RING_CAPACITY & (RING_CAPACITY - 1):
     # Indices are derived from the 32-bit wire seq in the native worker; a

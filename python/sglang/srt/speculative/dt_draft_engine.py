@@ -143,29 +143,37 @@ def _select_candidate_rows(rows: torch.Tensor, indices: list[int]) -> torch.Tens
 GPU_READY_RECORD = os.environ.get("DT_GPU_READY_RECORD", "1") == "1"
 PUSH_COMPLETION_RECORD = os.environ.get("DT_PUSH_COMPLETION_RECORD", "1") == "1"
 DIRECT_RING = os.environ.get("DT_DIRECT_RING", "1") == "1"
+# Draft redesign D11 (issue #280): the redesign switches below, D6's
+# DT_DRAFT_INGRESS (dt_direct_ring) and D3/D4's DT_RING_CONFIRMATION
+# (dt_protocol) default to the new path.  Each later DFlash stage requires
+# the earlier ones (checked in __init__), so the legacy loop is selected by
+# setting them back together: DT_DRAFT_SCHEDULER= DT_DRAFT_SEND_LOOP=0
+# DT_DRAFT_INGRESS= DT_DRAFT_CONTROL_LOOP=0 DT_RING_CONFIRMATION=1
+# DT_DRAFT_ADMISSION= DT_DRAFT_SLOT_DECOUPLE=0 (and DT_DRAFT_GC= for the old
+# heap; DT_COORDINATOR_GC= in the Coordinator).
 # Draft redesign D1 (issue #270): DFlash scratch is per batch, not per staging
 # slot, so a row is never held behind the batch that owns its landing buffer
 # (no compute-busy, no submit-time seal; the ring worker seals on overflow).
-DRAFT_SLOT_DECOUPLE = os.environ.get("DT_DRAFT_SLOT_DECOUPLE", "0") == "1"
+DRAFT_SLOT_DECOUPLE = os.environ.get("DT_DRAFT_SLOT_DECOUPLE", "1") == "1"
 # Draft redesign D5 (issue #274): a native thread owns the Coordinator socket
 # (dt_control.DraftControlLoop, issue #288) and the DFlash loop's idle tail
 # waits on the native wake word (dt_wake) for the same poll interval, so a
 # Coordinator message ends the wait at once.
-DRAFT_CONTROL_LOOP = os.environ.get("DT_DRAFT_CONTROL_LOOP", "0") == "1"
+DRAFT_CONTROL_LOOP = os.environ.get("DT_DRAFT_CONTROL_LOOP", "1") == "1"
 # Draft redesign D8 (issue #277, design §7): the native publish worker also
 # watches each submitted batch's completion event, so a batch stops counting
 # against the depth gate at its GPU done rather than when this loop reaches
 # the completion poll.  It pushes the batch's landing releases to ingress
 # itself and hands the scheduler a DONE record (CUDA elapsed included) to
 # absorb.
-DRAFT_SEND_LOOP = os.environ.get("DT_DRAFT_SEND_LOOP", "0") == "1"
+DRAFT_SEND_LOOP = os.environ.get("DT_DRAFT_SEND_LOOP", "1") == "1"
 # Draft redesign D10 (issue #279, design §5.1-5.2): DT_DRAFT_SCHEDULER=v2 runs
 # DFlash on a wake-driven state machine (_run_scheduler_v2) instead of run()'s
 # staged loop: the depth gate reads frozen_seq - done_seq, and with one batch
 # in flight the next one freezes late, when the running batch's estimated GPU
 # end minus the estimated CPU work of the next is reached.  Other methods keep
 # run().
-DRAFT_SCHEDULER_V2 = os.environ.get("DT_DRAFT_SCHEDULER", "") == "v2"
+DRAFT_SCHEDULER_V2 = os.environ.get("DT_DRAFT_SCHEDULER", "v2") == "v2"
 # Subtracted from the late-freeze deadline (design §5.2; 0 as the Target's).
 DRAFT_LATE_FREEZE_MARGIN_NS = (
     int(os.environ.get("DT_DRAFT_LATE_FREEZE_MARGIN_US", "0")) * 1000
@@ -180,12 +188,12 @@ DEFAULT_DIRECT_PROPOSAL_ADMISSION_LIMIT = 64
 # Draft redesign D2 (§5.3): DT_DRAFT_ADMISSION=bound drops that credit.  The
 # batch bound (max_batch_size rows, feature_buffer_max_tokens) plus the KV and
 # req-row fit at ring admission are then the only proposal admission limits.
-DRAFT_ADMISSION_BOUND = os.environ.get("DT_DRAFT_ADMISSION", "") == "bound"
+DRAFT_ADMISSION_BOUND = os.environ.get("DT_DRAFT_ADMISSION", "bound") == "bound"
 # Draft redesign D7b (issue #295): DT_DRAFT_GC=managed freezes the Draft
 # process's warm heap.  A full (generation-2) collection scans the whole heap
 # with the scheduler loop stopped (0.36-0.54 s at r56); ~0.93 M of its objects
 # exist before serving starts (imported code) and serving adds only ~10 k.
-DRAFT_GC_MANAGED = os.environ.get("DT_DRAFT_GC", "") == "managed"
+DRAFT_GC_MANAGED = os.environ.get("DT_DRAFT_GC", "managed") == "managed"
 
 
 def _resolve_direct_proposal_admission_limit() -> int:
