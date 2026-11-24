@@ -580,6 +580,45 @@ class DTTargetController:
             )
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
+        # Optional same-host shared-memory channel for the per-poll TP packet.
+        # It replaces the two gloo broadcasts without changing packet semantics.
+        self._tp_control_channel = None
+        if (
+            scheduler.ps.tp_size > 1
+            and os.environ.get("DT_TARGET_SHM_CONTROL", "0") == "1"
+        ):
+            from sglang.srt.speculative.dt_tp_control_channel import (
+                open_tp_control_channel,
+            )
+
+            def _broadcast_once(obj):
+                return broadcast_pyobj(
+                    [obj],
+                    scheduler.tp_group.rank,
+                    scheduler.tp_cpu_group,
+                    src=scheduler.tp_group.ranks[0],
+                )[0]
+
+            def _all_reduce_min(value: int) -> int:
+                flag = torch.tensor([value], dtype=torch.int64)
+                torch.distributed.all_reduce(
+                    flag,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=scheduler.tp_cpu_group,
+                )
+                return int(flag.item())
+
+            self._tp_control_channel = open_tp_control_channel(
+                instance_id=str(self.instance_id),
+                tp_rank=scheduler.ps.tp_rank,
+                tp_size=scheduler.ps.tp_size,
+                broadcast=_broadcast_once,
+                all_reduce_min=_all_reduce_min,
+            )
+            logger.info(
+                "DT Target TP control channel: %s",
+                "shared memory" if self._tp_control_channel else "gloo (fallback)",
+            )
         self.target_phase_profile_enabled = bool(
             self.is_export_rank and self._profile_active
         )
@@ -3700,12 +3739,24 @@ class DTTargetController:
             receive_ns = time.monotonic_ns() - receive_start_ns
         broadcast_start_ns = time.monotonic_ns()
         if self.scheduler.ps.tp_size > 1:
-            packet = broadcast_pyobj(
-                packet,
-                self.scheduler.tp_group.rank,
-                self.scheduler.tp_cpu_group,
-                src=self.scheduler.tp_group.ranks[0],
-            )
+            delivered = False
+            channel = self._tp_control_channel
+            if channel is not None:
+                if self.is_export_rank:
+                    delivered = channel.send(packet)
+                else:
+                    delivered, received = channel.recv()
+                    if delivered:
+                        packet = received
+            if not delivered:
+                # No channel, or an oversize packet: every rank takes the same
+                # gloo fallback branch for this packet.
+                packet = broadcast_pyobj(
+                    packet,
+                    self.scheduler.tp_group.rank,
+                    self.scheduler.tp_cpu_group,
+                    src=self.scheduler.tp_group.ranks[0],
+                )
         broadcast_ns = time.monotonic_ns() - broadcast_start_ns
         assert packet is not None
         (
@@ -5384,6 +5435,10 @@ class DTTargetController:
             del req.dt_pipeline_lane_id
 
     def close(self) -> None:
+        channel = getattr(self, "_tp_control_channel", None)
+        if channel is not None:
+            self._tp_control_channel = None
+            channel.close()
         previous_failure = getattr(
             self, "_source_shutdown_quarantine_error", None
         )
