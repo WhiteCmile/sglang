@@ -1924,8 +1924,8 @@ class Scheduler(
 
             # Issue #281 P3 (default off): the export rank runs the control
             # half of the split after this launch returns, while the GPU is
-            # busy, and before the previous result is consumed.  Non-export
-            # ranks return immediately; no collective is issued.  An idle
+            # busy, and before the previous result is consumed. Non-export
+            # ranks return immediately; no collective is issued. An idle
             # iteration still reaches here once, so control cannot starve.
             if (
                 self.dt_target_controller is not None

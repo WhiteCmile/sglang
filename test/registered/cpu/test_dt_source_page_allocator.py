@@ -241,4 +241,3 @@ def test_scalar_stats_reads_do_not_iterate_extents() -> None:
     assert _scalar_stats(allocator) == (1, 6, 16, 1, 0, 48, 64, 16, 1, 2)
 
     assert tuple(arena.free_extents.iterations for arena in allocator._arenas) == before
-
