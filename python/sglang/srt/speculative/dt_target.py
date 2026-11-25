@@ -6326,9 +6326,14 @@ class DTTargetController:
     ) -> None:
         for message in self._client.recv_nowait():
             if isinstance(message, TaskBatchAck):
+                # Retire the reliable-delivery entry first: a confirmation-free
+                # catch-up copy batch never entered the ledger, so the guard
+                # below skips it — but without this ack its outbox entry would
+                # resend every second forever (issue #329, the transition
+                # resend storm).
+                self._delivery_outbox.ack("task_batch", message.batch_id)
                 if not self._ledger.has_submitted_batch(message.batch_id):
                     continue
-                self._delivery_outbox.ack("task_batch", message.batch_id)
                 retry_tasks = self._ledger.apply_ack(message)
                 if self.candidate_transport == "cuda-ipc":
                     if self._candidate_arena is None:
