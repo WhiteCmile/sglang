@@ -1808,6 +1808,15 @@ class TargetCandidateArena:
                     completed_ids.add(id(slot.completion))
         return tuple(completed)
 
+    def holds(self, completion: CandidateCompletion) -> bool:
+        """Whether ``completion``, returned by an earlier poll(), is still its
+        slot's READY completion: the slot was not read, freed, cancelled or
+        reused since."""
+
+        with self._lock:
+            slot = self._slots[completion.slot_id]
+            return slot.state is CandidateSlotState.READY and slot.completion is completion
+
     def poll_ready_records(self) -> int:
         """Mark assigned ARMED slots READY from GPU-written host records.
 
