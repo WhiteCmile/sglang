@@ -60,6 +60,9 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         )
         self._is_token_only = server_args.speculative_algorithm == "STANDALONE_DT"
         self._is_dflash = server_args.speculative_algorithm == "DFLASH"
+        # Per-wave verify CUDA events (DT_PROFILE_DIR only) are recorded for both
+        # disaggregated verify paths; FlashMTP previously had no GPU timing at all.
+        self._is_flashmtp = server_args.speculative_algorithm == "FLASHMTP"
         self._defer_dflash_feature_stage = self._is_dflash and (
             server_args.draft_target_defer_dflash_feature_stage
             or (
@@ -198,6 +201,12 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         if sync_profile:
             torch.get_device_module(self.device).synchronize()
             started_ns = time.monotonic_ns()
+        hostpath_marks = (
+            [("worker_entry", started_ns)]
+            if profile and getattr(batch, "dt_full_wave_id", None) is not None
+            else None
+        )
+        batch.dt_hostpath_worker_marks = hostpath_marks
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "disaggregated linear-chain verification does not support "
@@ -241,6 +250,8 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         assert self._draft_verify_out_cache_loc_buf is not None
         candidates = self._draft_block_tokens_buf[:batch_size]
         candidates.copy_(remote_candidates.to(device=self.device, dtype=torch.int64))
+        if hostpath_marks is not None:
+            hostpath_marks.append(("candidate_copy", time.monotonic_ns()))
         if profile:
             if sync_profile:
                 torch.get_device_module(self.device).synchronize()
@@ -265,6 +276,8 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             target_positions_2d=target_positions_2d,
             verify_out_cache_loc_2d=verify_out_cache_loc_2d,
         )
+        if hostpath_marks is not None:
+            hostpath_marks.append(("layout", time.monotonic_ns()))
         if profile:
             if sync_profile:
                 torch.get_device_module(self.device).synchronize()
@@ -290,6 +303,16 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
             on_publish=on_publish,
             grammar_barrier=grammar_barrier,
         )
+        if hostpath_marks is not None:
+            hostpath_marks.append(("verify_returned", time.monotonic_ns()))
+            from dt_profile import emit as profile_emit
+
+            profile_emit(
+                "target_hostpath_worker",
+                wave_id=batch.dt_full_wave_id,
+                batch_size=batch_size,
+                marks=hostpath_marks,
+            )
         if profile:
             if sync_profile:
                 torch.get_device_module(self.device).synchronize()
@@ -323,7 +346,9 @@ class FlashMTPDisaggregatedTargetWorkerV2(FlashMTPWorkerV2):
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=capture_mode
         )
-        if self._is_dflash:
+        # The P0 Target-hop trace uses this host timestamp as the producer
+        # boundary for both DFlash rows and the one-row FlashMTP pivot.
+        if not self._is_token_only:
             batch_output.dt_hidden_produced_ns = time.monotonic_ns()
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids

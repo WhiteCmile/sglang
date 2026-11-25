@@ -714,7 +714,18 @@ class TargetRdmaEndpoint:
             self._session_tag = pool_generation_tag(pool.source_session_id)
             self._ready_generation = np.zeros(pool.slot_count, dtype=np.uint32)
             self._ready_cq = self.device.completion_queue(4 * READY_SEND_DEPTH)
-            pool.set_ready_listener(self._publications.put)
+            # Profile-only publisher marks (explicit DT_PROFILE_EVENTS member only).
+            try:
+                from dt_profile import emit as _emit, explicit_event_enabled
+                self._ready_trace = explicit_event_enabled("target_rdma_ready_publish")
+                self._ready_emit = _emit
+            except ImportError:
+                self._ready_trace = False
+            if self._ready_trace:
+                put = self._publications.put
+                pool.set_ready_listener(lambda item: put((*item, time.monotonic_ns())))
+            else:
+                pool.set_ready_listener(self._publications.put)
             self._start(self._publisher_loop, "dt-rdma-ready-publisher")
         if arena is not None:
             records = arena._completion_records
@@ -867,6 +878,11 @@ class TargetRdmaEndpoint:
                 slot_nbytes=pool.slot_nbytes,
                 slot_count=pool.slot_count,
                 allocation_offset=pool.allocation_offset,
+                allocation_length=getattr(
+                    pool,
+                    "allocation_length",
+                    pool.slot_count * pool.slot_nbytes,
+                ),
                 pool_generation=pool.pool_generation,
                 source_session_id=pool.source_session_id,
             )
@@ -957,13 +973,30 @@ class TargetRdmaEndpoint:
             except queue.Empty:
                 item = None
             if item is not None:
-                slot_id, generation, producer_event = item
+                trace = self._ready_trace
+                if trace:
+                    slot_id, generation, producer_event, enqueued_ns = item
+                    dequeued_ns = time.monotonic_ns()
+                    done_at_dequeue = bool(producer_event.query())
+                else:
+                    slot_id, generation, producer_event = item
                 try:
                     producer_event.synchronize()
                 except Exception:  # noqa: BLE001 - the slot stays unready
                     logger.exception("feature producer event failed; slot %d not ready", slot_id)
                 else:
+                    if trace:
+                        event_done_ns = time.monotonic_ns()
                     self._publish_ready(slot_id, generation)
+                    if trace:
+                        self._ready_emit(
+                            "target_rdma_ready_publish",
+                            slot_id=slot_id, slot_generation=generation,
+                            enqueued_ns=enqueued_ns, dequeued_ns=dequeued_ns,
+                            event_done_ns=event_done_ns, posted_ns=time.monotonic_ns(),
+                            done_at_dequeue=done_at_dequeue,
+                            queue_depth=self._publications.qsize(),
+                        )
             self._reap_ready_sends()
 
     def _publish_ready(self, slot_id: int, generation: int) -> None:
@@ -1201,6 +1234,7 @@ class DraftRdmaPuller:
             self._slot_nbytes = int(remote["slot_nbytes"])
             self._slot_count = int(remote["slot_count"])
             self.allocation_offset = int(remote["allocation_offset"])
+            self.allocation_length = int(remote["allocation_length"])
             self.native_ready = native_ready
             self._device = device
             self._landing: torch.Tensor | None = None
@@ -1267,11 +1301,14 @@ class DraftRdmaPuller:
         ):
             raise StaleDescriptorError("feature descriptor names a stale source incarnation")
         slot_id, generation = int(source.source_slot_id), int(source.slot_generation)
+        source_offset = int(source.allocation_offset) + int(source.byte_offset)
         if (
             slot_id >= self._slot_count
-            or source.byte_offset + source.nbytes > self._slot_nbytes
+            or source_offset < self.allocation_offset
+            or source_offset + source.nbytes
+            > self.allocation_offset + self.allocation_length
         ):
-            raise StaleDescriptorError("feature descriptor range exceeds the source slot")
+            raise StaleDescriptorError("feature descriptor range exceeds the source pool")
         deadline = time.monotonic() + RDMA_OP_TIMEOUT_S
         while self._ready[slot_id] < generation:
             if time.monotonic() >= deadline:
@@ -1285,7 +1322,7 @@ class DraftRdmaPuller:
         return {
             "slot_id": slot_id,
             "generation": generation,
-            "remote": self._pool_addr + slot_id * self._slot_nbytes + source.byte_offset,
+            "remote": self._pool_addr + source_offset - self.allocation_offset,
             "nbytes": int(source.nbytes),
             "ready_ns": time.monotonic_ns(),
         }
@@ -1963,6 +2000,7 @@ class DraftRemoteRing(MailboxConsumer):
             spec.pool_addr = puller._pool_addr
             spec.pool_rkey = puller._pool_rkey
             spec.pool_allocation_offset = puller.allocation_offset
+            spec.pool_length = puller.allocation_length
             spec.slot_nbytes = puller._slot_nbytes
             spec.slot_count = puller._slot_count
             spec.ready_qp = ready.qp.handle

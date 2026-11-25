@@ -110,3 +110,14 @@ class GpuClock:
             self._calibrate()
         value = int(self._slots[slot])
         return value + self._offset_ns if value else 0
+
+    def globaltimer_to_monotonic(self, value: int) -> int:
+        """Convert an already-read ``%globaltimer`` value without synchronizing.
+
+        P0 hop tracing reads the launch-published ring header on the CPU after
+        its seq word is visible.  Reuse this clock's latest calibration rather
+        than recalibrating on the scheduler path; the diagnostic run is short
+        and the same offset is refreshed by ordinary completed GPU stamps.
+        """
+
+        return int(value) + self._offset_ns if value else 0

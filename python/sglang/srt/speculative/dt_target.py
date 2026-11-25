@@ -31,7 +31,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.model_runner import (
     DT_BENCHMARK_MEASUREMENT_RID_PREFIX,
 )
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.sampling import penaltylib
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import is_pin_memory_available
@@ -51,6 +54,8 @@ DT_DIRECT_GPU_SOURCE_MARKER = "DT direct GPU source evidence: "
 DT_LIFECYCLE_STATUS_MARKER = "DT lifecycle status: "
 DT_LIFECYCLE_STATUS_INTERVAL_NS = 250_000_000
 EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
+TARGET_P0_HOP_PROFILE_EVENT = "target_p0_hop"
+TARGET_SOURCE_BUFFER_PROFILE_EVENT = "target_source_buffer"
 # Target round-expiry scan cadence (issue #193): expiry is failure detection
 # with second-scale timeouts, so the O(parked) scan runs at most every 2 ms
 # instead of inside every scheduler poll.
@@ -60,6 +65,16 @@ _EXPIRE_SCAN_INTERVAL_NS = 2_000_000
 # underestimates the tail and lands the next launch after the in-flight
 # wave's GPU end; see issue #108.
 _FREEZE_LEAD_WINDOW = 64
+# DT_FLASHMTP_PRE_RESERVE_DEST (issue #281 P2) keeps this many arena slots
+# untouched when deciding whether one staged FlashMTP wave fits.  A wave that
+# exactly fills the arena would leave the ordinary park-time path no slot for
+# a row that becomes eligible only after launch.
+_FLASHMTP_PRE_RESERVE_SAFETY_SLOTS = 1
+# DT_TARGET_P3_CONTROL_SPLIT (issue #281) bounds the deferred control-event
+# FIFO at one whole control phase's worth of events per scheduler iteration.
+# It is a safety net, not a capacity policy: overflow means the READY phase
+# stopped draining the queue, which must fail loudly rather than drop events.
+_P3_CONTROL_EVENT_FIFO_LIMIT = 65536
 
 
 class _PendingTaskPayloadMismatch(ValueError):
@@ -206,6 +221,10 @@ def _flashmtp_park_scalar_values(
         [int(value) for value in seq_len_values.detach().cpu().tolist()],
         staged_bonus is not None,
     )
+
+
+# Experiment flag: lean READY-wave construction for uniform greedy batches.
+_LEAN_READY = os.environ.get("DT_TARGET_LEAN_READY", "0") == "1"
 
 
 def _ready_batch_h2d(
@@ -362,6 +381,7 @@ class RingPublishRecord:
     # must not re-read the ring: the Draft consumes records and the producer
     # wraps, after which the old seq word can never reappear at its slot.
     record: object | None = None
+    observed_ns: int = 0
 
 
 @dataclass(slots=True)
@@ -383,6 +403,7 @@ class RingPublishWave:
     # (requires_proposal, previous_transfer_id).
     proposals: dict
     records: tuple  # RingPublishRecord, one per ring record
+    wave_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +417,11 @@ class StagedFlashMTPTask:
 class StagedFlashMTPPivotBatch:
     tasks: tuple[StagedFlashMTPTask, ...]
     descriptors_by_transfer: dict[str, object]
+    # DT_FLASHMTP_PRE_RESERVE_DEST only: transfer_id -> (destination,
+    # reserve_ns).  Launch staging knows the source but not the authoritative
+    # park scalars, so it only arms export-rank arena rows.  None in the
+    # default path, which allocates no container.
+    pre_reserved_destinations: dict[str, tuple[object, int]] | None = None
 
 
 @dataclass(slots=True)
@@ -420,7 +446,14 @@ class DTTargetController:
     # ``__init__``.  Their established behavior is the mmap A/B baseline.
     candidate_transport = "mmap"
     _candidate_arena = None
+    flashmtp_pre_reserve_dest = False
     target_phase_profile_enabled = False
+    # Issue #281 P3 ablation: when set in __init__ (DT_TARGET_P3_CONTROL_SPLIT),
+    # the export rank's READY snapshot and its post-launch control work run as
+    # two phases.  Class-level defaults keep object.__new__ diagnostics on the
+    # legacy monolithic path.
+    p3_control_split = False
+    _deferred_control_events = None
 
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
 
@@ -482,6 +515,32 @@ class DTTargetController:
         self.whole_batch_task_fifo_ablation = (
             os.environ.get("SGLANG_DT_WHOLE_BATCH_TASK_FIFO_ABLATION", "0") == "1"
         )
+        # Issue #281 P2 ablation: reserve each staged FlashMTP wave's candidate
+        # destinations at launch staging, while all final park scalars stay
+        # authoritative at the ordinary park/flush boundary.  Read once here so
+        # the default-off path adds no per-poll lookup.
+        self.flashmtp_pre_reserve_dest = (
+            os.environ.get("DT_FLASHMTP_PRE_RESERVE_DEST", "0") == "1"
+        )
+        # Issue #281 P3 ablation: cache the switch once.  The split attaches
+        # the control phase to the overlap launch boundary, so without
+        # Draft-Target overlap scheduling it is disabled harmlessly rather
+        # than silently behaving like the legacy path under a different name.
+        p3_control_split_requested = (
+            os.environ.get("DT_TARGET_P3_CONTROL_SPLIT", "0") == "1"
+        )
+        self.p3_control_split = bool(
+            p3_control_split_requested
+            and self.server_args.draft_target_overlap_schedule
+        )
+        if p3_control_split_requested and not self.p3_control_split:
+            logger.warning(
+                "DT_TARGET_P3_CONTROL_SPLIT ignored: requires Draft-Target "
+                "overlap scheduling"
+            )
+        self._deferred_control_events = (
+            deque() if self.p3_control_split else None
+        )
         self.continuous_batching = not getattr(
             self.server_args, "draft_target_disable_continuous_batching", False
         )
@@ -529,6 +588,46 @@ class DTTargetController:
             )
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
+        # Optional same-host shared-memory channel for the per-poll TP packet.
+        # It replaces the two gloo broadcasts without changing packet semantics.
+        self._tp_control_channel = None
+        self._lean_sampling_tensors: dict[tuple, tuple] = {}
+        if (
+            scheduler.ps.tp_size > 1
+            and os.environ.get("DT_TARGET_SHM_CONTROL", "0") == "1"
+        ):
+            from sglang.srt.speculative.dt_tp_control_channel import (
+                open_tp_control_channel,
+            )
+
+            def _broadcast_once(obj):
+                return broadcast_pyobj(
+                    [obj],
+                    scheduler.tp_group.rank,
+                    scheduler.tp_cpu_group,
+                    src=scheduler.tp_group.ranks[0],
+                )[0]
+
+            def _all_reduce_min(value: int) -> int:
+                flag = torch.tensor([value], dtype=torch.int64)
+                torch.distributed.all_reduce(
+                    flag,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=scheduler.tp_cpu_group,
+                )
+                return int(flag.item())
+
+            self._tp_control_channel = open_tp_control_channel(
+                instance_id=str(self.instance_id),
+                tp_rank=scheduler.ps.tp_rank,
+                tp_size=scheduler.ps.tp_size,
+                broadcast=_broadcast_once,
+                all_reduce_min=_all_reduce_min,
+            )
+            logger.info(
+                "DT Target TP control channel: %s",
+                "shared memory" if self._tp_control_channel else "gloo (fallback)",
+            )
         self.target_phase_profile_enabled = bool(
             self.is_export_rank and self._profile_active
         )
@@ -550,6 +649,27 @@ class DTTargetController:
             and self.is_export_rank
             and profile_event_explicitly_enabled(EAGLE3_HOST_SPAN_PROFILE_EVENT)
         )
+        # Issue #281 P0 is deliberately explicit-only: it emits one bounded
+        # chronology record per transfer at the existing ownership boundaries.
+        # Merely setting DT_PROFILE_DIR must not add per-row work to production.
+        self.target_p0_hop_profile_enabled = bool(
+            self.is_export_rank
+            and profile_event_explicitly_enabled(TARGET_P0_HOP_PROFILE_EVENT)
+        )
+        # Source-buffer measurements are explicit-only because they keep one
+        # small record per live publication.  They never change admission,
+        # ownership, release order, or the wire protocol.
+        self.target_source_buffer_profile_enabled = bool(
+            self.is_export_rank
+            and profile_event_explicitly_enabled(
+                TARGET_SOURCE_BUFFER_PROFILE_EVENT
+            )
+        )
+        self._source_buffer_profile_leases: dict[tuple[int, int], dict] = {}
+        self._source_low_free_started_ns = 0
+        self._source_low_free_last_effective = None
+        self._source_gate_profile_started_ns: dict[str, int] = {}
+        self._source_gate_profile_decisions: Counter[str] = Counter()
         if (
             self.eagle3_host_span_profile_enabled
             and not self.server_args.draft_target_overlap_schedule
@@ -667,6 +787,14 @@ class DTTargetController:
             float(os.environ.get("DT_TARGET_BATCH_WAIT_MS", "10")) * 1_000_000
         )
         self._ready_batch_min_size = int(os.environ.get("DT_TARGET_BATCH_MIN_SIZE", "16"))
+        # Experimental GPU-aware READY hold (issue #5): release the hold as soon
+        # as the TP0 poll broadcast reports the in-flight result's copy_done
+        # ready, instead of idling until the 10 ms budget.  Off by default; the
+        # env var is read once here, never from the per-poll hot path.
+        # False/None from the broadcast keep the unchanged 10 ms policy.
+        self._adaptive_ready_hold = (
+            os.environ.get("DT_TARGET_ADAPTIVE_READY_HOLD", "0") == "1"
+        )
         self._ready_hold_started_ns = 0
         # Same-host Target -> owner-Draft descriptor rings (dt_direct_ring).
         # They replace the former ZMQ direct dispatch (DT_DIRECT_DISPATCH).
@@ -829,6 +957,21 @@ class DTTargetController:
                                 "DT_FEATURE_SOURCE_SLOTS must be positive, "
                                 f"got {feature_source_slot_count}"
                             )
+                    feature_source_page_rows = 0
+                    env_page_rows = os.environ.get("DT_FEATURE_SOURCE_PAGE_ROWS")
+                    if env_page_rows:
+                        try:
+                            feature_source_page_rows = int(env_page_rows)
+                        except ValueError as exc:
+                            raise ValueError(
+                                "DT_FEATURE_SOURCE_PAGE_ROWS must be an integer, "
+                                f"got {env_page_rows!r}"
+                            ) from exc
+                        if feature_source_page_rows <= 0:
+                            raise ValueError(
+                                "DT_FEATURE_SOURCE_PAGE_ROWS must be positive, "
+                                f"got {feature_source_page_rows}"
+                            )
                     self._feature_source_pool = TargetFeatureSourcePool(
                         target_instance_id=self.instance_id,
                         source_session_id=self._client.instance_session_id,
@@ -836,6 +979,8 @@ class DTTargetController:
                         slot_count=feature_source_slot_count,
                         max_tokens=max_source_rows,
                         feature_width=self.pivot_width,
+                        page_rows=feature_source_page_rows,
+                        profile_timing=self.target_source_buffer_profile_enabled,
                     )
                     self._profile_emit(
                         "target_feature_pool_registration",
@@ -843,6 +988,11 @@ class DTTargetController:
                         source_session_id=self._feature_source_pool.source_session_id,
                         pool_generation=self._feature_source_pool.pool_generation,
                         transport_session=self._feature_source_pool.transport_session,
+                        physical_slot_count=(
+                            self._feature_source_pool.physical_slot_count
+                        ),
+                        logical_slot_count=self._feature_source_pool.slot_count,
+                        page_rows=self._feature_source_pool.page_rows,
                     )
                     self._feature_source_free_slots = (
                         self._feature_source_pool.free_slot_count
@@ -1210,6 +1360,7 @@ class DTTargetController:
                             batch_result, "dt_hidden_produced_ns", publish_started_ns
                         ),
                     )
+                    self._profile_register_source_publication(published)
                     publish_done_ns = (
                         time.monotonic_ns() if self._profile_active else 0
                     )
@@ -1217,6 +1368,34 @@ class DTTargetController:
                         descriptor.transfer_id: descriptor
                         for descriptor in published.descriptors
                     }
+                    # Issue #281 P0 originally covered only the DFlash
+                    # feature publication path.  The production experiment
+                    # uses FlashMTP, whose one-row pivots are published here,
+                    # so the analyzer saw dispatch/candidate/freeze but no
+                    # producer or descriptor boundary.  Emit the same stable
+                    # hop schema used by DFlash while the request index and
+                    # next round are still unambiguous.
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        spec_by_transfer = {values[2]: values for values in specs}
+                        for descriptor in published.descriptors:
+                            request_id, request_index, _transfer_id = (
+                                spec_by_transfer[descriptor.transfer_id]
+                            )
+                            self._p0_emit(
+                                "feature_published",
+                                transfer_id=descriptor.transfer_id,
+                                request_id=request_id,
+                                round_id=self._next_round.get(request_id, 0),
+                                hidden_produced_ns=published.hidden_produced_ns,
+                                descriptor_published_ns=(
+                                    published.descriptor_published_ns
+                                ),
+                                source_slot_id=descriptor.source_slot_id,
+                                slot_generation=descriptor.slot_generation,
+                                feature_rows=1,
+                                request_index=request_index,
+                                source_kind="flashmtp_pivot",
+                            )
                     # The source may be a stable CUDA Graph output buffer.  The
                     # copy stream already waits for the producing forward; add
                     # the reverse edge after the pool copy so the next replay
@@ -1375,19 +1554,167 @@ class DTTargetController:
         if error is not None:
             raise RuntimeError(f"FlashMTP pivot publication failed: {error}")
 
-        staged_tasks = []
-        for values in specs:
-            staged = StagedFlashMTPTask(*values)
-            if self.is_export_rank:
-                descriptor = descriptors[staged.source_lease_id]
-                if self._source_slot_by_transfer.get(staged.source_lease_id) != (
-                    descriptor.source_slot_id,
-                    descriptor.slot_generation,
-                ):
-                    raise RuntimeError("FlashMTP staged source lease was lost")
-            staged_tasks.append(staged)
-        batch_result.dt_staged_flashmtp_pivots = StagedFlashMTPPivotBatch(
-            tasks=tuple(staged_tasks), descriptors_by_transfer=descriptors
+        pre_reserved = None
+        try:
+            staged_tasks = []
+            for values in specs:
+                staged = StagedFlashMTPTask(*values)
+                if self.is_export_rank:
+                    descriptor = descriptors[staged.source_lease_id]
+                    if self._source_slot_by_transfer.get(staged.source_lease_id) != (
+                        descriptor.source_slot_id,
+                        descriptor.slot_generation,
+                    ):
+                        raise RuntimeError("FlashMTP staged source lease was lost")
+                staged_tasks.append(staged)
+            # Every descriptor, transfer id and the TP packet are stable here.
+            # Only the export rank owns candidate destinations, and it arms
+            # them all-or-nothing; the ordinary park/flush path still performs
+            # authorization, ledger begin and Coordinator submission.
+            if self.flashmtp_pre_reserve_dest and self.is_export_rank:
+                pre_reserved = self._pre_reserve_flashmtp_destinations(specs)
+            batch_result.dt_staged_flashmtp_pivots = StagedFlashMTPPivotBatch(
+                tasks=tuple(staged_tasks),
+                descriptors_by_transfer=descriptors,
+                pre_reserved_destinations=pre_reserved,
+            )
+        except Exception:
+            if pre_reserved:
+                self._cancel_flashmtp_pre_reserved_destinations(
+                    pre_reserved, reason="stage_failure"
+                )
+            raise
+
+    def _pre_reserve_flashmtp_destinations(self, specs) -> dict | None:
+        """Arm one local destination per staged row, all-or-nothing.
+
+        Launch staging has no authoritative bonus token, sequence length,
+        round ownership or eligibility, so it can only reserve the export
+        rank's own arena rows.  Any failure cancels what this attempt created
+        and returns None, leaving the ordinary park-time reserve untouched.
+        """
+        arena = self._candidate_arena
+        num_attempt_rows = len(specs)
+        if arena is None or num_attempt_rows <= 0:
+            return None
+        started_ns = time.monotonic_ns()
+        free_before = -1
+        reservations: dict[str, tuple[object, int]] = {}
+        try:
+            free_before = arena.free_slot_count
+            if free_before < num_attempt_rows + _FLASHMTP_PRE_RESERVE_SAFETY_SLOTS:
+                self._emit_flashmtp_pre_reserve(
+                    num_attempt_rows=num_attempt_rows,
+                    num_reserved_rows=0,
+                    num_fallback_rows=num_attempt_rows,
+                    rollback_reason="capacity",
+                    free_slots_before=free_before,
+                    free_slots_after=free_before,
+                    reserve_ns=time.monotonic_ns() - started_ns,
+                )
+                return None
+            for values in specs:
+                transfer_id = values[2]
+                destination = arena.reserve(transfer_id)
+                reservations[transfer_id] = (destination, time.monotonic_ns())
+            self._emit_flashmtp_pre_reserve(
+                num_attempt_rows=num_attempt_rows,
+                num_reserved_rows=len(reservations),
+                num_fallback_rows=0,
+                rollback_reason=None,
+                free_slots_before=free_before,
+                free_slots_after=free_before - len(reservations),
+                reserve_ns=time.monotonic_ns() - started_ns,
+            )
+            return reservations
+        except Exception as exc:
+            rollback_reason = f"{type(exc).__name__}: {exc}"
+            self._cancel_flashmtp_pre_reserved_destinations(
+                reservations, reason="reserve_failure"
+            )
+            try:
+                free_after = arena.free_slot_count
+            except Exception:
+                free_after = free_before
+            try:
+                self._emit_flashmtp_pre_reserve(
+                    num_attempt_rows=num_attempt_rows,
+                    num_reserved_rows=0,
+                    num_fallback_rows=num_attempt_rows,
+                    rollback_reason=rollback_reason,
+                    free_slots_before=free_before,
+                    free_slots_after=free_after,
+                    reserve_ns=time.monotonic_ns() - started_ns,
+                )
+            except Exception:
+                pass
+            return None
+
+    def _cancel_flashmtp_pre_reserved_destinations(
+        self, reservations: dict, *, reason: str
+    ) -> None:
+        """Cancel every destination still owned by one pre-reserve attempt.
+
+        Rollback is best-effort: each entry is popped before the cancel attempt
+        so ownership stays exactly-once, and one failed cancel is logged and
+        must not stop the remaining cleanup or mask the caller's exception.
+        """
+
+        for transfer_id in tuple(reservations):
+            entry = reservations.pop(transfer_id)
+            try:
+                self._cancel_flashmtp_pre_reserved_destination(
+                    transfer_id, entry, reason=reason
+                )
+            except Exception:
+                logger.exception(
+                    "FlashMTP pre-reserve rollback failed for %s (%s); continuing",
+                    transfer_id,
+                    reason,
+                )
+
+    def _cancel_flashmtp_pre_reserved_destination(
+        self, transfer_id: str, entry: tuple[object, int], *, reason: str
+    ) -> bool:
+        """Cancel one unused destination exactly once and record its hold."""
+
+        if self._candidate_arena is None:
+            return False
+        _destination, reserved_ns = entry
+        self._candidate_arena.cancel(transfer_id, remote_quiescent=True)
+        if self._profile_active:
+            self._profile_emit(
+                "target_flashmtp_pre_reserve_row",
+                target_instance=self.instance_id,
+                transfer_id=transfer_id,
+                outcome=reason,
+                hold_ns=time.monotonic_ns() - reserved_ns,
+            )
+        return True
+
+    def _emit_flashmtp_pre_reserve(
+        self,
+        *,
+        num_attempt_rows: int,
+        num_reserved_rows: int,
+        num_fallback_rows: int,
+        rollback_reason: str | None,
+        free_slots_before: int,
+        free_slots_after: int,
+        reserve_ns: int,
+    ) -> None:
+        if not self._profile_active:
+            return
+        self._profile_emit(
+            "target_flashmtp_pre_reserve",
+            target_instance=self.instance_id,
+            num_attempt_rows=num_attempt_rows,
+            num_reserved_rows=num_reserved_rows,
+            num_fallback_rows=num_fallback_rows,
+            rollback_reason=rollback_reason,
+            free_slots_before=free_slots_before,
+            free_slots_after=free_slots_after,
+            reserve_ns=reserve_ns,
         )
 
     def _cancel_staged_flashmtp_pivots(
@@ -1395,9 +1722,22 @@ class DTTargetController:
     ) -> None:
         """Release FlashMTP source leases that never reached control routing."""
 
+        reservations = staged.pre_reserved_destinations
         for task in staged.tasks:
             self._parked.pop(task.source_lease_id, None)
             if self.is_export_rank:
+                if reservations is not None:
+                    entry = reservations.pop(task.source_lease_id, None)
+                    if entry is not None:
+                        try:
+                            self._cancel_flashmtp_pre_reserved_destination(
+                                task.source_lease_id, entry, reason="staged_cancel"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "FlashMTP staged rollback failed for %s; continuing",
+                                task.source_lease_id,
+                            )
                 self._release_source_slot(task.source_lease_id)
         batch_result.dt_staged_flashmtp_pivots = None
 
@@ -2092,6 +2432,7 @@ class DTTargetController:
                                 time.monotonic_ns(),
                             ),
                         )
+                    self._profile_register_source_publication(published)
                     batch_result.dt_dflash_feature_publish_strategy = (
                         published.pack_strategy
                     )
@@ -2140,7 +2481,11 @@ class DTTargetController:
                     profile_publish_transfer = profile_event_enabled(
                         "target_feature_publish"
                     )
-                    if profile_publish_batch or profile_publish_transfer:
+                    if (
+                        profile_publish_batch
+                        or profile_publish_transfer
+                        or getattr(self, "target_p0_hop_profile_enabled", False)
+                    ):
                         specs_by_transfer = {
                             values[1]: values for values in specs
                         }
@@ -2208,6 +2553,22 @@ class DTTargetController:
                                 descriptor_published_ns=(
                                     published.descriptor_published_ns
                                 ),
+                            )
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        for descriptor in published.descriptors:
+                            spec = specs_by_transfer[descriptor.transfer_id]
+                            self._p0_emit(
+                                "feature_published",
+                                transfer_id=descriptor.transfer_id,
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                hidden_produced_ns=published.hidden_produced_ns,
+                                descriptor_published_ns=(
+                                    published.descriptor_published_ns
+                                ),
+                                source_slot_id=descriptor.source_slot_id,
+                                slot_generation=descriptor.slot_generation,
+                                feature_rows=spec[6],
                             )
                     measurement_specs = [
                         values
@@ -2748,6 +3109,283 @@ class DTTargetController:
             can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
         )
 
+    def _p0_emit(self, hop: str, **fields) -> None:
+        """Emit one opt-in #281 P0 hop without changing scheduler state."""
+
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            self._profile_emit(TARGET_P0_HOP_PROFILE_EVENT, hop=hop, **fields)
+
+    def _source_buffer_emit(self, stage: str, **fields) -> None:
+        """Emit one opt-in source-buffer record without changing ownership."""
+
+        if getattr(self, "target_source_buffer_profile_enabled", False):
+            self._profile_emit(
+                TARGET_SOURCE_BUFFER_PROFILE_EVENT, stage=stage, **fields
+            )
+
+    def _source_buffer_pool_stats(self) -> dict[str, int]:
+        """Return scalar pool state used by the source-buffer experiment."""
+
+        pool = getattr(self, "_feature_source_pool", None)
+        if pool is None:
+            return {}
+        allocator = getattr(pool, "_page_allocator", None)
+        return {
+            "source_slots_free": int(pool.free_slot_count_snapshot),
+            "source_slots_total": int(pool.slot_count),
+            "source_active_leases": int(pool.active_lease_count),
+            "source_identity_high_water": int(pool.active_identity_high_water),
+            "source_allocation_count": int(pool.allocation_count),
+            "source_failure_count": int(pool.failure_count),
+            "source_requested_rows_total": int(pool.requested_rows_total),
+            "source_allocated_rows_total": int(pool.allocated_rows_total),
+            "source_internal_fragmentation_rows_total": int(
+                pool.internal_fragmentation_rows_total
+            ),
+            "source_leased_pages_high_water": int(
+                pool.leased_page_count_high_water
+            ),
+            "source_pages_free": int(
+                allocator.free_page_count if allocator is not None else 0
+            ),
+            "source_pages_total": int(
+                allocator.total_page_count if allocator is not None else 0
+            ),
+            "source_largest_extent_pages": int(
+                allocator.largest_free_extent_pages
+                if allocator is not None
+                else 0
+            ),
+        }
+
+    def _profile_update_source_low_free(self, *, observed_ns: int | None = None) -> None:
+        """Track wall time for which effective reusable source slots are <= 1."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        pool = getattr(self, "_feature_source_pool", None)
+        if pool is None:
+            return
+        now_ns = time.monotonic_ns() if observed_ns is None else observed_ns
+        free_slots = int(pool.free_slot_count_snapshot)
+        deferred = int(getattr(self, "_deferred_dflash_feature_stages", 0))
+        effective = free_slots - deferred
+        started_ns = int(getattr(self, "_source_low_free_started_ns", 0))
+        if effective <= 1 and not started_ns:
+            self._source_low_free_started_ns = now_ns
+            self._source_buffer_emit(
+                "effective_free_low",
+                phase="start",
+                observed_ns=now_ns,
+                effective_free_slots=effective,
+                deferred_feature_stages=deferred,
+                **self._source_buffer_pool_stats(),
+            )
+        elif effective > 1 and started_ns:
+            self._source_low_free_started_ns = 0
+            self._source_buffer_emit(
+                "effective_free_low",
+                phase="end",
+                started_ns=started_ns,
+                observed_ns=now_ns,
+                duration_ns=now_ns - started_ns,
+                effective_free_slots=effective,
+                deferred_feature_stages=deferred,
+                **self._source_buffer_pool_stats(),
+            )
+        self._source_low_free_last_effective = effective
+
+    def _profile_source_gate_transition(
+        self, gate: str, *, blocked: bool, reason: str
+    ) -> None:
+        """Track a scheduler gate episode and its blocked decision count."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        now_ns = time.monotonic_ns()
+        started = self._source_gate_profile_started_ns.get(gate, 0)
+        if blocked:
+            self._source_gate_profile_decisions[gate] += 1
+            if not started:
+                self._source_gate_profile_started_ns[gate] = now_ns
+                self._source_gate_profile_decisions[gate] = 1
+                self._source_buffer_emit(
+                    "source_gate",
+                    phase="start",
+                    gate=gate,
+                    reason=reason,
+                    observed_ns=now_ns,
+                    **self._source_buffer_pool_stats(),
+                )
+            return
+        if not started:
+            return
+        decisions = int(self._source_gate_profile_decisions.pop(gate, 0))
+        self._source_gate_profile_started_ns.pop(gate, None)
+        self._source_buffer_emit(
+            "source_gate",
+            phase="end",
+            gate=gate,
+            reason=reason,
+            started_ns=started,
+            observed_ns=now_ns,
+            duration_ns=now_ns - started,
+            blocked_decisions=decisions,
+            **self._source_buffer_pool_stats(),
+        )
+
+    def _profile_register_source_publication(self, published) -> None:
+        """Register one publication for lifetime and slowest-reader accounting."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        key = (int(published.source_slot_id), int(published.slot_generation))
+        transfer_ids = tuple(
+            descriptor.transfer_id for descriptor in published.descriptors
+        )
+        published_ns = int(published.descriptor_published_ns)
+        reserved_ns = int(getattr(published, "reserved_ns", 0))
+        leases = self._source_buffer_profile_leases
+        if key in leases:
+            raise RuntimeError("source-buffer profile identity was reused while active")
+        leases[key] = {
+            "published_ns": published_ns,
+            "reserved_ns": reserved_ns,
+            "requested_rows": int(published.requested_rows),
+            "allocated_rows": int(published.allocated_rows),
+            "transfer_count": len(transfer_ids),
+            "remaining": set(transfer_ids),
+            "first_done_ns": 0,
+            "last_done_owner": "",
+            "last_done_channel": "",
+        }
+        self._source_buffer_emit(
+            "publication",
+            source_slot_id=key[0],
+            slot_generation=key[1],
+            transfer_ids=transfer_ids,
+            transfer_count=len(transfer_ids),
+            requested_rows=int(published.requested_rows),
+            allocated_rows=int(published.allocated_rows),
+            internal_fragmentation_rows=(
+                int(published.allocated_rows) - int(published.requested_rows)
+            ),
+            descriptor_published_ns=published_ns,
+            reserved_ns=reserved_ns,
+            reserve_to_publish_ns=(
+                published_ns - reserved_ns if reserved_ns else None
+            ),
+            **self._source_buffer_pool_stats(),
+        )
+        self._profile_update_source_low_free(observed_ns=published_ns)
+
+    def _profile_note_source_read_done(
+        self,
+        *,
+        transfer_id: str,
+        source_slot_id: int,
+        slot_generation: int,
+        owner: str,
+        channel: str,
+        observed_ns: int,
+        freed_publication: bool,
+    ) -> None:
+        """Retire one measured transfer and summarize the publication at drain."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        key = (int(source_slot_id), int(slot_generation))
+        lease = self._source_buffer_profile_leases.get(key)
+        if lease is None:
+            self._source_buffer_emit(
+                "read_done_untracked",
+                transfer_id=transfer_id,
+                source_slot_id=key[0],
+                slot_generation=key[1],
+                owner=owner,
+                channel=channel,
+                observed_ns=observed_ns,
+                freed_publication=bool(freed_publication),
+            )
+            self._profile_update_source_low_free(observed_ns=observed_ns)
+            return
+        remaining = lease["remaining"]
+        if transfer_id not in remaining:
+            return
+        remaining.remove(transfer_id)
+        if not lease["first_done_ns"]:
+            lease["first_done_ns"] = observed_ns
+        lease["last_done_owner"] = owner
+        lease["last_done_channel"] = channel
+        self._source_buffer_emit(
+            "read_done",
+            transfer_id=transfer_id,
+            source_slot_id=key[0],
+            slot_generation=key[1],
+            owner=owner,
+            channel=channel,
+            observed_ns=observed_ns,
+            remaining_transfers=len(remaining),
+            freed_publication=bool(freed_publication),
+        )
+        if not remaining:
+            published_ns = int(lease["published_ns"])
+            reserved_ns = int(lease["reserved_ns"])
+            first_done_ns = int(lease["first_done_ns"])
+            self._source_buffer_emit(
+                "publication_complete",
+                source_slot_id=key[0],
+                slot_generation=key[1],
+                published_ns=published_ns,
+                reserved_ns=reserved_ns,
+                first_done_ns=first_done_ns,
+                completed_ns=observed_ns,
+                reserve_to_first_read_ns=(
+                    first_done_ns - reserved_ns if reserved_ns else None
+                ),
+                reserve_to_release_ns=(
+                    observed_ns - reserved_ns if reserved_ns else None
+                ),
+                lease_lifetime_ns=observed_ns - published_ns,
+                first_reader_delay_ns=first_done_ns - published_ns,
+                slowest_reader_pin_ns=observed_ns - first_done_ns,
+                requested_rows=int(lease["requested_rows"]),
+                allocated_rows=int(lease["allocated_rows"]),
+                internal_fragmentation_rows=(
+                    int(lease["allocated_rows"])
+                    - int(lease["requested_rows"])
+                ),
+                transfer_count=int(lease["transfer_count"]),
+                slowest_owner=str(lease["last_done_owner"]),
+                slowest_channel=str(lease["last_done_channel"]),
+                freed_publication=bool(freed_publication),
+                **self._source_buffer_pool_stats(),
+            )
+            self._source_buffer_profile_leases.pop(key, None)
+        self._profile_update_source_low_free(observed_ns=observed_ns)
+
+    def profile_source_capacity_blocked(
+        self,
+        *,
+        work_kind: str,
+        batch_size: int,
+        waiting_requests: int,
+        parked_rounds: int,
+    ) -> None:
+        """Record one launch opportunity rejected by the hard source gate."""
+
+        if not getattr(self, "target_source_buffer_profile_enabled", False):
+            return
+        self._source_buffer_emit(
+            "blocked_launch_opportunity",
+            observed_ns=time.monotonic_ns(),
+            work_kind=work_kind,
+            batch_size=int(batch_size),
+            waiting_requests=int(waiting_requests),
+            parked_rounds=int(parked_rounds),
+            **self._source_buffer_pool_stats(),
+        )
+
     def _record_full_wave_completion(
         self, batch: ScheduleBatch, *, batch_result, batch_size: int
     ) -> None:
@@ -2965,6 +3603,9 @@ class DTTargetController:
         # the counter additionally fences older queued results.  Exporting
         # either kind here would give one request two concurrent Draft rounds.
         chunked_req = getattr(batch, "chunked_req", None)
+        pre_reserved = None
+        num_pre_reserve_cancel_rows = 0
+        num_reused_rows = 0
         if self.is_token_only:
             active_indices = [
                 index
@@ -2977,6 +3618,10 @@ class DTTargetController:
             ]
             active_flash_tasks = ()
         else:
+            # Launch-time reservations are still unowned: only a row that
+            # passes the final eligibility checks below may carry one into an
+            # ordinary DraftTask.  All others are cancelled exactly once.
+            pre_reserved = staged_flash.pre_reserved_destinations
             req_by_id = {req.rid: req for req in batch.reqs}
             active_flash = []
             for staged_task in staged_flash.tasks:
@@ -3002,6 +3647,24 @@ class DTTargetController:
                 )
                 if not eligible:
                     if self.is_export_rank:
+                        if pre_reserved is not None:
+                            entry = pre_reserved.pop(
+                                staged_task.source_lease_id, None
+                            )
+                            if entry is not None:
+                                try:
+                                    if self._cancel_flashmtp_pre_reserved_destination(
+                                        staged_task.source_lease_id,
+                                        entry,
+                                        reason="ineligible",
+                                    ):
+                                        num_pre_reserve_cancel_rows += 1
+                                except Exception:
+                                    logger.exception(
+                                        "FlashMTP ineligible pre-reserve cleanup "
+                                        "failed for %s; continuing",
+                                        staged_task.source_lease_id,
+                                    )
                         self._release_source_slot(staged_task.source_lease_id)
                     continue
                 active_flash.append(staged_task)
@@ -3043,6 +3706,7 @@ class DTTargetController:
         try:
             for active_index, index in enumerate(active_indices):
                 req = batch.reqs[index]
+                candidate_destination = None
                 if self.is_token_only:
                     round_id = self._next_round.get(req.rid, 0)
                     attempt = self._ensure_lifecycle_attempt(req.rid)
@@ -3054,6 +3718,10 @@ class DTTargetController:
                     attempt = self._ensure_lifecycle_attempt(req.rid)
                     transfer_id = staged_task.source_lease_id
                     self._next_round[req.rid] = round_id + 1
+                    if pre_reserved is not None:
+                        entry = pre_reserved.get(transfer_id)
+                        if entry is not None:
+                            candidate_destination = entry[0]
                 previous_transfer_id = None
                 if self.is_token_only and round_id > 0:
                     previous_transfer_id = self._verify_transfer_by_request.pop(
@@ -3087,6 +3755,7 @@ class DTTargetController:
                             bonus_token=bonus_token,
                             previous_transfer_id=previous_transfer_id,
                             feature_descriptor=descriptors_by_transfer.get(transfer_id),
+                            candidate_destination=candidate_destination,
                         )
                     )
             if flashmtp_profile_active:
@@ -3100,6 +3769,23 @@ class DTTargetController:
                     task.transfer_id for task in tasks
                 )
                 control_committed = True
+                if pre_reserved is not None:
+                    # Queued tasks now own their destinations through the
+                    # ordinary pending-send/arena lifecycle; staging cleanup
+                    # must no longer cancel them.
+                    queued_ns = time.monotonic_ns()
+                    for task in tasks:
+                        entry = pre_reserved.pop(task.transfer_id, None)
+                        if entry is not None:
+                            num_reused_rows += 1
+                            if self._profile_active:
+                                self._profile_emit(
+                                    "target_flashmtp_pre_reserve_row",
+                                    target_instance=self.instance_id,
+                                    transfer_id=task.transfer_id,
+                                    outcome="reused",
+                                    hold_ns=queued_ns - entry[1],
+                                )
                 # Source slots are committed at this point, so publish the control
                 # message in the same scheduler turn. Waiting for the next poll
                 # adds a fixed idle bubble before Draft can start the round.
@@ -3119,6 +3805,19 @@ class DTTargetController:
             raise
         if not self.is_token_only:
             batch_result.dt_staged_flashmtp_pivots = None
+            if (
+                self.flashmtp_pre_reserve_dest
+                and self.is_export_rank
+                and self._profile_active
+            ):
+                self._profile_emit(
+                    "target_flashmtp_pre_reserve_park",
+                    target_instance=self.instance_id,
+                    num_eligible_rows=len(active_flash_tasks),
+                    num_reused_rows=num_reused_rows,
+                    num_fallback_rows=len(active_flash_tasks) - num_reused_rows,
+                    num_cancel_rows=num_pre_reserve_cancel_rows,
+                )
         if parked_reqs:
             parked_by_lane = Counter(state.lane_id for state in self._parked.values())
             for lane_id, parked_count in parked_by_lane.items():
@@ -3337,12 +4036,24 @@ class DTTargetController:
             receive_ns = time.monotonic_ns() - receive_start_ns
         broadcast_start_ns = time.monotonic_ns()
         if self.scheduler.ps.tp_size > 1:
-            packet = broadcast_pyobj(
-                packet,
-                self.scheduler.tp_group.rank,
-                self.scheduler.tp_cpu_group,
-                src=self.scheduler.tp_group.ranks[0],
-            )
+            delivered = False
+            channel = self._tp_control_channel
+            if channel is not None:
+                if self.is_export_rank:
+                    delivered = channel.send(packet)
+                else:
+                    delivered, received = channel.recv()
+                    if delivered:
+                        packet = received
+            if not delivered:
+                # No channel, or an oversize packet: every rank takes the same
+                # gloo fallback branch for this packet.
+                packet = broadcast_pyobj(
+                    packet,
+                    self.scheduler.tp_group.rank,
+                    self.scheduler.tp_cpu_group,
+                    src=self.scheduler.tp_group.ranks[0],
+                )
         broadcast_ns = time.monotonic_ns() - broadcast_start_ns
         assert packet is not None
         (
@@ -3354,6 +4065,60 @@ class DTTargetController:
             ring_publish_fatal,
             hold_next_batch,
         ) = packet
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            for kind, transfer_id, payload in events:
+                if kind not in ("ready", "ready_direct"):
+                    continue
+                state = self._parked.get(transfer_id)
+                if state is None:
+                    continue
+                candidate_payload = payload[0]
+                self._p0_emit(
+                    "ready_snapshot",
+                    transfer_id=transfer_id,
+                    request_id=state.req.rid,
+                    round_id=state.round_id,
+                    completion_observed_ns=getattr(
+                        candidate_payload, "observed_ns", 0
+                    ),
+                    ready_snapshot_ns=poll_now_ns,
+                    tp_broadcast_start_ns=broadcast_start_ns,
+                    tp_broadcast_end_ns=broadcast_exit_ns,
+                    broadcast_ns=broadcast_ns,
+                )
+        if self._profile_active and (
+            len(events) > 0
+            or broadcast_ns >= 1_000_000
+            or (
+                previous_poll_ns
+                and poll_entered_ns - previous_poll_ns >= 1_000_000
+            )
+        ):
+            # Measurement only: no collective, packet, or ordering change.
+            # ``poll_now_ns`` is stamped on the export rank and broadcast
+            # unchanged, so it groups one collective across ranks without
+            # subtracting unsynchronized per-rank monotonic clocks.  The two
+            # duration fields are same-rank measurements: work before entering
+            # the broadcast within this poll, and the host gap since this rank
+            # last left poll (its preceding loop work).
+            # Sparse idle tracing: empty polls record only when this rank's
+            # broadcast or host gap is a >=1 ms long-tail outlier.
+            local_poll_gap_ns = (
+                poll_entered_ns - previous_poll_ns if previous_poll_ns else 0
+            )
+            self._profile_emit(
+                "target_ready_broadcast",
+                tp_rank=self.scheduler.ps.tp_rank,
+                tp_size=self.scheduler.ps.tp_size,
+                poll_now_ns=poll_now_ns,
+                broadcast_enter_ns=broadcast_start_ns,
+                broadcast_exit_ns=broadcast_start_ns + broadcast_ns,
+                broadcast_ns=broadcast_ns,
+                pre_broadcast_work_ns=broadcast_start_ns - poll_entered_ns,
+                local_poll_gap_ns=local_poll_gap_ns,
+                receive_ns=receive_ns,
+                event_count=len(events),
+            )
         self._last_poll_ns = poll_now_ns
         self._overlap_launch_ns = overlap_launch_ns
         self._overlap_result_ready = result_ready
@@ -3363,8 +4128,22 @@ class DTTargetController:
             # A publication failure is fatal on the export rank; the other
             # ranks learn it here rather than through a per-wave broadcast.
             raise RuntimeError(ring_publish_fatal)
-        if self.is_export_rank and events:
-            poll_finished_ns = time.monotonic_ns()
+        # Binding the stamp in the guard keeps one clock read and adds no
+        # profile-off work (the two attribute checks short-circuit first).
+        if (
+            self.is_export_rank
+            and self._profile_active
+            and (poll_finished_ns := time.monotonic_ns()) >= poll_entered_ns
+            and (
+                len(events) > 0
+                or poll_finished_ns - poll_entered_ns >= 1_000_000
+                or receive_ns >= 1_000_000
+                or broadcast_ns >= 1_000_000
+                or max(receive_parts.values(), default=0) >= 1_000_000
+            )
+        ):
+            # Sparse idle tracing: keep event polls and empty polls whose
+            # total or a measured segment is a >=1 ms long-tail outlier.
             self._profile_emit(
                 "target_result_poll",
                 started_ns=poll_entered_ns,
@@ -3431,6 +4210,15 @@ class DTTargetController:
                 applied_before_ns = time.monotonic_ns() if observe_ready else 0
                 if kind == "ready_direct":
                     state.candidate_completion = candidate_payload
+                    self._p0_emit(
+                        "tp_ready_applied",
+                        transfer_id=transfer_id,
+                        request_id=state.req.rid,
+                        round_id=state.round_id,
+                        completion_observed_ns=candidate_payload.observed_ns,
+                        tp_apply_ns=time.monotonic_ns(),
+                        broadcast_ns=broadcast_ns,
+                    )
                     if self.is_export_rank and self._profile_active:
                         self._profile_emit(
                             "target_direct_tp_apply",
@@ -3523,6 +4311,7 @@ class DTTargetController:
             submission_returned_ns=submission_returned_ns,
             submission_wall_ns=submission_returned_ns - submission_started_ns,
             update_running_ns=getattr(batch, "dt_update_running_ns", 0),
+            hostpath_marks=getattr(batch, "dt_hostpath_marks", None),
             result_queue_depth_before=result_queue_depth_before,
             target_compute_batches_inflight=self._target_compute_batches_inflight,
             iteration_started_ns=iteration_started_ns,
@@ -3531,6 +4320,22 @@ class DTTargetController:
             poll_started_ns=poll_started_ns,
             poll_finished_ns=poll_finished_ns,
         )
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            for transfer_id in transfer_ids:
+                self._p0_emit(
+                    "verify_submitted",
+                    transfer_id=transfer_id,
+                    wave_id=wave_id,
+                    selection_started_ns=selection_started_ns,
+                    selection_finished_ns=selection_finished_ns,
+                    submission_started_ns=submission_started_ns,
+                    submission_returned_ns=submission_returned_ns,
+                    control_phase_ns=max(
+                        0, submission_started_ns - poll_finished_ns
+                    ),
+                    poll_phase_ns=max(0, poll_finished_ns - poll_started_ns),
+                    batch_size=len(batch.reqs),
+                )
 
     def _verify_gpu_clock(self):
         clock = getattr(self, "_gpu_clock", None)
@@ -3584,6 +4389,14 @@ class DTTargetController:
                 if previous_end_event is not None
                 else None
             )
+            cuda_total_ns = int(
+                observation.start_event.elapsed_time(observation.end_event) * 1_000_000
+            )
+            gpu_end_clock_ns = (
+                self._gpu_clock.read(observation.clock_slot)
+                if observation.clock_slot >= 0
+                else 0
+            )
             self._profile_emit(
                 "target_verify_cuda_observed",
                 wave_id=observation.wave_id,
@@ -3595,19 +4408,21 @@ class DTTargetController:
                 submission_returned_ns=observation.submission_returned_ns,
                 gpu_start_observed_ns=observation.start_observed_ns,
                 gpu_end_observed_ns=end_observed_ns,
-                cuda_total_ns=int(
-                    observation.start_event.elapsed_time(observation.end_event)
-                    * 1_000_000
-                ),
+                cuda_total_ns=cuda_total_ns,
                 cuda_previous_verify_end_to_start_ns=(
                     previous_verify_end_to_start_ns
                 ),
-                gpu_end_clock_ns=(
-                    self._gpu_clock.read(observation.clock_slot)
-                    if observation.clock_slot >= 0
-                    else 0
-                ),
+                gpu_end_clock_ns=gpu_end_clock_ns,
             )
+            for transfer_id in observation.transfer_ids:
+                self._p0_emit(
+                    "verify_gpu_end",
+                    transfer_id=transfer_id,
+                    wave_id=observation.wave_id,
+                    gpu_end_observed_ns=end_observed_ns,
+                    gpu_end_clock_ns=gpu_end_clock_ns,
+                    cuda_total_ns=cuda_total_ns,
+                )
             self._last_target_verify_end_event = observation.end_event
         self._pending_target_gpu_observations = retained
 
@@ -3703,6 +4518,13 @@ class DTTargetController:
         has_capacity = not self.uses_direct_gpu_source or self._feature_source_free_slots > (
             self._deferred_dflash_feature_stages
         )
+        if getattr(self, "target_source_buffer_profile_enabled", False):
+            self._profile_update_source_low_free()
+            self._profile_source_gate_transition(
+                "launch",
+                blocked=not has_capacity,
+                reason="no_effective_source_slot",
+            )
         if self.is_export_rank and self.uses_direct_gpu_source:
             now_ns = time.monotonic_ns()
             if not has_capacity and not self._feature_source_stall_started_ns:
@@ -4352,6 +5174,12 @@ class DTTargetController:
         if not outstanding:
             self._end_ready_hold("drained", ready_count)
             return False
+        if self._adaptive_ready_hold and self._overlap_result_ready is True:
+            # The broadcast copy_done snapshot says the in-flight result is
+            # ready, so holding longer would only leave the GPU idle.  Only an
+            # explicit True releases early; False/None fall through unchanged.
+            self._end_ready_hold("gpu_ready", ready_count)
+            return False
         now_ns = self._last_poll_ns
         if not self._ready_hold_started_ns:
             self._ready_hold_started_ns = now_ns
@@ -4382,6 +5210,76 @@ class DTTargetController:
                 held_ns=self._last_poll_ns - started_ns,
                 ready_count=ready_count,
             )
+
+    def _lean_ready_sampling_info(self, batch: ScheduleBatch):
+        """Build uniform greedy sampling metadata from cached device tensors."""
+        reqs = batch.reqs
+        first = reqs[0].sampling_params
+        key = (first.temperature, first.top_p, first.top_k, first.min_p)
+        if first.top_k > 1 or get_server_args().enable_deterministic_inference:
+            return None
+        for req in reqs:
+            params = req.sampling_params
+            if (
+                (params.temperature, params.top_p, params.top_k, params.min_p) != key
+                or params.logit_bias is not None
+                or params.frequency_penalty != 0.0
+                or params.presence_penalty != 0.0
+                or params.repetition_penalty != 1.0
+                or params.min_new_tokens != 0
+                or req.custom_logit_processor
+                or req.return_sampling_mask
+                or req.grammar is not None
+            ):
+                return None
+        device = batch.device
+        n = len(reqs)
+        cached = self._lean_sampling_tensors.get(key)
+        if cached is None or cached[0] < n:
+            capacity = max(int(self.scheduler.max_running_requests), n)
+            temperature, top_p, top_k, min_p = key
+            cached = (
+                capacity,
+                torch.full((capacity, 1), temperature, dtype=torch.float, device=device),
+                torch.full((capacity,), top_p, dtype=torch.float, device=device),
+                torch.full((capacity,), top_k, dtype=torch.int32, device=device),
+                torch.full((capacity,), min_p, dtype=torch.float, device=device),
+            )
+            self._lean_sampling_tensors[key] = cached
+        _, temperatures, top_ps, top_ks, min_ps = cached
+        vocab_size = self.scheduler.model_config.vocab_size
+        info = SamplingBatchInfo(
+            temperatures=temperatures[:n],
+            top_ps=top_ps[:n],
+            top_ks=top_ks[:n],
+            min_ps=min_ps[:n],
+            sampling_seed=None,
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=first.top_p != 1.0,
+            need_top_k_sampling=first.top_k != TOP_K_ALL,
+            need_min_p_sampling=first.min_p > 0,
+            vocab_size=vocab_size,
+            penalizer_orchestrator=penaltylib.BatchedPenalizerOrchestrator(
+                vocab_size=vocab_size,
+                batch=batch,
+                penalizers={
+                    penaltylib.BatchedFrequencyPenalizer,
+                    penaltylib.BatchedMinNewTokensPenalizer,
+                    penaltylib.BatchedPresencePenalizer,
+                    penaltylib.BatchedRepetitionPenalizer,
+                },
+            ),
+            has_custom_logit_processor=False,
+            custom_params=None,
+            custom_logit_processor=None,
+            device=device,
+            logit_bias=None,
+            return_sampling_masks=[False] * n,
+            sampling_mask_max_top_k=0,
+        )
+        info.adjusted_from_schedule_batch(batch, vocab_size)
+        return info
 
     def build_ready_batch(self) -> ScheduleBatch | None:
         observer = getattr(self, "_overlap_fix_observer", None)
@@ -4615,7 +5513,9 @@ class DTTargetController:
             ),
         )
         relay_ready_ns = time.monotonic_ns()
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+        batch.sampling_info = (
+            self._lean_ready_sampling_info(batch) if _LEAN_READY else None
+        ) or SamplingBatchInfo.from_schedule_batch(
             batch, self.scheduler.model_config.vocab_size
         )
         finished_ns = time.monotonic_ns()
@@ -4692,6 +5592,63 @@ class DTTargetController:
                 sampling_ns=finished_ns - relay_ready_ns,
                 total_ns=finished_ns - started_ns,
             )
+        if getattr(self, "target_p0_hop_profile_enabled", False):
+            feature_pool = getattr(self, "_feature_source_pool", None)
+            source_allocator = getattr(feature_pool, "_page_allocator", None)
+            candidate_free = (
+                self._candidate_arena.free_slot_count
+                if self._candidate_arena is not None
+                else 0
+            )
+            ring_credit_free = sum(
+                writer.free_entries()
+                for writer in getattr(self, "_ring_writers", {}).values()
+            )
+            for state in ready:
+                self._p0_emit(
+                    "frozen_for_verify",
+                    transfer_id=state.transfer_id,
+                    request_id=state.req.rid,
+                    round_id=state.round_id,
+                    wave_id=wave_id,
+                    candidate_observed_ns=state.result_received_ns,
+                    selection_started_ns=build_entry_ns,
+                    freeze_ns=freeze_ns,
+                    build_finished_ns=finished_ns,
+                    batch_size=len(ready),
+                    candidate_slots_free=candidate_free,
+                    candidate_slots_total=(
+                        self._candidate_arena.slot_count
+                        if self._candidate_arena is not None
+                        else 0
+                    ),
+                    source_slots_free=(
+                        feature_pool.free_slot_count
+                        if feature_pool is not None
+                        else 0
+                    ),
+                    source_slots_total=(
+                        feature_pool.slot_count
+                        if feature_pool is not None
+                        else 0
+                    ),
+                    source_pages_free=(
+                        source_allocator.free_page_count
+                        if source_allocator is not None
+                        else 0
+                    ),
+                    source_pages_total=(
+                        source_allocator.total_page_count
+                        if source_allocator is not None
+                        else 0
+                    ),
+                    source_largest_extent_pages=(
+                        source_allocator.largest_free_extent_pages
+                        if source_allocator is not None
+                        else 0
+                    ),
+                    ring_credit_free=ring_credit_free,
+                )
         return batch
 
     def should_defer_prefill(
@@ -4700,14 +5657,23 @@ class DTTargetController:
         # Bootstrap features may retain slots while Draft owner admission is
         # full. Keep one slot for existing owners to verify or finish a chunk.
         # A locally staged KV handle is not evidence of Draft admission.
-        if self.is_feature_backed and (
+        source_blocked = self.is_feature_backed and (
             self._feature_source_free_slots - self._deferred_dflash_feature_stages
             <= 1
-        ):
-            if chunked_req is None or self._draft_admitted_attempts.get(
-                chunked_req.rid
-            ) != self._lifecycle_attempt_by_request.get(chunked_req.rid, -1):
-                return True
+        ) and (
+            chunked_req is None
+            or self._draft_admitted_attempts.get(chunked_req.rid)
+            != self._lifecycle_attempt_by_request.get(chunked_req.rid, -1)
+        )
+        if getattr(self, "target_source_buffer_profile_enabled", False):
+            self._profile_update_source_low_free()
+            self._profile_source_gate_transition(
+                "prefill",
+                blocked=source_blocked,
+                reason="preserve_one_source_slot",
+            )
+        if source_blocked:
+            return True
         # Once a frozen wave is ready, run it before admitting replacement
         # prefills.  Otherwise get_new_batch_prefill wins scheduler priority,
         # the replacement becomes the next frozen wave by itself, and the
@@ -4854,6 +5820,10 @@ class DTTargetController:
             del req.dt_pipeline_lane_id
 
     def close(self) -> None:
+        channel = getattr(self, "_tp_control_channel", None)
+        if channel is not None:
+            self._tp_control_channel = None
+            channel.close()
         previous_failure = getattr(
             self, "_source_shutdown_quarantine_error", None
         )
@@ -5113,6 +6083,7 @@ class DTTargetController:
         committed_token_ids: tuple[int, ...] = (),
         feature_token_offset: int = 0,
         requires_proposal: bool = True,
+        candidate_destination=None,
     ):
         now_ns = time.monotonic_ns()
         if self.is_token_only:
@@ -5251,6 +6222,7 @@ class DTTargetController:
             source=SourceRef(**feature_descriptor.source_ref_kwargs()),
             created_ns=now_ns,
             deadline_ns=now_ns + self.round_timeout_ns,
+            candidate_destination=candidate_destination,
         )
 
     def _queue_task_batch(self, tasks: tuple) -> None:
@@ -5502,7 +6474,26 @@ class DTTargetController:
                         - max(task.created_ns for task in dispatch_batch.entries)
                     ),
                 )
+            ledger_begin_started_ns = (
+                time.monotonic_ns()
+                if getattr(self, "target_p0_hop_profile_enabled", False)
+                else 0
+            )
             self._ledger.begin(dispatch_batch)
+            if getattr(self, "target_p0_hop_profile_enabled", False):
+                ledger_begin_finished_ns = time.monotonic_ns()
+                for task in dispatch_batch.entries:
+                    self._p0_emit(
+                        "dispatch_registered",
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        queued_ns=queued_origin_by_transfer[task.transfer_id][1],
+                        submitted_ns=submitted_ns,
+                        ledger_begin_started_ns=ledger_begin_started_ns,
+                        ledger_begin_finished_ns=ledger_begin_finished_ns,
+                        requires_proposal=task.requires_proposal,
+                    )
             lease_marks = getattr(self, "_lease_marks", None)
             if lease_marks:
                 # A ring copy written before a submit that did not go out is
@@ -5548,38 +6539,16 @@ class DTTargetController:
             if blocked is None:
                 self._last_pending_send_block = None
 
-    def _poll_export_rank(self) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
-        profile_receive = bool(getattr(self, "_profile_active", False))
-        receive_parts: dict[str, int] = {}
-        mark_ns = time.monotonic_ns()
+    def _consume_control_messages(
+        self, events: list[tuple[str, str, object]]
+    ) -> None:
+        """Apply one non-blocking Coordinator receive batch.
 
-        def mark(name: str) -> None:
-            nonlocal mark_ns
-            if not profile_receive:
-                return
-            now_ns = time.monotonic_ns()
-            receive_parts[name] = now_ns - mark_ns
-            mark_ns = now_ns
+        Extracted unchanged from the legacy ``_poll_export_rank`` so the P3
+        split's control phase preserves the original per-message order.  The
+        legacy path still calls this at the exact former position.
+        """
 
-        if getattr(self, "_ring_publish_pending", None):
-            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
-            # kernel-published waves, off the park critical path.
-            self._ring_publish_cleanup()
-        mark("ring_cleanup_ns")
-        self._flush_pending_send()
-        mark("flush_send_ns")
-
-        events: list[tuple[str, str, object]] = []
-        if self._candidate_arena is not None:
-            # Direct Draft completion is intentionally observed before the
-            # independent Coordinator retirement channel.
-            self._candidate_arena.poll_completion_notices()
-            self._candidate_arena.poll_completion_records()
-            if self._ring_outstanding:
-                self._poll_direct_ring_reads()
-                if self._ring_lease:
-                    self._fence_dead_ring_owners()
-        mark("arena_notice_ns")
         for message in self._client.recv_nowait():
             if isinstance(message, TaskBatchAck):
                 if not self._ledger.has_submitted_batch(message.batch_id):
@@ -5720,69 +6689,212 @@ class DTTargetController:
                 raise TypeError(
                     f"unexpected Target Coordinator message {type(message).__name__}"
                 )
+    def _observe_ready_direct_completions(
+        self,
+    ) -> list[tuple[str, str, object]]:
+        """Drain native candidate completions into ``ready_direct`` events."""
+
+        events: list[tuple[str, str, object]] = []
+        arena = self._candidate_arena
+        completions = arena.poll()
+        unparked = self._unparked_completions
+        if unparked:
+            # Keep an early completion only while its arena slot still holds it.
+            held = {t: c for t, c in unparked.items() if arena.holds(c)}
+            unparked.clear()
+            held.update((c.transfer_id, c) for c in completions)
+            completions = held.values()
+        for completion in completions:
+            state = self._ledger.get(completion.transfer_id)
+            parked = self._parked.get(completion.transfer_id)
+            if state is None or parked is None:
+                # The push landed before this round parked (a destination
+                # known at launch, issue #330). poll() returns it once, so
+                # retain it until the round parks.
+                unparked[completion.transfer_id] = completion
+                continue
+            if parked.candidate_completion is not None:
+                continue
+            if completion.root_token != parked.bonus_token:
+                raise ValueError(
+                    "direct candidate root does not match Target bonus token"
+                )
+            self._ledger.mark_direct_ready(
+                completion.transfer_id,
+                draft_instance_id=completion.draft_instance_id,
+            )
+            self._note_draft_progress(completion.draft_instance_id)
+            parked.result_received_ns = completion.observed_ns
+            self._p0_emit(
+                "candidate_observed",
+                transfer_id=completion.transfer_id,
+                request_id=parked.req.rid,
+                round_id=parked.round_id,
+                completion_observed_ns=completion.observed_ns,
+                producer_globaltimer_ns=getattr(
+                    completion, "producer_globaltimer_ns", 0
+                ),
+                ready_source=getattr(completion, "ready_source", "notice"),
+            )
+            if self._profile_active:
+                export_ledger_ready_ns = time.monotonic_ns()
+                self._profile_emit(
+                    "target_direct_completion",
+                    transfer_id=completion.transfer_id,
+                    request_id=parked.req.rid,
+                    round_id=parked.round_id,
+                    slot_id=completion.slot_id,
+                    generation=completion.generation,
+                    notice_queued_ns=completion.notice_queued_ns,
+                    notice_received_ns=completion.notice_received_ns,
+                    metadata_submitted_ns=completion.metadata_submitted_ns,
+                    metadata_gpu_ns=completion.metadata_gpu_ns,
+                    completion_observed_ns=completion.observed_ns,
+                    ready_source=getattr(completion, "ready_source", "notice"),
+                    producer_globaltimer_ns=getattr(
+                        completion, "producer_globaltimer_ns", 0
+                    ),
+                    delivery_ns=getattr(completion, "delivery_ns", 0),
+                    export_ledger_ready_ns=export_ledger_ready_ns,
+                    target_compute_batches_inflight=self._target_compute_batches_inflight,
+                )
+            events.append(
+                (
+                    "ready_direct",
+                    completion.transfer_id,
+                    (completion, parked.bonus_token, parked.seq_len),
+                )
+            )
+        return events
+
+    def _poll_ready_phase(
+        self,
+    ) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
+        """READY-only export-rank poll for the P3 split (issue #281).
+
+        Only native completion observation and the deferred control events
+        feed the packet.  No Coordinator I/O, pending-send flush, ring
+        cleanup, release/cancel scan, timeout/lease scan or lifecycle status
+        runs here, so the broadcast follows observation directly.
+        """
+
+        profile_receive = bool(getattr(self, "_profile_active", False))
+        receive_parts: dict[str, int] = {}
+        mark_ns = time.monotonic_ns()
+
+        def mark(name: str) -> None:
+            nonlocal mark_ns
+            if not profile_receive:
+                return
+            now_ns = time.monotonic_ns()
+            receive_parts[name] = now_ns - mark_ns
+            mark_ns = now_ns
+
+        events: list[tuple[str, str, object]] = []
+        deferred = self._deferred_control_events
+        if deferred:
+            # Exactly one drain per READY packet.  A second refresh in the
+            # same scheduler iteration sees an empty FIFO and only new native
+            # completions, so older control events are never replayed.
+            while deferred:
+                events.append(deferred.popleft())
+        mark("deferred_events_ns")
+        if self._candidate_arena is not None:
+            # Direct Draft completion is intentionally observed before the
+            # independent Coordinator retirement channel.
+            self._candidate_arena.poll_completion_notices()
+            self._candidate_arena.poll_completion_records()
+            events.extend(self._observe_ready_direct_completions())
+        mark("arena_complete_ns")
+        return events, receive_parts
+
+    def run_control_phase(self) -> None:
+        """TP0 post-launch control work for the P3 split (issue #281).
+
+        Called from ``event_loop_overlap`` after the current batch launch (or
+        once in an idle iteration) and before the previous result is consumed.
+        Non-export ranks return immediately, so every rank keeps the same
+        scheduler control flow.  Produced events are queued for the next READY
+        packet in production order; no collective is issued.
+        """
+
+        if not self.p3_control_split or not self.is_export_rank:
+            return
+        events: list[tuple[str, str, object]] = []
+        if getattr(self, "_ring_publish_pending", None):
+            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
+            # kernel-published waves, off the READY critical path.
+            self._ring_publish_cleanup()
+        self._flush_pending_send()
+        if self._candidate_arena is not None and self._ring_outstanding:
+            self._poll_direct_ring_reads()
+            if self._ring_lease:
+                self._fence_dead_ring_owners()
+        self._consume_control_messages(events)
+        if self._candidate_arena is not None:
+            self._candidate_arena.poll_releases()
+            self._candidate_arena.poll_cancelled()
+        events.extend(self._expire_local_rounds())
+        self._expire_source_leases(now_ns=time.monotonic_ns())
+        self._maybe_emit_lifecycle_status()
+        self._defer_control_events(events)
+
+    def _defer_control_events(
+        self, events: list[tuple[str, str, object]]
+    ) -> None:
+        if not events:
+            return
+        fifo = self._deferred_control_events
+        if len(fifo) + len(events) > _P3_CONTROL_EVENT_FIFO_LIMIT:
+            raise RuntimeError(
+                "DT P3 control event FIFO overflow: READY phase stopped "
+                "draining deferred events"
+            )
+        fifo.extend(events)
+
+    def _poll_export_rank(self) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
+        if self.p3_control_split:
+            # Issue #281 P3 (default off): the READY snapshot is the only
+            # export-rank work on the pre-broadcast path.  The control half
+            # runs from event_loop_overlap after launch.
+            return self._poll_ready_phase()
+        profile_receive = bool(getattr(self, "_profile_active", False))
+        receive_parts: dict[str, int] = {}
+        mark_ns = time.monotonic_ns()
+
+        def mark(name: str) -> None:
+            nonlocal mark_ns
+            if not profile_receive:
+                return
+            now_ns = time.monotonic_ns()
+            receive_parts[name] = now_ns - mark_ns
+            mark_ns = now_ns
+
+        if getattr(self, "_ring_publish_pending", None):
+            # Deferred §7.1 bookkeeping: Coordinator confirmation tasks for
+            # kernel-published waves, off the park critical path.
+            self._ring_publish_cleanup()
+        mark("ring_cleanup_ns")
+        self._flush_pending_send()
+        mark("flush_send_ns")
+
+        events: list[tuple[str, str, object]] = []
+        if self._candidate_arena is not None:
+            # Direct Draft completion is intentionally observed before the
+            # independent Coordinator retirement channel.
+            self._candidate_arena.poll_completion_notices()
+            self._candidate_arena.poll_completion_records()
+            if self._ring_outstanding:
+                self._poll_direct_ring_reads()
+                if self._ring_lease:
+                    self._fence_dead_ring_owners()
+        mark("arena_notice_ns")
+        self._consume_control_messages(events)
         mark("zmq_recv_ns")
         if self._candidate_arena is not None:
             self._candidate_arena.poll_releases()
             self._candidate_arena.poll_cancelled()
-            arena = self._candidate_arena
-            completions = arena.poll()
-            unparked = self._unparked_completions
-            if unparked:
-                # Kept only while its slot still holds it (not let go since).
-                held = {t: c for t, c in unparked.items() if arena.holds(c)}
-                unparked.clear()
-                held.update((c.transfer_id, c) for c in completions)
-                completions = held.values()
-            for completion in completions:
-                state = self._ledger.get(completion.transfer_id)
-                parked = self._parked.get(completion.transfer_id)
-                if state is None or parked is None:
-                    # The push landed before this round parked (a destination
-                    # known at launch, issue #330).  poll() returns a
-                    # completion once, so keep it until the round parks.
-                    unparked[completion.transfer_id] = completion
-                    continue
-                if parked.candidate_completion is not None:
-                    continue
-                if completion.root_token != parked.bonus_token:
-                    raise ValueError(
-                        "direct candidate root does not match Target bonus token"
-                    )
-                self._ledger.mark_direct_ready(
-                    completion.transfer_id,
-                    draft_instance_id=completion.draft_instance_id,
-                )
-                self._note_draft_progress(completion.draft_instance_id)
-                parked.result_received_ns = completion.observed_ns
-                if self._profile_active:
-                    export_ledger_ready_ns = time.monotonic_ns()
-                    self._profile_emit(
-                        "target_direct_completion",
-                        transfer_id=completion.transfer_id,
-                        request_id=parked.req.rid,
-                        round_id=parked.round_id,
-                        slot_id=completion.slot_id,
-                        generation=completion.generation,
-                        notice_queued_ns=completion.notice_queued_ns,
-                        notice_received_ns=completion.notice_received_ns,
-                        metadata_submitted_ns=completion.metadata_submitted_ns,
-                        metadata_gpu_ns=completion.metadata_gpu_ns,
-                        completion_observed_ns=completion.observed_ns,
-                        ready_source=getattr(completion, "ready_source", "notice"),
-                        producer_globaltimer_ns=getattr(
-                            completion, "producer_globaltimer_ns", 0
-                        ),
-                        delivery_ns=getattr(completion, "delivery_ns", 0),
-                        export_ledger_ready_ns=export_ledger_ready_ns,
-                        target_compute_batches_inflight=self._target_compute_batches_inflight,
-                    )
-                events.append(
-                    (
-                        "ready_direct",
-                        completion.transfer_id,
-                        (completion, parked.bonus_token, parked.seq_len),
-                    )
-                )
+            events.extend(self._observe_ready_direct_completions())
         mark("arena_complete_ns")
         events.extend(self._expire_local_rounds())
         mark("expire_rounds_ns")
@@ -6256,13 +7368,31 @@ class DTTargetController:
             pass
         elif self.uses_direct_gpu_source:
             assert self._feature_source_pool is not None
-            self._feature_source_pool.read_done(
+            observed_ns = (
+                time.monotonic_ns()
+                if getattr(self, "target_source_buffer_profile_enabled", False)
+                else 0
+            )
+            freed_publication = self._feature_source_pool.read_done(
                 transfer_id=message.transfer_id,
                 source_slot_id=message.source_slot_id,
                 slot_generation=message.slot_generation,
                 source_session_id=message.source_session_id,
                 pool_generation=message.pool_generation,
             )
+            if observed_ns:
+                self._profile_note_source_read_done(
+                    transfer_id=message.transfer_id,
+                    source_slot_id=message.source_slot_id,
+                    slot_generation=message.slot_generation,
+                    owner=(
+                        getattr(message, "instance_session_id", "")
+                        or getattr(message, "draft_instance_id", "")
+                    ),
+                    channel="relayed_source_read_done",
+                    observed_ns=observed_ns,
+                    freed_publication=freed_publication,
+                )
             self._source_slot_by_transfer.pop(message.transfer_id, None)
             self._source_deadline_by_transfer.pop(message.transfer_id, None)
             staged_leases = getattr(
@@ -6842,7 +7972,7 @@ class DTTargetController:
                     if landed is not None:
                         landed.add(transfer_id)
                 return
-            retirement.pop(transfer_id)
+            draft_session_id = retirement.pop(transfer_id)
         source_ref = self._source_slot_by_transfer.get(transfer_id)
         if source_ref is None:
             return
@@ -6850,13 +7980,28 @@ class DTTargetController:
         if not self.uses_direct_gpu_source or pool is None:
             return
         try:
-            pool.read_done(
+            observed_ns = (
+                time.monotonic_ns()
+                if getattr(self, "target_source_buffer_profile_enabled", False)
+                else 0
+            )
+            freed_publication = pool.read_done(
                 transfer_id=transfer_id,
                 source_slot_id=source_ref[0],
                 slot_generation=source_ref[1],
                 source_session_id=pool.source_session_id,
                 pool_generation=pool.pool_generation,
             )
+            if observed_ns:
+                self._profile_note_source_read_done(
+                    transfer_id=transfer_id,
+                    source_slot_id=source_ref[0],
+                    slot_generation=source_ref[1],
+                    owner=draft_session_id or "",
+                    channel="remote_candidate_proof",
+                    observed_ns=observed_ns,
+                    freed_publication=freed_publication,
+                )
         except Exception:
             logger.exception(
                 "remote source retirement proof failed for %s; "
@@ -7127,6 +8272,7 @@ class DTTargetController:
     def _launch_fallback(self, reason: str):
         if self._profile_active:
             self._profile_emit("target_ring_publish_launch_fallback", reason=reason)
+        self._p0_emit("at_launch_fallback", reason=reason)
         return None
 
     def _dflash_ring_publish_at_launch_impl(
@@ -7392,7 +8538,7 @@ class DTTargetController:
 
         staging_slot = publisher.next_launch_slot()
         publisher.stage_requests(entries, staging_slot=staging_slot)
-        source_byte_offset = pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
+        source_byte_offset = pool.publication_offset(slot_id, generation)
         try:
             return publisher.publish(
                 stream=int(self.scheduler.forward_stream.cuda_stream),
@@ -7456,6 +8602,7 @@ class DTTargetController:
                     row_start=0,
                 ),
             ),
+            wave_id=getattr(batch, "dt_full_wave_id", None),
         )
         self._ring_publish_pending.append(wave)
         batch_result.dt_ring_publish_wave = wave
@@ -7717,9 +8864,7 @@ class DTTargetController:
                 _mark("handle_war")
                 publisher.stage_requests(entries)
                 _mark("entries")
-                source_byte_offset = (
-                    pool._buffer.allocation_offset + slot_id * pool._slot_nbytes
-                )
+                source_byte_offset = pool.publication_offset(slot_id, generation)
                 # The kernel reads the per-slot accept counts straight from the
                 # verify's GPU tensor (same int32 layout as the staged copy); the
                 # CPU-staged counts buffer is only a fallback for CPU-side
@@ -7867,8 +9012,7 @@ class DTTargetController:
                         staging_slot=staging_slot,
                     )
                     source_byte_offset = (
-                        pool._buffer.allocation_offset
-                        + slot_id * pool._slot_nbytes
+                        pool.publication_offset(slot_id, generation)
                         + row_cursor * self.pivot_width * 2
                     )
                     wave_seq = publisher.publish(
@@ -7935,6 +9079,7 @@ class DTTargetController:
             reqs={req.rid: req for req in batch.reqs},
             proposals={},
             records=records,
+            wave_id=getattr(batch, "dt_full_wave_id", None),
         )
         self._ring_publish_pending.append(wave)
         _mark("wave_build")
@@ -8062,6 +9207,13 @@ class DTTargetController:
                         f"<{token_total}I", raw, base + V2_TOKEN_OFFSET
                     )
                     hidden_produced_ns = _struct.unpack_from("<Q", raw, base + 64)[0]
+                    gpu_clock = getattr(self, "_gpu_clock", None)
+                    hidden_produced_host_ns = (
+                        gpu_clock.globaltimer_to_monotonic(hidden_produced_ns)
+                        if gpu_clock is not None
+                        else 0
+                    )
+                    record.observed_ns = time.monotonic_ns()
                     record.record = [
                         row_count,
                         request_count,
@@ -8071,6 +9223,19 @@ class DTTargetController:
                         hidden_produced_ns,
                         slot_seq,
                     ]
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        for spec in record.specs:
+                            self._p0_emit(
+                                "record_visible",
+                                transfer_id=spec[1],
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                wave_id=wave.wave_id,
+                                ring_seq=record.wave_seq,
+                                hidden_produced_ns=hidden_produced_ns,
+                                hidden_produced_host_ns=hidden_produced_host_ns,
+                                record_visible_ns=record.observed_ns,
+                            )
                 else:
                     # Snapshotted records proceed from the snapshot even if
                     # the producer has wrapped (the Drafts consume records
@@ -8186,6 +9351,19 @@ class DTTargetController:
                             self._candidate_arena._metadata_buffer.allocation_offset
                         ),
                     )
+                    destination_written_ns = time.monotonic_ns()
+                    if getattr(self, "target_p0_hop_profile_enabled", False):
+                        for spec in specs:
+                            self._p0_emit(
+                                "destination_written",
+                                transfer_id=spec[1],
+                                request_id=spec[0],
+                                round_id=spec[2],
+                                wave_id=wave.wave_id,
+                                ring_seq=record.wave_seq,
+                                record_visible_ns=record.observed_ns,
+                                destination_written_ns=destination_written_ns,
+                            )
             # Publish the source slot exactly once, now that every record is
             # visible: all records name disjoint ranges of its rows.
             hidden_produced_ns = max(record.record[5] for record in wave.records)
@@ -8208,6 +9386,7 @@ class DTTargetController:
                 producer_event=wave.ready_event,
                 hidden_produced_ns=hidden_produced_ns,
             )
+            self._profile_register_source_publication(published)
             descriptors_by_transfer = {
                 descriptor.transfer_id: descriptor
                 for descriptor in published.descriptors
@@ -8546,6 +9725,7 @@ class DTTargetController:
                     continue
                 if seq != ring_task.direct_ring_seq:
                     raise RuntimeError("direct ring sequence diverged from its plan")
+                write_finished_ns = time.monotonic_ns()
                 self._remote_ring_records[task.transfer_id] = seq
                 # Remember the destination with the seq: if this submit does
                 # not go out, the re-flush must reuse both together, never a
@@ -8565,6 +9745,16 @@ class DTTargetController:
                         written_ns=written_ns,
                         remote=True,
                     )
+                self._p0_emit(
+                    "ring_written",
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    ring_seq=seq,
+                    written_ns=written_ns,
+                    write_finished_ns=write_finished_ns,
+                    remote=True,
+                )
                 stamped.append(ring_task)
                 continue
             planned_next[binding[1]] = next_seq(seq)
@@ -8636,6 +9826,7 @@ class DTTargetController:
                 pull = (source.source_slot_id, source.slot_generation)
             if seq != task.direct_ring_seq:
                 raise RuntimeError("direct ring sequence diverged from its plan")
+            write_finished_ns = time.monotonic_ns()
             # Applied after ledger.begin() registers the round.
             self._lease_marks.append(
                 (task.transfer_id, self._draft_binding[task.request_id][0])
@@ -8651,6 +9842,16 @@ class DTTargetController:
                     written_ns=written_ns,
                     remote=False,
                 )
+            self._p0_emit(
+                "ring_written",
+                transfer_id=task.transfer_id,
+                request_id=task.request_id,
+                round_id=task.round_id,
+                ring_seq=seq,
+                written_ns=written_ns,
+                write_finished_ns=write_finished_ns,
+                remote=False,
+            )
             self._ring_unproven[task.transfer_id] = draft_session_id
             self._ring_outstanding[draft_session_id].append(
                 (seq, task.transfer_id, pull)
@@ -8728,13 +9929,38 @@ class DTTargetController:
                     proven.popitem(last=False)
                 if self._source_slot_by_transfer.get(transfer_id) != pull:
                     continue
-                pool.read_done(
+                profile_read = self._profile_active
+                observed_ns = time.monotonic_ns() if profile_read else 0
+                free_slots_before = pool.free_slot_count if profile_read else 0
+                freed_publication = pool.read_done(
                     transfer_id=transfer_id,
                     source_slot_id=pull[0],
                     slot_generation=pull[1],
                     source_session_id=pool.source_session_id,
                     pool_generation=pool.pool_generation,
                 )
+                if getattr(self, "target_source_buffer_profile_enabled", False):
+                    self._profile_note_source_read_done(
+                        transfer_id=transfer_id,
+                        source_slot_id=pull[0],
+                        slot_generation=pull[1],
+                        owner=draft_session_id,
+                        channel="same_host_ring_read_proof",
+                        observed_ns=observed_ns,
+                        freed_publication=freed_publication,
+                    )
+                if profile_read:
+                    self._profile_emit(
+                        "target_feature_read_proof",
+                        transfer_id=transfer_id,
+                        draft_session_id=draft_session_id,
+                        seq=seq,
+                        slot_id=pull[0],
+                        generation=pull[1],
+                        observed_ns=observed_ns,
+                        free_slots_before=free_slots_before,
+                        free_slots_after=pool.free_slot_count,
+                    )
                 self._source_slot_by_transfer.pop(transfer_id, None)
                 self._source_deadline_by_transfer.pop(transfer_id, None)
                 self._staged_flashmtp_source_leases.discard(transfer_id)

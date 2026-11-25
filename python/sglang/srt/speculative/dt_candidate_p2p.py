@@ -747,6 +747,12 @@ class _PendingCompletionNotice:
     send_failures: int = 0
 
 
+# Experiment flag (Target host path 2b, S3): per-poll arena scans visit only
+# slots that can match instead of every slot (same results, fewer lock and
+# Python iterations on every scheduler poll).
+_LEAN_POLL = os.environ.get("DT_TARGET_LEAN_POLL", "0") == "1"
+
+
 class TargetCandidateArena:
     """Bounded fixed-address rows with transport host completion."""
 
@@ -825,6 +831,9 @@ class TargetCandidateArena:
         # the O(slot_count) sweep entirely while no such slot can exist.
         self._scanned_slot_epoch = 0
         self._release_scan: tuple[int, bool] = (-1, True)
+        # Superset of the slots in READING (begin_read is the only place that
+        # enters READING); poll_releases re-checks the state under the lock.
+        self._reading_slot_ids: set[int] = set()
         self._cancel_scan: tuple[int, bool] = (-1, True)
         self._retired_transfers: OrderedDict[str, None] = OrderedDict()
         # Completion events are released here at slot free and reused by the
@@ -1691,6 +1700,13 @@ class TargetCandidateArena:
         queries = min(max_queries, self.slot_count)
         for offset in range(queries):
             slot_id = (self._poll_cursor + offset) % self.slot_count
+            if (
+                _LEAN_POLL
+                and self._slots[slot_id].state is not CandidateSlotState.ARMED
+            ):
+                # Unlocked pre-filter; an ARMED slot is re-checked under the
+                # lock below, exactly as before.
+                continue
             with self._lock:
                 slot = self._slots[slot_id]
                 if slot.state is not CandidateSlotState.ARMED:
@@ -2301,6 +2317,9 @@ class TargetCandidateArena:
                 ):
                     raise CandidateTransportError("candidate completion is stale")
                 slot.state = CandidateSlotState.READING
+                reading_ids = getattr(self, "_reading_slot_ids", None)
+                if reading_ids is not None:
+                    reading_ids.add(slot_id)
                 self._scanned_slot_epoch += 1
                 slot_ids.append(slot_id)
         # A pageable list upload would block the scheduler until the verify
@@ -2334,11 +2353,22 @@ class TargetCandidateArena:
         if not had_candidates and last_epoch == epoch:
             return 0
         with self._lock:
-            candidates = [
-                (index, slot.generation, slot.read_event)
-                for index, slot in enumerate(self._slots)
-                if slot.state is CandidateSlotState.READING
-            ]
+            # Objects built without __init__ (tests) have no index: full scan.
+            reading = getattr(self, "_reading_slot_ids", None)
+            if _LEAN_POLL and reading is not None:
+                candidates = []
+                for index in sorted(reading):
+                    slot = self._slots[index]
+                    if slot.state is CandidateSlotState.READING:
+                        candidates.append((index, slot.generation, slot.read_event))
+                    else:
+                        reading.discard(index)
+            else:
+                candidates = [
+                    (index, slot.generation, slot.read_event)
+                    for index, slot in enumerate(self._slots)
+                    if slot.state is CandidateSlotState.READING
+                ]
         self._release_scan = (epoch, bool(candidates))
         for slot_id, generation, event in candidates:
             if event is None:

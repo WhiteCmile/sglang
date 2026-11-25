@@ -116,6 +116,7 @@ def make_controller():
     c._feature_source_pool = SimpleNamespace(
         _buffer=SimpleNamespace(allocation_offset=1 << 20),
         _slot_nbytes=6,
+        publication_offset=lambda slot_id, _generation: (1 << 20) + slot_id * 6,
         quarantine_reserved=lambda *args: setattr(c, "_quarantined", args),
     )
     c._quarantined = None

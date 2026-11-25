@@ -1689,6 +1689,17 @@ class Scheduler(
                 False,
             )
         )
+        # Opt-in: consume a head result that poll() already proved complete
+        # before selecting the next batch. Default-off keeps the baseline
+        # iteration order byte-for-byte.
+        early_ready_result_enabled = (
+            os.environ.get("DT_TARGET_EARLY_READY_RESULT", "0") == "1"
+        )
+        # Default-off switch for the bounded second READY collection below,
+        # cached once when the loop starts so the hot path reads one bool.
+        ready_refresh_before_select = (
+            os.environ.get("DT_TARGET_READY_REFRESH_BEFORE_SELECT", "0") == "1"
+        )
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1803,6 +1814,46 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # Bounded second READY collection (default off): refresh parked
+            # requests once between the first poll and batch selection so a
+            # candidate that completed in that window can still join this
+            # batch. The entry state is TP lockstep: the cached switch is read
+            # from the launch environment on every rank, the controller exists
+            # on every Target rank, ``len(controller)`` counts the replicated
+            # ``_parked`` rounds created/drained on every rank from the same
+            # batches and broadcast poll events, ``hold_next_batch`` is the
+            # value the export rank just broadcast in the first poll, and
+            # ``has_compute_slot()`` reads the launch/result counter every
+            # rank advances in lockstep with the shared batch sequence. This
+            # straight-line block runs at most once per loop iteration, so no
+            # per-round counter or assertion is needed.
+            if (
+                ready_refresh_before_select
+                and self.dt_target_controller is not None
+                and len(self.dt_target_controller) > 0
+                and not self.dt_target_controller.hold_next_batch
+                and self.dt_target_controller.has_compute_slot()
+            ):
+                self.dt_target_controller.poll(overlap_result=pending_result)
+                if target_phase_profile_enabled:
+                    poll_finished_ns = time.monotonic_ns()
+
+            # Bounded early consumption of an already-complete head result.
+            # poll() broadcast the copy_done readiness decision, so every TP
+            # rank enters this branch together. Reuse pop_and_process itself
+            # (same deque FIFO, note_overlap_result_done, process_batch_result
+            # and KV/request ownership release) and suppress the later pop.
+            early_ready_result_consumed = False
+            if (
+                early_ready_result_enabled
+                and self.dt_target_controller is not None
+                and self.last_batch
+                and self.result_queue
+                and self.dt_target_controller._overlap_result_ready is True
+            ):
+                pop_and_process()
+                early_ready_result_consumed = True
+
             # Get the next batch to run
             selection_started_ns = (
                 time.monotonic_ns()
@@ -1843,7 +1894,8 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                if not early_ready_result_consumed:
+                    pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1870,9 +1922,26 @@ class Scheduler(
             else:
                 batch_result = None
 
+            # Issue #281 P3 (default off): the export rank runs the control
+            # half of the split after this launch returns, while the GPU is
+            # busy, and before the previous result is consumed. Non-export
+            # ranks return immediately; no collective is issued. An idle
+            # iteration still reaches here once, so control cannot starve.
+            if (
+                self.dt_target_controller is not None
+                and getattr(
+                    self.dt_target_controller, "p3_control_split", False
+                )
+            ):
+                self.dt_target_controller.run_control_phase()
+
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and not defer_dt_result:
+                if (
+                    not disable_overlap_for_batch
+                    and not defer_dt_result
+                    and not early_ready_result_consumed
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -3182,6 +3251,19 @@ class Scheduler(
             # feature rows. Keep the selected work in running_batch until TP0
             # observes a reusable registered source slot; this is ordinary
             # scheduler backpressure, not a per-round allocation fallback.
+            work_kind = "selection"
+            if not running_batch.is_empty():
+                work_kind = (
+                    "prefill"
+                    if running_batch.forward_mode.is_extend()
+                    else "verify"
+                )
+            self.dt_target_controller.profile_source_capacity_blocked(
+                work_kind=work_kind,
+                batch_size=running_batch.batch_size(),
+                waiting_requests=len(self.waiting_queue),
+                parked_rounds=len(self.dt_target_controller),
+            )
             if dt_arbitration_profile_enabled:
                 self.dt_target_controller.profile_empty_prefill_arbitration(
                     decision_started_ns=dt_arbitration_decision_started_ns,
@@ -3338,6 +3420,10 @@ class Scheduler(
                     )
                     else 0
                 )
+                if update_running_started_ns:
+                    running_batch.dt_hostpath_marks = [
+                        ("update_running_start", update_running_started_ns)
+                    ]
                 running_batch = self.update_running_batch(running_batch)
                 if update_running_started_ns:
                     running_batch.dt_update_running_ns = (
@@ -3710,7 +3796,10 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        hostpath_marks = getattr(batch, "dt_hostpath_marks", None)
         batch.filter_batch()
+        if hostpath_marks is not None:
+            hostpath_marks.append(("filter", time.monotonic_ns()))
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -3723,6 +3812,8 @@ class Scheduler(
         if kv_full_retract_flag and self.dt_target_controller is not None:
             self._retract_dt_owned_for_oom()
             kv_full_retract_flag = not batch.check_decode_mem()
+        if hostpath_marks is not None:
+            hostpath_marks.append(("check_decode_mem", time.monotonic_ns()))
 
         # Check if decode out of memory
         if kv_full_retract_flag or (
@@ -3801,8 +3892,12 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
+        if hostpath_marks is not None:
+            hostpath_marks.append(("retract_or_decay", time.monotonic_ns()))
         # Update batch tensors
         batch.prepare_for_decode()
+        if hostpath_marks is not None:
+            hostpath_marks.append(("prepare_for_decode", time.monotonic_ns()))
         return batch
 
     def _retract_dt_owned_for_oom(self) -> None:
@@ -3987,6 +4082,13 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        dt_tail = (
+                            [("worker_returned", time.monotonic_ns())]
+                            if self.dt_target_controller is not None
+                            and self.dt_target_controller.target_phase_profile_enabled
+                            and getattr(batch, "dt_full_wave_id", None) is not None
+                            else None
+                        )
                         if eagle3_host_span_active:
                             batch.dt_eagle3_after_worker_call_ns = time.monotonic_ns()
                             batch_result.dt_eagle3_host_span_active = True
@@ -4058,10 +4160,14 @@ class Scheduler(
                                 forward_done,
                                 batch.out_cache_loc,
                             )
+                        if dt_tail is not None:
+                            dt_tail.append(("keepalive", time.monotonic_ns()))
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
+                            if dt_tail is not None:
+                                dt_tail.append(("relay", time.monotonic_ns()))
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -4087,6 +4193,10 @@ class Scheduler(
                                         self.dt_target_controller.stage_overlap_pivot_copy(
                                             batch, batch_result
                                         )
+                                        if dt_tail is not None:
+                                            dt_tail.append(
+                                                ("pivot_copy", time.monotonic_ns())
+                                            )
                                     if eagle3_host_span_active:
                                         batch_result.dt_eagle3_copy_submit_started_ns = (
                                             time.monotonic_ns()
@@ -4102,6 +4212,9 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
+                if dt_tail is not None:
+                    dt_tail.append(("ctx_exit", time.monotonic_ns()))
+                    batch_result.dt_run_batch_tail = dt_tail
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
 
@@ -4196,6 +4309,16 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        tail = getattr(ret, "dt_run_batch_tail", None)
+        if tail is not None:
+            tail.append(("return", time.monotonic_ns()))
+            self.dt_target_controller._profile_emit(
+                "target_run_batch_tail",
+                wave_id=getattr(batch, "dt_full_wave_id", None),
+                batch_size=len(batch.reqs),
+                marks=tail,
+            )
+            ret.dt_run_batch_tail = None
         self._maybe_report_active_ranks()
 
         if eagle3_host_span_active:

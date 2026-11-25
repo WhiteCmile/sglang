@@ -582,8 +582,8 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             sync_profile = cuda_sync_enabled()
         started_ns = time.monotonic_ns()
         gpu_profile_events = None
-        if bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
-            self, "_is_dflash", False
+        if bool(os.environ.get("DT_PROFILE_DIR")) and (
+            getattr(self, "_is_dflash", False) or getattr(self, "_is_flashmtp", False)
         ):
             event_type = torch.get_device_module(self.device).Event
             gpu_profile_events = tuple(
@@ -631,6 +631,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         batch.seq_lens_sum = seq_lens_sum_backup
         if gpu_profile_events is not None:
             gpu_profile_events[0].record()
+        hostpath_marks = getattr(batch, "dt_hostpath_worker_marks", None)
+        if hostpath_marks is not None:
+            hostpath_marks.append(("verify_entry", started_ns))
+            hostpath_marks.append(("prepare_for_verify", prepared_ns))
+            hostpath_marks.append(("event0_recorded", time.monotonic_ns()))
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -869,8 +874,14 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             batch, "dt_full_wave_ready_ns", None
         )
         batch_result.dt_pipeline_lane_id = getattr(batch, "dt_pipeline_lane_id", None)
-        if getattr(self, "_is_dflash", False):
+        # P0 hop tracing needs the producer-side boundary for both DFlash
+        # feature rows and FlashMTP pivots.  FlashMTP publishes the pivot via
+        # ``_stage_flashmtp_pivot_copy`` below the scheduler, so without this
+        # stamp its Target send corridor starts at publication and silently
+        # drops the verify-to-publish portion.
+        if not getattr(self, "_is_token_only", False):
             batch_result.dt_hidden_produced_ns = target_done_ns
+        if getattr(self, "_is_dflash", False):
             if getattr(
                 self, "_defer_dflash_feature_stage",
                 self.server_args.draft_target_defer_dflash_feature_stage,
@@ -880,9 +891,9 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
                 batch_result.dt_dflash_candidate_tokens = deferred_feature_tokens
                 if deferred_feature_error is not None:
                     batch_result.dt_deferred_feature_error = deferred_feature_error
-            if gpu_profile_events is not None:
-                gpu_profile_events[3].record()
-                batch_result.dt_target_verify_gpu_events = gpu_profile_events
+        if gpu_profile_events is not None:
+            gpu_profile_events[3].record()
+            batch_result.dt_target_verify_gpu_events = gpu_profile_events
         return batch_result
 
     def _prepare_draft_block_eager(

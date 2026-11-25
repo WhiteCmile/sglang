@@ -3501,6 +3501,40 @@ class ServerArgs:
         NS("observability"),
     ] = None
 
+    def _handle_dt_target_env_overrides(self):
+        # Experiment (Target-side verify cost): DT_TARGET_QUANTIZATION=<method>
+        # (e.g. fp8 = online FP8 weight quantization of a bf16 checkpoint) applies
+        # to role=target only; the launcher sets one environment for every
+        # instance and has no Target-only server-arg passthrough. Default unset =
+        # unchanged.
+        method = os.environ.get("DT_TARGET_QUANTIZATION", "")
+        if method and self.draft_target_disaggregation_role == "target":
+            if self.quantization not in (None, method):
+                raise ValueError(
+                    f"DT_TARGET_QUANTIZATION={method} conflicts with "
+                    f"--quantization {self.quantization}"
+                )
+            self.quantization = method
+            logger.info("DT_TARGET_QUANTIZATION: Target quantization=%s", method)
+        # Experiment (verify GEMM shapes): DT_TARGET_CUDA_GRAPH_BS=1,2,...
+        # replaces the Target decode CUDA-graph request buckets so verify waves
+        # pad to row counts whose GEMM shapes are fast (cuBLAS gate_up is slow
+        # at M=320/216/192 tokens). The topology-file launcher only offers
+        # --target-cuda-graph-config, which also turns on Target metrics.
+        buckets = os.environ.get("DT_TARGET_CUDA_GRAPH_BS", "")
+        if buckets and self.draft_target_disaggregation_role == "target":
+            values = [int(v) for v in buckets.split(",")]
+            if values != sorted(set(values)) or values[0] <= 0:
+                raise ValueError(
+                    "DT_TARGET_CUDA_GRAPH_BS must be strictly increasing positive ints"
+                )
+            if self.cuda_graph_bs_decode is not None:
+                raise ValueError(
+                    "DT_TARGET_CUDA_GRAPH_BS conflicts with --cuda-graph-bs-decode"
+                )
+            self.cuda_graph_bs_decode = values
+            logger.info("DT_TARGET_CUDA_GRAPH_BS: Target decode buckets=%s", values)
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3552,6 +3586,9 @@ class ServerArgs:
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
+
+        # Experiment env overrides for disaggregated Target instances.
+        self._handle_dt_target_env_overrides()
 
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()

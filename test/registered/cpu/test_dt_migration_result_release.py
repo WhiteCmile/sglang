@@ -62,6 +62,10 @@ from sglang.srt.speculative.dt_candidate_p2p import (
     TargetCandidateArena,
     _CandidateSlot,
 )
+from sglang.srt.speculative.dt_source_page_allocator import (
+    SourcePageAllocationError,
+    TargetSourcePageAllocator,
+)
 from sglang.srt.speculative.dt_target import (
     DTTargetController,
     ParkedTargetRound,
@@ -1604,7 +1608,7 @@ def test_target_shutdown_missing_source_ack_retains_pool_on_repeated_close() -> 
 
 
 def _cpu_feature_source_pool_for_publish_test(
-    monkeypatch, *, max_tokens: int, feature_width: int
+    monkeypatch, *, max_tokens: int, feature_width: int, slot_count: int = 1
 ):
     class ProducerEvent:
         def __init__(self) -> None:
@@ -1633,12 +1637,12 @@ def _cpu_feature_source_pool_for_publish_test(
     pool.device_uuid = "GPU-target"
     pool.device_index = 0
     pool.device = torch.device("cuda", 0)
-    pool.slot_count = 1
+    pool.slot_count = slot_count
     pool.max_tokens = max_tokens
     pool.feature_width = feature_width
     pool._slot_nbytes = max_tokens * feature_width * 2
     storage = torch.full(
-        (1, max_tokens, feature_width),
+        (slot_count, max_tokens, feature_width),
         -1,
         dtype=torch.bfloat16,
     )
@@ -1652,7 +1656,12 @@ def _cpu_feature_source_pool_for_publish_test(
             active_transfers=set(),
             producer_event=None,
         )
+        for _ in range(slot_count)
     ]
+    pool._free_identities = deque(range(slot_count))
+    pool._free_count = slot_count
+    pool._reserved_count = 0
+    pool._quarantined_count = 0
     pool._active = {}
     pool._cancelled_transfers = set()
     pool._completed = OrderedDict()
@@ -2083,7 +2092,200 @@ def _source_pool_with_pending_producer(producer_event):
     pool._completed_limit = 64
     pool._closed = False
     pool._lock = Lock()
+    pool._free_identities = deque()
+    pool._free_count = 0
+    pool._reserved_count = 0
+    pool._quarantined_count = 0
     return pool, storage
+
+
+class _CountingSlots(list):
+    """List that counts iteration so a logical-slot scan stays observable."""
+
+    def __init__(self, slots):
+        super().__init__(slots)
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+
+def _failing_page_allocator(error):
+    def allocate(*_args):
+        raise error
+
+    return SimpleNamespace(allocate=allocate)
+
+
+def _identity_pool(monkeypatch, *, slot_count: int = 1, max_tokens: int = 1):
+    return _cpu_feature_source_pool_for_publish_test(
+        monkeypatch, max_tokens=max_tokens, feature_width=2, slot_count=slot_count
+    )[0]
+
+
+def _publish_reserved(pool, slot_id, generation, transfer_id, token_count=1):
+    pool.publish_reserved(
+        slot_id=slot_id,
+        generation=generation,
+        token_count=token_count,
+        feature_schema_id="schema",
+        transfers=(FeatureTransferSlice(transfer_id, 0, token_count),),
+        producer_event=SimpleNamespace(ipc_handle=lambda: b"event"),
+    )
+
+
+def _assert_identity_bookkeeping(pool: TargetFeatureSourcePool) -> None:
+    states = [slot.state for slot in pool._slots]
+    free_ids = [i for i, s in enumerate(states) if s is FeatureSlotState.FREE]
+    identities = list(pool._free_identities)
+    assert len(identities) == len(set(identities)), "freelist has duplicates"
+    assert set(identities) == set(free_ids), "freelist drifted from FREE slots"
+    assert pool._free_count == len(free_ids)
+    assert pool._reserved_count == states.count(FeatureSlotState.RESERVED)
+    assert pool._quarantined_count == states.count(FeatureSlotState.QUARANTINED)
+
+
+def test_identity_reserve_release_and_duplicate_are_exact(monkeypatch) -> None:
+    pool = _identity_pool(monkeypatch, slot_count=2, max_tokens=2)
+    _assert_identity_bookkeeping(pool)
+    slot_id, generation, _rows = pool.reserve(2)
+    _assert_identity_bookkeeping(pool)
+    assert (pool._free_count, pool._reserved_count) == (1, 1)
+    pool.release_reserved(slot_id, generation - 1)
+    _assert_identity_bookkeeping(pool)
+    assert pool._reserved_count == 1
+    pool.release_reserved(slot_id, generation)
+    _assert_identity_bookkeeping(pool)
+    identities = list(pool._free_identities)
+    pool.release_reserved(slot_id, generation)
+    _assert_identity_bookkeeping(pool)
+    assert list(pool._free_identities) == identities
+    assert (pool._free_count, pool._reserved_count) == (2, 0)
+
+
+def test_identity_reserve_publish_read_done_matches_scan(monkeypatch) -> None:
+    pool = _identity_pool(monkeypatch, max_tokens=2)
+    slot_id, generation, _rows = pool.reserve(2)
+    _publish_reserved(pool, slot_id, generation, "transfer", token_count=2)
+    _assert_identity_bookkeeping(pool)
+    kwargs = dict(
+        transfer_id="transfer",
+        source_slot_id=slot_id,
+        slot_generation=generation,
+        source_session_id=pool.source_session_id,
+        pool_generation=pool.pool_generation,
+    )
+    assert pool.read_done(**kwargs)
+    _assert_identity_bookkeeping(pool)
+    assert pool._free_count == 1
+    assert not pool.read_done(**kwargs)  # repeated release stays inert
+
+
+def test_page_allocation_failure_restores_identity(monkeypatch) -> None:
+    pool = _identity_pool(monkeypatch, slot_count=2)
+    before = list(pool._free_identities)
+    pool._page_allocator = _failing_page_allocator(
+        SourcePageAllocationError("no extent")
+    )
+    assert pool.reserve(1) is None
+    assert list(pool._free_identities) == before
+    _assert_identity_bookkeeping(pool)
+
+
+def test_quarantine_transitions_keep_identity_leased(monkeypatch) -> None:
+    pool = _identity_pool(monkeypatch, slot_count=2)
+    reserved_id, reserved_generation, _rows = pool.reserve(1)
+    pool.quarantine_reserved(reserved_id, reserved_generation)
+    _assert_identity_bookkeeping(pool)
+    assert (pool._reserved_count, pool._quarantined_count) == (0, 1)
+    assert reserved_id not in pool._free_identities
+    slot_id, generation, _rows = pool.reserve(1)
+    _publish_reserved(pool, slot_id, generation, "published")
+    pool.quarantine(
+        source_slot_id=slot_id,
+        slot_generation=generation,
+        source_session_id=pool.source_session_id,
+        pool_generation=pool.pool_generation,
+    )
+    _assert_identity_bookkeeping(pool)
+    assert (pool._free_count, pool._quarantined_count) == (0, 2)
+
+
+def test_identity_reserve_release_does_not_iterate_logical_slots(monkeypatch) -> None:
+    for slot_count in (1, 2048):
+        pool = _identity_pool(monkeypatch, slot_count=slot_count)
+        pool._slots = _CountingSlots(pool._slots)
+        scans = pool._slots.iterations
+        slot_id, generation, _rows = pool.reserve(1)
+        pool.release_reserved(slot_id, generation)
+        assert pool._slots.iterations == scans
+        _assert_identity_bookkeeping(pool)
+
+
+def test_pool_page_allocator_stats_forward_and_rollback(monkeypatch) -> None:
+    pool = _identity_pool(monkeypatch, slot_count=2, max_tokens=64)
+    allocator = TargetSourcePageAllocator(slot_count=1, slot_rows=64, page_rows=32)
+    pool._page_allocator = allocator
+
+    slot_id, generation, _rows = pool.reserve(48)
+    assert (
+        pool.allocation_count,
+        pool.requested_rows_total,
+        pool.allocated_rows_total,
+        pool.internal_fragmentation_rows_total,
+        pool.leased_page_count_high_water,
+    ) == (
+        allocator.allocation_count,
+        allocator.requested_rows_total,
+        allocator.allocated_rows_total,
+        allocator.internal_fragmentation_rows_total,
+        allocator.leased_page_count_high_water,
+    ) == (1, 48, 64, 16, 2)
+
+    # A rolled-back reservation restores the identity and must not inflate history.
+    assert pool.reserve(1) is None
+    assert (pool.allocation_count, pool.failure_count) == (1, 1)
+    assert pool.active_identity_high_water == 1
+    _assert_identity_bookkeeping(pool)
+
+    _publish_reserved(pool, slot_id, generation, "transfer", token_count=48)
+    assert pool.read_done(
+        transfer_id="transfer",
+        source_slot_id=slot_id,
+        slot_generation=generation,
+        source_session_id=pool.source_session_id,
+        pool_generation=pool.pool_generation,
+    )
+    assert allocator.free_page_count == allocator.total_page_count
+    assert pool.leased_page_count_high_water == 2
+
+
+def test_pool_stats_and_high_water_reads_do_not_scan_slots(monkeypatch) -> None:
+    for slot_count in (1, 2048):
+        pool = _identity_pool(monkeypatch, slot_count=slot_count)
+        pool._slots = _CountingSlots(pool._slots)
+        scans = pool._slots.iterations
+        assert (
+            pool.active_lease_count,
+            pool.active_identity_high_water,
+            pool.free_slot_count,
+            pool.reserved_slot_count,
+            pool.quarantined_slot_count,
+            pool.allocation_count,
+            pool.failure_count,
+            pool.leased_page_count_high_water,
+            pool.requested_rows_total,
+            pool.allocated_rows_total,
+            pool.internal_fragmentation_rows_total,
+        ) == (0, 0, slot_count, 0, 0, 0, 0, 0, 0, 0, 0)
+        assert pool._slots.iterations == scans
+
+        reservations = [pool.reserve(1) for _ in range(min(2, slot_count))]
+        assert pool.active_identity_high_water == len(reservations)
+        for slot_id, generation, _rows in reservations:
+            pool.release_reserved(slot_id, generation)
+        assert pool.active_identity_high_water == len(reservations)
 
 
 def test_feature_source_cancel_defers_retirement_until_producer_completion() -> None:
@@ -2111,9 +2313,11 @@ def test_feature_source_cancel_defers_retirement_until_producer_completion() -> 
     assert pool._cancelled_transfers == {"transfer-0"}
     assert pool._slots[0].producer_event is producer_event
     assert pool._storage is storage
+    _assert_identity_bookkeeping(pool)
 
     producer_event.ready = True
     assert pool.free_slot_count == 1
+    _assert_identity_bookkeeping(pool)
     assert pool._active == {}
     assert pool._cancelled_transfers == set()
     assert pool._slots[0].state is FeatureSlotState.FREE
