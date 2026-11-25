@@ -594,6 +594,8 @@ class DTTargetController:
                 "target_eagle3_host_span requires Draft-Target overlap scheduling"
             )
         self._parked: dict[str, ParkedTargetRound] = {}
+        # Direct completions observed before their round parked, by transfer.
+        self._unparked_completions: dict[str, object] = {}
         self._feature_control_rounds: dict[str, ParkedTargetRound] = {}
         self._draft_admitted_attempts: dict[str, int] = {}
         # Latest observed progress per Draft. The round timeout is a failure
@@ -6040,12 +6042,23 @@ class DTTargetController:
         if self._candidate_arena is not None:
             self._candidate_arena.poll_releases()
             self._candidate_arena.poll_cancelled()
-            for completion in self._candidate_arena.poll():
+            arena = self._candidate_arena
+            completions = arena.poll()
+            unparked = self._unparked_completions
+            if unparked:
+                # Kept only while its slot still holds it (not let go since).
+                held = {t: c for t, c in unparked.items() if arena.holds(c)}
+                unparked.clear()
+                held.update((c.transfer_id, c) for c in completions)
+                completions = held.values()
+            for completion in completions:
                 state = self._ledger.get(completion.transfer_id)
-                if state is None:
-                    continue
                 parked = self._parked.get(completion.transfer_id)
-                if parked is None:
+                if state is None or parked is None:
+                    # The push landed before this round parked (a destination
+                    # known at launch, issue #330).  poll() returns a
+                    # completion once, so keep it until the round parks.
+                    unparked[completion.transfer_id] = completion
                     continue
                 if parked.candidate_completion is not None:
                     continue
