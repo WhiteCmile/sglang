@@ -4069,6 +4069,13 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        dt_tail = (
+                            [("worker_returned", time.monotonic_ns())]
+                            if self.dt_target_controller is not None
+                            and self.dt_target_controller.target_phase_profile_enabled
+                            and getattr(batch, "dt_full_wave_id", None) is not None
+                            else None
+                        )
                         if eagle3_host_span_active:
                             batch.dt_eagle3_after_worker_call_ns = time.monotonic_ns()
                             batch_result.dt_eagle3_host_span_active = True
@@ -4140,10 +4147,14 @@ class Scheduler(
                                 forward_done,
                                 batch.out_cache_loc,
                             )
+                        if dt_tail is not None:
+                            dt_tail.append(("keepalive", time.monotonic_ns()))
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
+                            if dt_tail is not None:
+                                dt_tail.append(("relay", time.monotonic_ns()))
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -4169,6 +4180,10 @@ class Scheduler(
                                         self.dt_target_controller.stage_overlap_pivot_copy(
                                             batch, batch_result
                                         )
+                                        if dt_tail is not None:
+                                            dt_tail.append(
+                                                ("pivot_copy", time.monotonic_ns())
+                                            )
                                     if eagle3_host_span_active:
                                         batch_result.dt_eagle3_copy_submit_started_ns = (
                                             time.monotonic_ns()
@@ -4184,6 +4199,9 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
+                if dt_tail is not None:
+                    dt_tail.append(("ctx_exit", time.monotonic_ns()))
+                    batch_result.dt_run_batch_tail = dt_tail
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
 
@@ -4278,6 +4296,16 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        tail = getattr(ret, "dt_run_batch_tail", None)
+        if tail is not None:
+            tail.append(("return", time.monotonic_ns()))
+            self.dt_target_controller._profile_emit(
+                "target_run_batch_tail",
+                wave_id=getattr(batch, "dt_full_wave_id", None),
+                batch_size=len(batch.reqs),
+                marks=tail,
+            )
+            ret.dt_run_batch_tail = None
         self._maybe_report_active_ranks()
 
         if eagle3_host_span_active:
