@@ -1794,13 +1794,17 @@ class Scheduler(
                 pending_result = (
                     self.result_queue[0][1] if self.result_queue else None
                 )
-                self.dt_target_controller.poll(overlap_result=pending_result)
+                self.dt_target_controller.ready_sync(overlap_result=pending_result)
             poll_finished_ns = (
                 time.monotonic_ns()
                 if target_phase_profile_enabled
                 else 0
             )
             if self._engine_paused:
+                if self.dt_target_controller is not None:
+                    # P3: the Coordinator I/O half of the split poll must keep
+                    # running while the engine is paused (no launch to follow).
+                    self.dt_target_controller.control_phase()
                 continue
 
             # Get the next batch to run
@@ -1869,6 +1873,14 @@ class Scheduler(
                 )
             else:
                 batch_result = None
+
+            if self.dt_target_controller is not None:
+                # P3 (DT_TARGET_POLL_SPLIT, issue #328): the poll's control
+                # half — Coordinator I/O, flush, releases, read proofs, expiry
+                # — runs here, after launch and before the previous wave's
+                # result processing, while the GPU holds up to two waves.
+                # No-op with the flag off and on non-export ranks.
+                self.dt_target_controller.control_phase()
 
             # Process the last batch
             if self.last_batch:

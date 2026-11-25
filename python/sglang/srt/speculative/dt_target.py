@@ -441,6 +441,8 @@ class DTTargetController:
     _last_poll_broadcast_ns = 0
     _last_poll_receive_ns = 0
     _last_ready_snapshot_ns = 0
+    _last_control_phase_ns = 0
+    _target_poll_split = False
     _driver_stats_dump_ns = 0
     _capacity_gauge_emit_ns = 0
     _arena_active_high_water = 0
@@ -775,6 +777,7 @@ class DTTargetController:
         from sglang.srt.speculative.dt_direct_ring import (
             RING_PUBLISH_AT_LAUNCH,
             TARGET_DEST_AT_LAUNCH,
+            TARGET_POLL_SPLIT,
         )
 
         self._ring_publish_at_launch = RING_PUBLISH_AT_LAUNCH
@@ -782,6 +785,12 @@ class DTTargetController:
         # authorize their candidate destinations at launch and the cleanup
         # shrinks to source accounting and read-proof registration.
         self._target_dest_at_launch = TARGET_DEST_AT_LAUNCH
+        # P3 (DT_TARGET_POLL_SPLIT): ready_sync at the loop head, the
+        # Coordinator/cleanup control phase after launch (TP0 only).
+        self._target_poll_split = TARGET_POLL_SPLIT
+        # TP-relevant events the control phase produced; the next ready_sync
+        # packet carries them ahead of its own, preserving the poll's order.
+        self._control_pending_events: list[tuple[str, str, object]] = []
         self._ring_publishers: dict[str, object] = {}  # session -> RingGpuPublisher
         self._ring_publish_pending: deque = deque()
         self._ring_publish_transfers: set[str] = set()
@@ -3413,6 +3422,15 @@ class DTTargetController:
         batch_result.dt_dflash_release_ns = time.monotonic_ns() - phase_started_ns
 
     def poll(self, *, overlap_result=None) -> None:
+        self.ready_sync(overlap_result=overlap_result)
+        self.control_phase()
+
+    def ready_sync(self, *, overlap_result=None) -> None:
+        """The loop-head half of the poll (P3, issue #328): with
+        DT_TARGET_POLL_SPLIT=1 the export rank only snapshots completions and
+        marks READY before the TP exchange; Coordinator I/O and cleanup wait
+        for the post-launch control_phase().  With the flag off this is the
+        whole poll, exactly as before."""
         poll_entered_ns = time.monotonic_ns()
         self._poll_target_gpu_observations()
         observer = getattr(self, "_overlap_fix_observer", None)
@@ -3423,7 +3441,14 @@ class DTTargetController:
         packet = None
         if self.is_export_rank:
             receive_start_ns = time.monotonic_ns()
-            events, receive_parts = self._poll_export_rank()
+            if self._target_poll_split:
+                ready_events, receive_parts = self._ready_sync_export_rank()
+                # The previous control phase's events ride this packet ahead
+                # of the fresh READY events: the same relative order the
+                # unsplit poll applies them in (Coordinator before arena).
+                events = self._drain_control_pending_events() + ready_events
+            else:
+                events, receive_parts = self._poll_export_rank()
             packet = (
                 time.monotonic_ns(),
                 events,
@@ -3481,9 +3506,11 @@ class DTTargetController:
             self._drain_gc_trace_events()
             self._maybe_dump_driver_stats(time.monotonic_ns())
             rdma = getattr(self, "_rdma_endpoint", None)
-            if rdma is not None:
+            if rdma is not None and not self._target_poll_split:
                 # P5a (issue #313): the native slot-ready sender's stamps,
-                # as target_ready_publish / target_ready_cqe events.
+                # as target_ready_publish / target_ready_cqe events.  With the
+                # poll split the sender completion ring drains in the control
+                # phase instead.
                 rdma.dump_sender_trace()
         if ring_publish_fatal:
             # A publication failure is fatal on the export rank; the other
@@ -3582,6 +3609,45 @@ class DTTargetController:
 
         if observer is not None:
             observer.target_decision(self)
+
+    def control_phase(self) -> None:
+        """The post-launch half of the split poll (P3, issue #328): TP0 only,
+        after launch, while the GPU holds up to two waves.  Runs the
+        Coordinator receive loop, pending-send flush, ring cleanup, arena
+        releases, read proofs and expiry scans.  TP-relevant events are
+        stashed and ride the next ready_sync packet in order, so every rank
+        applies them at the same loop point.  A no-op with the flag off."""
+        if not self._target_poll_split or not self.is_export_rank:
+            return
+        control_started_ns = time.monotonic_ns()
+        events, control_parts = self._control_phase_export_rank()
+        if events:
+            pending = getattr(self, "_control_pending_events", None)
+            if pending is None:
+                pending = self._control_pending_events = []
+            pending.extend(events)
+        control_finished_ns = time.monotonic_ns()
+        self._last_control_phase_ns = control_finished_ns - control_started_ns
+        if self._profile_active:
+            rdma = getattr(self, "_rdma_endpoint", None)
+            if rdma is not None:
+                # The native sender's completion ring (P5a, issue #313).
+                rdma.dump_sender_trace()
+            self._profile_emit(
+                "target_control_phase",
+                started_ns=control_started_ns,
+                finished_ns=control_finished_ns,
+                total_ns=control_finished_ns - control_started_ns,
+                event_count=len(events),
+                **control_parts,
+            )
+
+    def _drain_control_pending_events(self) -> list[tuple[str, str, object]]:
+        pending = getattr(self, "_control_pending_events", None)
+        if not pending:
+            return []
+        self._control_pending_events = []
+        return pending
 
     def record_target_batch_submission(
         self,
@@ -3920,6 +3986,7 @@ class DTTargetController:
             poll_receive_ns=self._last_poll_receive_ns,
             tp_broadcast_ns=self._last_poll_broadcast_ns,
             ready_snapshot_ns=self._last_ready_snapshot_ns,
+            control_ns=self._last_control_phase_ns,
             select_ns=(
                 selection_finished_ns - poll_finished_ns
                 if selection_finished_ns >= poll_finished_ns
@@ -5891,13 +5958,109 @@ class DTTargetController:
         if self._candidate_arena is not None:
             # Direct Draft completion is intentionally observed before the
             # independent Coordinator retirement channel.
-            self._candidate_arena.poll_completion_notices()
-            self._candidate_arena.poll_completion_records()
-            if self._ring_outstanding:
-                self._poll_direct_ring_reads()
-                if self._ring_lease:
-                    self._fence_dead_ring_owners()
+            self._poll_ring_completions()
+            self._poll_ring_read_proofs()
         mark("arena_notice_ns")
+        self._recv_coordinator_events(events)
+        mark("zmq_recv_ns")
+        if self._candidate_arena is not None:
+            self._candidate_arena.poll_releases()
+            self._candidate_arena.poll_cancelled()
+            self._poll_arena_ready(events)
+        mark("arena_complete_ns")
+        events.extend(self._expire_local_rounds())
+        mark("expire_rounds_ns")
+        self._expire_source_leases(now_ns=time.monotonic_ns())
+        mark("expire_leases_ns")
+        self._maybe_emit_lifecycle_status()
+        mark("lifecycle_ns")
+        if profile_receive:
+            self._emit_capacity_gauge(time.monotonic_ns())
+        return events, receive_parts
+
+    def _ready_sync_export_rank(self) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
+        """P3 (issue #328): the loop-head half of the split poll — the
+        completion snapshot, the arena poll and mark-ready.  The packet's
+        READY snapshot is stamped right after this returns, with no
+        Coordinator I/O or cleanup in between."""
+        profile_receive = bool(getattr(self, "_profile_active", False))
+        receive_parts: dict[str, int] = {}
+        mark_ns = time.monotonic_ns()
+
+        def mark(name: str) -> None:
+            nonlocal mark_ns
+            if not profile_receive:
+                return
+            now_ns = time.monotonic_ns()
+            receive_parts[name] = now_ns - mark_ns
+            mark_ns = now_ns
+
+        events: list[tuple[str, str, object]] = []
+        if self._candidate_arena is not None:
+            self._poll_ring_completions()
+        mark("arena_notice_ns")
+        if self._candidate_arena is not None:
+            self._poll_arena_ready(events)
+        mark("arena_complete_ns")
+        return events, receive_parts
+
+    def _control_phase_export_rank(self) -> tuple[list[tuple[str, str, object]], dict[str, int]]:
+        """P3 (issue #328): the poll's control residue — Coordinator I/O,
+        pending-send flush, ring cleanup, arena releases, read proofs and
+        expiry scans — after launch, TP0 only."""
+        profile_receive = bool(getattr(self, "_profile_active", False))
+        receive_parts: dict[str, int] = {}
+        mark_ns = time.monotonic_ns()
+
+        def mark(name: str) -> None:
+            nonlocal mark_ns
+            if not profile_receive:
+                return
+            now_ns = time.monotonic_ns()
+            receive_parts[name] = now_ns - mark_ns
+            mark_ns = now_ns
+
+        if getattr(self, "_ring_publish_pending", None):
+            self._ring_publish_cleanup()
+        mark("ring_cleanup_ns")
+        self._flush_pending_send()
+        mark("flush_send_ns")
+
+        events: list[tuple[str, str, object]] = []
+        if self._candidate_arena is not None:
+            self._poll_ring_read_proofs()
+        mark("ring_read_proof_ns")
+        self._recv_coordinator_events(events)
+        mark("zmq_recv_ns")
+        if self._candidate_arena is not None:
+            self._candidate_arena.poll_releases()
+            self._candidate_arena.poll_cancelled()
+        mark("arena_release_ns")
+        events.extend(self._expire_local_rounds())
+        mark("expire_rounds_ns")
+        self._expire_source_leases(now_ns=time.monotonic_ns())
+        mark("expire_leases_ns")
+        self._maybe_emit_lifecycle_status()
+        mark("lifecycle_ns")
+        if profile_receive:
+            self._emit_capacity_gauge(time.monotonic_ns())
+        return events, receive_parts
+
+    def _poll_ring_completions(self) -> None:
+        # Direct Draft completion is intentionally observed before the
+        # independent Coordinator retirement channel.
+        self._candidate_arena.poll_completion_notices()
+        self._candidate_arena.poll_completion_records()
+
+    def _poll_ring_read_proofs(self) -> None:
+        if self._ring_outstanding:
+            self._poll_direct_ring_reads()
+            if self._ring_lease:
+                self._fence_dead_ring_owners()
+
+    def _recv_coordinator_events(
+        self, events: list[tuple[str, str, object]]
+    ) -> None:
         for message in self._client.recv_nowait():
             if isinstance(message, TaskBatchAck):
                 if not self._ledger.has_submitted_batch(message.batch_id):
@@ -6038,79 +6201,67 @@ class DTTargetController:
                 raise TypeError(
                     f"unexpected Target Coordinator message {type(message).__name__}"
                 )
-        mark("zmq_recv_ns")
-        if self._candidate_arena is not None:
-            self._candidate_arena.poll_releases()
-            self._candidate_arena.poll_cancelled()
-            arena = self._candidate_arena
-            completions = arena.poll()
-            unparked = self._unparked_completions
-            if unparked:
-                # Kept only while its slot still holds it (not let go since).
-                held = {t: c for t, c in unparked.items() if arena.holds(c)}
-                unparked.clear()
-                held.update((c.transfer_id, c) for c in completions)
-                completions = held.values()
-            for completion in completions:
-                state = self._ledger.get(completion.transfer_id)
-                parked = self._parked.get(completion.transfer_id)
-                if state is None or parked is None:
-                    # The push landed before this round parked (a destination
-                    # known at launch, issue #330).  poll() returns a
-                    # completion once, so keep it until the round parks.
-                    unparked[completion.transfer_id] = completion
-                    continue
-                if parked.candidate_completion is not None:
-                    continue
-                if completion.root_token != parked.bonus_token:
-                    raise ValueError(
-                        "direct candidate root does not match Target bonus token"
-                    )
-                self._ledger.mark_direct_ready(
+
+    def _poll_arena_ready(self, events: list[tuple[str, str, object]]) -> None:
+        arena = self._candidate_arena
+        completions = arena.poll()
+        unparked = self._unparked_completions
+        if unparked:
+            # Kept only while its slot still holds it (not let go since).
+            held = {t: c for t, c in unparked.items() if arena.holds(c)}
+            unparked.clear()
+            held.update((c.transfer_id, c) for c in completions)
+            completions = held.values()
+        for completion in completions:
+            state = self._ledger.get(completion.transfer_id)
+            parked = self._parked.get(completion.transfer_id)
+            if state is None or parked is None:
+                # The push landed before this round parked (a destination
+                # known at launch, issue #330).  poll() returns a
+                # completion once, so keep it until the round parks.
+                unparked[completion.transfer_id] = completion
+                continue
+            if parked.candidate_completion is not None:
+                continue
+            if completion.root_token != parked.bonus_token:
+                raise ValueError(
+                    "direct candidate root does not match Target bonus token"
+                )
+            self._ledger.mark_direct_ready(
+                completion.transfer_id,
+                draft_instance_id=completion.draft_instance_id,
+            )
+            self._note_draft_progress(completion.draft_instance_id)
+            parked.result_received_ns = completion.observed_ns
+            if self._profile_active:
+                export_ledger_ready_ns = time.monotonic_ns()
+                self._profile_emit(
+                    "target_direct_completion",
+                    transfer_id=completion.transfer_id,
+                    request_id=parked.req.rid,
+                    round_id=parked.round_id,
+                    slot_id=completion.slot_id,
+                    generation=completion.generation,
+                    notice_queued_ns=completion.notice_queued_ns,
+                    notice_received_ns=completion.notice_received_ns,
+                    metadata_submitted_ns=completion.metadata_submitted_ns,
+                    metadata_gpu_ns=completion.metadata_gpu_ns,
+                    completion_observed_ns=completion.observed_ns,
+                    ready_source=getattr(completion, "ready_source", "notice"),
+                    producer_globaltimer_ns=getattr(
+                        completion, "producer_globaltimer_ns", 0
+                    ),
+                    delivery_ns=getattr(completion, "delivery_ns", 0),
+                    export_ledger_ready_ns=export_ledger_ready_ns,
+                    target_compute_batches_inflight=self._target_compute_batches_inflight,
+                )
+            events.append(
+                (
+                    "ready_direct",
                     completion.transfer_id,
-                    draft_instance_id=completion.draft_instance_id,
+                    (completion, parked.bonus_token, parked.seq_len),
                 )
-                self._note_draft_progress(completion.draft_instance_id)
-                parked.result_received_ns = completion.observed_ns
-                if self._profile_active:
-                    export_ledger_ready_ns = time.monotonic_ns()
-                    self._profile_emit(
-                        "target_direct_completion",
-                        transfer_id=completion.transfer_id,
-                        request_id=parked.req.rid,
-                        round_id=parked.round_id,
-                        slot_id=completion.slot_id,
-                        generation=completion.generation,
-                        notice_queued_ns=completion.notice_queued_ns,
-                        notice_received_ns=completion.notice_received_ns,
-                        metadata_submitted_ns=completion.metadata_submitted_ns,
-                        metadata_gpu_ns=completion.metadata_gpu_ns,
-                        completion_observed_ns=completion.observed_ns,
-                        ready_source=getattr(completion, "ready_source", "notice"),
-                        producer_globaltimer_ns=getattr(
-                            completion, "producer_globaltimer_ns", 0
-                        ),
-                        delivery_ns=getattr(completion, "delivery_ns", 0),
-                        export_ledger_ready_ns=export_ledger_ready_ns,
-                        target_compute_batches_inflight=self._target_compute_batches_inflight,
-                    )
-                events.append(
-                    (
-                        "ready_direct",
-                        completion.transfer_id,
-                        (completion, parked.bonus_token, parked.seq_len),
-                    )
-                )
-        mark("arena_complete_ns")
-        events.extend(self._expire_local_rounds())
-        mark("expire_rounds_ns")
-        self._expire_source_leases(now_ns=time.monotonic_ns())
-        mark("expire_leases_ns")
-        self._maybe_emit_lifecycle_status()
-        mark("lifecycle_ns")
-        if profile_receive:
-            self._emit_capacity_gauge(time.monotonic_ns())
-        return events, receive_parts
+            )
 
     def _lifecycle_status(self) -> dict[str, object]:
         ledger = (

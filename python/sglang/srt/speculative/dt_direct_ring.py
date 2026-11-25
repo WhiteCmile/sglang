@@ -113,6 +113,13 @@ if TARGET_DEST_AT_LAUNCH and not RING_PUBLISH_AT_LAUNCH:
     raise RuntimeError(
         "DT_TARGET_DEST_AT_LAUNCH=1 requires DT_RING_PUBLISH_AT_LAUNCH=1"
     )
+# Target redesign P3 (DT_TARGET_POLL_SPLIT=1, issue #328): the per-loop poll
+# splits into ready_sync (completion snapshot, arena poll, mark-ready, READY
+# snapshot; no Coordinator I/O or cleanup before the snapshot) at the head of
+# the scheduler loop and a TP0-only control phase after launch (Coordinator
+# recv, flush, releases, read proofs, expiry); the control phase's
+# TP-relevant events ride the next ready_sync packet in order.
+TARGET_POLL_SPLIT = os.environ.get("DT_TARGET_POLL_SPLIT", "0") == "1"
 LAUNCH_STAGING_SLOTS = 8
 V2_VERSION = 2
 V2_HEADER_BYTES = 128
