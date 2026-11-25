@@ -726,8 +726,11 @@ def test_ring_rounds_fallback_reconcile_passes_and_cancel_reaches_the_draft():
         )
     )
 
-    # Target side: the ring round (round 1) is held, then the fallback
-    # RECONCILE (round 2) catches the copy up ahead of itself.
+    # Target side: two ring rounds (rounds 1-2) are held, latest only; the
+    # fallback RECONCILE (round 3) catches the round-2 copy up ahead of
+    # itself.  Round 1's copy never leaves the Target — the production
+    # shape that failed before the Coordinator stopped demanding one-round
+    # continuity from a catch-up copy (issue #329 legs b1-on/b1t-on).
     c, sent_ops = _outbox_controller()
     ring = _task(
         "t-ring",
@@ -744,28 +747,45 @@ def test_ring_rounds_fallback_reconcile_passes_and_cancel_reaches_the_draft():
     assert c._held_ring_copies["request-a"].transfer_id == "t-ring"
 
     c._ledger.finish("t-ring")
+    ring2 = _task(
+        "t-ring2",
+        "request-a",
+        ring_seq=8,
+        destination=_candidate_destination("t-ring2", generation=3, nonce=34567),
+        round_id=2,
+        committed_kv_len=3,
+        committed_token_ids=(102,),
+    )
+    c._pending_send.append(_queued_batch(ring2))
+    c._flush_pending_send()
+    assert not sent_ops
+    assert c._held_ring_copies["request-a"].transfer_id == "t-ring2"
+
+    c._ledger.finish("t-ring2")
     fallback = _task(
         "t-fallback",
         "request-a",
-        round_id=2,
-        destination=_candidate_destination("t-fallback", generation=3, nonce=34567),
-        committed_kv_len=4,
-        committed_token_ids=(102, 103),
+        round_id=3,
+        destination=_candidate_destination("t-fallback", generation=4, nonce=45678),
+        committed_kv_len=5,
+        committed_token_ids=(103, 104),
     )
     c._pending_send.append(_queued_batch(fallback))
     c._flush_pending_send()
     assert [op for op, _ in sent_ops] == ["submit", "submit"]
     copy_batch, fallback_batch = sent_ops[0][1], sent_ops[1][1]
-    assert [task.transfer_id for task in copy_batch.entries] == ["t-ring"]
+    assert [task.transfer_id for task in copy_batch.entries] == ["t-ring2"]
     assert [task.transfer_id for task in fallback_batch.entries] == ["t-fallback"]
 
-    # Coordinator side, in socket order: absorb the copy, then the fallback
-    # RECONCILE passes its length check against the advanced owner record.
+    # Coordinator side, in socket order: the catch-up copy skips round 1
+    # and is absorbed past the gap (committed_kv_len 1 -> 3), then the
+    # fallback RECONCILE passes its length check against the advanced
+    # owner record.
     copy_plan = _dispatch(router, copy_batch, now_ns=2)
-    assert copy_plan.ack.accepted_transfer_ids == ("t-ring",)
+    assert copy_plan.ack.accepted_transfer_ids == ("t-ring2",)
     assert copy_plan.batches == ()
     assert router.ring_copies_absorbed == 1
-    assert router.request_owners[("target", "request-a")].committed_kv_len == 2
+    assert router.request_owners[("target", "request-a")].committed_kv_len == 3
     fallback_plan = _dispatch(router, fallback_batch, now_ns=3)
     assert fallback_plan.ack.accepted_transfer_ids == ("t-fallback",)
     assert [batch.draft_instance_id for batch in fallback_plan.batches] == ["draft-0"]
@@ -776,7 +796,7 @@ def test_ring_rounds_fallback_reconcile_passes_and_cancel_reaches_the_draft():
     cancel = CancelTransfers(
         protocol_version=PROTOCOL_VERSION,
         target_instance_id="target",
-        transfer_ids=("t-ring",),
+        transfer_ids=("t-ring2",),
         reason="client_abort",
     )
     c._delivery_outbox.add(CANCEL_TRANSFERS, cancel_transfers_id(cancel), cancel)
@@ -786,7 +806,7 @@ def test_ring_rounds_fallback_reconcile_passes_and_cancel_reaches_the_draft():
     assert cancel_message is cancel
     routed = router.cancel(cancel_message, now_ns=5)
     assert [(item.draft_instance_id, item.message.transfer_ids) for item in routed] == [
-        ("draft-0", ("t-ring",))
+        ("draft-0", ("t-ring2",))
     ]
     # ... and a cancel that arrives before any copy would have been dropped:
     # no absorbed owner, no inflight entry, nothing to route.
