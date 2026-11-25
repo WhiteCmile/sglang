@@ -345,6 +345,12 @@ class TargetFeatureSourcePool:
 
         return self._buffer.allocation_offset
 
+    @property
+    def allocation_length(self) -> int:
+        """Registered source allocation length exposed to RDMA peers."""
+
+        return int(self._storage.nbytes)
+
     def publication_offset(self, slot_id: int, generation: int) -> int:
         """Byte offset of a logical publication inside the IPC allocation."""
 

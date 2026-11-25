@@ -878,7 +878,11 @@ class TargetRdmaEndpoint:
                 slot_nbytes=pool.slot_nbytes,
                 slot_count=pool.slot_count,
                 allocation_offset=pool.allocation_offset,
-                allocation_length=pool._storage.nbytes,
+                allocation_length=getattr(
+                    pool,
+                    "allocation_length",
+                    pool.slot_count * pool.slot_nbytes,
+                ),
                 pool_generation=pool.pool_generation,
                 source_session_id=pool.source_session_id,
             )
