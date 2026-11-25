@@ -714,7 +714,18 @@ class TargetRdmaEndpoint:
             self._session_tag = pool_generation_tag(pool.source_session_id)
             self._ready_generation = np.zeros(pool.slot_count, dtype=np.uint32)
             self._ready_cq = self.device.completion_queue(4 * READY_SEND_DEPTH)
-            pool.set_ready_listener(self._publications.put)
+            # Profile-only publisher marks (explicit DT_PROFILE_EVENTS member only).
+            try:
+                from dt_profile import emit as _emit, explicit_event_enabled
+                self._ready_trace = explicit_event_enabled("target_rdma_ready_publish")
+                self._ready_emit = _emit
+            except ImportError:
+                self._ready_trace = False
+            if self._ready_trace:
+                put = self._publications.put
+                pool.set_ready_listener(lambda item: put((*item, time.monotonic_ns())))
+            else:
+                pool.set_ready_listener(self._publications.put)
             self._start(self._publisher_loop, "dt-rdma-ready-publisher")
         if arena is not None:
             records = arena._completion_records
@@ -958,13 +969,30 @@ class TargetRdmaEndpoint:
             except queue.Empty:
                 item = None
             if item is not None:
-                slot_id, generation, producer_event = item
+                trace = self._ready_trace
+                if trace:
+                    slot_id, generation, producer_event, enqueued_ns = item
+                    dequeued_ns = time.monotonic_ns()
+                    done_at_dequeue = bool(producer_event.query())
+                else:
+                    slot_id, generation, producer_event = item
                 try:
                     producer_event.synchronize()
                 except Exception:  # noqa: BLE001 - the slot stays unready
                     logger.exception("feature producer event failed; slot %d not ready", slot_id)
                 else:
+                    if trace:
+                        event_done_ns = time.monotonic_ns()
                     self._publish_ready(slot_id, generation)
+                    if trace:
+                        self._ready_emit(
+                            "target_rdma_ready_publish",
+                            slot_id=slot_id, slot_generation=generation,
+                            enqueued_ns=enqueued_ns, dequeued_ns=dequeued_ns,
+                            event_done_ns=event_done_ns, posted_ns=time.monotonic_ns(),
+                            done_at_dequeue=done_at_dequeue,
+                            queue_depth=self._publications.qsize(),
+                        )
             self._reap_ready_sends()
 
     def _publish_ready(self, slot_id: int, generation: int) -> None:
