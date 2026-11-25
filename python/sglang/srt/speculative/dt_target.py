@@ -8819,6 +8819,8 @@ class DTTargetController:
         from sglang.srt.speculative.dt_candidate_p2p import CandidateTransportError
         from sglang.srt.speculative.dt_feature_p2p import FeatureTransferSlice
 
+        from dt_protocol import DraftAssignment
+
         pool = self._feature_source_pool
         retained = deque()
         for wave in self._ring_publish_pending:
@@ -9160,12 +9162,48 @@ class DTTargetController:
                         # Confirmation-free (issue #329): no Coordinator copy.
                         # The round begins in the local ledger here, where its
                         # destination reservation is complete, and the owner
-                        # lease supplies the assignment acceptance.
+                        # lease supplies the assignment acceptance.  The owner
+                        # lease must also authorize the arena: with ring
+                        # confirmation that ran in _plan_direct_ring's
+                        # confirmation-only branch, which confirmation-free
+                        # rounds never reach, so without it the Draft's
+                        # candidate push is rejected and the round never
+                        # completes (gate-measured, issue #329).
                         self._begin_ring_round_local(ring_task)
                         if binding is not None:
                             self._ledger.mark_lease_dispatched(
                                 transfer_id, draft_instance_id=binding[0]
                             )
+                            destination = ring_task.candidate_destination
+                            if destination is not None:
+                                try:
+                                    self._candidate_arena.authorize(
+                                        DraftAssignment(
+                                            transfer_id=transfer_id,
+                                            draft_instance_id=binding[0],
+                                            draft_session_id=binding[1],
+                                            authorization_nonce=(
+                                                destination.authorization_nonce
+                                            ),
+                                            owner_epoch=binding[2],
+                                        )
+                                    )
+                                    if self._profile_active:
+                                        self._profile_emit(
+                                            "target_authorize",
+                                            transfer_id=transfer_id,
+                                            request_id=spec[0],
+                                            round_id=spec[2],
+                                            draft_session_id=binding[1],
+                                            ring_seq=int(record.wave_seq),
+                                            authorized_ns=time.monotonic_ns(),
+                                        )
+                                except CandidateTransportError:
+                                    logger.warning(
+                                        "owner lease cannot authorize %s; "
+                                        "confirmation-free round has no copy",
+                                        transfer_id,
+                                    )
                     self._ring_unproven[transfer_id] = record.session_id
                     self._direct_sent.add(transfer_id)
                     self._ring_outstanding[record.session_id].append(

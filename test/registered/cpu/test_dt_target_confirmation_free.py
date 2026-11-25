@@ -116,6 +116,7 @@ class _Publisher:
 class _Arena:
     def __init__(self):
         self.reserved = []
+        self.authorized = []
         self._data_buffer = SimpleNamespace(allocation_offset=4096)
         self._metadata_buffer = SimpleNamespace(allocation_offset=8192)
 
@@ -128,7 +129,7 @@ class _Arena:
         return _Destination()
 
     def authorize(self, assignment):
-        pass
+        self.authorized.append(assignment)
 
     def cancel(self, transfer_id, *, remote_quiescent=False):
         pass
@@ -304,6 +305,17 @@ def test_cleanup_confirmation_free_begins_local_ledger():
         "target:a:1:5",
         "target:b:1:7",
     ]
+    # The owner lease authorized every reserved destination: without this the
+    # arena rejects the Draft's candidate push and the round never completes
+    # (gate-measured pre-warmup quiescence wedge, issue #329).
+    assert [item.transfer_id for item in c._candidate_arena.authorized] == [
+        "target:a:1:5",
+        "target:b:1:7",
+    ]
+    assert all(
+        item.draft_instance_id == "di" and item.draft_session_id == "session"
+        for item in c._candidate_arena.authorized
+    )
 
 
 def _flush_controller(ring_confirmation: bool):
