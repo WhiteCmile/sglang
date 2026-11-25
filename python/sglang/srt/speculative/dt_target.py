@@ -446,6 +446,9 @@ class DTTargetController:
     _driver_stats_dump_ns = 0
     _capacity_gauge_emit_ns = 0
     _arena_active_high_water = 0
+    # Class default keeps object-level constructions (CPU diagnostics) on the
+    # ring-confirmation path; __init__ replaces it with the env flag.
+    _ring_confirmation = True
 
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
 
@@ -764,11 +767,29 @@ class DTTargetController:
         # request_id -> (draft_instance_id, draft_session_id, owner_epoch).
         self._draft_binding: dict[str, tuple[str, str, int]] = {}
         # Ring rounds written but not yet accepted by the Coordinator.
+        # Confirmation-free (DT_RING_CONFIRMATION=0, issue #329, the shared
+        # dt_protocol default): ring rounds are never submitted to the
+        # Coordinator, so no acceptance ever retires the set entry; the read
+        # proof (_poll_direct_ring_reads), the authenticated remote push
+        # proof (_consume_remote_source_proof) and owner revocation do.
         self._direct_sent: set[str] = set()
         # §7.1 GPU ring publish (DT_RING_PUBLISH=1): eligible verify waves go
-        # out as kernel-written ring records; the Coordinator confirmation
-        # tasks are built by a deferred cleanup off the park critical path.
+        # out as kernel-written ring records; under ring confirmation the
+        # Coordinator confirmation tasks are built by a deferred cleanup off
+        # the park critical path, confirmation-free the cleanup only
+        # registers the rounds in the local ledger.
         self._ring_publish = os.environ.get("DT_RING_PUBLISH", "1") == "1"
+        # P4 (DT_RING_CONFIRMATION=0, issue #329): confirmation-free Target,
+        # same flag and SSOT as the Draft engine and the Coordinator router.
+        # Ring rounds carry their own dispatch (the ring record the Draft
+        # consumes); the Target never builds, submits or resends their
+        # Coordinator copy, the ledger begins from Target-local state, the
+        # local v1 ring write no longer waits for a Coordinator submit, and
+        # remote ring rounds retire on the Draft's authenticated push proof
+        # with no accepted/unaccepted split.
+        from dt_protocol import ring_confirmation_enabled
+
+        self._ring_confirmation = ring_confirmation_enabled()
         # Q15b (DT_RING_PUBLISH_AT_LAUNCH=1): eligible deferred verify waves
         # enqueue the publish kernel on the verify stream at launch, right
         # behind the verify forward, instead of from host park.  The park
@@ -5674,6 +5695,31 @@ class DTTargetController:
         # Commit only after every matching copy passed the full equality check.
         self._pending_send = retained
 
+    def _begin_ring_round_local(self, task) -> None:
+        """Begin a ring round in the local ledger (DT_RING_CONFIRMATION=0).
+
+        The round was dispatched by its ring record, which the owning Draft
+        consumes directly; the Coordinator copy that would have adopted a P2
+        local registration never exists, so the local registration is the
+        round's only ledger entry.  The owner lease — authorized at plan
+        time — supplies the assignment acceptance (mark_lease_dispatched),
+        which is what the direct completion path requires.
+        """
+
+        if self._ledger.get(task.transfer_id) is not None:
+            # A P2 launch-published wave already began this round at park;
+            # nothing new may replace it confirmation-free.
+            return
+        self._ledger.begin_local(task)
+        if self._profile_active:
+            self._profile_emit(
+                "target_ledger_local_begin",
+                transfer_id=task.transfer_id,
+                request_id=task.request_id,
+                round_id=task.round_id,
+                ledger_local_begin_ns=time.monotonic_ns(),
+            )
+
     def _flush_pending_send(self) -> None:
         self._flush_reliable_outbox()
         while self._pending_send:
@@ -5812,82 +5858,107 @@ class DTTargetController:
             if getattr(self, "_direct_ring", False):
                 dispatchable, ring_plan = self._plan_direct_ring(dispatchable)
 
-            self._batch_sequence += 1
-            dispatch_batch = TargetTaskBatch(
-                protocol_version=self._pending_send[0].protocol_version,
-                batch_id=f"{self.instance_id}:tasks:{self._batch_sequence}",
-                target_instance_id=self.instance_id,
-                entries=tuple(dispatchable),
-                sent_ns=time.monotonic_ns(),
-            )
-            remote_records = getattr(self, "_remote_ring_records", None)
-            try:
-                submitted = self._client.submit(dispatch_batch)
-            except Exception:
-                for transfer_id in reserved:
-                    if remote_records is not None and transfer_id in remote_records:
-                        # A ring record naming this destination is already
-                        # visible at the Draft; keep the reservation so the
-                        # re-flushed copy still matches the record.
-                        continue
-                    self._candidate_arena.cancel(
-                        transfer_id, remote_quiescent=True
-                    )
-                raise
-            if not submitted:
-                for transfer_id in reserved:
-                    if remote_records is not None and transfer_id in remote_records:
-                        # Keep the destination the visible record names; the
-                        # re-flush reuses it together with the reused seq.
-                        continue
-                    self._candidate_arena.cancel(
-                        transfer_id, remote_quiescent=True
-                    )
-                break
-            submitted_ns = time.monotonic_ns()
+            # P4 (DT_RING_CONFIRMATION=0, issue #329): ring rounds carry
+            # their own dispatch — the ring record the owning Draft consumes
+            # — so they never join the Coordinator batch.  Only the
+            # unstamped remainder is routed; the local v1 ring write no
+            # longer waits for a Coordinator submit and each ring round
+            # begins in the local ledger instead.
+            ring_tasks: tuple = ()
+            if not self._ring_confirmation:
+                ring_tasks = tuple(t for t in dispatchable if t.direct_ring_seq)
+                dispatchable = tuple(
+                    t for t in dispatchable if not t.direct_ring_seq
+                )
+
+            submitted_ns = 0
+            dispatch_batch = None
+            if dispatchable:
+                self._batch_sequence += 1
+                dispatch_batch = TargetTaskBatch(
+                    protocol_version=self._pending_send[0].protocol_version,
+                    batch_id=f"{self.instance_id}:tasks:{self._batch_sequence}",
+                    target_instance_id=self.instance_id,
+                    entries=tuple(dispatchable),
+                    sent_ns=time.monotonic_ns(),
+                )
+                remote_records = getattr(self, "_remote_ring_records", None)
+                try:
+                    submitted = self._client.submit(dispatch_batch)
+                except Exception:
+                    for transfer_id in reserved:
+                        if remote_records is not None and transfer_id in remote_records:
+                            # A ring record naming this destination is already
+                            # visible at the Draft; keep the reservation so the
+                            # re-flushed copy still matches the record.
+                            continue
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    raise
+                if not submitted:
+                    for transfer_id in reserved:
+                        if remote_records is not None and transfer_id in remote_records:
+                            # Keep the destination the visible record names; the
+                            # re-flush reuses it together with the reused seq.
+                            continue
+                        self._candidate_arena.cancel(
+                            transfer_id, remote_quiescent=True
+                        )
+                    break
+                submitted_ns = time.monotonic_ns()
             if ring_plan:
+                # With ring confirmation this publishes after the
+                # Coordinator submit succeeded; confirmation-free it publishes
+                # without any submit.  A routed-submit backpressure above
+                # breaks out before here: the wave stays queued and its
+                # remote records keep their stamps for the next pass.
                 self._write_direct_ring(ring_plan)
-            if self._profile_active:
-                self._profile_emit(
-                    "target_task_submit",
-                    batch_id=dispatch_batch.batch_id,
-                    entries=len(dispatch_batch.entries),
-                    transfer_ids=tuple(
-                        task.transfer_id for task in dispatch_batch.entries
-                    ),
-                    proposal_transfer_ids=tuple(
-                        task.transfer_id
-                        for task in dispatch_batch.entries
-                        if task.requires_proposal
-                    ),
-                    materialization_transfer_ids=tuple(
-                        task.transfer_id
-                        for task in dispatch_batch.entries
-                        if not task.requires_proposal
-                    ),
-                    feature_rows=tuple(
-                        int(task.feature_token_count)
-                        for task in dispatch_batch.entries
-                    ),
-                    submitted_ns=submitted_ns,
-                    submit_call_ns=submitted_ns - dispatch_batch.sent_ns,
-                    oldest_task_age_ns=(
-                        submitted_ns
-                        - min(task.created_ns for task in dispatch_batch.entries)
-                    ),
-                    newest_task_age_ns=(
-                        submitted_ns
-                        - max(task.created_ns for task in dispatch_batch.entries)
-                    ),
-                )
-            self._ledger.begin(dispatch_batch)
-            if self._profile_active:
-                self._profile_emit(
-                    "target_ledger_begin",
-                    batch_id=dispatch_batch.batch_id,
-                    entries=len(dispatch_batch.entries),
-                    ledger_begin_ns=time.monotonic_ns(),
-                )
+            if ring_tasks:
+                for task in ring_tasks:
+                    self._begin_ring_round_local(task)
+            if dispatch_batch is not None:
+                if self._profile_active:
+                    self._profile_emit(
+                        "target_task_submit",
+                        batch_id=dispatch_batch.batch_id,
+                        entries=len(dispatch_batch.entries),
+                        transfer_ids=tuple(
+                            task.transfer_id for task in dispatch_batch.entries
+                        ),
+                        proposal_transfer_ids=tuple(
+                            task.transfer_id
+                            for task in dispatch_batch.entries
+                            if task.requires_proposal
+                        ),
+                        materialization_transfer_ids=tuple(
+                            task.transfer_id
+                            for task in dispatch_batch.entries
+                            if not task.requires_proposal
+                        ),
+                        feature_rows=tuple(
+                            int(task.feature_token_count)
+                            for task in dispatch_batch.entries
+                        ),
+                        submitted_ns=submitted_ns,
+                        submit_call_ns=submitted_ns - dispatch_batch.sent_ns,
+                        oldest_task_age_ns=(
+                            submitted_ns
+                            - min(task.created_ns for task in dispatch_batch.entries)
+                        ),
+                        newest_task_age_ns=(
+                            submitted_ns
+                            - max(task.created_ns for task in dispatch_batch.entries)
+                        ),
+                    )
+                self._ledger.begin(dispatch_batch)
+                if self._profile_active:
+                    self._profile_emit(
+                        "target_ledger_begin",
+                        batch_id=dispatch_batch.batch_id,
+                        entries=len(dispatch_batch.entries),
+                        ledger_begin_ns=time.monotonic_ns(),
+                    )
             lease_marks = getattr(self, "_lease_marks", None)
             if lease_marks:
                 # A ring copy written before a submit that did not go out is
@@ -5907,11 +5978,19 @@ class DTTargetController:
                             if remote_destinations is not None:
                                 remote_destinations.pop(transfer_id, None)
                 self._lease_marks = retained_marks
-            outbox = self._delivery_outbox
-            outbox.add("task_batch", dispatch_batch.batch_id, dispatch_batch)
-            outbox.mark_sent("task_batch", dispatch_batch.batch_id, now_ns=submitted_ns)
+            if dispatch_batch is not None:
+                outbox = self._delivery_outbox
+                outbox.add(
+                    "task_batch", dispatch_batch.batch_id, dispatch_batch
+                )
+                outbox.mark_sent(
+                    "task_batch", dispatch_batch.batch_id, now_ns=submitted_ns
+                )
 
-            dispatched_ids = {task.transfer_id for task in dispatchable}
+            dispatched_ids = {
+                task.transfer_id
+                for task in (*ring_tasks, *dispatchable)
+            }
             retained = deque()
             for pending_batch in self._pending_send:
                 entries = tuple(
@@ -7277,21 +7356,26 @@ class DTTargetController:
         self._release_candidate_destination(transfer_id, remote_quiescent=True)
 
     def _consume_remote_source_proof(self, transfer_id: str) -> None:
-        """Retire a retired-unaccepted remote round's source lease.
+        """Retire a remote ring round's source lease on its authenticated proof.
 
         The arena reports a cross-host candidate record — a cancelled
         tombstone (valid length 0) or a successful row — only after it
         authenticated it against the destination slot's generation, nonce,
         and producer tag, so the round's source read is complete or never
-        started:
-        either way the lease is quiescent and the bounded pool reclaims it
-        here.  A proof that lands while its round has no waiter here (the
-        Coordinator never accepted it, so its copy can sit in _pending_send
-        through Draft-side abandons) is recorded in
+        started: either way the lease is quiescent and the bounded pool
+        reclaims it here.
+
+        With ring confirmation, accepted rounds retire on the relayed
+        SourceReadDone instead, and a proof landing while its round has no
+        waiter (the Coordinator never accepted it, so its copy can sit in
+        _pending_send through Draft-side abandons) is recorded in
         ``_remote_source_proof_landed`` and replayed by
-        ``_retire_unaccepted_transfer``.  Rounds the Coordinator accepted
-        are not registered in ``_remote_source_retirement`` and keep
-        retiring on the relayed SourceReadDone.
+        ``_retire_unaccepted_transfer``.
+
+        Confirmation-free (issue #329) there is no acceptance event to split
+        rounds by: the accepted/unaccepted distinction is gone, and every
+        remote ring round — live or retired — retires its source lease on
+        the first authenticated proof.
         """
         retirement = getattr(self, "_remote_source_retirement", None)
         if retirement is None:
@@ -7302,18 +7386,38 @@ class DTTargetController:
         # critical section, else a proof is lost between the waiter check
         # and the cache insert, or recorded after the ACK cleanup (CI
         # review, PR #210).
+        apply_proof = False
         with self._remote_source_guard():
-            if transfer_id not in retirement:
-                # No waiter (yet).  Only a round the Coordinator has not
-                # confirmed can gain one later; recording its proof costs one
-                # entry for the lifetime of its pending round.
+            if transfer_id in retirement:
+                retirement.pop(transfer_id)
+                apply_proof = True
+            else:
                 direct_sent = getattr(self, "_direct_sent", None)
-                if direct_sent is not None and transfer_id in direct_sent:
+                if direct_sent is None or transfer_id not in direct_sent:
+                    return
+                if self._ring_confirmation:
+                    # No waiter (yet).  Only a round the Coordinator has not
+                    # confirmed can gain one later; recording its proof costs
+                    # one entry for the lifetime of its pending round.
                     landed = getattr(self, "_remote_source_proof_landed", None)
                     if landed is not None:
                         landed.add(transfer_id)
-                return
-            retirement.pop(transfer_id)
+                    return
+                # Confirmation-free: this round will never be Coordinator
+                # accepted, so no retirement waiter and no replay are coming;
+                # the proof retires it directly.
+                apply_proof = True
+            if apply_proof and not self._ring_confirmation:
+                # No acceptance ACK will clean the unconfirmed-round
+                # bookkeeping; the proof is the round's terminal event.
+                direct_sent = getattr(self, "_direct_sent", None)
+                if direct_sent is not None:
+                    direct_sent.discard(transfer_id)
+                sessions = getattr(self, "_remote_ring_sessions", None)
+                if sessions is not None:
+                    sessions.pop(transfer_id, None)
+        if not apply_proof:
+            return
         source_ref = self._source_slot_by_transfer.get(transfer_id)
         if source_ref is None:
             return
@@ -8690,12 +8794,15 @@ class DTTargetController:
         return True
 
     def _ring_publish_cleanup(self) -> None:
-        """Build Coordinator confirmation tasks for kernel-published waves.
+        """Deferred bookkeeping for kernel-published waves.
 
         Runs from _poll_export_rank, off the park critical path.  A wave is
         processed once its record's seq word is visible in the Target's own
         ring mapping (the kernel has landed), so no GPU sync is needed; the
-        per-request token ids are read back from the record itself.
+        per-request token ids are read back from the record itself.  With
+        ring confirmation (DT_RING_CONFIRMATION=1) the cleanup also builds
+        the Coordinator confirmation copies; confirmation-free (issue #329)
+        it only registers the rounds in the local ledger.
         """
 
         import struct as _struct
@@ -8867,9 +8974,11 @@ class DTTargetController:
             if launch_destinations is not None:
                 # P2: every row's destination was reserved, authorized and
                 # written into the record's destination region at launch.
-                # The cleanup only stamps them into the confirmation copies
-                # below; ended rows are retired from the same reservations
-                # by the cancel path.
+                # With ring confirmation the cleanup only stamps them into
+                # the confirmation copies below; confirmation-free the local
+                # ledger registration below picks them up directly.  Ended
+                # rows are retired from the same reservations by the cancel
+                # path.
                 destinations = launch_destinations
             # The destination region is written for every record — with
             # zeros for cancelled rows — even when every row ended.  An
@@ -8908,14 +9017,16 @@ class DTTargetController:
                     # retained, so the slot must still show this record's seq;
                     # if it does not, writing the old seq would clobber a
                     # newer wave's destinations (its cancelled rows would lose
-                    # their only terminal signal).  Skip the ring write: live
-                    # rows still carry their destinations on the Coordinator
-                    # copies built below.
+                    # their only terminal signal).  Skip the ring write: with
+                    # ring confirmation the live rows still carry their
+                    # destinations on the Coordinator copies built below;
+                    # confirmation-free that is unrecoverable (the Draft
+                    # holds the push with no copy coming), so it must not
+                    # happen — publication backpressure guarantees it.
                     if slot_seq != record.wave_seq:
                         logger.critical(
                             "DT ring publish record %s destination slot reused "
-                            "(seq %s); skipping ring write, Coordinator copies "
-                            "carry the destinations",
+                            "(seq %s); skipping ring write",
                             record.wave_seq,
                             slot_seq,
                         )
@@ -9031,20 +9142,31 @@ class DTTargetController:
                         feature_token_offset=spec[5],
                         requires_proposal=requires_proposal,
                     )
-                    # Pre-stamped: the record is already on the ring, so the
-                    # planner only authorizes the owner lease (no second write).
-                    tasks.append(
-                        replace(
-                            task,
-                            direct_ring_seq=record.wave_seq,
-                            candidate_destination=destinations.get(transfer_id),
-                        )
+                    ring_task = replace(
+                        task,
+                        direct_ring_seq=record.wave_seq,
+                        candidate_destination=destinations.get(transfer_id),
                     )
-                    self._ring_publish_transfers.add(transfer_id)
-                    self._ring_unproven[transfer_id] = record.session_id
                     binding = self._draft_binding.get(spec[0])
-                    if binding is not None:
-                        self._lease_marks.append((transfer_id, binding[0]))
+                    if self._ring_confirmation:
+                        # Pre-stamped: the record is already on the ring, so
+                        # the planner only authorizes the owner lease (no
+                        # second write) and the copy is confirmation-only.
+                        tasks.append(ring_task)
+                        self._ring_publish_transfers.add(transfer_id)
+                        if binding is not None:
+                            self._lease_marks.append((transfer_id, binding[0]))
+                    else:
+                        # Confirmation-free (issue #329): no Coordinator copy.
+                        # The round begins in the local ledger here, where its
+                        # destination reservation is complete, and the owner
+                        # lease supplies the assignment acceptance.
+                        self._begin_ring_round_local(ring_task)
+                        if binding is not None:
+                            self._ledger.mark_lease_dispatched(
+                                transfer_id, draft_instance_id=binding[0]
+                            )
+                    self._ring_unproven[transfer_id] = record.session_id
                     self._direct_sent.add(transfer_id)
                     self._ring_outstanding[record.session_id].append(
                         (record.wave_seq, transfer_id, (wave.slot_id, wave.generation))
@@ -9150,7 +9272,9 @@ class DTTargetController:
         Remote ring records are published here, before the Coordinator batch
         goes out, so a stamped (confirmation-only) copy never names a record
         whose write failed; local ring records stay planned for the
-        post-submit publish, as before.
+        post-submit publish.  Confirmation-free (issue #329) the stamped
+        rounds never join a Coordinator batch at all: the local write happens
+        without any submit and the round begins in the local ledger.
         """
 
         from dt_protocol import DraftTaskKind
@@ -9378,9 +9502,11 @@ class DTTargetController:
         push legs keep serving that Coordinator-relay fallback, and the
         candidate arena and the bindings keep the session's producer
         authorization.  Remote ring rounds never reach ``_ring_outstanding``
-        (no early read proof exists remotely); accepted rounds retire on the
-        relayed SourceReadDone, retired-unaccepted rounds on the Draft's
-        authenticated candidate tombstone.
+        (no early read proof exists remotely): with ring confirmation,
+        accepted rounds retire on the relayed SourceReadDone and
+        retired-unaccepted rounds on the Draft's authenticated candidate
+        tombstone; confirmation-free (issue #329) every remote ring round
+        retires on that authenticated proof.
         """
 
         if draft_session_id in self._ring_revoked_sessions:
@@ -9410,7 +9536,12 @@ class DTTargetController:
         )
 
     def _write_direct_ring(self, plan) -> None:
-        """Publish planned local ring entries after the Coordinator submit succeeded."""
+        """Publish planned local ring entries.
+
+        With ring confirmation this runs after the Coordinator submit
+        succeeded; confirmation-free (issue #329) there is no submit, the
+        caller publishes the plan as soon as it is formed.
+        """
 
         for draft_session_id, writer, task, payload in plan:
             # Stamped before the seq store: the Draft may take it immediately.
@@ -9516,6 +9647,11 @@ class DTTargetController:
                 blocked_since.pop(draft_session_id, None)
                 outstanding.popleft()
                 self._ring_unproven.pop(transfer_id, None)
+                if not self._ring_confirmation:
+                    # Confirmation-free (issue #329): no acceptance ACK will
+                    # retire the unconfirmed-ring-round marker for a local
+                    # round; the read proof is its terminal event.
+                    self._direct_sent.discard(transfer_id)
                 if self._profile_active:
                     # H5, same-host (issue #303): the Draft worker's
                     # INPUT_READY read proof was first seen by this poll.
@@ -9598,6 +9734,10 @@ class DTTargetController:
         outstanding = self._ring_outstanding.pop(draft_session_id, deque())
         for _seq, transfer_id, pull in outstanding:
             self._ring_unproven.pop(transfer_id, None)
+            if not self._ring_confirmation:
+                # Confirmation-free (issue #329): no acceptance ACK cleans
+                # the local rounds' unconfirmed markers either.
+                self._direct_sent.discard(transfer_id)
             if pull is None:
                 continue
             if quiescent:
@@ -9619,6 +9759,31 @@ class DTTargetController:
                     if session_id != draft_session_id:
                         continue
                     retirement.pop(retired_id)
+                    (release_ids if quiescent else quarantine_ids).append(
+                        retired_id
+                    )
+            for retired_id in release_ids:
+                self._release_source_slot(retired_id)
+            for retired_id in quarantine_ids:
+                self._quarantine_source_slot(retired_id)
+        if not self._ring_confirmation:
+            # Confirmation-free (issue #329): the session's remote ring
+            # rounds have no retirement waiters and no acceptance ACKs; the
+            # fence above is their terminal event.  Release or quarantine
+            # their source leases exactly like the waiters, and clean the
+            # unconfirmed-round bookkeeping so it cannot leak.
+            release_ids = []
+            quarantine_ids = []
+            with self._remote_source_guard():
+                for retired_id, session_id in tuple(
+                    self._remote_ring_sessions.items()
+                ):
+                    if session_id != draft_session_id:
+                        continue
+                    self._remote_ring_sessions.pop(retired_id)
+                    self._direct_sent.discard(retired_id)
+                    self._remote_ring_records.pop(retired_id, None)
+                    self._remote_ring_destinations.pop(retired_id, None)
                     (release_ids if quiescent else quarantine_ids).append(
                         retired_id
                     )
