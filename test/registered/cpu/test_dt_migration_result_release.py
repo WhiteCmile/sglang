@@ -3113,6 +3113,7 @@ def test_source_read_done_batch_queues_one_reliable_ack() -> None:
     controller._delivery_outbox = RetryOutbox(retry_interval_ns=1)
     controller._source_done_batch_entries = {}
     controller._maybe_emit_lifecycle_status = lambda: None
+    controller._maybe_emit_target_stats = lambda *_args: None
     validated = []
     consumed = []
     flushes = []

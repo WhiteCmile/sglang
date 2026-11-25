@@ -70,6 +70,9 @@ def _control_stubs(controller, calls, events):
         lambda *, now_ns: calls.append("expire_leases")
     )
     controller._maybe_emit_lifecycle_status = lambda: calls.append("lifecycle")
+    controller._maybe_emit_target_stats = (
+        lambda _now_ns: calls.append("target_stats")
+    )
     arena = SimpleNamespace(
         poll_releases=lambda: calls.append("releases"),
         poll_cancelled=lambda: calls.append("cancelled"),
@@ -123,6 +126,7 @@ def test_poll_split_ready_sync_defers_coordinator_io_to_control_phase() -> None:
         "expire_rounds",
         "expire_leases",
         "lifecycle",
+        "target_stats",
     ]
 
     # Non-export ranks never run the control phase.

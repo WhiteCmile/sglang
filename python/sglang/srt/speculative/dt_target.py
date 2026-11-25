@@ -55,6 +55,10 @@ EAGLE3_HOST_SPAN_PROFILE_EVENT = "target_eagle3_host_span"
 # with second-scale timeouts, so the O(parked) scan runs at most every 2 ms
 # instead of inside every scheduler poll.
 _EXPIRE_SCAN_INTERVAL_NS = 2_000_000
+# Always-on Target stats cadence (issue #329): the ring-copy counters back
+# the P4 evidence legs, unread when profiling is off, so the line logs at
+# most every 2 s like the Draft's sample (dt_draft_engine.py).
+DT_TARGET_STATS_INTERVAL_NS = 2_000_000_000
 # Late-freeze lead estimation: p90 over the last N poll -> launch samples per
 # wave class (extend/decode). A mean-tracking estimator systematically
 # underestimates the tail and lands the next launch after the in-flight
@@ -445,10 +449,21 @@ class DTTargetController:
     _target_poll_split = False
     _driver_stats_dump_ns = 0
     _capacity_gauge_emit_ns = 0
+    _target_stats_emit_ns = 0
     _arena_active_high_water = 0
     # Class default keeps object-level constructions (CPU diagnostics) on the
     # ring-confirmation path; __init__ replaces it with the env flag.
     _ring_confirmation = True
+    # P4 lazy catch-up copies (DT_RING_CONFIRMATION=0, issue #329): the
+    # per-request latest undelivered same-host ring copy and its
+    # transfer -> request index.  None on bare constructions; the helpers
+    # below build them on first use.  The counters are plain ints.
+    _held_ring_copies = None
+    _held_ring_copy_requests = None
+    _ring_copy_suppressed = 0
+    _ring_copy_sent = 0
+    _ring_copy_flushed = 0
+    _fallback_reconcile_sent = 0
 
     """Owns WAIT_DRAFT requests outside the normal SGLang running batch."""
 
@@ -776,20 +791,29 @@ class DTTargetController:
         # §7.1 GPU ring publish (DT_RING_PUBLISH=1): eligible verify waves go
         # out as kernel-written ring records; under ring confirmation the
         # Coordinator confirmation tasks are built by a deferred cleanup off
-        # the park critical path, confirmation-free the cleanup only
-        # registers the rounds in the local ledger.
+        # the park critical path, confirmation-free the cleanup registers the
+        # rounds in the local ledger and retains their catch-up copies.
         self._ring_publish = os.environ.get("DT_RING_PUBLISH", "1") == "1"
         # P4 (DT_RING_CONFIRMATION=0, issue #329): confirmation-free Target,
         # same flag and SSOT as the Draft engine and the Coordinator router.
         # Ring rounds carry their own dispatch (the ring record the Draft
-        # consumes); the Target never builds, submits or resends their
-        # Coordinator copy, the ledger begins from Target-local state, the
-        # local v1 ring write no longer waits for a Coordinator submit, and
-        # remote ring rounds retire on the Draft's authenticated push proof
-        # with no accepted/unaccepted split.
+        # consumes); the Target does not send their Coordinator copy per
+        # round.  Same-host copies are held — one per request, the latest —
+        # and flushed ahead of the next Coordinator-routed message about the
+        # request (a fallback RECONCILE, a cancel, a release), because the
+        # Coordinator's owner record must advance (router._absorb_ring_copy
+        # overwrites committed_kv_len) before that message's length/offset
+        # checks and cancel routing can see the round.  Cross-host rounds
+        # keep sending the copy per round: their source read is acknowledged
+        # through the Coordinator.  The ledger begins from Target-local
+        # state, the local v1 ring write no longer waits for a Coordinator
+        # submit, and remote ring rounds retire on the Draft's authenticated
+        # push proof with no accepted/unaccepted split.
         from dt_protocol import ring_confirmation_enabled
 
         self._ring_confirmation = ring_confirmation_enabled()
+        self._held_ring_copies: dict[str, DraftTask] = {}
+        self._held_ring_copy_requests: dict[str, str] = {}
         # Q15b (DT_RING_PUBLISH_AT_LAUNCH=1): eligible deferred verify waves
         # enqueue the publish kernel on the verify stream at launch, right
         # behind the verify forward, instead of from host park.  The park
@@ -5699,11 +5723,13 @@ class DTTargetController:
         """Begin a ring round in the local ledger (DT_RING_CONFIRMATION=0).
 
         The round was dispatched by its ring record, which the owning Draft
-        consumes directly; the Coordinator copy that would have adopted a P2
-        local registration never exists, so the local registration is the
-        round's only ledger entry.  The owner lease — authorized at plan
-        time — supplies the assignment acceptance (mark_lease_dispatched),
-        which is what the direct completion path requires.
+        consumes directly; its Coordinator copy is not submitted with the
+        round, so the local registration is the round's ledger entry until a
+        later catch-up flush carries the copy (cross-host rounds flush per
+        round instead, and adopt the registration through the submitted
+        batch).  The owner lease — authorized at plan time — supplies the
+        assignment acceptance (mark_lease_dispatched), which is what the
+        direct completion path requires.
         """
 
         if self._ledger.get(task.transfer_id) is not None:
@@ -5719,6 +5745,119 @@ class DTTargetController:
                 round_id=task.round_id,
                 ledger_local_begin_ns=time.monotonic_ns(),
             )
+
+    def _hold_ring_copy(self, task) -> None:
+        """Retain the latest undelivered same-host ring copy for its request.
+
+        Only the latest copy matters per request — the Coordinator's
+        ``_absorb_ring_copy`` overwrites ``committed_kv_len`` — so holding a
+        newer round's copy drops the older one.  The copy is flushed ahead of
+        the next Coordinator-routed message about the request (see
+        :meth:`_flush_held_ring_copies`).
+        """
+
+        held = self._held_ring_copies
+        if held is None:
+            held = self._held_ring_copies = {}
+        index = self._held_ring_copy_requests
+        if index is None:
+            index = self._held_ring_copy_requests = {}
+        previous = held.get(task.request_id)
+        if previous is not None:
+            index.pop(previous.transfer_id, None)
+        held[task.request_id] = task
+        index[task.transfer_id] = task.request_id
+        self._ring_copy_suppressed += 1
+        if self._profile_active:
+            self._profile_emit(
+                "target_ring_copy_held",
+                transfer_id=task.transfer_id,
+                request_id=task.request_id,
+                round_id=task.round_id,
+                ring_seq=int(task.direct_ring_seq or 0),
+                held_ns=time.monotonic_ns(),
+            )
+
+    def _flush_held_ring_copies(self, request_ids) -> bool:
+        """Catch-up flush: submit the held copies for these requests first.
+
+        Runs immediately before any Coordinator-routed message about the same
+        request — a batch carrying a fallback RECONCILE (:meth:`_flush_pending_send`),
+        a CancelTransfers or a DraftRequestRelease (:meth:`_flush_reliable_outbox`)
+        — so the Coordinator absorbs the copy (advancing the owner record and
+        registering the absorbed round) before the message's length/offset
+        checks and cancel routing see the request.  The single Target→
+        Coordinator socket orders the copy ahead of the message.
+
+        Returns False on send backpressure: the copies are restored and the
+        caller must not send its message, or the ordering guarantee would
+        break.  The copies bypass the local ledger on purpose — the round is
+        already registered (or retired) Target-locally; only the Coordinator
+        accounting needs them.
+        """
+
+        held = self._held_ring_copies
+        if not held:
+            return True
+        copies = []
+        for request_id in dict.fromkeys(request_ids):
+            copy = held.pop(request_id, None)
+            if copy is not None:
+                copies.append(copy)
+        if not copies:
+            return True
+        self._batch_sequence += 1
+        batch = TargetTaskBatch(
+            protocol_version=PROTOCOL_VERSION,
+            batch_id=f"{self.instance_id}:tasks:{self._batch_sequence}",
+            target_instance_id=self.instance_id,
+            entries=tuple(copies),
+            sent_ns=time.monotonic_ns(),
+        )
+        if not self._client.submit(batch):
+            for copy in copies:
+                held[copy.request_id] = copy
+            return False
+        index = self._held_ring_copy_requests
+        for copy in copies:
+            index.pop(copy.transfer_id, None)
+        self._ring_copy_flushed += len(copies)
+        outbox = self._delivery_outbox
+        outbox.add("task_batch", batch.batch_id, batch)
+        outbox.mark_sent(
+            "task_batch", batch.batch_id, now_ns=time.monotonic_ns()
+        )
+        if self._profile_active:
+            self._profile_emit(
+                "target_ring_copy_catchup",
+                batch_id=batch.batch_id,
+                transfer_ids=tuple(copy.transfer_id for copy in copies),
+                request_ids=tuple(copy.request_id for copy in copies),
+                flushed_ns=time.monotonic_ns(),
+            )
+        return True
+
+    def _held_requests_for_cancel(self, message) -> list[str]:
+        """Map a CancelTransfers' transfer ids to requests with held copies."""
+
+        held = self._held_ring_copies
+        if not held:
+            return []
+        index = self._held_ring_copy_requests
+        request_ids = []
+        for transfer_id in message.transfer_ids:
+            request_id = index.get(transfer_id)
+            if request_id is None:
+                state = (
+                    None
+                    if self._ledger is None
+                    else self._ledger.get(transfer_id)
+                )
+                if state is not None:
+                    request_id = state.task.request_id
+            if request_id is not None and request_id in held:
+                request_ids.append(request_id)
+        return request_ids
 
     def _flush_pending_send(self) -> None:
         self._flush_reliable_outbox()
@@ -5860,16 +5999,51 @@ class DTTargetController:
 
             # P4 (DT_RING_CONFIRMATION=0, issue #329): ring rounds carry
             # their own dispatch — the ring record the owning Draft consumes
-            # — so they never join the Coordinator batch.  Only the
-            # unstamped remainder is routed; the local v1 ring write no
-            # longer waits for a Coordinator submit and each ring round
-            # begins in the local ledger instead.
-            ring_tasks: tuple = ()
+            # — so they never join the Coordinator batch as dispatches.
+            # Same-host copies are held (one per request, the latest) and
+            # catch-up flushed ahead of the next Coordinator-routed message
+            # about the request; cross-host rounds keep sending the copy per
+            # round because their source read is acknowledged through the
+            # Coordinator (owner decision, issue #329).  Only the unstamped
+            # remainder is routed; the local v1 ring write no longer waits
+            # for a Coordinator submit and each ring round begins in the
+            # local ledger instead.
+            ring_tasks: list = []
             if not self._ring_confirmation:
-                ring_tasks = tuple(t for t in dispatchable if t.direct_ring_seq)
-                dispatchable = tuple(
-                    t for t in dispatchable if not t.direct_ring_seq
-                )
+                remote_sessions = getattr(self, "_remote_ring_sessions", None)
+                kept = []
+                for task in dispatchable:
+                    if not task.direct_ring_seq:
+                        kept.append(task)
+                    elif remote_sessions is not None and (
+                        task.transfer_id in remote_sessions
+                    ):
+                        kept.append(task)
+                        self._ring_copy_sent += 1
+                    else:
+                        ring_tasks.append(task)
+                dispatchable = tuple(kept)
+                if dispatchable:
+                    # A routed message about a request with a held copy must
+                    # never reach the Coordinator before the copy: flush the
+                    # copy first, on the same ordered socket.  On backpressure
+                    # the message (and this pass's reservations) stay put.
+                    if not self._flush_held_ring_copies(
+                        task.request_id for task in dispatchable
+                    ):
+                        remote_records = getattr(
+                            self, "_remote_ring_records", None
+                        )
+                        for transfer_id in reserved:
+                            if remote_records is not None and (
+                                transfer_id in remote_records
+                            ):
+                                continue
+                            self._candidate_arena.cancel(
+                                transfer_id, remote_quiescent=True
+                            )
+                        break
+            ring_tasks = tuple(ring_tasks)
 
             submitted_ns = 0
             dispatch_batch = None
@@ -5882,6 +6056,13 @@ class DTTargetController:
                     entries=tuple(dispatchable),
                     sent_ns=time.monotonic_ns(),
                 )
+                if not self._ring_confirmation:
+                    self._fallback_reconcile_sent += sum(
+                        1
+                        for task in dispatchable
+                        if task.kind == DraftTaskKind.RECONCILE
+                        and not task.direct_ring_seq
+                    )
                 remote_records = getattr(self, "_remote_ring_records", None)
                 try:
                     submitted = self._client.submit(dispatch_batch)
@@ -5917,6 +6098,7 @@ class DTTargetController:
             if ring_tasks:
                 for task in ring_tasks:
                     self._begin_ring_round_local(task)
+                    self._hold_ring_copy(task)
             if dispatch_batch is not None:
                 if self._profile_active:
                     self._profile_emit(
@@ -6052,6 +6234,7 @@ class DTTargetController:
         self._expire_source_leases(now_ns=time.monotonic_ns())
         mark("expire_leases_ns")
         self._maybe_emit_lifecycle_status()
+        self._maybe_emit_target_stats(time.monotonic_ns())
         mark("lifecycle_ns")
         if profile_receive:
             self._emit_capacity_gauge(time.monotonic_ns())
@@ -6120,6 +6303,7 @@ class DTTargetController:
         self._expire_source_leases(now_ns=time.monotonic_ns())
         mark("expire_leases_ns")
         self._maybe_emit_lifecycle_status()
+        self._maybe_emit_target_stats(time.monotonic_ns())
         mark("lifecycle_ns")
         if profile_receive:
             self._emit_capacity_gauge(time.monotonic_ns())
@@ -6419,6 +6603,39 @@ class DTTargetController:
             "quiescent": not any(active.values()) and not any(fatal.values()),
         }
 
+    def _maybe_emit_target_stats(self, now_ns: int) -> None:
+        """Always-on ring-copy counters (issue #329), for the P4 evidence legs.
+
+        Unlike the profile events these persist with profiling off, so the
+        acceptance legs can read copies suppressed vs sent vs catch-up
+        flushed and the routed fallback-RECONCILE count from the logs alone.
+        """
+
+        if now_ns - self._target_stats_emit_ns < DT_TARGET_STATS_INTERVAL_NS:
+            return
+        self._target_stats_emit_ns = now_ns
+        from dt_protocol import DT_TARGET_STATS_MARKER
+
+        held = self._held_ring_copies
+        logger.info(
+            "%s%s",
+            DT_TARGET_STATS_MARKER,
+            json.dumps(
+                {
+                    "instance": self.instance_id,
+                    "observed_ns": now_ns,
+                    "ring_confirmation": int(self._ring_confirmation),
+                    "ring_copy_suppressed": self._ring_copy_suppressed,
+                    "ring_copy_sent": self._ring_copy_sent,
+                    "ring_copy_flushed": self._ring_copy_flushed,
+                    "fallback_reconcile_sent": self._fallback_reconcile_sent,
+                    "ring_copy_held": 0 if not held else len(held),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
     def _maybe_emit_lifecycle_status(self) -> None:
         now_ns = time.monotonic_ns()
         if (
@@ -6469,8 +6686,18 @@ class DTTargetController:
             elif operation == PULL_DONE:
                 sent = self._client.pull_done(message)
             elif operation == CANCEL_TRANSFERS:
+                # A cancel of a round whose copy the Coordinator never saw
+                # would be dropped there (no absorbed owner to route it to);
+                # flush the request's held copy first, on the same socket.
+                if not self._flush_held_ring_copies(
+                    self._held_requests_for_cancel(message)
+                ):
+                    break
                 sent = self._client.cancel(message)
             elif operation == RELEASE_DRAFT_REQUEST:
+                # Same ordering for the request's terminal release.
+                if not self._flush_held_ring_copies((message.request_id,)):
+                    break
                 sent = self._client.release_draft_request(message)
             elif operation == SOURCE_READ_DONE:
                 sent = self._client.send(message)
@@ -8802,7 +9029,8 @@ class DTTargetController:
         per-request token ids are read back from the record itself.  With
         ring confirmation (DT_RING_CONFIRMATION=1) the cleanup also builds
         the Coordinator confirmation copies; confirmation-free (issue #329)
-        it only registers the rounds in the local ledger.
+        it registers the rounds in the local ledger and retains their
+        catch-up copies (kernel publish is same-host only).
         """
 
         import struct as _struct
@@ -9159,7 +9387,7 @@ class DTTargetController:
                         if binding is not None:
                             self._lease_marks.append((transfer_id, binding[0]))
                     else:
-                        # Confirmation-free (issue #329): no Coordinator copy.
+                        # Confirmation-free (issue #329): no per-round copy.
                         # The round begins in the local ledger here, where its
                         # destination reservation is complete, and the owner
                         # lease supplies the assignment acceptance.  The owner
@@ -9168,8 +9396,14 @@ class DTTargetController:
                         # confirmation-only branch, which confirmation-free
                         # rounds never reach, so without it the Draft's
                         # candidate push is rejected and the round never
-                        # completes (gate-measured, issue #329).
+                        # completes (gate-measured, issue #329).  The wave's
+                        # Coordinator copy is retained as the request's
+                        # catch-up copy: kernel publish is same-host only
+                        # (remote waves publish per round on the remote ring),
+                        # so it is held here and flushed ahead of the
+                        # request's next Coordinator-routed message.
                         self._begin_ring_round_local(ring_task)
+                        self._hold_ring_copy(ring_task)
                         if binding is not None:
                             self._ledger.mark_lease_dispatched(
                                 transfer_id, draft_instance_id=binding[0]

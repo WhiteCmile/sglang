@@ -106,6 +106,7 @@ def _controller(arena):
     c._expire_local_rounds = lambda: []
     c._expire_source_leases = lambda **_kwargs: None
     c._maybe_emit_lifecycle_status = lambda: None
+    c._maybe_emit_target_stats = lambda _now_ns: None
     return c, rounds
 
 
