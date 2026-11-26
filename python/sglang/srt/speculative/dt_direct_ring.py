@@ -91,17 +91,18 @@ STATE_CLOSED = 4
 # entries keep the high half of the source offset there, always 0 because
 # source allocations are smaller than 4 GiB — enforced by RingGpuPublisher).
 RING_PUBLISH = os.environ.get("DT_RING_PUBLISH", "1") == "1"
-# Q15b (DT_RING_PUBLISH_AT_LAUNCH=1): eligible deferred verify waves enqueue
-# the publish kernel on the verify stream at launch, right behind the verify
-# forward, instead of from host park one result boundary later.  The staging
-# slots rotate: the host stages wave k+1 while the GPU may still hold wave
-# k-1's kernel queued behind its forward, so a single staging buffer could be
-# overwritten before the queued kernel reads it.  Slot 0 remains the
-# single-record park path's staging; a multi-record wave (one record per
-# owner Draft group and geometry chunk, at park or at launch) rotates the
-# remaining slots so its later records never overwrite an earlier record's
-# staging before that kernel has run.
-RING_PUBLISH_AT_LAUNCH = os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "0") == "1"
+# Q15b (DT_RING_PUBLISH_AT_LAUNCH=1, default on since issue #343): eligible
+# deferred verify waves enqueue the publish kernel on the verify stream at
+# launch, right behind the verify forward, instead of from host park one
+# result boundary later.  The staging slots rotate: the host stages wave k+1
+# while the GPU may still hold wave k-1's kernel queued behind its forward,
+# so a single staging buffer could be overwritten before the queued kernel
+# reads it.  Slot 0 remains the single-record park path's staging; a
+# multi-record wave (one record per owner Draft group and geometry chunk, at
+# park or at launch) rotates the remaining slots so its later records never
+# overwrite an earlier record's staging before that kernel has run.  =0
+# still selects the park path.
+RING_PUBLISH_AT_LAUNCH = os.environ.get("DT_RING_PUBLISH_AT_LAUNCH", "1") == "1"
 # Target redesign P2 (DT_TARGET_DEST_AT_LAUNCH=1, issue #321): an at-launch
 # published wave also reserves and authorizes every row's candidate
 # destination at launch and CPU-writes the ring's destination region before
@@ -113,13 +114,14 @@ if TARGET_DEST_AT_LAUNCH and not RING_PUBLISH_AT_LAUNCH:
     raise RuntimeError(
         "DT_TARGET_DEST_AT_LAUNCH=1 requires DT_RING_PUBLISH_AT_LAUNCH=1"
     )
-# Target redesign P3 (DT_TARGET_POLL_SPLIT=1, issue #328): the per-loop poll
-# splits into ready_sync (completion snapshot, arena poll, mark-ready, READY
-# snapshot; no Coordinator I/O or cleanup before the snapshot) at the head of
-# the scheduler loop and a TP0-only control phase after launch (Coordinator
-# recv, flush, releases, read proofs, expiry); the control phase's
-# TP-relevant events ride the next ready_sync packet in order.
-TARGET_POLL_SPLIT = os.environ.get("DT_TARGET_POLL_SPLIT", "0") == "1"
+# Target redesign P3 (DT_TARGET_POLL_SPLIT=1, default on since issue #343):
+# the per-loop poll splits into ready_sync (completion snapshot, arena poll,
+# mark-ready, READY snapshot; no Coordinator I/O or cleanup before the
+# snapshot) at the head of the scheduler loop and a TP0-only control phase
+# after launch (Coordinator recv, flush, releases, read proofs, expiry); the
+# control phase's TP-relevant events ride the next ready_sync packet in
+# order.  =0 still selects the fused single-phase poll.
+TARGET_POLL_SPLIT = os.environ.get("DT_TARGET_POLL_SPLIT", "1") == "1"
 LAUNCH_STAGING_SLOTS = 8
 V2_VERSION = 2
 V2_HEADER_BYTES = 128
