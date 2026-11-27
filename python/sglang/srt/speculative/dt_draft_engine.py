@@ -7899,7 +7899,7 @@ class FlashMTPDraftEngine:
                 allocated_lens,
             ) = metadata
             token_counts = committed_lens - feature_offsets
-            if self.device.type == "cuda":
+            if self._canonical_draft_device(self.device).type == "cuda":
                 positions, _ = compute_position(
                     self._draft_model_runner.server_args.attention_backend,
                     feature_offsets,
@@ -8402,7 +8402,7 @@ class FlashMTPDraftEngine:
         """Write packed KV pages into per-row [start, end) page-table ranges."""
 
         req_to_token = self._draft_model_runner.req_to_token_pool.req_to_token
-        if self.device.type == "cuda":
+        if self._canonical_draft_device(self.device).type == "cuda":
             from sglang.srt.mem_cache.allocation import (
                 assign_req_to_token_pool_func,
             )
@@ -8631,7 +8631,7 @@ class FlashMTPDraftEngine:
             if marks is not None:
                 marks["proposal_kv"] = time.monotonic_ns()
 
-            if self.device.type == "cuda":
+            if self._canonical_draft_device(self.device).type == "cuda":
                 from sglang.kernels.ops.speculative.dflash import (
                     _prepare_dflash_draft_block_unchecked,
                 )
