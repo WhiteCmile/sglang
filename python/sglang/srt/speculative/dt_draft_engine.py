@@ -1040,6 +1040,9 @@ class FlashMTPDraftEngine:
     _profile_candidate_push_retire = False
     _profile_notice_ack = False
     _profile_result_publish = False
+    _profile_ready_skip = False
+    _profile_push_timing = False
+    _profile_ready_skip_accounting = False
     _submit_marks = None
     _submit_sub_ns = None
 
@@ -1112,49 +1115,7 @@ class FlashMTPDraftEngine:
         self.EntryStatus = EntryStatus
         self.instance_id = instance_id
         self._profile_active = profile_enabled()
-        # Per-event profiling gates (issue #362): every expensive path —
-        # CUDA-event queries, per-row dicts, extra clock reads, the submit
-        # marks — runs only when an event that consumes its output is
-        # enabled, not merely when DT_PROFILE_DIR is set.  event_enabled
-        # reads import-time cached config, so these startup snapshots never
-        # go stale; an empty DT_PROFILE_EVENTS filter enables everything,
-        # reproducing the old _profile_active behaviour exactly.
-        self._profile_batch_estimate = profile_event_enabled("draft_batch_estimate")
-        self._profile_batch_complete = profile_event_enabled(
-            "draft_dflash_batch_complete"
-        )
-        self._profile_input_ready = profile_event_enabled("draft_input_ready")
-        self._profile_ring_take = profile_event_enabled("draft_ring_take")
-        self._profile_input_ready_submit = profile_event_enabled(
-            "draft_input_ready_submit"
-        )
-        self._profile_input_ready_select = profile_event_enabled(
-            "draft_input_ready_select"
-        )
-        self._profile_ready_state_event = profile_event_enabled(
-            "draft_input_ready_state"
-        )
-        self._profile_kv_or_proposal = bool(
-            profile_event_enabled("draft_kv_materialization")
-            or profile_event_enabled("draft_proposal")
-        )
-        self._profile_feature_pull_complete = profile_event_enabled(
-            "draft_feature_pull_complete"
-        )
-        self._profile_done_absorb = profile_event_enabled("draft_dflash_done_absorb")
-        self._profile_candidate_push_submit = profile_event_enabled(
-            "draft_candidate_push_submit"
-        )
-        self._profile_candidate_push_retire = bool(
-            profile_event_enabled("draft_candidate_producer_completion_observed")
-            or profile_event_enabled("draft_candidate_push_complete")
-        )
-        self._profile_notice_ack = profile_event_enabled("draft_candidate_notice_ack")
-        self._profile_result_publish = bool(
-            profile_event_enabled("draft_result_publish")
-            or profile_event_enabled("draft_flashmtp_result_publish")
-            or profile_event_enabled("draft_flashmtp_result_send")
-        )
+        self._snapshot_profile_gates()
         self._last_input_ready_profile_state = None
         self._batch_estimator = (
             DraftBatchEstimator() if self._profile_batch_estimate else None
@@ -1566,11 +1527,7 @@ class FlashMTPDraftEngine:
                     draft_instance_id=self.instance_id,
                     draft_session_id=self._client.instance_session_id,
                     device=self.device,
-                    profile_timing=(
-                        self._profile_candidate_push_submit
-                        or self._profile_candidate_push_retire
-                        or self._profile_notice_ack
-                    ),
+                    profile_timing=self._profile_push_timing,
                     host_addr=self._dt_host_addr,
                 )
             if (
@@ -2570,16 +2527,74 @@ class FlashMTPDraftEngine:
         self._loop_stage_calls[name] += 1
         return result
 
+    def _snapshot_profile_gates(self) -> None:
+        """Snapshot the per-event profiling gates onto self (issue #362).
+
+        Every expensive path — CUDA-event queries, per-row dicts, extra
+        clock reads, the submit marks — runs only when an event that
+        consumes its output is enabled, not merely when DT_PROFILE_DIR is
+        set.  event_enabled reads import-time cached config, so these
+        startup snapshots never go stale; an empty DT_PROFILE_EVENTS filter
+        enables everything, reproducing the old _profile_active behaviour
+        exactly.  A producer of records for several events gets ONE flag
+        naming all of its consumers, and the drain of those records runs
+        under that same flag — otherwise a partial DT_PROFILE_EVENTS set
+        either starves the consumer or lets the records grow without bound
+        (issue #366).
+        """
+        enabled = profile_event_enabled
+        self._profile_batch_estimate = enabled("draft_batch_estimate")
+        self._profile_batch_complete = enabled("draft_dflash_batch_complete")
+        self._profile_input_ready = enabled("draft_input_ready")
+        self._profile_ring_take = enabled("draft_ring_take")
+        self._profile_input_ready_submit = enabled("draft_input_ready_submit")
+        self._profile_input_ready_select = enabled("draft_input_ready_select")
+        self._profile_ready_state_event = enabled("draft_input_ready_state")
+        self._profile_kv_or_proposal = bool(
+            enabled("draft_kv_materialization") or enabled("draft_proposal")
+        )
+        self._profile_feature_pull_complete = enabled("draft_feature_pull_complete")
+        self._profile_done_absorb = enabled("draft_dflash_done_absorb")
+        self._profile_candidate_push_submit = enabled("draft_candidate_push_submit")
+        self._profile_candidate_push_retire = bool(
+            enabled("draft_candidate_producer_completion_observed")
+            or enabled("draft_candidate_push_complete")
+        )
+        self._profile_notice_ack = enabled("draft_candidate_notice_ack")
+        self._profile_result_publish = bool(
+            enabled("draft_result_publish")
+            or enabled("draft_flashmtp_result_publish")
+            or enabled("draft_flashmtp_result_send")
+        )
+        self._profile_ready_skip = enabled("draft_ready_skip")
+        # The push transport collects per-push timing and completion-ACK
+        # records for all of these events; _push_transport_progress drains
+        # the ACK records under this same flag.
+        self._profile_push_timing = bool(
+            self._profile_candidate_push_submit
+            or self._profile_candidate_push_retire
+            or self._profile_notice_ack
+        )
+        # The FREEZE skip accounting feeds the draft_batch_estimate stats
+        # and the per-row draft_ready_skip records.
+        self._profile_ready_skip_accounting = bool(
+            self._profile_batch_estimate or self._profile_ready_skip
+        )
+
     def _push_transport_progress(self) -> None:
         transport = self._candidate_push_transport
         transport.progress_completions()
-        if self._profile_notice_ack:
-            for acknowledgement in transport.pop_acknowledgements():
-                profile_emit(
-                    "draft_candidate_notice_ack",
-                    draft_instance=self.instance_id,
-                    **acknowledgement,
-                )
+        if self._profile_push_timing:
+            # Drain whenever the transport collects (see
+            # _snapshot_profile_gates), emit only when the event is on.
+            acknowledgements = transport.pop_acknowledgements()
+            if self._profile_notice_ack:
+                for acknowledgement in acknowledgements:
+                    profile_emit(
+                        "draft_candidate_notice_ack",
+                        draft_instance=self.instance_id,
+                        **acknowledgement,
+                    )
 
     def run(self) -> None:
         logger.info("DT Draft engine serving")
@@ -3892,7 +3907,7 @@ class FlashMTPDraftEngine:
         deferred_cells = self._deferred_release_cells
         pass_handles = set()
 
-        if profile:
+        if self._profile_ready_skip_accounting:
             # Skip accounting (#292).  A waiting row's state is [reason, last
             # evaluation ns, gate mark, passes, first reason, fit, held ns per
             # reason, late-freeze mark]; a row frozen at its first pass gets
@@ -3961,7 +3976,7 @@ class FlashMTPDraftEngine:
                     self._ready_long_rows[held.index(max(held))] += 1
                     if self._ready_longest is None or held_ns > self._ready_longest["held_ns"]:
                         self._ready_longest = summary
-                if profile_event_enabled("draft_ready_skip"):
+                if self._profile_ready_skip:
                     _, transfer_id, rid = self._ready_row_identity(row)
                     profile_emit(
                         "draft_ready_skip",

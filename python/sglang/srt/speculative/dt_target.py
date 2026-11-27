@@ -598,63 +598,8 @@ class DTTargetController:
             )
         self.overlap_result_defer_ns = int(overlap_result_defer_ms * 1_000_000)
         self.is_export_rank = scheduler.ps.tp_rank == 0
-        # Per-event profiling gates (issue #362): every expensive path —
-        # CUDA-event pairs, the observation poll, per-row dicts, extra clock
-        # reads — runs only when an event that consumes its output is
-        # enabled, not merely when DT_PROFILE_DIR is set.  event_enabled
-        # reads import-time cached config, so these startup snapshots never
-        # go stale.  An empty DT_PROFILE_EVENTS filter enables everything,
-        # reproducing the old _profile_active behaviour exactly.
-        self.target_loop_profile_enabled = bool(
-            self.is_export_rank
-            and (
-                profile_event_enabled("target_loop_iteration")
-                or profile_event_enabled("target_iteration_tail")
-                or profile_event_enabled("target_old_result_process")
-            )
-        )
-        self.target_submission_profile_enabled = bool(
-            self.is_export_rank
-            and (
-                profile_event_enabled("target_batch_submit")
-                or profile_event_enabled("target_verify_cuda_observed")
-            )
-        )
-        self.target_phase_profile_enabled = bool(
-            self.target_loop_profile_enabled
-            or self.target_submission_profile_enabled
-        )
-        self._profile_verify_observation = bool(
-            self.is_export_rank
-            and (
-                profile_event_enabled("target_verify_cuda_observed")
-                or profile_event_enabled("target_verify_cuda_observation_error")
-            )
-        )
-        self._profile_park_batch = profile_event_enabled("target_park_batch")
-        self._profile_maintenance = bool(
-            profile_event_enabled("target_gc")
-            or profile_event_enabled("target_gc_stats")
-            or profile_event_enabled("target_driver_call_hist")
-        )
-        self._profile_poll_splits = bool(
-            profile_event_enabled("target_result_poll")
-            or profile_event_enabled("target_control_phase")
-        )
-        self._profile_tp_apply = bool(
-            self.is_export_rank and profile_event_enabled("target_direct_tp_apply")
-        )
-        self._profile_capacity_gauge = profile_event_enabled("target_capacity")
-        self._profile_rdma_sender_trace = bool(
-            profile_event_enabled("target_ready_publish")
-            or profile_event_enabled("target_ready_cqe")
-        )
-        self._profile_ready_snapshot = profile_event_enabled("target_ready_snapshot")
+        self._snapshot_profile_gates()
         self._gpu_clock_wanted = os.environ.get("DT_GPU_CLOCK", "0") == "1"
-        self.empty_prefill_arbitration_profile_enabled = bool(
-            self.is_export_rank
-            and profile_event_enabled("target_empty_prefill_arbitration")
-        )
         self._overlap_fix_observer = None
         if os.environ.get("DT_OVERLAP_FIX_OBSERVER_DIR"):
             from overlap_observer import create
@@ -3772,6 +3717,68 @@ class DTTargetController:
             return []
         self._control_pending_events = []
         return pending
+
+    def _snapshot_profile_gates(self) -> None:
+        """Snapshot the per-event profiling gates onto self (issue #362).
+
+        Every expensive path — CUDA-event pairs, the observation poll,
+        per-row dicts, extra clock reads — runs only when an event that
+        consumes its output is enabled, not merely when DT_PROFILE_DIR is
+        set.  event_enabled reads import-time cached config, so these
+        startup snapshots never go stale.  An empty DT_PROFILE_EVENTS
+        filter enables everything, reproducing the old _profile_active
+        behaviour exactly.  A producer of records for several events gets
+        ONE flag naming all of its consumers, and the drain of those
+        records runs under that same flag (issue #366): the submission
+        record feeds target_batch_submit and the verify observation alike,
+        so its gate derives from _profile_verify_observation and a partial
+        DT_PROFILE_EVENTS set can neither starve the observation-error
+        consumer nor orphan the pending observations.
+        """
+        enabled = profile_event_enabled
+        self.target_loop_profile_enabled = bool(
+            self.is_export_rank
+            and (
+                enabled("target_loop_iteration")
+                or enabled("target_iteration_tail")
+                or enabled("target_old_result_process")
+            )
+        )
+        self._profile_verify_observation = bool(
+            self.is_export_rank
+            and (
+                enabled("target_verify_cuda_observed")
+                or enabled("target_verify_cuda_observation_error")
+            )
+        )
+        self.target_submission_profile_enabled = bool(
+            self.is_export_rank
+            and (enabled("target_batch_submit") or self._profile_verify_observation)
+        )
+        self.target_phase_profile_enabled = bool(
+            self.target_loop_profile_enabled
+            or self.target_submission_profile_enabled
+        )
+        self._profile_park_batch = enabled("target_park_batch")
+        self._profile_maintenance = bool(
+            enabled("target_gc")
+            or enabled("target_gc_stats")
+            or enabled("target_driver_call_hist")
+        )
+        self._profile_poll_splits = bool(
+            enabled("target_result_poll") or enabled("target_control_phase")
+        )
+        self._profile_tp_apply = bool(
+            self.is_export_rank and enabled("target_direct_tp_apply")
+        )
+        self._profile_capacity_gauge = enabled("target_capacity")
+        self._profile_rdma_sender_trace = bool(
+            enabled("target_ready_publish") or enabled("target_ready_cqe")
+        )
+        self._profile_ready_snapshot = enabled("target_ready_snapshot")
+        self.empty_prefill_arbitration_profile_enabled = bool(
+            self.is_export_rank and enabled("target_empty_prefill_arbitration")
+        )
 
     def record_target_batch_submission(
         self,
