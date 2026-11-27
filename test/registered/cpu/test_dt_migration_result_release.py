@@ -2564,130 +2564,10 @@ def test_feature_publication_fences_graph_buffer_reuse(feature_path: str) -> Non
     assert len(batch_result.dt_staged_dflash_features.tasks) == 1
 
 
-def test_dflash_grouped_suffix_free_flushes_before_reuse_and_cleanup() -> None:
-    allocator = TokenToKVPoolAllocator(
-        size=5,
-        dtype=torch.bfloat16,
-        device="cpu",
-        kvcache=None,
-        need_sort=False,
-    )
-    old_pages = allocator.alloc(5)
-    assert old_pages is not None
-    req_to_token = torch.zeros((2, 8), dtype=torch.int64)
-    req_to_token[1, :5] = old_pages
-    req = SimpleNamespace(
-        req_pool_idx=1,
-        kv=SimpleNamespace(kv_allocated_len=5),
-    )
-    state = SimpleNamespace(
-        request_id="request-0",
-        target_instance_id="target-0",
-        draft_kv_handle="kv-0",
-        last_round_id=0,
-        valid_committed_len=2,
-        proposal_base_len=2,
-        req=req,
-    )
-    task = SimpleNamespace(
-        kind=DraftTaskKind.RECONCILE,
-        request_id=state.request_id,
-        target_instance_id=state.target_instance_id,
-        draft_kv_handle=state.draft_kv_handle,
-        round_id=1,
-        feature_token_offset=2,
-    )
-    engine = object.__new__(FlashMTPDraftEngine)
-    engine._persistent_requests = {state.draft_kv_handle: state}
-    engine._draft_model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-        token_to_kv_pool_allocator=allocator,
-        server_args=SimpleNamespace(page_size=1),
-    )
-
-    assert engine._free_dflash_reconcile_suffixes([task, task]) is None
-    assert req.kv.kv_allocated_len == 5
-    assert allocator.free_pages.numel() == 0
-    discarded = engine._free_dflash_reconcile_suffixes([task])
-
-    assert discarded == {state.draft_kv_handle: 3}
-    assert req.kv.kv_allocated_len == 2
-    replacement = allocator.alloc(2)
-    assert replacement is not None
-    assert replacement.tolist() == [3, 4]
-    req_to_token[1, 2:4] = replacement
-    assert allocator.free_pages.tolist() == [5]
-
-    # Emulate failure cleanup after the replacement pages became owned.  The
-    # committed prefix plus replacement must free every page exactly once.
-    req.kv.kv_allocated_len = 4
-    allocator.free(req_to_token[1, : req.kv.kv_allocated_len])
-    released = allocator.free_pages.tolist()
-    assert sorted(released) == [1, 2, 3, 4, 5]
-    assert len(released) == len(set(released))
-
-
-def test_dflash_grouped_reconcile_reuses_packed_rows_and_cleanup_ownership() -> None:
-    allocator = TokenToKVPoolAllocator(
-        size=10,
-        dtype=torch.bfloat16,
-        device="cpu",
-        kvcache=None,
-        need_sort=False,
-    )
-    old_pages = allocator.alloc(10)
-    assert old_pages is not None
-    req_to_token = torch.zeros((3, 8), dtype=torch.int32)
-    req_to_token[1, :5] = old_pages[:5]
-    req_to_token[2, :5] = old_pages[5:]
-
-    def make_req(row: int):
-        req = SimpleNamespace(
-            req_pool_idx=row,
-            kv=SimpleNamespace(kv_allocated_len=5),
-            kv_committed_len=0,
-            prefix_indices=torch.empty((0,), dtype=torch.int64),
-            output_ids=[],
-        )
-        req._refresh_fill_ids = lambda: None
-        req.set_extend_range = lambda start, end: setattr(
-            req, "extend_range", (start, end)
-        )
-        return req
-
-    reqs = [make_req(1), make_req(2)]
-    states = [
-        SimpleNamespace(
-            request_id=f"request-{index}",
-            target_instance_id="target-0",
-            draft_kv_handle=f"kv-{index}",
-            last_round_id=0,
-            valid_committed_len=committed_len,
-            proposal_base_len=committed_len,
-            committed_token_ids=list(range(committed_len)),
-            req=req,
-        )
-        for index, (req, committed_len) in enumerate(zip(reqs, (2, 3)))
-    ]
-    tasks = [
-        SimpleNamespace(
-            kind=DraftTaskKind.RECONCILE,
-            request_id=state.request_id,
-            target_instance_id=state.target_instance_id,
-            draft_kv_handle=state.draft_kv_handle,
-            round_id=1,
-            feature_token_offset=state.valid_committed_len,
-            feature_token_count=token_count,
-            committed_kv_len=state.valid_committed_len + token_count,
-            committed_token_ids=list(range(100 + index, 100 + index + token_count)),
-        )
-        for index, (state, token_count) in enumerate(zip(states, (1, 2)))
-    ]
+def _make_dflash_reconcile_engine(req_to_token, allocator, states):
     engine = object.__new__(FlashMTPDraftEngine)
     engine.device = torch.device("cpu")
-    engine.profile = SimpleNamespace(draft_k=7)
     engine.instance_id = "draft-0"
-    _init_lifetime_state(engine)
     engine._persistent_requests = {
         state.draft_kv_handle: state for state in states
     }
@@ -2698,6 +2578,62 @@ def test_dflash_grouped_reconcile_reuses_packed_rows_and_cleanup_ownership() -> 
         token_to_kv_pool_allocator=allocator,
         server_args=SimpleNamespace(page_size=1),
     )
+    return engine
+
+
+def _make_dflash_reconcile_task(state, token_count, next_token_id=900):
+    return SimpleNamespace(
+        kind=DraftTaskKind.RECONCILE,
+        request_id=state.request_id,
+        target_instance_id=state.target_instance_id,
+        draft_kv_handle=state.draft_kv_handle,
+        round_id=state.last_round_id + 1,
+        feature_token_offset=state.valid_committed_len,
+        feature_token_count=token_count,
+        committed_kv_len=state.valid_committed_len + token_count,
+        committed_token_ids=list(range(100, 100 + token_count)),
+        next_token_id=next_token_id,
+        transfer_id=f"transfer-{state.draft_kv_handle}-{state.last_round_id + 1}",
+    )
+
+
+def test_dflash_reconcile_keeps_proposal_pages_and_tops_up_shortfall() -> None:
+    allocator = TokenToKVPoolAllocator(
+        size=16,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=None,
+        need_sort=False,
+    )
+    req_to_token = torch.zeros((4, 10), dtype=torch.int32)
+    # Row 1 as a proposal left it: committed prefix 2 plus a 3-page lookahead
+    # block.  Row 2 as a bootstrap left it: committed prefix 3, no lookahead.
+    req_to_token[1, :5] = torch.arange(1, 6, dtype=torch.int32)
+    req_to_token[2, :3] = torch.arange(6, 9, dtype=torch.int32)
+    allocator.free_pages = allocator.free_pages[8:]
+
+    def make_state(row, committed_len, allocated_len):
+        return SimpleNamespace(
+            request_id=f"request-{row}",
+            target_instance_id="target-0",
+            draft_kv_handle=f"kv-{row}",
+            last_round_id=0,
+            valid_committed_len=committed_len,
+            proposal_base_len=committed_len,
+            committed_token_ids=list(range(committed_len)),
+            req=SimpleNamespace(
+                req_pool_idx=row,
+                kv=SimpleNamespace(kv_allocated_len=allocated_len),
+                kv_committed_len=committed_len,
+            ),
+        )
+
+    states = [make_state(1, 2, 5), make_state(2, 3, 3)]
+    tasks = [
+        _make_dflash_reconcile_task(states[0], 1),
+        _make_dflash_reconcile_task(states[1], 2),
+    ]
+    engine = _make_dflash_reconcile_engine(req_to_token, allocator, states)
     alloc_calls = []
     original_alloc = allocator.alloc
 
@@ -2706,47 +2642,136 @@ def test_dflash_grouped_reconcile_reuses_packed_rows_and_cleanup_ownership() -> 
         return original_alloc(size)
 
     allocator.alloc = counted_alloc
-    phases = [0] * 6
-    discarded = engine._free_dflash_reconcile_suffixes(tasks, phases)
-    grouped = engine._allocate_dflash_reconcile_rows(tasks, discarded, phases)
-    assert grouped is not None
-    cache_locs, packed_cache_locs, positions = grouped
+    metadata_host = torch.zeros((5, 8), dtype=torch.int64)
+    metadata_device = torch.zeros((5, 8), dtype=torch.int64)
 
-    assert alloc_calls == [3]
-    assert req_to_token.dtype == torch.int32
-    assert packed_cache_locs.dtype == torch.int64
-    assert positions.dtype == torch.int64
-    assert all(cache_loc.dtype == torch.int64 for cache_loc in cache_locs)
-    assert packed_cache_locs.device == req_to_token.device
-    assert positions.device == req_to_token.device
-    assert positions.tolist() == [2, 3, 4]
-    assert torch.cat(cache_locs).tolist() == packed_cache_locs.tolist()
-    assert [req.kv.kv_allocated_len for req in reqs] == [3, 5]
-    assert req_to_token[1, 2:3].tolist() == cache_locs[0].tolist()
-    assert req_to_token[2, 3:5].tolist() == cache_locs[1].tolist()
+    prepared, metadata, total_tokens = engine._reconcile_dflash_rows(
+        tasks, metadata_host=metadata_host, metadata_device=metadata_device
+    )
 
-    for task, cache_loc in zip(tasks, cache_locs, strict=True):
-        engine._prepare_dflash_task(
-            task,
-            phases,
-            suffix_already_freed=True,
-            discarded_tokens_override=discarded[task.draft_kv_handle],
-            refresh_prefix_indices=False,
-            cache_loc_override=cache_loc,
-            row_already_written=True,
-        )
-    assert alloc_calls == [3]
+    # The steady-state row neither frees nor allocates: its committed range
+    # already sits on the previous proposal's pages.  The bootstrap row tops
+    # up exactly its shortfall.
+    assert alloc_calls == [2]
+    assert total_tokens == 3
     assert [state.valid_committed_len for state in states] == [3, 5]
-    assert [req.extend_range for req in reqs] == [(2, 3), (3, 5)]
+    assert [state.req.kv.kv_allocated_len for state in states] == [5, 5]
+    assert [state.last_round_id for state in states] == [1, 1]
+    assert [state.committed_token_ids[-1] for state in states] == [100, 101]
+    # The top-up landed in the page table; the untouched row kept its pages.
+    assert req_to_token[1, :5].tolist() == [1, 2, 3, 4, 5]
+    assert req_to_token[2, :5].tolist() == [6, 7, 8, 9, 10]
+    # The packed metadata feeds the gather, the top-up, and the proposal.
+    assert metadata[0].tolist() == [1, 2]
+    assert metadata[1].tolist() == [2, 3]
+    assert metadata[2].tolist() == [3, 5]
+    assert metadata[3].tolist() == [900, 900]
+    assert metadata[4].tolist() == [5, 3]
+    # A release still returns every page exactly once (see the invariant
+    # test below for the full lifecycle).
+    assert prepared == states
 
+
+def test_dflash_pages_and_rows_returned_after_release_and_migration() -> None:
+    """Leak invariant: cancel/release/expiry/migration return every KV page
+    and every request row exactly once.
+
+    Cancel and expiry both funnel into ``_release_persistent_request``; a
+    migration export frees the uncommitted suffix and keeps the row for a
+    later release.  Drive both funnels after pages-stay-put reconcile rounds
+    and check the allocator returns to its initial size with no double-free.
+    """
+
+    allocator = TokenToKVPoolAllocator(
+        size=32,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=None,
+        need_sort=False,
+    )
+    req_to_token = torch.zeros((4, 10), dtype=torch.int32)
+    start_available = allocator.available_size()
+
+    def make_state(row, committed_len):
+        pages = allocator.alloc(committed_len)
+        assert pages is not None
+        req_to_token[row, :committed_len] = pages.to(torch.int32)
+        return SimpleNamespace(
+            request_id=f"request-{row}",
+            target_instance_id="target-0",
+            draft_kv_handle=f"kv-{row}",
+            last_round_id=0,
+            valid_committed_len=committed_len,
+            proposal_base_len=committed_len,
+            committed_token_ids=list(range(committed_len)),
+            req=SimpleNamespace(
+                req_pool_idx=row,
+                kv=SimpleNamespace(kv_allocated_len=committed_len),
+                kv_committed_len=committed_len,
+            ),
+        )
+
+    states = [make_state(1, 2), make_state(2, 3), make_state(3, 1)]
+    engine = _make_dflash_reconcile_engine(req_to_token, allocator, states)
+    _init_lifetime_state(engine)
+    freed_rows = []
+    engine._draft_model_runner.req_to_token_pool.free = (
+        lambda req: freed_rows.append(req.req_pool_idx)
+    )
+    metadata_host = torch.zeros((5, 8), dtype=torch.int64)
+    metadata_device = torch.zeros((5, 8), dtype=torch.int64)
+
+    def simulate_proposal(state, block_size=3):
+        """The ownership half of _run_dflash_proposal: one batched tail
+        allocation, one page-table write, kv_allocated_len = valid + B."""
+        valid = state.valid_committed_len
+        allocated = state.req.kv.kv_allocated_len
+        pages = allocator.alloc(valid + block_size - allocated)
+        assert pages is not None
+        req_to_token[state.req.req_pool_idx, allocated : valid + block_size] = (
+            pages.to(torch.int32)
+        )
+        state.req.kv.kv_allocated_len = valid + block_size
+
+    # Round 1: bootstrap rows top up (no lookahead yet), then propose.
+    engine._reconcile_dflash_rows(
+        [_make_dflash_reconcile_task(state, 1) for state in states],
+        metadata_host=metadata_host,
+        metadata_device=metadata_device,
+    )
     for state in states:
-        assert engine._release_persistent_request(state.draft_kv_handle)
+        simulate_proposal(state)
+    # Round 2: every committed range already sits on owned pages.
+    free_pages_before = allocator.free_pages.clone()
+    engine._reconcile_dflash_rows(
+        [_make_dflash_reconcile_task(state, 2) for state in states],
+        metadata_host=metadata_host,
+        metadata_device=metadata_device,
+    )
+    assert allocator.free_pages.tolist() == free_pages_before.tolist()
+    for state in states:
+        simulate_proposal(state)
+
+    # Cancel/expiry funnel: release returns the prefix plus the lookahead.
+    assert engine._release_persistent_request(states[0].draft_kv_handle)
+    # Migration funnel: export frees the uncommitted suffix, release the rest.
+    exported = states[1]
+    engine._free_persistent_kv_suffix(
+        exported.req,
+        exported.valid_committed_len,
+        exported.req.kv.kv_allocated_len,
+    )
+    exported.req.kv.kv_allocated_len = exported.valid_committed_len
+    assert engine._release_persistent_request(exported.draft_kv_handle)
+    assert engine._release_persistent_request(states[2].draft_kv_handle)
+
+    assert allocator.available_size() == start_available
     released = allocator.free_pages.tolist()
-    assert sorted(released) == list(range(1, 11))
     assert len(released) == len(set(released))
+    assert sorted(freed_rows) == [1, 2, 3]
 
 
-def test_dflash_grouped_reconcile_install_failure_frees_only_replacements() -> None:
+def test_dflash_reconcile_topup_failure_frees_only_topup_pages() -> None:
     allocator = TokenToKVPoolAllocator(
         size=10,
         dtype=torch.bfloat16,
@@ -2754,83 +2779,60 @@ def test_dflash_grouped_reconcile_install_failure_frees_only_replacements() -> N
         kvcache=None,
         need_sort=False,
     )
-    old_pages = allocator.alloc(10)
+    old_pages = allocator.alloc(8)
     assert old_pages is not None
     req_to_token = torch.zeros((3, 8), dtype=torch.int32)
     req_to_token[1, :5] = old_pages[:5]
-    req_to_token[2, :5] = old_pages[5:]
+    req_to_token[2, :3] = old_pages[5:]
 
-    def make_req(row: int):
-        req = SimpleNamespace(
-            req_pool_idx=row,
-            kv=SimpleNamespace(kv_allocated_len=5),
-            kv_committed_len=0,
-            prefix_indices=torch.empty((0,), dtype=torch.int64),
-            output_ids=[],
-        )
-        req._refresh_fill_ids = lambda: None
-        req.set_extend_range = lambda start, end: setattr(
-            req, "extend_range", (start, end)
-        )
-        return req
-
-    reqs = [make_req(1), make_req(2)]
-    states = [
-        SimpleNamespace(
-            request_id=f"request-{index}",
+    def make_state(row, committed_len, allocated_len):
+        return SimpleNamespace(
+            request_id=f"request-{row}",
             target_instance_id="target-0",
-            draft_kv_handle=f"kv-{index}",
+            draft_kv_handle=f"kv-{row}",
             last_round_id=0,
             valid_committed_len=committed_len,
             proposal_base_len=committed_len,
             committed_token_ids=list(range(committed_len)),
-            req=req,
+            req=SimpleNamespace(
+                req_pool_idx=row,
+                kv=SimpleNamespace(kv_allocated_len=allocated_len),
+                kv_committed_len=committed_len,
+            ),
         )
-        for index, (req, committed_len) in enumerate(zip(reqs, (2, 3)))
-    ]
+
+    # Row 1 is steady-state (lookahead covers the committed range); row 2
+    # must top up two pages.  Corrupt row 2's pool index so the top-up
+    # page-table write fails after the allocation.
+    states = [make_state(1, 2, 5), make_state(2, 3, 3)]
     tasks = [
-        SimpleNamespace(
-            kind=DraftTaskKind.RECONCILE,
-            request_id=state.request_id,
-            target_instance_id=state.target_instance_id,
-            draft_kv_handle=state.draft_kv_handle,
-            round_id=1,
-            feature_token_offset=state.valid_committed_len,
-            feature_token_count=token_count,
-            committed_kv_len=state.valid_committed_len + token_count,
-            committed_token_ids=list(range(100, 100 + token_count)),
-        )
-        for state, token_count in zip(states, (1, 2))
+        _make_dflash_reconcile_task(states[0], 1),
+        _make_dflash_reconcile_task(states[1], 2),
     ]
-    engine = object.__new__(FlashMTPDraftEngine)
-    engine.device = torch.device("cpu")
-    engine.profile = SimpleNamespace(draft_k=7)
-    engine.instance_id = "draft-0"
+    engine = _make_dflash_reconcile_engine(req_to_token, allocator, states)
     _init_lifetime_state(engine)
-    engine._persistent_requests = {
-        state.draft_kv_handle: state for state in states
-    }
-    req_pool = SimpleNamespace(req_to_token=req_to_token)
-    req_pool.free = lambda req: setattr(req, "req_pool_idx", None)
-    engine._draft_model_runner = SimpleNamespace(
-        req_to_token_pool=req_pool,
-        token_to_kv_pool_allocator=allocator,
-        server_args=SimpleNamespace(page_size=1),
-    )
+    free_calls = []
+    original_free = allocator.free
 
-    discarded = engine._free_dflash_reconcile_suffixes(tasks)
-    assert discarded == {"kv-0": 3, "kv-1": 2}
-    # Corrupt the second row handle only after suffix release. This forces the
-    # packed page-table transition to fail after replacement allocation.
-    reqs[1].req_pool_idx = req_to_token.shape[0]
+    def counted_free(pages):
+        free_calls.append(int(pages.numel()))
+        return original_free(pages)
+
+    allocator.free = counted_free
+    states[1].req.req_pool_idx = req_to_token.shape[0]
     with pytest.raises(IndexError, match="out of bounds"):
-        engine._allocate_dflash_reconcile_rows(tasks, discarded)
+        engine._reconcile_dflash_rows(
+            tasks,
+            metadata_host=torch.zeros((5, 8), dtype=torch.int64),
+            metadata_device=torch.zeros((5, 8), dtype=torch.int64),
+        )
 
-    # The helper must return all replacement pages to the allocator without
-    # publishing the longer ownership boundaries. The stable prefixes remain
-    # owned by their original request rows and are independently releasable.
-    assert [req.kv.kv_allocated_len for req in reqs] == [2, 3]
-    reqs[1].req_pool_idx = 2
+    # The helper returns the top-up pages without publishing any ownership or
+    # state change; both rows stay releasable under their old boundaries.
+    assert free_calls == [2]
+    assert [state.req.kv.kv_allocated_len for state in states] == [5, 3]
+    assert [state.valid_committed_len for state in states] == [2, 3]
+    states[1].req.req_pool_idx = 2
     for state in states:
         assert engine._release_persistent_request(state.draft_kv_handle)
     released = allocator.free_pages.tolist()

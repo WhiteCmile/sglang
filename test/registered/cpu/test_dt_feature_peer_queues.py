@@ -856,13 +856,9 @@ def test_dflash_proposal_recovery_fence_failure_retains_all_gpu_ownership(
     proposal_error = RuntimeError("injected DFlash proposal failure")
     synchronization_error = RuntimeError("injected DFlash recovery fence failure")
 
-    class FailingProposalAllocation:
-        def view(self, *_shape):
-            raise proposal_error
-
     class TrackingAllocator:
         def __init__(self) -> None:
-            self.allocation = FailingProposalAllocation()
+            self.allocation = object()
             self.free_calls = []
 
         def alloc(self, _size):
@@ -997,16 +993,27 @@ def test_dflash_proposal_recovery_fence_failure_retains_all_gpu_ownership(
     engine._publish_capacity = lambda: capacity_updates.append("capacity")
     engine._handle_migration_finalize = migration_finalizations.append
 
-    proposal_state = SimpleNamespace(request_id="request-1")
+    proposal_state = SimpleNamespace(
+        request_id="request-1",
+        valid_committed_len=2,
+        req=SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=2)),
+    )
+
+    def fail_page_install(*_args, **_kwargs) -> None:
+        raise proposal_error
+
+    monkeypatch.setattr(
+        FlashMTPDraftEngine, "_install_dflash_row_pages", fail_page_install
+    )
 
     def launch_through_real_proposal_handler(**_kwargs) -> None:
         FlashMTPDraftEngine._run_dflash_proposal(
             engine,
             states=[proposal_state],
-            req_pool_indices=object(),
-            prefix_lens=object(),
-            seq_lens_cpu=object(),
-            bonus_tokens=object(),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            prefix_lens=torch.tensor([2], dtype=torch.int64),
+            alloc_starts=torch.tensor([2], dtype=torch.int64),
+            bonus_tokens=torch.tensor([7], dtype=torch.int64),
         )
 
     engine._launch_dflash_materialization = launch_through_real_proposal_handler
