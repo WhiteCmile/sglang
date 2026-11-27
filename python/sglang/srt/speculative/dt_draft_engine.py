@@ -69,14 +69,21 @@ DFLASH_MATERIALIZE_GRAPH_BUCKETS = (8, 16, 32, 64, 96, 128, 192, 256, 384, 512)
 # batch and consumed by the reconcile gather, the top-up page-table write,
 # and the proposal block preparation.  This field order is the single
 # source for the host pack and every device-side slice.
+_DFLASH_META_FIELD_NAMES = (
+    "req_pool_idx",  # request row in req_to_token
+    "feature_offset",  # first newly committed position (gather start)
+    "committed_len",  # committed prefix end = proposal prefix length
+    "bonus_token",  # Target-provided root of the proposal block
+    "allocated_len",  # kv_allocated_len before this batch's top-up
+)
 (
-    _DFLASH_META_REQ_POOL_IDX,  # request row in req_to_token
-    _DFLASH_META_FEATURE_OFFSET,  # first newly committed position (gather start)
-    _DFLASH_META_COMMITTED_LEN,  # committed prefix end = proposal prefix length
-    _DFLASH_META_BONUS_TOKEN,  # Target-provided root of the proposal block
-    _DFLASH_META_ALLOCATED_LEN,  # kv_allocated_len before this batch's top-up
-) = range(5)
-_DFLASH_META_FIELDS = 5
+    _DFLASH_META_REQ_POOL_IDX,
+    _DFLASH_META_FEATURE_OFFSET,
+    _DFLASH_META_COMMITTED_LEN,
+    _DFLASH_META_BONUS_TOKEN,
+    _DFLASH_META_ALLOCATED_LEN,
+) = range(len(_DFLASH_META_FIELD_NAMES))
+_DFLASH_META_FIELDS = len(_DFLASH_META_FIELD_NAMES)
 
 
 class _GraphedDFlashMaterializer:
