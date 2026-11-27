@@ -141,6 +141,29 @@ class _GraphedDFlashMaterializer:
             self._cache_loc[rows:bucket].zero_()
             self._positions[rows:bucket].zero_()
         self._graphs[bucket].replay()
+
+    def append_rows(self, *, source, rows_index, cache_loc, positions) -> None:
+        """An all-native-ring batch: gather its landing-buffer rows straight
+        into the static hidden buffer (one index_select; the caller's per-row
+        views, torch.cat and the copy_ it needed are all skipped)."""
+
+        rows = int(rows_index.shape[0])
+        bucket = next((size for size in self._buckets if size >= rows), None)
+        if bucket is None or bucket not in self._graphs or rows == 0:
+            self._materializer.append(
+                target_hidden=source.index_select(0, rows_index),
+                cache_loc=cache_loc,
+                positions=positions,
+            )
+            return
+        torch.index_select(source, 0, rows_index, out=self._hidden[:rows])
+        self._cache_loc[:rows].copy_(cache_loc)
+        self._positions[:rows].copy_(positions)
+        if rows < bucket:
+            self._hidden[rows:bucket].zero_()
+            self._cache_loc[rows:bucket].zero_()
+            self._positions[rows:bucket].zero_()
+        self._graphs[bucket].replay()
 # A direct dispatch never confirmed by the Coordinator is dropped from local
 # accounting this long after its task deadline, once its result is held.
 UNCONFIRMED_DIRECT_GRACE_NS = 1_000_000_000
@@ -500,6 +523,10 @@ class PersistentDraftRequest:
     last_round_id: int
     proposal_base_len: int
     committed_token_ids: list[int]
+    # Native ingress: (gen << 32) | cell of the request's rid-ledger
+    # registration at insert (0: none), so the index can drop exactly this
+    # registration even if the rid was registered again meanwhile.
+    cell_key: int = 0
 
 
 @dataclass(slots=True)
@@ -540,7 +567,6 @@ class PendingFeatureBatch:
 
 @dataclass(slots=True)
 class InputReadyFeature:
-    batch_id: str
     pending: PendingDraftTask
     staging_slot: int
     row_range: tuple[int, int]
@@ -1135,6 +1161,12 @@ class FlashMTPDraftEngine:
         self._received_ns_by_transfer: dict[str, int] = {}
         self._cancelled_ids: set[str] = set()
         self._persistent_requests: dict[str, PersistentDraftRequest] = {}
+        # Native-ingress hot path: the same states indexed by ledger cell key
+        # ((gen << 32) | cell) so READY-table rows are evaluated without
+        # building their f-string handle.  Values are (state, attempt); a row
+        # naming another attempt of the request is not this state's row (the
+        # old string-key check misses it the same way).
+        self._persistent_by_cell: dict[int, tuple[PersistentDraftRequest, int]] = {}
         self._migration_roles: dict[str, str] = {}
         self._migration_decisions: dict[str, bool] = {}
         self._migration_release_requests: dict[str, bool] = {}
@@ -1272,6 +1304,7 @@ class FlashMTPDraftEngine:
         self._ring_waiting: dict[str, object] = {}
         self._ring_task_decoder = None
         self._landing_slot_base = -1
+        self._ring_landing = None
         self._landing_taken: list[int] = []
         # Landing frees waiting for the GPU work that last read the buffer.
         self._landing_free_pending: deque[tuple[int, torch.cuda.Event]] = deque()
@@ -2718,7 +2751,7 @@ class FlashMTPDraftEngine:
         gpu_ns = estimator.predict(
             "tokens", sum(item.task.feature_token_count for item in running.pending), "g"
         )
-        ready_tokens = sum(row[5] for row in self._ready_pending) + sum(
+        ready_tokens = sum(row[4] for row in self._ready_pending) + sum(
             entry.row_range[1] - entry.row_range[0] for entry in self._input_ready_features
         )
         cpu_ns = estimator.predict(
@@ -2855,6 +2888,7 @@ class FlashMTPDraftEngine:
                 base = len(self._feature_staging_buffers)
                 self._landing_slot_base = base
                 self._feature_staging_buffers.extend(landing[index] for index in range(count))
+                self._ring_landing = landing
                 # Every per-staging-slot scratch list (proposal metadata, pinned
                 # candidate rows, ...) gets entries for the landing slots too;
                 # under DT_DRAFT_SLOT_DECOUPLE they are per batch instead.
@@ -3573,7 +3607,6 @@ class FlashMTPDraftEngine:
             self._received_ns_by_transfer.pop(task.transfer_id, None)
             self._input_ready_features.append(
                 InputReadyFeature(
-                    batch_id=f"ring:{task.transfer_id}",
                     pending=PendingDraftTask(task=task, taken_ns=now_ns),
                     staging_slot=slot,
                     row_range=rows,
@@ -3652,7 +3685,6 @@ class FlashMTPDraftEngine:
         self._ready_table[(entries["seq"] - 1) % len(self._ready_table)] = entries
         drained_ns = time.monotonic_ns()
         kind = entries["kind"] & ~np.uint32(kinds["DEST_KNOWN"])
-        ledger, targets = self._rid_ledger, self._ring_targets
         marks = (self._ready_gate_ns, self._ready_frozen_batches, self._ready_late_ns)
         done, dropped = [], []
         for kind, (
@@ -3670,11 +3702,14 @@ class FlashMTPDraftEngine:
                 else:
                     record[0] += 1
             if kind == kinds["ROW"]:
-                # The row's identity, built once (a waiting row is rescanned
-                # on every freeze pass).
-                target, rid = targets[ring_id], ledger.rid_of(cell, gen)
-                handle = f"{target}:{rid}:{attempt}"
-                transfer_id = f"{target}:{rid}:{round_id}:{attempt}"
+                # Native row: its identity is the rid-ledger cell key; the
+                # f-string handle/transfer_id are built lazily
+                # (_ready_row_identity) when a row freezes or retires.
+                ident = (gen << 32) | cell
+                fields = (
+                    ring_id, record_seq, position, round_id, attempt, seq_len,
+                    token_at, bonus, ready_ns, cell, gen,
+                )
                 deadline_ns, requires_proposal = ready_ns + _RING_RECORD_TIMEOUT_NS, True
             else:
                 task = self._accept_ready_v1(worker, seq, ring_id, record_seq, k)
@@ -3682,14 +3717,16 @@ class FlashMTPDraftEngine:
                     done.append(seq)
                     dropped.append(key)
                     continue
-                rid, handle, transfer_id = task.request_id, task.draft_kv_handle, task.transfer_id
+                ident = (task.draft_kv_handle, task.transfer_id)
+                fields = (
+                    ring_id, record_seq, position, round_id, attempt, seq_len,
+                    token_at, bonus, ready_ns, task.request_id,
+                )
                 deadline_ns, requires_proposal = task.deadline_ns, task.requires_proposal
                 count = task.feature_token_count
             self._ready_pending.append((
-                seq, handle, transfer_id, deadline_ns, requires_proposal, count, k,
-                row_first, drained_ns, (ring_id, record_seq, position, round_id,
-                                        attempt, seq_len, token_at, bonus, ready_ns, rid),
-                marks,
+                seq, ident, deadline_ns, requires_proposal, count, k,
+                row_first, drained_ns, fields, marks,
             ))
         if dropped:
             self._release_ready_rows(dropped, fence_seqs=done)
@@ -3722,6 +3759,22 @@ class FlashMTPDraftEngine:
         self._ready_tasks[seq] = task
         return task
 
+    def _ready_row_identity(self, row):
+        """(handle, transfer_id, rid) of a READY-table row, built lazily.
+
+        Native rows keep only their rid-ledger cell key through DRAIN and
+        FREEZE; the strings are needed by the retire/publish/profile paths
+        and by the DraftTask a frozen row gets.  V1 rows carry the decoded
+        task's identity."""
+
+        ident, fields = row[1], row[8]
+        if type(ident) is tuple:
+            return ident[0], ident[1], fields[9]
+        target = self._ring_targets[fields[0]]
+        rid = self._rid_ledger.rid_of(fields[9], fields[10])
+        handle = f"{target}:{rid}:{fields[4]}"
+        return handle, f"{target}:{rid}:{fields[3]}:{fields[4]}", rid
+
     def _freeze_ready_rows(
         self, selected, busy_handles, proposal_mode, token_count, now_ns
     ) -> None:
@@ -3730,7 +3783,13 @@ class FlashMTPDraftEngine:
         mode, batch bound, KV and req-row fit).  A row that does not fit stays
         READY; there is no head-of-line break.  Rows of released or cancelled
         requests and expired rows retire here.  Only a frozen row gets a
-        DraftTask: the retire and push paths still take one until D8/D9."""
+        DraftTask: the retire and push paths still take one until D8/D9.
+
+        Native rows are evaluated by their ledger cell key; the f-string
+        handle/transfer_id and the DraftTask are built lazily, only for a
+        row that freezes or retires (and under the profile).  The #292 skip
+        accounting runs only under the profile; production keeps the drop
+        and frozen-batch counters."""
 
         if not self._ready_pending:
             return
@@ -3741,105 +3800,150 @@ class FlashMTPDraftEngine:
         profile = self._profile_active
         sub_ns = self._submit_sub_ns if profile else None  # SUBMIT_SUB_STAGES
         retained, done, dropped = [], [], []
-        # Skip accounting (#292).  A waiting row's state is [reason, last
-        # evaluation ns, gate mark, passes, first reason, fit, held ns per
-        # reason, late-freeze mark]; a row frozen at its first pass gets none.
-        states, gate_ns = self._ready_skip_state, self._ready_gate_ns
-        late_ns = self._ready_late_ns
-        total, skips, pass_handles = self._ready_skip_held_ns, self._ready_skips, set()
-        unscanned, gate = int(_ReadySkip.unscanned), int(_ReadySkip.compute_depth)
-        late = int(_ReadySkip.late_freeze)
-        self._ready_passes += 1
+        by_cell = self._persistent_by_cell
+        cancelled_ids = self._cancelled_ids
+        deferred = self._deferred_persistent_releases
+        # Owner-busy by cell key (native rows) and handle (V1 rows); a frozen
+        # row joins both (its handle is built anyway, a V1 row's key costs
+        # one ledger lookup).
+        busy_cells = set()
+        if busy_handles:
+            persistent = self._persistent_requests
+            for handle in busy_handles:
+                state = persistent.get(handle)
+                if state is not None and state.cell_key:
+                    busy_cells.add(state.cell_key)
+        pass_cells, pass_handles = set(), set()
 
-        def charge(held, last, waited, gate_mark, late_mark):
-            # The gate and late-freeze time since the marks, then the rest
-            # to the reason of the earlier evaluation.
-            gated = min(gate_ns - gate_mark, waited)
-            held_late = min(late_ns - late_mark, waited - gated)
-            for index, value in (
-                (last, waited - gated - held_late), (gate, gated), (late, held_late)
-            ):
-                held[index] += value
-                total[index] += value
+        if profile:
+            # Skip accounting (#292).  A waiting row's state is [reason, last
+            # evaluation ns, gate mark, passes, first reason, fit, held ns per
+            # reason, late-freeze mark]; a row frozen at its first pass gets
+            # none.
+            states, gate_ns = self._ready_skip_state, self._ready_gate_ns
+            late_ns = self._ready_late_ns
+            total, skips = self._ready_skip_held_ns, self._ready_skips
+            unscanned, gate = int(_ReadySkip.unscanned), int(_ReadySkip.compute_depth)
+            late = int(_ReadySkip.late_freeze)
+            self._ready_passes += 1
 
-        def skip(row, reason, fit=None):
-            state = states.get(row[0])
-            if state is None:
-                held = [0] * len(total)
-                charge(held, unscanned, now_ns - row[9][8], row[10][0], row[10][2])
-                states[row[0]] = [reason, now_ns, gate_ns, 1, reason, fit, held, late_ns]
-            else:
-                charge(state[6], state[0], now_ns - state[1], state[2], state[7])
-                state[0], state[1], state[2], state[7] = reason, now_ns, gate_ns, late_ns
-                state[3] += 1
-                if fit is not None:
-                    state[5] = fit
-            skips[reason] += 1
-            retained.append(row)
+            def charge(held, last, waited, gate_mark, late_mark):
+                # The gate and late-freeze time since the marks, then the rest
+                # to the reason of the earlier evaluation.
+                gated = min(gate_ns - gate_mark, waited)
+                held_late = min(late_ns - late_mark, waited - gated)
+                for index, value in (
+                    (last, waited - gated - held_late), (gate, gated), (late, held_late)
+                ):
+                    held[index] += value
+                    total[index] += value
 
-        def finish(row, outcome):
-            fields, marks = row[9], row[10]
-            state = states.pop(row[0], None)
-            if state is None:
-                held = [0] * len(total)
-                charge(held, unscanned, now_ns - fields[8], marks[0], marks[2])
-                last = unscanned
-            else:
-                held, last = state[6], state[0]
-                charge(held, last, now_ns - state[1], state[2], state[7])
-            if outcome != "frozen":
-                self._ready_drops[_READY_DROP_OUTCOMES.index(outcome)] += 1
-            held_ns = now_ns - fields[8]
-            if held_ns < _READY_SKIP_RECORD_NS:
-                return
-            summary = {
-                "outcome": outcome,
-                "held_ns": held_ns,
-                "passes": 0 if state is None else state[3],
-                "first_reason": None if state is None else _READY_SKIP_REASONS[state[4]],
-                "last_reason": None if state is None else _READY_SKIP_REASONS[state[0]],
-                "reasons_ns": {n: v for n, v in zip(_READY_SKIP_REASONS, held) if v},
-                "batches": self._ready_frozen_batches - marks[1],
-                "fit": None if state is None else state[5],
-            }
-            if held_ns >= _READY_LONG_HOLD_NS:
-                for index, value in enumerate(held):
-                    self._ready_long_held_ns[index] += value
-                self._ready_long_rows[held.index(max(held))] += 1
-                if self._ready_longest is None or held_ns > self._ready_longest["held_ns"]:
-                    self._ready_longest = summary
-            if profile:
+            def skip(row, reason, fit=None):
+                state = states.get(row[0])
+                if state is None:
+                    held = [0] * len(total)
+                    charge(held, unscanned, now_ns - row[8][8], row[9][0], row[9][2])
+                    states[row[0]] = [reason, now_ns, gate_ns, 1, reason, fit, held, late_ns]
+                else:
+                    charge(state[6], state[0], now_ns - state[1], state[2], state[7])
+                    state[0], state[1], state[2], state[7] = reason, now_ns, gate_ns, late_ns
+                    state[3] += 1
+                    if fit is not None:
+                        state[5] = fit
+                skips[reason] += 1
+                retained.append(row)
+
+            def finish(row, outcome):
+                fields, marks = row[8], row[9]
+                state = states.pop(row[0], None)
+                if state is None:
+                    held = [0] * len(total)
+                    charge(held, unscanned, now_ns - fields[8], marks[0], marks[2])
+                    last = unscanned
+                else:
+                    held, last = state[6], state[0]
+                    charge(held, last, now_ns - state[1], state[2], state[7])
+                if outcome != "frozen":
+                    self._ready_drops[_READY_DROP_OUTCOMES.index(outcome)] += 1
+                held_ns = now_ns - fields[8]
+                if held_ns < _READY_SKIP_RECORD_NS:
+                    return
+                summary = {
+                    "outcome": outcome,
+                    "held_ns": held_ns,
+                    "passes": 0 if state is None else state[3],
+                    "first_reason": None if state is None else _READY_SKIP_REASONS[state[4]],
+                    "last_reason": None if state is None else _READY_SKIP_REASONS[state[0]],
+                    "reasons_ns": {n: v for n, v in zip(_READY_SKIP_REASONS, held) if v},
+                    "batches": self._ready_frozen_batches - marks[1],
+                    "fit": None if state is None else state[5],
+                }
+                if held_ns >= _READY_LONG_HOLD_NS:
+                    for index, value in enumerate(held):
+                        self._ready_long_held_ns[index] += value
+                    self._ready_long_rows[held.index(max(held))] += 1
+                    if self._ready_longest is None or held_ns > self._ready_longest["held_ns"]:
+                        self._ready_longest = summary
+                _, transfer_id, rid = self._ready_row_identity(row)
                 profile_emit(
                     "draft_ready_skip",
                     draft_instance=self.instance_id,
-                    transfer_id=row[2],
-                    request_id=fields[9],
+                    transfer_id=transfer_id,
+                    request_id=rid,
                     round_id=fields[3],
                     ready_ns=fields[8],
-                    drained_ns=row[8],
+                    drained_ns=row[7],
                     finished_ns=now_ns,
                     long=held_ns >= _READY_LONG_HOLD_NS,
                     **summary,
                 )
 
+        else:
+
+            def skip(row, reason, fit=None):
+                retained.append(row)
+
+            def finish(row, outcome):
+                if outcome != "frozen":
+                    self._ready_drops[_READY_DROP_OUTCOMES.index(outcome)] += 1
+
         for row in self._ready_pending:
             (
-                seq, handle, transfer_id, deadline_ns, requires_proposal, count, k,
+                seq, ident, deadline_ns, requires_proposal, count, k,
                 row_first, drained_ns, fields, _marks,
             ) = row
             ring_id, record_seq, position, round_id = fields[:4]
             task = self._ready_tasks.get(seq)
-            # The handle's request is gone, or its release waits only on an
+            # The row's request is gone, or its release waits only on an
             # in-flight batch: this later round must not run (as the legacy
-            # admission's released drop).
-            released = (
-                handle not in self._persistent_requests
-                or handle in self._deferred_persistent_releases
-            )
-            cancelled = released or transfer_id in self._cancelled_ids
+            # admission's released drop).  Native rows answer from the cell
+            # index; the handle string is built only while a cancel or
+            # deferred release is outstanding.
+            if type(ident) is int:
+                entry = by_cell.get(ident)
+                released = entry is None or entry[1] != fields[4]
+                if released:
+                    state = None
+                else:
+                    state = entry[0]
+                    if deferred and self._ready_row_identity(row)[0] in deferred:
+                        released = True
+            else:
+                state = None
+                released = (
+                    ident[0] not in self._persistent_requests
+                    or ident[0] in deferred
+                )
+            if released:
+                cancelled = True
+            elif cancelled_ids:
+                cancelled = self._ready_row_identity(row)[1] in cancelled_ids
+            else:
+                cancelled = False
             if cancelled or now_ns >= deadline_ns:
+                handle, transfer_id, rid = self._ready_row_identity(row)
                 if task is None and not cancelled:
-                    task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields)
+                    task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields, rid)
                 if cancelled:
                     if task is not None:
                         self._retire_cancelled_transfer_identity(task)
@@ -3863,8 +3967,16 @@ class FlashMTPDraftEngine:
                 done.append(seq)
                 finish(row, "released" if released else "cancelled" if cancelled else "expired")
                 continue
-            if handle in busy_handles:
-                skip(row, _ReadySkip.owner_selected if handle in pass_handles
+            if type(ident) is int:
+                busy = ident in busy_cells
+            else:
+                busy = ident[0] in busy_handles
+            if busy:
+                if type(ident) is int:
+                    owner_selected = ident in pass_cells
+                else:
+                    owner_selected = ident[0] in pass_handles
+                skip(row, _ReadySkip.owner_selected if owner_selected
                      else _ReadySkip.owner_inflight)
                 continue
             if len(selected) >= self.max_batch_size:
@@ -3880,14 +3992,24 @@ class FlashMTPDraftEngine:
                 continue
             if profile:
                 part_ns = time.monotonic_ns()
-            if task is None:
-                task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields)
+            if type(ident) is int:
+                # _persistent_task_allocation of the row's (not yet built)
+                # task: a native row always requires a proposal, so the fit
+                # reserves one block over the committed prefix.
+                allocated = (
+                    int(state.req.kv.kv_allocated_len)
+                    if state.req.kv is not None
+                    else 0
+                )
+                row_cost = int(state.req.req_pool_idx is None)
+                kv_cost = fields[5] + self.profile.block_size - allocated
+            else:
+                if task is None:
+                    handle, transfer_id, rid = self._ready_row_identity(row)
+                    task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields, rid)
+                row_cost, kv_cost = self._persistent_task_allocation(task)
             if profile:
-                built_ns = time.monotonic_ns()
-                sub_ns[0] += built_ns - part_ns
-            row_cost, kv_cost = self._persistent_task_allocation(task)
-            if profile:
-                sub_ns[1] += time.monotonic_ns() - built_ns
+                sub_ns[1] += time.monotonic_ns() - part_ns
             if row_cost > available_rows or kv_cost > available_kv:
                 fit = (available_rows, available_kv, row_cost, kv_cost)
                 skip(row, _ReadySkip.req_rows if row_cost > available_rows
@@ -3896,6 +4018,26 @@ class FlashMTPDraftEngine:
             available_rows -= row_cost
             available_kv -= max(kv_cost, 0)
             token_count += count
+            if type(ident) is int:
+                handle, transfer_id, rid = self._ready_row_identity(row)
+                if profile:
+                    part_ns = time.monotonic_ns()
+                task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields, rid)
+                if profile:
+                    sub_ns[0] += time.monotonic_ns() - part_ns
+                busy_cells.add(ident)
+                pass_cells.add(ident)
+            else:
+                handle, transfer_id = ident
+                loc = (
+                    self._rid_ledger.handle(fields[9])
+                    if self._rid_ledger is not None
+                    else None
+                )
+                if loc is not None:
+                    key = (loc[1] << 32) | loc[0]
+                    busy_cells.add(key)
+                    pass_cells.add(key)
             busy_handles.add(handle)
             pass_handles.add(handle)
             finish(row, "frozen")
@@ -3908,7 +4050,6 @@ class FlashMTPDraftEngine:
                 )
             selected.append(
                 InputReadyFeature(
-                    batch_id=f"ring:{transfer_id}",
                     pending=PendingDraftTask(task=task, taken_ns=drained_ns),
                     staging_slot=self._landing_slot_base + k,
                     row_range=(row_first, row_first + count),
@@ -3967,7 +4108,7 @@ class FlashMTPDraftEngine:
             row = self._ready_pending[0]
             state = self._ready_skip_state.get(row[0])
             oldest = {
-                "held_ms": (observed_ns - row[9][8]) / 1e6,
+                "held_ms": (observed_ns - row[8][8]) / 1e6,
                 "reason": _READY_SKIP_REASONS[0 if state is None else state[0]],
                 "passes": 0 if state is None else state[3],
             }
@@ -3986,15 +4127,16 @@ class FlashMTPDraftEngine:
             "longest": self._ready_longest,
         }
 
-    def _ready_row_task(self, handle, transfer_id, deadline_ns, count, fields):
+    def _ready_row_task(self, handle, transfer_id, deadline_ns, count, fields, rid):
         """The DraftTask of one natively parsed v2 row: the fields the legacy
         take built from the mailbox, without a SourceRef (the row is already
         in its landing buffer) and without _validate_task (ingress applied
-        the record's field checks)."""
+        the record's field checks).  Built lazily: only a frozen or retiring
+        row needs one (FREEZE evaluates rows by their cell key)."""
 
         from dt_protocol import DraftTask, DraftTaskKind
 
-        ring_id, record_seq, _, round_id, attempt, seq_len, token_at, bonus, ready_ns, rid = fields
+        ring_id, record_seq, _, round_id, attempt, seq_len, token_at, bonus, ready_ns = fields[:9]
         tokens = self._ring_worker.ready_tokens
         at = token_at % len(tokens)
         ids = tuple(tokens[at : at + count].tolist())
@@ -4366,15 +4508,21 @@ class FlashMTPDraftEngine:
         worker = self._ring_worker
         rows = self._ready_table[(np.asarray(seqs, dtype=np.int64) - 1) % len(self._ready_table)]
         no_event = worker.ready_kinds["NO_EVENT"]
-        events = {
-            pair
-            for pair in zip(rows["copy_event_idx"].tolist(), rows["copy_event_gen"].tolist())
-            if pair[0] != no_event
-        }
-        if events:
-            index, gen = (np.array(column, dtype=np.uint32) for column in zip(*events))
+        index = rows["copy_event_idx"]
+        with_event = index != no_event
+        if with_event.any():
+            # Dedup the (idx, gen) pairs with numpy (the wait is
+            # order-free); the old per-row Python set of tuples cost ~100 µs
+            # per batch (#353 copy_waits).
+            pairs = np.stack(
+                (index[with_event].astype(np.int64), rows["copy_event_gen"][with_event].astype(np.int64)),
+                axis=1,
+            )
+            unique = np.unique(pairs, axis=0)
             worker.wait_copy_events(
-                torch.cuda.current_stream(self.device).cuda_stream, index, gen
+                torch.cuda.current_stream(self.device).cuda_stream,
+                unique[:, 0].astype(np.uint32),
+                unique[:, 1].astype(np.uint32),
             )
 
     def _resolve_ready_releases(self, keys) -> tuple[tuple[int, int], ...]:
@@ -6863,7 +7011,6 @@ class FlashMTPDraftEngine:
 
                 self._input_ready_features.append(
                     InputReadyFeature(
-                        batch_id=feature_batch.batch_id,
                         pending=item,
                         staging_slot=feature_batch.staging_slot,
                         row_range=row_range,
@@ -7910,8 +8057,13 @@ class FlashMTPDraftEngine:
                 positions, _ = compute_position_torch(feature_offsets, token_counts)
             # The committed range already maps to pages each row owns, so the
             # materializer's cache_loc is one gather from the page table.
+            # output_size pins the result length: without it repeat_interleave
+            # syncs the submit thread on the token-count sum.
             packed_cache_locs = self._draft_model_runner.req_to_token_pool.req_to_token[
-                torch.repeat_interleave(req_pool_indices, token_counts), positions
+                torch.repeat_interleave(
+                    req_pool_indices, token_counts, output_size=total_tokens
+                ),
+                positions,
             ].to(torch.int64)
         else:
             states = []
@@ -7935,20 +8087,49 @@ class FlashMTPDraftEngine:
             self._wait_ready_copies(ready_seqs)
         if marks is not None:
             marks["copy_waits"] = time.monotonic_ns()
-        hidden_rows = [
-            self._feature_staging_buffers[slot][start:end]
-            for slot, (start, end) in zip(staging_slots, row_ranges, strict=True)
-        ]
-        if len(slots_used) == 1 and all(
-            row_ranges[index][1] == row_ranges[index + 1][0]
-            for index in range(len(row_ranges) - 1)
+        gather_source = None
+        if (
+            self._ring_landing is not None
+            and isinstance(self._dflash_materializer, _GraphedDFlashMaterializer)
+            and all(slot >= self._landing_slot_base for slot in slots_used)
         ):
-            # The contiguous-range view only exists within one slot's buffer.
-            target_hidden = self._feature_staging_buffers[slots_used[0]][
-                row_ranges[0][0] : row_ranges[-1][1]
-            ]
+            # All-native-ring batch: gather the rows from the landing buffer
+            # straight into the graphed materializer's static hidden buffer
+            # (one index_select) instead of per-row views + torch.cat + the
+            # copy_ into that buffer it would need.  Mixed/relayed batches
+            # keep the staging views.
+            max_tokens = self.feature_buffer_max_tokens
+            gather_index = torch.from_numpy(
+                np.concatenate(
+                    [
+                        np.arange(
+                            (slot - self._landing_slot_base) * max_tokens + start,
+                            (slot - self._landing_slot_base) * max_tokens + end,
+                            dtype=np.int64,
+                        )
+                        for slot, (start, end) in zip(
+                            staging_slots, row_ranges, strict=True
+                        )
+                    ]
+                )
+            ).to(self.device, non_blocking=True)
+            gather_source = self._ring_landing.view(-1, self._ring_landing.shape[-1])
+            target_hidden = None
         else:
-            target_hidden = torch.cat(hidden_rows, dim=0)
+            hidden_rows = [
+                self._feature_staging_buffers[slot][start:end]
+                for slot, (start, end) in zip(staging_slots, row_ranges, strict=True)
+            ]
+            if len(slots_used) == 1 and all(
+                row_ranges[index][1] == row_ranges[index + 1][0]
+                for index in range(len(row_ranges) - 1)
+            ):
+                # The contiguous-range view only exists within one slot's buffer.
+                target_hidden = self._feature_staging_buffers[slots_used[0]][
+                    row_ranges[0][0] : row_ranges[-1][1]
+                ]
+            else:
+                target_hidden = torch.cat(hidden_rows, dim=0)
         materialize_start = torch.cuda.Event(enable_timing=True)
         materialize_done = torch.cuda.Event(enable_timing=True)
         proposal_done = torch.cuda.Event(enable_timing=True)
@@ -7997,11 +8178,19 @@ class FlashMTPDraftEngine:
             marks["metadata"] = proposal_metadata_ready_ns
 
         materialize_start.record(torch.cuda.current_stream(self.device))
-        self._dflash_materializer.append(
-            target_hidden=target_hidden,
-            cache_loc=packed_cache_locs,
-            positions=positions,
-        )
+        if gather_source is not None:
+            self._dflash_materializer.append_rows(
+                source=gather_source,
+                rows_index=gather_index,
+                cache_loc=packed_cache_locs,
+                positions=positions,
+            )
+        else:
+            self._dflash_materializer.append(
+                target_hidden=target_hidden,
+                cache_loc=packed_cache_locs,
+                positions=positions,
+            )
         materialize_done.record(torch.cuda.current_stream(self.device))
         materialize_submitted_ns = time.monotonic_ns()
         if marks is not None:
@@ -8491,6 +8680,7 @@ class FlashMTPDraftEngine:
                 # §7.1 ring records reference requests by rid hash.
                 ledger.register(task.request_id)
             self._persistent_requests[task.draft_kv_handle] = state
+            self._persistent_index_add(state)
             positions = torch.arange(
                 task.committed_kv_len, dtype=torch.int64, device=self.device
             )
@@ -9492,6 +9682,7 @@ class FlashMTPDraftEngine:
                 # §7.1 ring records reference requests by rid hash.
                 ledger.register(task.request_id)
             self._persistent_requests[task.draft_kv_handle] = state
+            self._persistent_index_add(state)
             return state
 
         state = self._persistent_requests.get(task.draft_kv_handle)
@@ -10300,6 +10491,7 @@ class FlashMTPDraftEngine:
                 committed_token_ids=list(token_ids),
             )
             self._persistent_requests[message.draft_kv_handle] = state
+            self._persistent_index_add(state)
         elif prepared is not None:
             if getattr(error, "resources_quiescent", True):
                 self._cleanup_partial_migration_request(prepared.req)
@@ -10882,6 +11074,32 @@ class FlashMTPDraftEngine:
         ):
             raise ValueError("KV migration source state does not match admission")
 
+    def _persistent_index_add(self, state: PersistentDraftRequest) -> None:
+        """Index a persistent state by its rid-ledger cell key so the native
+        FREEZE can evaluate READY rows without their f-string handle."""
+
+        by_cell = getattr(self, "_persistent_by_cell", None)
+        ledger = getattr(self, "_rid_ledger", None)
+        if by_cell is None or ledger is None:
+            return
+        loc = ledger.handle(state.request_id)
+        if loc is None:
+            return
+        state.cell_key = (loc[1] << 32) | loc[0]
+        by_cell[state.cell_key] = (
+            state,
+            int(state.draft_kv_handle.rsplit(":", 1)[1]),
+        )
+
+    def _persistent_index_remove(self, state: PersistentDraftRequest) -> None:
+        by_cell = getattr(self, "_persistent_by_cell", None)
+        if by_cell is None:
+            return
+        entry = by_cell.get(getattr(state, "cell_key", 0))
+        if entry is not None and entry[0] is state:
+            del by_cell[state.cell_key]
+        state.cell_key = 0
+
     def _release_persistent_request(
         self, draft_kv_handle: str, *, request_id: str | None = None
     ) -> bool:
@@ -10920,6 +11138,7 @@ class FlashMTPDraftEngine:
             )
             return False
         self._persistent_requests.pop(draft_kv_handle)
+        self._persistent_index_remove(state)
         self._deferred_persistent_releases.pop(draft_kv_handle, None)
         ledger = getattr(self, "_rid_ledger", None)
         if ledger is not None:
