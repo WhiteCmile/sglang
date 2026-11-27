@@ -42,6 +42,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    compute_position,
+    compute_position_torch,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -61,6 +63,27 @@ INFLIGHT_POLL_S = 0.00005
 DIRECT_PUSH_SPIN_NS = 200_000
 # Token-count buckets for the CUDA-graphed DFlash KV materializer.
 DFLASH_MATERIALIZE_GRAPH_BUCKETS = (8, 16, 32, 64, 96, 128, 192, 256, 384, 512)
+
+# Packed per-row DFlash submit metadata (issue #358): one pinned host block
+# plus one device block per staging slot, uploaded with a single H2D per
+# batch and consumed by the reconcile gather, the top-up page-table write,
+# and the proposal block preparation.  This field order is the single
+# source for the host pack and every device-side slice.
+_DFLASH_META_FIELD_NAMES = (
+    "req_pool_idx",  # request row in req_to_token
+    "feature_offset",  # first newly committed position (gather start)
+    "committed_len",  # committed prefix end = proposal prefix length
+    "bonus_token",  # Target-provided root of the proposal block
+    "allocated_len",  # kv_allocated_len before this batch's top-up
+)
+(
+    _DFLASH_META_REQ_POOL_IDX,
+    _DFLASH_META_FEATURE_OFFSET,
+    _DFLASH_META_COMMITTED_LEN,
+    _DFLASH_META_BONUS_TOKEN,
+    _DFLASH_META_ALLOCATED_LEN,
+) = range(len(_DFLASH_META_FIELD_NAMES))
+_DFLASH_META_FIELDS = len(_DFLASH_META_FIELD_NAMES)
 
 
 class _GraphedDFlashMaterializer:
@@ -1214,10 +1237,8 @@ class FlashMTPDraftEngine:
         self._quarantined_flashmtp_completions: list[
             PendingFlashMTPCompletion
         ] = []
-        self._proposal_req_pool_indices_host_buffers: list[torch.Tensor] = []
-        self._proposal_req_pool_indices_buffers: list[torch.Tensor] = []
-        self._proposal_prefix_lens_host_buffers: list[torch.Tensor] = []
-        self._proposal_prefix_lens_buffers: list[torch.Tensor] = []
+        self._dflash_metadata_host_buffers: list[torch.Tensor] = []
+        self._dflash_metadata_buffers: list[torch.Tensor] = []
         self._proposal_bonus_tokens_host_buffers: list[torch.Tensor] = []
         self._proposal_bonus_tokens_buffers: list[torch.Tensor] = []
         self._candidate_result_host_buffers: list[torch.Tensor] = []
@@ -2023,52 +2044,18 @@ class FlashMTPDraftEngine:
             if self._slot_decouple
             else self.feature_buffer_slot_count
         )
-        self._proposal_req_pool_indices_host_buffers = [
+        self._dflash_metadata_host_buffers = [
             torch.empty(
-                self.max_batch_size,
+                (_DFLASH_META_FIELDS, self.max_batch_size),
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=True,
             )
             for _ in range(scratch_count)
         ]
-        self._proposal_req_pool_indices_buffers = [
+        self._dflash_metadata_buffers = [
             torch.empty(
-                self.max_batch_size,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            for _ in range(scratch_count)
-        ]
-        self._proposal_prefix_lens_host_buffers = [
-            torch.empty(
-                self.max_batch_size,
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-            for _ in range(scratch_count)
-        ]
-        self._proposal_prefix_lens_buffers = [
-            torch.empty(
-                self.max_batch_size,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            for _ in range(scratch_count)
-        ]
-        self._proposal_bonus_tokens_host_buffers = [
-            torch.empty(
-                self.max_batch_size,
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-            for _ in range(scratch_count)
-        ]
-        self._proposal_bonus_tokens_buffers = [
-            torch.empty(
-                self.max_batch_size,
+                (_DFLASH_META_FIELDS, self.max_batch_size),
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -7889,100 +7876,57 @@ class FlashMTPDraftEngine:
         tasks = [item.task for item in pending]
         if getattr(self, "continuous_batching", False) and len({bool(task.requires_proposal) for task in tasks}) > 1:
             raise RuntimeError("DFLASH frozen batch mixed proposal boundaries")
-        states = []
-        cache_locs = []
+        from dt_protocol import DraftTaskKind
+
         reconcile_prepare_phase_ns = [0] * 6 if profile_enabled() else None
-        grouped_discarded = self._free_dflash_reconcile_suffixes(
-            tasks, reconcile_prepare_phase_ns
-        )
-        grouped_rows = self._allocate_dflash_reconcile_rows(
-            tasks, grouped_discarded, reconcile_prepare_phase_ns
-        )
-        grouped_cache_locs = None if grouped_rows is None else grouped_rows[0]
-        batch_prefix_refresh = len(
-            {task.draft_kv_handle for task in tasks}
-        ) == len(tasks)
-        prior_prefix_indices = []
-        for task_index, task in enumerate(tasks):
-            prior_state = self._persistent_requests.get(task.draft_kv_handle)
-            prior_prefix_indices.append(
-                None
-                if not batch_prefix_refresh or prior_state is None
-                else prior_state.req.prefix_indices
+        if (
+            tasks
+            and all(task.kind == DraftTaskKind.RECONCILE for task in tasks)
+            and len({task.draft_kv_handle for task in tasks}) == len(tasks)
+        ):
+            states, metadata, total_tokens = self._reconcile_dflash_rows(
+                tasks,
+                metadata_host=self._dflash_metadata_host_buffers[metadata_slot],
+                metadata_device=self._dflash_metadata_buffers[metadata_slot],
+                reconcile_prepare_phase_ns=reconcile_prepare_phase_ns,
+                submit_sub_ns=self._submit_sub_ns if marks is not None else None,
             )
-            state, cache_loc = self._prepare_dflash_task(
-                task,
-                reconcile_prepare_phase_ns,
-                suffix_already_freed=(
-                    grouped_discarded is not None
-                    and task.draft_kv_handle in grouped_discarded
-                ),
-                discarded_tokens_override=(
-                    None
-                    if grouped_discarded is None
-                    else grouped_discarded.get(task.draft_kv_handle)
-                ),
-                refresh_prefix_indices=not batch_prefix_refresh,
-                cache_loc_override=(
-                    None
-                    if grouped_cache_locs is None
-                    else grouped_cache_locs[task_index]
-                ),
-                row_already_written=grouped_cache_locs is not None,
-            )
-            states.append(state)
-            cache_locs.append(cache_loc)
-        # Preserve Req's committed-prefix view with one GPU concatenation for
-        # the whole batch.  Proposal suffixes never extend prefix_indices; the
-        # prior tensor therefore ends exactly at feature_token_offset.
-        if batch_prefix_refresh:
-            prefix_refresh_started_ns = (
-                time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
-            )
-            prefix_parts = []
-            prefix_lengths = []
-            for task, prior_prefix, cache_loc in zip(
-                tasks, prior_prefix_indices, cache_locs, strict=True
-            ):
-                if task.feature_token_offset:
-                    if (
-                        prior_prefix is None
-                        or int(prior_prefix.numel()) != task.feature_token_offset
-                    ):
-                        raise RuntimeError(
-                            "DFLASH committed prefix indices differ from feature offset"
-                        )
-                    prefix_parts.append(prior_prefix)
-                prefix_parts.append(cache_loc)
-                prefix_lengths.append(task.committed_kv_len)
-            packed_prefix_indices = torch.cat(prefix_parts, dim=0)
-            for state, prefix_indices in zip(
-                states,
-                torch.split(packed_prefix_indices, prefix_lengths),
-                strict=True,
-            ):
-                state.req.prefix_indices = prefix_indices
-            if reconcile_prepare_phase_ns is not None:
-                reconcile_prepare_phase_ns[4] += (
-                    time.monotonic_ns() - prefix_refresh_started_ns
+            (
+                req_pool_indices,
+                feature_offsets,
+                committed_lens,
+                bonus_tokens,
+                allocated_lens,
+            ) = metadata
+            token_counts = committed_lens - feature_offsets
+            if self._canonical_draft_device(self.device).type == "cuda":
+                positions, _ = compute_position(
+                    self._draft_model_runner.server_args.attention_backend,
+                    feature_offsets,
+                    token_counts,
+                    total_tokens,
                 )
-        if grouped_rows is None:
-            packed_cache_locs = torch.cat(cache_locs, dim=0)
-            async_metadata = getattr(self, "continuous_batching", False)
-            positions = torch.tensor(
-                [
-                    position
-                    for task in tasks
-                    for position in range(
-                        task.feature_token_offset, task.committed_kv_len
-                    )
-                ],
-                dtype=torch.int64,
-                device="cpu" if async_metadata else self.device,
-                pin_memory=async_metadata,
-            ).to(self.device, non_blocking=async_metadata)
+            else:
+                positions, _ = compute_position_torch(feature_offsets, token_counts)
+            # The committed range already maps to pages each row owns, so the
+            # materializer's cache_loc is one gather from the page table.
+            packed_cache_locs = self._draft_model_runner.req_to_token_pool.req_to_token[
+                torch.repeat_interleave(req_pool_indices, token_counts), positions
+            ].to(torch.int64)
         else:
-            _grouped_cache_locs, packed_cache_locs, positions = grouped_rows
+            states = []
+            cache_locs = []
+            position_parts = []
+            for task in tasks:
+                state, cache_loc, position = self._prepare_dflash_task(
+                    task, reconcile_prepare_phase_ns
+                )
+                states.append(state)
+                cache_locs.append(cache_loc)
+                position_parts.append(position)
+            packed_cache_locs = torch.cat(cache_locs, dim=0)
+            positions = torch.cat(position_parts, dim=0)
+            metadata = None
         tasks_prepared_ns = time.monotonic_ns()
         if marks is not None:
             marks["task_prepare"] = tasks_prepared_ns
@@ -8015,75 +7959,39 @@ class FlashMTPDraftEngine:
         proposal_states = [states[index] for index in proposal_indices]
         proposal_req_pool_indices = None
         proposal_prefix_lens = None
-        proposal_seq_lens_cpu = None
+        proposal_alloc_starts = None
         proposal_bonus_tokens = None
         if marks is not None:
             marks["hidden_view"] = time.monotonic_ns()
-            h2d = self._submit_sub_ns
         if proposal_indices:
-            # Stage CPU-derived proposal metadata through per-slot pinned host
-            # buffers.  The corresponding nonblocking H2D copies may be queued
-            # behind a prior proposal without synchronizing the scheduler
-            # thread, and the batch's slot ownership retains the buffers until
-            # completion.  Committed lengths are already authoritative CPU
-            # state, so seq_lens_cpu never needs a GPU round-trip.
-            committed_lens = [state.valid_committed_len for state in proposal_states]
-            proposal_count = len(proposal_states)
-            req_pool_indices_host = self._proposal_req_pool_indices_host_buffers[
-                metadata_slot
-            ][:proposal_count]
-            req_pool_indices_host.copy_(
-                torch.tensor(
+            if metadata is not None and len(proposal_indices) == len(tasks):
+                # The single packed upload already carries every proposal
+                # input; only the tail-start view is derived here.
+                proposal_req_pool_indices = req_pool_indices
+                proposal_prefix_lens = committed_lens
+                proposal_alloc_starts = torch.maximum(allocated_lens, committed_lens)
+                proposal_bonus_tokens = bonus_tokens
+            else:
+                proposal_req_pool_indices = torch.tensor(
                     [state.req.req_pool_idx for state in proposal_states],
                     dtype=torch.int64,
-                    device="cpu",
+                    device=self.device,
                 )
-            )
-            proposal_req_pool_indices = self._proposal_req_pool_indices_buffers[
-                metadata_slot
-            ][:proposal_count]
-            if marks is not None:
-                h2d_started_ns = time.monotonic_ns()
-            proposal_req_pool_indices.copy_(req_pool_indices_host, non_blocking=True)
-            if marks is not None:
-                h2d[2] += time.monotonic_ns() - h2d_started_ns
-            prefix_lens_host = self._proposal_prefix_lens_host_buffers[metadata_slot][
-                :proposal_count
-            ]
-            prefix_lens_host.copy_(
-                torch.tensor(committed_lens, dtype=torch.int64, device="cpu")
-            )
-            proposal_prefix_lens = self._proposal_prefix_lens_buffers[metadata_slot][
-                :proposal_count
-            ]
-            if marks is not None:
-                h2d_started_ns = time.monotonic_ns()
-            proposal_prefix_lens.copy_(prefix_lens_host, non_blocking=True)
-            if marks is not None:
-                h2d[2] += time.monotonic_ns() - h2d_started_ns
-            proposal_seq_lens_cpu = torch.tensor(
-                [length + int(self.profile.block_size) for length in committed_lens],
-                dtype=torch.int32,
-                device="cpu",
-            )
-            bonus_tokens_host = self._proposal_bonus_tokens_host_buffers[metadata_slot][
-                :proposal_count
-            ]
-            bonus_tokens_host.copy_(
-                torch.tensor(
+                proposal_prefix_lens = torch.tensor(
+                    [state.valid_committed_len for state in proposal_states],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                proposal_alloc_starts = torch.tensor(
+                    [state.req.kv.kv_allocated_len for state in proposal_states],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                proposal_bonus_tokens = torch.tensor(
                     [task.next_token_id for task in proposal_tasks],
                     dtype=torch.int64,
-                    device="cpu",
+                    device=self.device,
                 )
-            )
-            proposal_bonus_tokens = self._proposal_bonus_tokens_buffers[metadata_slot][
-                :proposal_count
-            ]
-            if marks is not None:
-                h2d_started_ns = time.monotonic_ns()
-            proposal_bonus_tokens.copy_(bonus_tokens_host, non_blocking=True)
-            if marks is not None:
-                h2d[2] += time.monotonic_ns() - h2d_started_ns
         proposal_metadata_ready_ns = time.monotonic_ns()
         if marks is not None:
             marks["metadata"] = proposal_metadata_ready_ns
@@ -8111,13 +8019,9 @@ class FlashMTPDraftEngine:
                 states=proposal_states,
                 req_pool_indices=proposal_req_pool_indices,
                 prefix_lens=proposal_prefix_lens,
-                seq_lens_cpu=proposal_seq_lens_cpu,
+                alloc_starts=proposal_alloc_starts,
                 bonus_tokens=proposal_bonus_tokens,
             )
-        if candidates is not None and self.candidate_transport == "cuda-ipc":
-            # Preserve graph-owned proposals before recording the completion
-            # event which makes this completion eligible for another replay.
-            candidates = candidates.clone()
         proposal_done.record(torch.cuda.current_stream(self.device))
         if marks is not None:
             marks["proposal_tail"] = time.monotonic_ns()
@@ -8310,20 +8214,42 @@ class FlashMTPDraftEngine:
             remove_pending_owner()
             raise
 
-    def _free_dflash_reconcile_suffixes(
-        self, tasks, reconcile_prepare_phase_ns: list[int] | None = None
-    ) -> dict[str, int] | None:
-        """Batch-free unique reconcile suffixes before any page-table overwrite."""
+    def _reconcile_dflash_rows(
+        self,
+        tasks,
+        *,
+        metadata_host: torch.Tensor,
+        metadata_device: torch.Tensor,
+        reconcile_prepare_phase_ns: list[int] | None = None,
+        submit_sub_ns: list[int] | None = None,
+    ) -> tuple[list, tuple[torch.Tensor, ...], int]:
+        """Advance one grouped DFlash reconcile wave without moving pages.
 
-        from dt_protocol import DraftTaskKind
+        A proposal leaves each row's lookahead block mapped at
+        [valid, valid + block_size), so the next reconcile's committed range
+        [offset, committed) already sits on pages the row owns: no free, no
+        allocation, and no page-table write in the common case.  Only a row
+        whose committed boundary outgrew its allocation (bootstrap's first
+        reconcile, rounds without a proposal) tops up the shortfall.  The
+        per-row metadata is packed once and uploaded with a single H2D that
+        also serves the materialize gather and the proposal block.
 
-        if not tasks or any(task.kind != DraftTaskKind.RECONCILE for task in tasks):
-            return None
-        handles = [task.draft_kv_handle for task in tasks]
-        if len(set(handles)) != len(handles):
-            return None
+        Returns (states, metadata_fields, total_feature_tokens), where
+        metadata_fields are the device-side per-field rows ordered by
+        _DFLASH_META_*.
+        """
 
-        validated = []
+        phase_started_ns = (
+            time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
+        )
+        states = []
+        req_pool_indices = []
+        feature_offsets = []
+        committed_lens = []
+        bonus_tokens = []
+        allocated_lens = []
+        topup_total = 0
+        total_tokens = 0
         for task in tasks:
             state = self._persistent_requests.get(task.draft_kv_handle)
             if state is None:
@@ -8353,129 +8279,99 @@ class FlashMTPDraftEngine:
                 raise RuntimeError(
                     "DFLASH allocated KV is shorter than its committed prefix"
                 )
-            validated.append((state, allocated_len))
-
-        phase_started_ns = (
-            time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
-        )
-        allocator = self._draft_model_runner.token_to_kv_pool_allocator
-        allocator.free_group_begin()
-        try:
-            for state, allocated_len in validated:
-                self._free_persistent_kv_suffix(
-                    state.req, state.valid_committed_len, allocated_len
-                )
-            allocator.free_group_end()
-        except Exception as exc:
-            # The allocator's ownership is indeterminate if a grouped update
-            # fails.  The outer feature-batch guard must quarantine the rows
-            # and stop instead of attempting a second free.
-            setattr(exc, "resources_quiescent", False)
-            raise
-        discarded = {}
-        for state, allocated_len in validated:
-            discarded[state.draft_kv_handle] = (
-                allocated_len - state.valid_committed_len
-            )
-            state.req.kv.kv_allocated_len = state.valid_committed_len
-        if reconcile_prepare_phase_ns is not None:
-            reconcile_prepare_phase_ns[1] += time.monotonic_ns() - phase_started_ns
-        return discarded
-
-    def _allocate_dflash_reconcile_rows(
-        self,
-        tasks,
-        grouped_discarded: dict[str, int] | None,
-        reconcile_prepare_phase_ns: list[int] | None = None,
-    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor] | None:
-        """Allocate and install one packed set of DFlash reconcile KV rows.
-
-        The grouped suffix release has already shortened every request's
-        ownership boundary.  One allocator call and one page-table write now
-        establish the replacement ownership for the whole wave.  The returned
-        packed cache and position tensors are also the materializer inputs, so
-        the caller does not repack the same rows a second time.
-        """
-
-        if grouped_discarded is None:
-            return None
-        req_pool = self._draft_model_runner.req_to_token_pool
-        allocator = self._draft_model_runner.token_to_kv_pool_allocator
-        validated = []
-        token_counts = []
-        for task in tasks:
-            state = self._persistent_requests.get(task.draft_kv_handle)
-            if state is None or task.draft_kv_handle not in grouped_discarded:
-                raise RuntimeError("DFLASH grouped allocation lost reconcile state")
-            req = state.req
-            if req.kv is None or req.req_pool_idx is None:
-                raise RuntimeError("DFLASH grouped allocation lost KV ownership")
             token_count = int(task.feature_token_count)
             if (
                 token_count <= 0
                 or task.committed_kv_len - task.feature_token_offset != token_count
             ):
-                raise ValueError("DFLASH grouped allocation token range mismatch")
-            if req.kv.kv_allocated_len != task.feature_token_offset:
-                raise RuntimeError(
-                    "DFLASH grouped allocation did not observe the released suffix"
-                )
-            validated.append((task, req))
-            token_counts.append(token_count)
-
-        phase_started_ns = (
-            time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
-        )
-        packed_cache_locs = allocator.alloc(sum(token_counts))
-        if packed_cache_locs is None:
-            raise RuntimeError("DFLASH grouped reconcile KV-page OOM")
+                raise ValueError("DFLASH reconcile token range mismatch")
+            states.append(state)
+            req_pool_indices.append(req.req_pool_idx)
+            feature_offsets.append(task.feature_token_offset)
+            committed_lens.append(task.committed_kv_len)
+            bonus_tokens.append(task.next_token_id)
+            allocated_lens.append(allocated_len)
+            topup_total += max(0, task.committed_kv_len - allocated_len)
+            total_tokens += token_count
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[0] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
+        allocator = self._draft_model_runner.token_to_kv_pool_allocator
+        topup_pages = None
+        if topup_total:
+            topup_pages = allocator.alloc(topup_total)
+            if topup_pages is None:
+                raise RuntimeError("DFLASH reconcile KV-page OOM")
         if reconcile_prepare_phase_ns is not None:
             phase_completed_ns = time.monotonic_ns()
             reconcile_prepare_phase_ns[2] += phase_completed_ns - phase_started_ns
             phase_started_ns = phase_completed_ns
+        row_count = len(tasks)
         try:
-            cache_locs = list(torch.split(packed_cache_locs, token_counts))
-            # Frozen metadata uploads precede the existing current-stream page-table
-            # write; pinned allocation lifetime is retained by the async copy.
-            async_metadata = getattr(self, "continuous_batching", False)
-            row_indices = torch.tensor(
-                [
-                    req.req_pool_idx
-                    for (_task, req), token_count in zip(
-                        validated, token_counts, strict=True
-                    )
-                    for _ in range(token_count)
-                ],
-                dtype=torch.int64,
-                device="cpu" if async_metadata else self.device,
-                pin_memory=async_metadata,
-            ).to(self.device, non_blocking=async_metadata)
-            positions = torch.tensor(
-                [
-                    position
-                    for task, _req in validated
-                    for position in range(
-                        task.feature_token_offset, task.committed_kv_len
-                    )
-                ],
-                dtype=torch.int64,
-                device="cpu" if async_metadata else self.device,
-                pin_memory=async_metadata,
-            ).to(self.device, non_blocking=async_metadata)
-            req_pool.req_to_token[row_indices, positions] = packed_cache_locs.to(
-                req_pool.req_to_token.dtype
+            metadata_host[:, :row_count].copy_(
+                torch.tensor(
+                    [
+                        req_pool_indices,
+                        feature_offsets,
+                        committed_lens,
+                        bonus_tokens,
+                        allocated_lens,
+                    ],
+                    dtype=torch.int64,
+                )
             )
-        except Exception as exc:
-            try:
-                allocator.free(packed_cache_locs)
-            except Exception:
-                setattr(exc, "resources_quiescent", False)
+            h2d_started_ns = (
+                time.monotonic_ns() if submit_sub_ns is not None else 0
+            )
+            # Upload the whole packed block in one H2D; only the first
+            # row_count columns are read below, and the slot's ownership
+            # retains the buffers until this batch completes.
+            metadata_device.copy_(metadata_host, non_blocking=True)
+            if submit_sub_ns is not None:
+                submit_sub_ns[2] += time.monotonic_ns() - h2d_started_ns
+            if topup_pages is not None:
+                committed = metadata_device[_DFLASH_META_COMMITTED_LEN][:row_count]
+                self._install_dflash_row_pages(
+                    metadata_device[_DFLASH_META_REQ_POOL_IDX][:row_count],
+                    torch.minimum(
+                        metadata_device[_DFLASH_META_ALLOCATED_LEN][:row_count],
+                        committed,
+                    ),
+                    committed,
+                    topup_pages,
+                    row_count,
+                )
+        except Exception:
+            if topup_pages is not None:
+                allocator.free(topup_pages)
             raise
-        # The page-table write and any later cleanup use the same CUDA stream.
+        if reconcile_prepare_phase_ns is not None:
+            phase_completed_ns = time.monotonic_ns()
+            reconcile_prepare_phase_ns[3] += phase_completed_ns - phase_started_ns
+            phase_started_ns = phase_completed_ns
+        # The top-up write and any later cleanup use the same CUDA stream.
         # Publish all CPU ownership boundaries only after the write is queued;
-        # from here, outer failure cleanup owns every packed replacement page.
-        for task, req in validated:
-            req.kv.kv_allocated_len = task.committed_kv_len
+        # from here, outer failure cleanup owns every topped-up page.
+        for state, task, allocated_len in zip(states, tasks, allocated_lens):
+            state.req.kv.kv_allocated_len = max(allocated_len, task.committed_kv_len)
+            state.req.kv_committed_len = task.committed_kv_len
+            discarded = max(0, allocated_len - task.committed_kv_len)
+            state.valid_committed_len = task.committed_kv_len
+            state.proposal_base_len = task.committed_kv_len
+            state.last_round_id = task.round_id
+            state.committed_token_ids.extend(task.committed_token_ids)
+            profile_emit(
+                "draft_reconciliation",
+                draft_instance=self.instance_id,
+                request_id=state.request_id,
+                round_id=task.round_id,
+                discarded_tokens=discarded,
+                materialized_tokens=int(task.feature_token_count),
+                committed_kv_len=task.committed_kv_len,
+            )
+        if reconcile_prepare_phase_ns is not None:
+            reconcile_prepare_phase_ns[5] += time.monotonic_ns() - phase_started_ns
         grouped_batches = (
             self.__dict__.get("_dflash_grouped_reconcile_batches", 0) + 1
         )
@@ -8486,27 +8382,67 @@ class FlashMTPDraftEngine:
         self._dflash_grouped_reconcile_rows = grouped_rows
         if grouped_batches & (grouped_batches - 1) == 0:
             logger.info(
-                "DT DFLASH grouped reconcile allocation observed: batches=%d rows=%d",
+                "DT DFLASH grouped reconcile observed: batches=%d rows=%d",
                 grouped_batches,
                 grouped_rows,
             )
-        if reconcile_prepare_phase_ns is not None:
-            reconcile_prepare_phase_ns[3] += (
-                time.monotonic_ns() - phase_started_ns
+        metadata_fields = tuple(
+            metadata_device[field][:row_count] for field in range(_DFLASH_META_FIELDS)
+        )
+        return states, metadata_fields, total_tokens
+
+    def _install_dflash_row_pages(
+        self,
+        req_pool_indices: torch.Tensor,
+        start_offsets: torch.Tensor,
+        end_offsets: torch.Tensor,
+        pages: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Write packed KV pages into per-row [start, end) page-table ranges."""
+
+        req_to_token = self._draft_model_runner.req_to_token_pool.req_to_token
+        if self._canonical_draft_device(self.device).type == "cuda":
+            from sglang.srt.mem_cache.allocation import (
+                assign_req_to_token_pool_func,
             )
-        return cache_locs, packed_cache_locs, positions
+
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                req_to_token,
+                start_offsets,
+                end_offsets,
+                pages,
+                batch_size,
+            )
+            return
+        offset = 0
+        for row, start, end in zip(
+            req_pool_indices.tolist(),
+            start_offsets.tolist(),
+            end_offsets.tolist(),
+            strict=True,
+        ):
+            length = end - start
+            if length > 0:
+                req_to_token[row, start:end] = pages[offset : offset + length].to(
+                    req_to_token.dtype
+                )
+            offset += length
 
     def _prepare_dflash_task(
         self,
         task,
         reconcile_prepare_phase_ns: list[int] | None = None,
-        *,
-        suffix_already_freed: bool = False,
-        discarded_tokens_override: int | None = None,
-        refresh_prefix_indices: bool = True,
-        cache_loc_override: torch.Tensor | None = None,
-        row_already_written: bool = False,
-    ) -> tuple[PersistentDraftRequest, torch.Tensor]:
+    ) -> tuple[PersistentDraftRequest, torch.Tensor, torch.Tensor]:
+        """Prepare one DFlash row outside the grouped reconcile wave.
+
+        Handles bootstrap rows and reconcile rows in mixed batches.  Returns
+        (state, cache_loc, positions) for the materializer.  Reconcile rows
+        follow the same pages-stay-put ownership as the grouped wave: no
+        free, and a page-table write only for a genuine shortfall.
+        """
+
         from dt_protocol import DraftTaskKind
 
         req_pool = self._draft_model_runner.req_to_token_pool
@@ -8537,8 +8473,6 @@ class FlashMTPDraftEngine:
                 swa_evicted_seqlen=0,
             )
             req.kv_committed_len = task.committed_kv_len
-            if refresh_prefix_indices:
-                req.prefix_indices = cache_loc.to(torch.int64)
             req_pool.req_to_token[req.req_pool_idx, : task.committed_kv_len] = (
                 cache_loc
             )
@@ -8557,7 +8491,10 @@ class FlashMTPDraftEngine:
                 # §7.1 ring records reference requests by rid hash.
                 ledger.register(task.request_id)
             self._persistent_requests[task.draft_kv_handle] = state
-            return state, cache_loc.to(torch.int64)
+            positions = torch.arange(
+                task.committed_kv_len, dtype=torch.int64, device=self.device
+            )
+            return state, cache_loc.to(torch.int64), positions
 
         phase_started_ns = (
             time.monotonic_ns() if reconcile_prepare_phase_ns is not None else 0
@@ -8584,63 +8521,34 @@ class FlashMTPDraftEngine:
             raise RuntimeError(
                 "DFLASH allocated KV is shorter than its committed prefix"
             )
-        discarded_tokens = (
-            allocated_len - state.valid_committed_len
-            if discarded_tokens_override is None
-            else discarded_tokens_override
-        )
+        if (
+            token_count <= 0
+            or task.committed_kv_len - task.feature_token_offset != token_count
+        ):
+            raise ValueError("DFLASH reconcile token range mismatch")
         if reconcile_prepare_phase_ns is not None:
             phase_completed_ns = time.monotonic_ns()
             reconcile_prepare_phase_ns[0] += phase_completed_ns - phase_started_ns
             phase_started_ns = phase_completed_ns
-        if not suffix_already_freed:
-            self._free_persistent_kv_suffix(
-                req, state.valid_committed_len, allocated_len
-            )
-        if reconcile_prepare_phase_ns is not None:
-            phase_completed_ns = time.monotonic_ns()
-            reconcile_prepare_phase_ns[1] += phase_completed_ns - phase_started_ns
-            phase_started_ns = phase_completed_ns
-        if cache_loc_override is None:
-            req.kv.kv_allocated_len = state.valid_committed_len
-            cache_loc = allocator.alloc(token_count)
-            if cache_loc is None:
+        topup = task.committed_kv_len - allocated_len
+        if topup > 0:
+            topup_pages = allocator.alloc(topup)
+            if topup_pages is None:
                 raise RuntimeError("DFLASH reconcile KV-page OOM")
-        else:
-            if not suffix_already_freed or not row_already_written:
-                raise RuntimeError(
-                    "DFLASH grouped allocation requires released suffix and row ownership"
-                )
-            cache_loc = cache_loc_override
-            if int(cache_loc.numel()) != token_count:
-                raise RuntimeError("DFLASH grouped allocation length mismatch")
-            if req.kv.kv_allocated_len != task.committed_kv_len:
-                raise RuntimeError("DFLASH grouped allocation ownership mismatch")
+            try:
+                req_pool.req_to_token[
+                    req.req_pool_idx, allocated_len : task.committed_kv_len
+                ] = topup_pages.to(req_pool.req_to_token.dtype)
+            except Exception:
+                allocator.free(topup_pages)
+                raise
+            req.kv.kv_allocated_len = task.committed_kv_len
         if reconcile_prepare_phase_ns is not None:
             phase_completed_ns = time.monotonic_ns()
             reconcile_prepare_phase_ns[2] += phase_completed_ns - phase_started_ns
             phase_started_ns = phase_completed_ns
-        if not row_already_written:
-            req_pool.req_to_token[
-                req.req_pool_idx, task.feature_token_offset : task.committed_kv_len
-            ] = cache_loc
-        if reconcile_prepare_phase_ns is not None:
-            phase_completed_ns = time.monotonic_ns()
-            reconcile_prepare_phase_ns[3] += phase_completed_ns - phase_started_ns
-            phase_started_ns = phase_completed_ns
-        req.kv.kv_allocated_len = task.committed_kv_len
         req.kv_committed_len = task.committed_kv_len
-        if refresh_prefix_indices:
-            req.prefix_indices = req_pool.req_to_token[
-                req.req_pool_idx, : task.committed_kv_len
-            ].to(torch.int64)
-        if reconcile_prepare_phase_ns is not None:
-            phase_completed_ns = time.monotonic_ns()
-            reconcile_prepare_phase_ns[4] += phase_completed_ns - phase_started_ns
-            phase_started_ns = phase_completed_ns
-        req.output_ids.extend(task.committed_token_ids)
-        req._refresh_fill_ids()
-        req.set_extend_range(task.feature_token_offset, task.committed_kv_len)
+        discarded_tokens = max(0, allocated_len - task.committed_kv_len)
         state.valid_committed_len = task.committed_kv_len
         state.proposal_base_len = task.committed_kv_len
         state.last_round_id = task.round_id
@@ -8656,7 +8564,16 @@ class FlashMTPDraftEngine:
         )
         if reconcile_prepare_phase_ns is not None:
             reconcile_prepare_phase_ns[5] += time.monotonic_ns() - phase_started_ns
-        return state, cache_loc.to(torch.int64)
+        cache_loc = req_pool.req_to_token[
+            req.req_pool_idx, task.feature_token_offset : task.committed_kv_len
+        ].to(torch.int64)
+        positions = torch.arange(
+            task.feature_token_offset,
+            task.committed_kv_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        return state, cache_loc, positions
 
     def _run_dflash_proposal(
         self,
@@ -8664,7 +8581,7 @@ class FlashMTPDraftEngine:
         states: list[PersistentDraftRequest],
         req_pool_indices: torch.Tensor,
         prefix_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        alloc_starts: torch.Tensor,
         bonus_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, str, str | None]:
         batch_size = len(states)
@@ -8672,31 +8589,85 @@ class FlashMTPDraftEngine:
         req_pool = self._draft_model_runner.req_to_token_pool
         allocator = self._draft_model_runner.token_to_kv_pool_allocator
         marks = self._submit_marks if getattr(self, "_profile_active", False) else None
-        out_cache_loc = allocator.alloc(batch_size * block_size)
-        if out_cache_loc is None:
-            raise RuntimeError("DFLASH proposal KV-page OOM")
-        try:
-            out_cache_loc_2d = out_cache_loc.view(batch_size, block_size)
-            positions = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-            req_rows = req_pool_indices.unsqueeze(1).expand_as(positions)
-            req_pool.req_to_token[req_rows, positions] = out_cache_loc_2d.to(
-                req_pool.req_to_token.dtype
+        # Each row's block head still maps the previous round's lookahead
+        # pages, which this forward overwrites; only the tail beyond the
+        # current allocation takes fresh pages, in one batched allocation.
+        tail_total = 0
+        for state in states:
+            tail = (
+                state.valid_committed_len
+                + block_size
+                - state.req.kv.kv_allocated_len
             )
+            if tail < 0:
+                raise RuntimeError("DFLASH proposal allocation exceeds its block")
+            tail_total += tail
+        # Committed lengths are already authoritative CPU state, so
+        # seq_lens_cpu never needs a GPU round-trip.
+        seq_lens_cpu = torch.tensor(
+            [state.valid_committed_len + block_size for state in states],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        tail_pages = allocator.alloc(tail_total) if tail_total else None
+        if tail_total and tail_pages is None:
+            raise RuntimeError("DFLASH proposal KV-page OOM")
+        pages_installed = False
+        try:
+            if tail_pages is not None:
+                self._install_dflash_row_pages(
+                    req_pool_indices,
+                    alloc_starts,
+                    prefix_lens + block_size,
+                    tail_pages,
+                    batch_size,
+                )
             for state in states:
                 end = state.valid_committed_len + block_size
                 state.req.kv.kv_allocated_len = end
                 state.req.kv_committed_len = state.valid_committed_len
                 state.proposal_base_len = state.valid_committed_len
+            pages_installed = True
             if marks is not None:
                 marks["proposal_kv"] = time.monotonic_ns()
 
-            block_ids = torch.full(
-                (batch_size, block_size),
-                self._mask_token_id,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            block_ids[:, 0].copy_(bonus_tokens)
+            if self._canonical_draft_device(self.device).type == "cuda":
+                from sglang.kernels.ops.speculative.dflash import (
+                    _prepare_dflash_draft_block_unchecked,
+                )
+
+                block_ids = torch.empty(
+                    (batch_size, block_size), dtype=torch.int64, device=self.device
+                )
+                positions = torch.empty(
+                    (batch_size, block_size), dtype=torch.int64, device=self.device
+                )
+                block_cache_locs = torch.empty(
+                    (batch_size, block_size), dtype=torch.int64, device=self.device
+                )
+                _prepare_dflash_draft_block_unchecked(
+                    bonus_tokens=bonus_tokens,
+                    prefix_lens=prefix_lens,
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=req_pool.req_to_token,
+                    block_ids_out=block_ids,
+                    positions_out=positions,
+                    cache_loc_out=block_cache_locs,
+                    mask_token_id=self._mask_token_id,
+                )
+            else:
+                block_ids = torch.full(
+                    (batch_size, block_size),
+                    self._mask_token_id,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                block_ids[:, 0].copy_(bonus_tokens)
+                positions = prefix_lens.unsqueeze(1) + self._block_pos_offsets
+                block_cache_locs = req_pool.req_to_token[
+                    req_pool_indices.unsqueeze(1).expand_as(positions), positions
+                ].to(torch.int64)
+            out_cache_loc = block_cache_locs.reshape(-1)
             input_embeds = self._token_embedding(block_ids).reshape(
                 batch_size * block_size, -1
             )
@@ -8761,10 +8732,10 @@ class FlashMTPDraftEngine:
             candidates[:, 1:].copy_(proposals)
             return candidates, proposal_execution, proposal_fallback_reason
         except Exception as exc:
-            # No successful completion event will own this allocation.  Fence
-            # exceptional GPU work before making the pages reusable; if that
-            # fence itself fails, report the resource as unquiesced so the
-            # caller quarantines every affected request instead.
+            # Fence exceptional GPU work before any touched page can be
+            # reused; if that fence itself fails, report the resource as
+            # unquiesced so the caller quarantines every affected request
+            # instead.
             try:
                 torch.cuda.current_stream(self.device).synchronize()
             except Exception as sync_exc:
@@ -8776,12 +8747,11 @@ class FlashMTPDraftEngine:
                 setattr(exc, "resources_quiescent", False)
                 setattr(sync_exc, "resources_quiescent", False)
                 raise sync_exc from exc
-            allocator.free(out_cache_loc)
-            for state in states:
-                if state.req.kv is not None:
-                    state.req.kv.kv_allocated_len = state.valid_committed_len
-                state.req.kv_committed_len = state.valid_committed_len
-                state.proposal_base_len = state.valid_committed_len
+            if not pages_installed and tail_pages is not None:
+                # The tail pages never entered the page table; return them
+                # directly.  Once installed, the rows own them and outer
+                # failure cleanup frees [0, kv_allocated_len) as usual.
+                allocator.free(tail_pages)
             raise
 
     def _profile_dflash_batch(self, completion, tasks, gpu_ns: int, estimate) -> None:
