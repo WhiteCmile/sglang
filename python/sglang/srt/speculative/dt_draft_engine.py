@@ -1184,6 +1184,11 @@ class FlashMTPDraftEngine:
         self._migration_source_events: dict[str, torch.cuda.Event] = {}
         self._migration_source_handles: dict[str, str] = {}
         self._deferred_persistent_releases: dict[str, str] = {}
+        # The same deferred releases by ledger cell key, so the native
+        # FREEZE answers its released check without building the row's
+        # handle (a deferred release is outstanding for ~one batch lifetime
+        # at serving churn, so the check runs on most freeze passes).
+        self._deferred_release_cells: set[int] = set()
         self._pending_request_release_acks: dict[str, object] = {}
         self._deferred_migration_finalizations: dict[str, object] = {}
         self._deferred_feature_source_tasks: dict[tuple[str, str], object] = {}
@@ -2083,6 +2088,19 @@ class FlashMTPDraftEngine:
         self._dflash_metadata_host_buffers = [
             torch.empty(
                 (_DFLASH_META_FIELDS, self.max_batch_size),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(scratch_count)
+        ]
+        # Landing-row gather indices for an all-native-ring batch: pinned so
+        # the H2D is asynchronous; per scratch slot so a batch's copy is done
+        # before the slot's next batch rewrites it (the metadata host buffer
+        # above has the same lifetime).
+        self._dflash_gather_index_host_buffers = [
+            torch.empty(
+                (self.feature_buffer_max_tokens,),
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=True,
@@ -3806,17 +3824,8 @@ class FlashMTPDraftEngine:
         by_cell = self._persistent_by_cell
         cancelled_ids = self._cancelled_ids
         deferred = self._deferred_persistent_releases
-        # Owner-busy by cell key (native rows) and handle (V1 rows); a frozen
-        # row joins both (its handle is built anyway, a V1 row's key costs
-        # one ledger lookup).
-        busy_cells = set()
-        if busy_handles:
-            persistent = self._persistent_requests
-            for handle in busy_handles:
-                state = persistent.get(handle)
-                if state is not None and state.cell_key:
-                    busy_cells.add(state.cell_key)
-        pass_cells, pass_handles = set(), set()
+        deferred_cells = self._deferred_release_cells
+        pass_handles = set()
 
         if profile:
             # Skip accounting (#292).  A waiting row's state is [reason, last
@@ -3920,17 +3929,17 @@ class FlashMTPDraftEngine:
             # The row's request is gone, or its release waits only on an
             # in-flight batch: this later round must not run (as the legacy
             # admission's released drop).  Native rows answer from the cell
-            # index; the handle string is built only while a cancel or
-            # deferred release is outstanding.
+            # index and the deferred-release cell set; the string identity
+            # is built only while a cancel is outstanding (and for a row
+            # that freezes or retires).
             if type(ident) is int:
                 entry = by_cell.get(ident)
-                released = entry is None or entry[1] != fields[4]
-                if released:
-                    state = None
-                else:
-                    state = entry[0]
-                    if deferred and self._ready_row_identity(row)[0] in deferred:
-                        released = True
+                released = (
+                    entry is None
+                    or entry[1] != fields[4]
+                    or ident in deferred_cells
+                )
+                state = None if released else entry[0]
             else:
                 state = None
                 released = (
@@ -3970,13 +3979,15 @@ class FlashMTPDraftEngine:
                 done.append(seq)
                 finish(row, "released" if released else "cancelled" if cancelled else "expired")
                 continue
+            # Owner-busy: native rows answer through the state the released
+            # check already fetched (same handle as the row's).
             if type(ident) is int:
-                busy = ident in busy_cells
+                busy = state.draft_kv_handle in busy_handles
             else:
                 busy = ident[0] in busy_handles
             if busy:
                 if type(ident) is int:
-                    owner_selected = ident in pass_cells
+                    owner_selected = state.draft_kv_handle in pass_handles
                 else:
                     owner_selected = ident[0] in pass_handles
                 skip(row, _ReadySkip.owner_selected if owner_selected
@@ -4028,19 +4039,8 @@ class FlashMTPDraftEngine:
                 task = self._ready_row_task(handle, transfer_id, deadline_ns, count, fields, rid)
                 if profile:
                     sub_ns[0] += time.monotonic_ns() - part_ns
-                busy_cells.add(ident)
-                pass_cells.add(ident)
             else:
                 handle, transfer_id = ident
-                loc = (
-                    self._rid_ledger.handle(fields[9])
-                    if self._rid_ledger is not None
-                    else None
-                )
-                if loc is not None:
-                    key = (loc[1] << 32) | loc[0]
-                    busy_cells.add(key)
-                    pass_cells.add(key)
             busy_handles.add(handle)
             pass_handles.add(handle)
             finish(row, "frozen")
@@ -8090,9 +8090,14 @@ class FlashMTPDraftEngine:
             self._wait_ready_copies(ready_seqs)
         if marks is not None:
             marks["copy_waits"] = time.monotonic_ns()
+        contiguous = len(slots_used) == 1 and all(
+            row_ranges[index][1] == row_ranges[index + 1][0]
+            for index in range(len(row_ranges) - 1)
+        )
         gather_source = None
         if (
-            self._ring_landing is not None
+            not contiguous
+            and self._ring_landing is not None
             and isinstance(self._dflash_materializer, _GraphedDFlashMaterializer)
             and all(slot >= self._landing_slot_base for slot in slots_used)
         ):
@@ -8101,38 +8106,30 @@ class FlashMTPDraftEngine:
             # (one index_select) instead of per-row views + torch.cat + the
             # copy_ into that buffer it would need.  Mixed/relayed batches
             # keep the staging views.
-            max_tokens = self.feature_buffer_max_tokens
-            gather_index = torch.from_numpy(
-                np.concatenate(
-                    [
-                        np.arange(
-                            (slot - self._landing_slot_base) * max_tokens + start,
-                            (slot - self._landing_slot_base) * max_tokens + end,
-                            dtype=np.int64,
-                        )
-                        for slot, (start, end) in zip(
-                            staging_slots, row_ranges, strict=True
-                        )
-                    ]
+            host = self._dflash_gather_index_host_buffers[metadata_slot]
+            host_np = host.numpy()
+            offset = 0
+            for slot, (start, end) in zip(staging_slots, row_ranges, strict=True):
+                first = (slot - self._landing_slot_base) * self.feature_buffer_max_tokens + start
+                count = end - start
+                host_np[offset : offset + count] = np.arange(
+                    first, first + count, dtype=np.int64
                 )
-            ).to(self.device, non_blocking=True)
+                offset += count
+            gather_index = host[:offset].to(self.device, non_blocking=True)
             gather_source = self._ring_landing.view(-1, self._ring_landing.shape[-1])
             target_hidden = None
+        elif contiguous:
+            # The contiguous-range view only exists within one slot's buffer.
+            target_hidden = self._feature_staging_buffers[slots_used[0]][
+                row_ranges[0][0] : row_ranges[-1][1]
+            ]
         else:
             hidden_rows = [
                 self._feature_staging_buffers[slot][start:end]
                 for slot, (start, end) in zip(staging_slots, row_ranges, strict=True)
             ]
-            if len(slots_used) == 1 and all(
-                row_ranges[index][1] == row_ranges[index + 1][0]
-                for index in range(len(row_ranges) - 1)
-            ):
-                # The contiguous-range view only exists within one slot's buffer.
-                target_hidden = self._feature_staging_buffers[slots_used[0]][
-                    row_ranges[0][0] : row_ranges[-1][1]
-                ]
-            else:
-                target_hidden = torch.cat(hidden_rows, dim=0)
+            target_hidden = torch.cat(hidden_rows, dim=0)
         materialize_start = torch.cuda.Event(enable_timing=True)
         materialize_done = torch.cuda.Event(enable_timing=True)
         proposal_done = torch.cuda.Event(enable_timing=True)
@@ -11103,6 +11100,12 @@ class FlashMTPDraftEngine:
             del by_cell[state.cell_key]
         state.cell_key = 0
 
+    def _defer_release_cell(self, state: PersistentDraftRequest) -> None:
+        cells = getattr(self, "_deferred_release_cells", None)
+        cell_key = getattr(state, "cell_key", 0)
+        if cells is not None and cell_key:
+            cells.add(cell_key)
+
     def _release_persistent_request(
         self, draft_kv_handle: str, *, request_id: str | None = None
     ) -> bool:
@@ -11114,6 +11117,7 @@ class FlashMTPDraftEngine:
             raise ValueError("Draft release request identity does not match KV owner")
         if draft_kv_handle in self._quarantined_feature_draft_handles:
             self._deferred_persistent_releases[draft_kv_handle] = state.request_id
+            self._defer_release_cell(state)
             profile_emit(
                 "draft_request_release_quarantined",
                 request_id=state.request_id,
@@ -11129,6 +11133,7 @@ class FlashMTPDraftEngine:
             for handle in self._migration_source_handles.values()
         ):
             self._deferred_persistent_releases[draft_kv_handle] = state.request_id
+            self._defer_release_cell(state)
             profile_emit(
                 "draft_request_release_deferred",
                 request_id=state.request_id,
@@ -11141,6 +11146,9 @@ class FlashMTPDraftEngine:
             )
             return False
         self._persistent_requests.pop(draft_kv_handle)
+        deferred_cells = getattr(self, "_deferred_release_cells", None)
+        if deferred_cells is not None:
+            deferred_cells.discard(getattr(state, "cell_key", 0))
         self._persistent_index_remove(state)
         self._deferred_persistent_releases.pop(draft_kv_handle, None)
         ledger = getattr(self, "_rid_ledger", None)
