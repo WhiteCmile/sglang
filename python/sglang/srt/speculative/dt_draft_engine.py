@@ -1421,9 +1421,10 @@ class FlashMTPDraftEngine:
         self._send_loop_remote: list[list] = []
         # READY table (scheduler-owned, native ingress): entries by READY seq
         # modulo the queue capacity (created with the ring worker), the
-        # unselected rows in arrival order (READY seq plus the identity DRAIN
-        # derived once), the decoded V1_PAYLOAD tasks (until Target item T4),
-        # per-record landing placements
+        # unselected rows in arrival order (READY seq plus the row's ledger
+        # cell key; the string identity is built lazily), the decoded
+        # V1_PAYLOAD tasks (until Target item T4), per-record landing
+        # placements
         # (ring id, record seq) -> [rows not yet released, k, gen], and
         # ready_consumed_seq with the consumed seqs past it (#276 decision 2:
         # reclaim per entry, the counter advances over the contiguous prefix).
@@ -1440,10 +1441,12 @@ class FlashMTPDraftEngine:
         # cumulative histogram of floor(4 * log2 ns) for its p99.
         self._ready_held_max_ns = 0
         self._ready_held_hist = np.zeros(256, dtype=np.int64)
-        # FREEZE skip reasons (#292): per waiting row (by READY seq) its
-        # [reason, last evaluation ns, gate mark, passes, first reason, fit at
-        # the last fit skip, held ns per reason]; cumulative counters for the
-        # lifecycle status; compute-depth gate time while rows waited.
+        # FREEZE skip reasons (#292), maintained only under the profile
+        # (production keeps _ready_drops/_ready_frozen_batches): per waiting
+        # row (by READY seq) its [reason, last evaluation ns, gate mark,
+        # passes, first reason, fit at the last fit skip, held ns per
+        # reason]; cumulative counters for the lifecycle status; compute-depth
+        # gate time while rows waited.
         self._ready_skip_state: dict[int, list] = {}
         reasons = len(_READY_SKIP_REASONS)
         self._ready_skips = [0] * reasons
