@@ -8105,18 +8105,32 @@ class FlashMTPDraftEngine:
             # straight into the graphed materializer's static hidden buffer
             # (one index_select) instead of per-row views + torch.cat + the
             # copy_ into that buffer it would need.  Mixed/relayed batches
-            # keep the staging views.
+            # keep the staging views.  The index is one vectorized fill of
+            # the pinned per-slot buffer (arange(total) - repeat(run starts)
+            # + repeat(firsts)); a per-run np.arange loop costs more host
+            # time than the cat it replaces.
             host = self._dflash_gather_index_host_buffers[metadata_slot]
+            counts = np.fromiter(
+                (end - start for _, (start, end) in zip(staging_slots, row_ranges, strict=True)),
+                dtype=np.int64,
+                count=len(row_ranges),
+            )
+            firsts = np.fromiter(
+                (
+                    (slot - self._landing_slot_base) * self.feature_buffer_max_tokens + start
+                    for slot, (start, _) in zip(staging_slots, row_ranges, strict=True)
+                ),
+                dtype=np.int64,
+                count=len(row_ranges),
+            )
+            total = int(counts.sum())
             host_np = host.numpy()
-            offset = 0
-            for slot, (start, end) in zip(staging_slots, row_ranges, strict=True):
-                first = (slot - self._landing_slot_base) * self.feature_buffer_max_tokens + start
-                count = end - start
-                host_np[offset : offset + count] = np.arange(
-                    first, first + count, dtype=np.int64
-                )
-                offset += count
-            gather_index = host[:offset].to(self.device, non_blocking=True)
+            host_np[:total] = (
+                np.arange(total, dtype=np.int64)
+                - np.repeat(np.cumsum(counts) - counts, counts)
+                + np.repeat(firsts, counts)
+            )
+            gather_index = host[:total].to(self.device, non_blocking=True)
             gather_source = self._ring_landing.view(-1, self._ring_landing.shape[-1])
             target_hidden = None
         elif contiguous:
