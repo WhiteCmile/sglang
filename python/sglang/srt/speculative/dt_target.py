@@ -5140,7 +5140,14 @@ class DTTargetController:
         self._next_full_wave_id += 1
         batch.dt_full_wave_id = wave_id
         batch.dt_full_wave_ready_ns = finished_ns
-        if trace_build:
+        # The wave's transfer identity feeds several events, not just
+        # target_ready_batch: target_batch_submit, the verify-CUDA
+        # observation record, and target_old_result_process all read it.
+        if (
+            trace_build
+            or self.target_phase_profile_enabled
+            or self._profile_verify_observation
+        ):
             batch.dt_full_wave_transfer_ids = tuple(
                 state.transfer_id for state in ready
             )
