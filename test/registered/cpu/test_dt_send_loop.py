@@ -182,7 +182,9 @@ def test_absorb_quarantines_every_popped_batch_behind_a_failure():
 def _gate_engine(done_seq, frozen_seq, batches, last_done_ns=0):
     engine = _engine()
     engine._fatal_gpu_quarantine_reason = None
-    engine._ready_pending = [(1, "h", "t", 0, True, 40, 0, 0, 0, (), ())]  # 40 tokens READY
+    # READY-table row: (seq, ident, deadline_ns, requires_proposal, count, k,
+    # row_first, drained_ns, fields, marks).
+    engine._ready_pending = [(1, 0, 0, True, 40, 0, 0, 0, (), ())]  # 40 tokens READY
     engine._input_ready_features = collections.deque()
     engine.feature_buffer_max_tokens = 8192
     engine._batch_estimator = draft_mod.DraftBatchEstimator()
