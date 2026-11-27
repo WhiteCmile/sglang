@@ -1024,6 +1024,24 @@ class FlashMTPDraftEngine:
     _scheduler_v2 = False
     _dflash_last_done_ns = 0
     _scheduler_wait_ns = (0, 0)
+    # Per-event profiling gates (issue #362); class defaults keep __new__
+    # fixtures on the untraced path.
+    _profile_batch_estimate = False
+    _profile_batch_complete = False
+    _profile_input_ready = False
+    _profile_ring_take = False
+    _profile_input_ready_submit = False
+    _profile_input_ready_select = False
+    _profile_ready_state_event = False
+    _profile_kv_or_proposal = False
+    _profile_feature_pull_complete = False
+    _profile_done_absorb = False
+    _profile_candidate_push_submit = False
+    _profile_candidate_push_retire = False
+    _profile_notice_ack = False
+    _profile_result_publish = False
+    _submit_marks = None
+    _submit_sub_ns = None
 
     # Preserve the historical transport for partially constructed test and
     # diagnostic instances that intentionally bypass ``__init__``.
@@ -1094,16 +1112,59 @@ class FlashMTPDraftEngine:
         self.EntryStatus = EntryStatus
         self.instance_id = instance_id
         self._profile_active = profile_enabled()
+        # Per-event profiling gates (issue #362): every expensive path —
+        # CUDA-event queries, per-row dicts, extra clock reads, the submit
+        # marks — runs only when an event that consumes its output is
+        # enabled, not merely when DT_PROFILE_DIR is set.  event_enabled
+        # reads import-time cached config, so these startup snapshots never
+        # go stale; an empty DT_PROFILE_EVENTS filter enables everything,
+        # reproducing the old _profile_active behaviour exactly.
+        self._profile_batch_estimate = profile_event_enabled("draft_batch_estimate")
+        self._profile_batch_complete = profile_event_enabled(
+            "draft_dflash_batch_complete"
+        )
+        self._profile_input_ready = profile_event_enabled("draft_input_ready")
+        self._profile_ring_take = profile_event_enabled("draft_ring_take")
+        self._profile_input_ready_submit = profile_event_enabled(
+            "draft_input_ready_submit"
+        )
+        self._profile_input_ready_select = profile_event_enabled(
+            "draft_input_ready_select"
+        )
+        self._profile_ready_state_event = profile_event_enabled(
+            "draft_input_ready_state"
+        )
+        self._profile_kv_or_proposal = bool(
+            profile_event_enabled("draft_kv_materialization")
+            or profile_event_enabled("draft_proposal")
+        )
+        self._profile_feature_pull_complete = profile_event_enabled(
+            "draft_feature_pull_complete"
+        )
+        self._profile_done_absorb = profile_event_enabled("draft_dflash_done_absorb")
+        self._profile_candidate_push_submit = profile_event_enabled(
+            "draft_candidate_push_submit"
+        )
+        self._profile_candidate_push_retire = bool(
+            profile_event_enabled("draft_candidate_producer_completion_observed")
+            or profile_event_enabled("draft_candidate_push_complete")
+        )
+        self._profile_notice_ack = profile_event_enabled("draft_candidate_notice_ack")
+        self._profile_result_publish = bool(
+            profile_event_enabled("draft_result_publish")
+            or profile_event_enabled("draft_flashmtp_result_publish")
+            or profile_event_enabled("draft_flashmtp_result_send")
+        )
         self._last_input_ready_profile_state = None
         self._batch_estimator = (
-            DraftBatchEstimator()
-            if profile_event_enabled("draft_batch_estimate")
-            else None
+            DraftBatchEstimator() if self._profile_batch_estimate else None
         )
-        # Absolute GPU end of each DFlash batch (dt_gpu_clock), profile only.
+        # Absolute GPU end of each DFlash batch (dt_gpu_clock), profile only;
+        # consumed solely by draft_batch_estimate's gpu_end_clock_ns.
         self._gpu_clock = None
         self._gpu_clock_enabled = (
-            self._profile_active and os.environ.get("DT_GPU_CLOCK", "0") == "1"
+            self._profile_batch_estimate
+            and os.environ.get("DT_GPU_CLOCK", "0") == "1"
         )
         self._input_ready_select_ns = (0, 0)
         # Profile-only stage marks of the batch being selected and submitted
@@ -1505,7 +1566,11 @@ class FlashMTPDraftEngine:
                     draft_instance_id=self.instance_id,
                     draft_session_id=self._client.instance_session_id,
                     device=self.device,
-                    profile_timing=self._profile_active,
+                    profile_timing=(
+                        self._profile_candidate_push_submit
+                        or self._profile_candidate_push_retire
+                        or self._profile_notice_ack
+                    ),
                     host_addr=self._dt_host_addr,
                 )
             if (
@@ -1719,7 +1784,7 @@ class FlashMTPDraftEngine:
         self._feature_pull_transport = DraftFeaturePullTransport(
             device=self.device,
             max_workers=self.max_batch_size,
-            profile_timing=self._profile_active,
+            profile_timing=self._profile_feature_pull_complete,
             host_addr=self._dt_host_addr,
         )
         # FlashMTP transfers exactly one pivot row per request. Unlike DFlash
@@ -2066,7 +2131,7 @@ class FlashMTPDraftEngine:
         self._feature_pull_transport = DraftFeaturePullTransport(
             device=self.device,
             max_workers=self.max_batch_size,
-            profile_timing=self._profile_active,
+            profile_timing=self._profile_feature_pull_complete,
             host_addr=self._dt_host_addr,
         )
         self._feature_staging_buffers = [
@@ -2426,7 +2491,7 @@ class FlashMTPDraftEngine:
         self._feature_pull_transport = DraftFeaturePullTransport(
             device=self.device,
             max_workers=self.max_batch_size,
-            profile_timing=self._profile_active,
+            profile_timing=self._profile_feature_pull_complete,
             host_addr=self._dt_host_addr,
         )
         self._feature_staging_buffers = [
@@ -2508,7 +2573,7 @@ class FlashMTPDraftEngine:
     def _push_transport_progress(self) -> None:
         transport = self._candidate_push_transport
         transport.progress_completions()
-        if self._profile_active:
+        if self._profile_notice_ack:
             for acknowledgement in transport.pop_acknowledgements():
                 profile_emit(
                     "draft_candidate_notice_ack",
@@ -2880,7 +2945,7 @@ class FlashMTPDraftEngine:
             )
         )
         self._early_pushed_ids.update(task.transfer_id for task in selected)
-        if self._profile_active:
+        if self._profile_candidate_push_submit:
             profile_emit(
                 "draft_candidate_push_submit",
                 draft_instance=self.instance_id,
@@ -3634,7 +3699,7 @@ class FlashMTPDraftEngine:
                     ready_ns=now_ns,
                 )
             )
-            if self._profile_active:
+            if self._profile_input_ready:
                 # Per-round READY on the direct path (issue #269; the pull
                 # path emits the same event in _poll_feature_batches).
                 profile_emit(
@@ -3647,7 +3712,7 @@ class FlashMTPDraftEngine:
                     ready_ns=now_ns,
                     direct=True,
                 )
-        if self._profile_active:
+        if profile_event_enabled("draft_ring_admission_state"):
             self._profile_ring_admission_state(
                 observed_ns=now_ns,
                 reason=stop_reason,
@@ -3818,7 +3883,7 @@ class FlashMTPDraftEngine:
         available_rows, available_kv = self._unreserved_allocation(
             (*selected, *self._input_ready_features)
         )
-        profile = self._profile_active
+        profile = self._profile_batch_estimate
         sub_ns = self._submit_sub_ns if profile else None  # SUBMIT_SUB_STAGES
         retained, done, dropped = [], [], []
         by_cell = self._persistent_by_cell
@@ -3896,19 +3961,20 @@ class FlashMTPDraftEngine:
                     self._ready_long_rows[held.index(max(held))] += 1
                     if self._ready_longest is None or held_ns > self._ready_longest["held_ns"]:
                         self._ready_longest = summary
-                _, transfer_id, rid = self._ready_row_identity(row)
-                profile_emit(
-                    "draft_ready_skip",
-                    draft_instance=self.instance_id,
-                    transfer_id=transfer_id,
-                    request_id=rid,
-                    round_id=fields[3],
-                    ready_ns=fields[8],
-                    drained_ns=row[7],
-                    finished_ns=now_ns,
-                    long=held_ns >= _READY_LONG_HOLD_NS,
-                    **summary,
-                )
+                if profile_event_enabled("draft_ready_skip"):
+                    _, transfer_id, rid = self._ready_row_identity(row)
+                    profile_emit(
+                        "draft_ready_skip",
+                        draft_instance=self.instance_id,
+                        transfer_id=transfer_id,
+                        request_id=rid,
+                        round_id=fields[3],
+                        ready_ns=fields[8],
+                        drained_ns=row[7],
+                        finished_ns=now_ns,
+                        long=held_ns >= _READY_LONG_HOLD_NS,
+                        **summary,
+                    )
 
         else:
 
@@ -4060,9 +4126,9 @@ class FlashMTPDraftEngine:
                     ready_seq=seq,
                 )
             )
-            if profile:
-                # Native ingress has no admission queue: the drain is both
-                # the take and READY of the D0 chain.
+            # Native ingress has no admission queue: the drain is both the
+            # take and READY of the D0 chain.
+            if self._profile_ring_take:
                 profile_emit(
                     "draft_ring_take",
                     draft_instance=self.instance_id,
@@ -4074,6 +4140,7 @@ class FlashMTPDraftEngine:
                     has_pull=True,
                     taken_ns=drained_ns,
                 )
+            if self._profile_input_ready:
                 profile_emit(
                     "draft_input_ready",
                     draft_instance=self.instance_id,
@@ -4243,7 +4310,7 @@ class FlashMTPDraftEngine:
         base = candidates.data_ptr()
         prequeue, rows, owned, cross = [], [], [], []
         proposal_tasks = list(proposal_tasks)
-        sub_ns = self._submit_sub_ns if self._profile_active else None
+        sub_ns = self._submit_sub_ns
         for index, task in enumerate(proposal_tasks):
             if task.transfer_id in self._cancelled_ids:
                 continue  # as the pre-queue skips it: the retire path owns it
@@ -4321,7 +4388,7 @@ class FlashMTPDraftEngine:
         self._loop_stage_calls["dflash_absorb"] += len(retired)
         failed = False
         for completion, gpu_done_ns, materialize_ns, proposal_ns, error in retired:
-            if self._profile_active:
+            if self._profile_done_absorb:
                 profile_emit(
                     "draft_dflash_done_absorb",
                     draft_instance=self.instance_id,
@@ -4477,7 +4544,7 @@ class FlashMTPDraftEngine:
             candidate_bytes=len(tasks) * candidates.shape[1] * candidates.element_size(),
             cold_mapping_count=0,
         )
-        if self._profile_active:
+        if self._profile_candidate_push_submit:
             # The send loop issued these at the GPU done (D0 chain:
             # push_submit is that issue, push_complete its observation).
             profile_emit(
@@ -6716,16 +6783,17 @@ class FlashMTPDraftEngine:
                 )
             row_ranges.append((row_offset, row_end))
             row_offset = row_end
-            profile_emit(
-                "draft_feature_pull_submit",
-                draft_instance=self.instance_id,
-                feature_batch_id=batch_id,
-                transfer_id=task.transfer_id,
-                request_id=task.request_id,
-                round_id=task.round_id,
-                feature_bytes=source.nbytes,
-                submitted_ns=submitted_ns,
-            )
+            if profile_event_enabled("draft_feature_pull_submit"):
+                profile_emit(
+                    "draft_feature_pull_submit",
+                    draft_instance=self.instance_id,
+                    feature_batch_id=batch_id,
+                    transfer_id=task.transfer_id,
+                    request_id=task.request_id,
+                    round_id=task.round_id,
+                    feature_bytes=source.nbytes,
+                    submitted_ns=submitted_ns,
+                )
         # Completion/admission is request-granular. The transport may still
         # serialize these copies on its bounded stream, but one slow entry no
         # longer freezes compute membership chosen for the other entries.
@@ -6770,15 +6838,16 @@ class FlashMTPDraftEngine:
                 failed.set_exception(exc)
                 futures[index] = failed
         flush_remote_run()
-        profile_emit(
-            "draft_feature_pull_batch_submit",
-            draft_instance=self.instance_id,
-            feature_batch_id=batch_id,
-            segment_count=len(sources),
-            peer_count=len({source.target_instance_id for source in sources}),
-            feature_bytes=sum(source.nbytes for source in sources),
-            submitted_ns=submitted_ns,
-        )
+        if profile_event_enabled("draft_feature_pull_batch_submit"):
+            profile_emit(
+                "draft_feature_pull_batch_submit",
+                draft_instance=self.instance_id,
+                feature_batch_id=batch_id,
+                segment_count=len(sources),
+                peer_count=len({source.target_instance_id for source in sources}),
+                feature_bytes=sum(source.nbytes for source in sources),
+                submitted_ns=submitted_ns,
+            )
         self._pending_feature_batches.append(
             PendingFeatureBatch(
                 batch_id=batch_id,
@@ -6931,37 +7000,38 @@ class FlashMTPDraftEngine:
                     continue
 
                 completed_ns = time.monotonic_ns()
-                profile_emit(
-                    "draft_feature_pull_complete",
-                    draft_instance=self.instance_id,
-                    feature_batch_id=feature_batch.batch_id,
-                    transfer_id=task.transfer_id,
-                    request_id=task.request_id,
-                    round_id=task.round_id,
-                    controller_submitted_ns=feature_batch.submitted_ns,
-                    worker_started_ns=getattr(metrics, "worker_started_ns", 0),
-                    mapping_done_ns=getattr(metrics, "mapping_done_ns", 0),
-                    transport_submitted_ns=metrics.submitted_ns,
-                    driver_submit_started_ns=getattr(
-                        metrics, "driver_submit_started_ns", 0
-                    ),
-                    driver_submit_done_ns=getattr(
-                        metrics, "driver_submit_done_ns", 0
-                    ),
-                    cuda_pre_copy_ns=getattr(metrics, "cuda_pre_copy_ns", 0),
-                    cuda_copy_ns=metrics.gpu_copy_ns,
-                    gpu_start_observed_ns=getattr(
-                        metrics, "gpu_start_observed_ns", 0
-                    ),
-                    gpu_completed_ns=metrics.gpu_completed_ns,
-                    owner_observed_ns=completed_ns,
-                    owner_poll_delay_ns=completed_ns - metrics.gpu_completed_ns,
-                    feature_bytes=metrics.feature_bytes,
-                    target_instance=task.source.target_instance_id,
-                    source_session_id=task.source.source_session_id,
-                    pool_generation=task.source.pool_generation,
-                    transport_session=task.source.transport_session,
-                )
+                if self._profile_feature_pull_complete:
+                    profile_emit(
+                        "draft_feature_pull_complete",
+                        draft_instance=self.instance_id,
+                        feature_batch_id=feature_batch.batch_id,
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        controller_submitted_ns=feature_batch.submitted_ns,
+                        worker_started_ns=getattr(metrics, "worker_started_ns", 0),
+                        mapping_done_ns=getattr(metrics, "mapping_done_ns", 0),
+                        transport_submitted_ns=metrics.submitted_ns,
+                        driver_submit_started_ns=getattr(
+                            metrics, "driver_submit_started_ns", 0
+                        ),
+                        driver_submit_done_ns=getattr(
+                            metrics, "driver_submit_done_ns", 0
+                        ),
+                        cuda_pre_copy_ns=getattr(metrics, "cuda_pre_copy_ns", 0),
+                        cuda_copy_ns=metrics.gpu_copy_ns,
+                        gpu_start_observed_ns=getattr(
+                            metrics, "gpu_start_observed_ns", 0
+                        ),
+                        gpu_completed_ns=metrics.gpu_completed_ns,
+                        owner_observed_ns=completed_ns,
+                        owner_poll_delay_ns=completed_ns - metrics.gpu_completed_ns,
+                        feature_bytes=metrics.feature_bytes,
+                        target_instance=task.source.target_instance_id,
+                        source_session_id=task.source.source_session_id,
+                        pool_generation=task.source.pool_generation,
+                        transport_session=task.source.transport_session,
+                    )
                 if task.request_id.startswith(DT_BENCHMARK_MEASUREMENT_RID_PREFIX):
                     source = task.source
                     self._record_direct_gpu_measurement_request(
@@ -7020,15 +7090,16 @@ class FlashMTPDraftEngine:
                         ready_ns=completed_ns,
                     )
                 )
-                profile_emit(
-                    "draft_input_ready",
-                    draft_instance=self.instance_id,
-                    transfer_id=task.transfer_id,
-                    request_id=task.request_id,
-                    round_id=task.round_id,
-                    staging_slot=feature_batch.staging_slot,
-                    ready_ns=completed_ns,
-                )
+                if self._profile_input_ready:
+                    profile_emit(
+                        "draft_input_ready",
+                        draft_instance=self.instance_id,
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        staging_slot=feature_batch.staging_slot,
+                        ready_ns=completed_ns,
+                    )
                 capacity_changed = True
             if unfinished_pending:
                 feature_batch.pending = unfinished_pending
@@ -7046,14 +7117,24 @@ class FlashMTPDraftEngine:
     def _take_input_ready_batch(self) -> list[InputReadyFeature]:
         """Choose final compute membership only from request-ready inputs."""
 
-        profile_active = getattr(self, "_profile_active", False)
+        profile_active = (
+            self._profile_input_ready_select
+            or self._profile_ready_state_event
+            or self._profile_input_ready_submit
+            or self._profile_batch_estimate
+        )
         selection_started_ns = time.monotonic_ns() if profile_active else 0
-        if profile_active:
+        if self._profile_batch_estimate:
             self._submit_marks = {"select_started": selection_started_ns}
             self._submit_sub_ns = [0] * len(SUBMIT_SUB_STAGES)
         inflight_before = self._draft_compute_batches_inflight()
-        waiting_before = tuple(
-            entry.pending.task.transfer_id for entry in self._input_ready_features
+        waiting_before = (
+            tuple(
+                entry.pending.task.transfer_id
+                for entry in self._input_ready_features
+            )
+            if (self._profile_input_ready_select or self._profile_ready_state_event)
+            else ()
         )
         if (
             not (self._input_ready_features or self._ready_pending)
@@ -7128,26 +7209,27 @@ class FlashMTPDraftEngine:
             if self._persistent:
                 busy_handles.add(task.draft_kv_handle)
         self._input_ready_features = retained
-        if profile_active:
+        if self._profile_batch_estimate:
             self._submit_marks["select_scan"] = time.monotonic_ns()
         if self._native_ingress:
             self._freeze_ready_rows(
                 selected, busy_handles, proposal_mode, token_count, now_ns
             )
         selection_finished_ns = time.monotonic_ns() if profile_active else 0
-        if profile_active:
+        if self._profile_batch_estimate:
             self._submit_marks["freeze"] = selection_finished_ns
         if not selected:
-            self._profile_input_ready_state(
-                observed_ns=selection_finished_ns,
-                waiting_transfer_ids=tuple(
-                    entry.pending.task.transfer_id for entry in retained
-                ),
-                reason="slot_or_owner_busy",
-                inflight=inflight_before,
-            )
+            if self._profile_ready_state_event:
+                self._profile_input_ready_state(
+                    observed_ns=selection_finished_ns,
+                    waiting_transfer_ids=tuple(
+                        entry.pending.task.transfer_id for entry in retained
+                    ),
+                    reason="slot_or_owner_busy",
+                    inflight=inflight_before,
+                )
             return []
-        if profile_active:
+        if self._profile_input_ready_select:
             profile_emit(
                 "draft_input_ready_select",
                 draft_instance=self.instance_id,
@@ -7169,16 +7251,17 @@ class FlashMTPDraftEngine:
                     for entry in selected
                 ),
             )
-        self._profile_input_ready_state(
-            observed_ns=selection_finished_ns,
-            waiting_transfer_ids=tuple(
-                entry.pending.task.transfer_id for entry in retained
-            ),
-            reason="selected",
-            inflight=inflight_before,
-        )
+        if self._profile_ready_state_event:
+            self._profile_input_ready_state(
+                observed_ns=selection_finished_ns,
+                waiting_transfer_ids=tuple(
+                    entry.pending.task.transfer_id for entry in retained
+                ),
+                reason="selected",
+                inflight=inflight_before,
+            )
         self._input_ready_select_ns = (selection_started_ns, selection_finished_ns)
-        if profile_active:  # the selection's own profile records above
+        if self._profile_batch_estimate:  # the selection's own profile records above
             self._submit_marks["select_profile"] = time.monotonic_ns()
         return selected
 
@@ -7192,7 +7275,7 @@ class FlashMTPDraftEngine:
     ) -> None:
         """Emit only transitions in request-granular Draft compute admission."""
 
-        if not getattr(self, "_profile_active", False):
+        if not self._profile_ready_state_event:
             return
         signature = (waiting_transfer_ids, reason, inflight)
         if signature == getattr(self, "_last_input_ready_profile_state", None):
@@ -7210,9 +7293,11 @@ class FlashMTPDraftEngine:
     def _execute_input_ready_batch(self, ready: list[InputReadyFeature]) -> None:
         if not ready:
             return
-        profile_active = getattr(self, "_profile_active", False)
+        profile_active = (
+            self._profile_input_ready_submit or self._profile_batch_estimate
+        )
         submit_started_ns = time.monotonic_ns() if profile_active else 0
-        marks = self._submit_marks if profile_active else None
+        marks = self._submit_marks
         if marks is not None:
             marks["select_return"] = submit_started_ns
         inflight_before = self._draft_compute_batches_inflight()
@@ -7270,13 +7355,15 @@ class FlashMTPDraftEngine:
                 )
             if profile_active:
                 submit_returned_ns = time.monotonic_ns()
-                marks["submit_tail"] = submit_returned_ns
+                if marks is not None:
+                    marks["submit_tail"] = submit_returned_ns
                 select_started_ns, frozen_ns = self._input_ready_select_ns
                 if self._persistent and not self._is_eagle3:  # the DFlash launch
                     completion = self._pending_dflash_completions[-1]
                     completion.select_started_ns = select_started_ns
                     completion.frozen_ns = frozen_ns
                     completion.handoff_ns = submit_returned_ns
+            if self._profile_input_ready_submit:
                 profile_emit(
                     "draft_input_ready_submit",
                     draft_instance=self.instance_id,
@@ -7647,28 +7734,29 @@ class FlashMTPDraftEngine:
             # cat/to above already snapshots graph-owned proposals on the
             # forward stream. The slot owns candidates, optional pinned rows,
             # and feature reads until its completion event.
-            profile_emit(
-                "draft_eagle3_batch",
-                draft_instance=self.instance_id,
-                batch_size=len(tasks),
-                transfer_ids=tuple(task.transfer_id for task in tasks),
-                execute_started_ns=batch_started_ns,
-                batch_finished_ns=time.monotonic_ns(),
-                proposal_enqueued_ns=proposal_done_ns,
-                state_batch_prepare_ns=batch_prepared_ns - batch_started_ns,
-                input_pack_ns=inputs_ready_ns - batch_prepared_ns,
-                extend_ns=extend_done_ns - inputs_ready_ns,
-                proposal_prepare_ns=proposal_prepared_ns - extend_done_ns,
-                proposal_execute_ns=proposal_done_ns - proposal_prepared_ns,
-                taken_ns=pending[0].taken_ns,
-                oldest_queue_age_ns=pending[0].oldest_queue_age_ns,
-                asynchronous_completion=True,
-                candidate_completion_wait_semantics=(
-                    "deferred_gpu_snapshot_event"
-                    if self.candidate_transport == "cuda-ipc"
-                    else "deferred_pinned_D2H_event"
-                ),
-            )
+            if profile_event_enabled("draft_eagle3_batch"):
+                profile_emit(
+                    "draft_eagle3_batch",
+                    draft_instance=self.instance_id,
+                    batch_size=len(tasks),
+                    transfer_ids=tuple(task.transfer_id for task in tasks),
+                    execute_started_ns=batch_started_ns,
+                    batch_finished_ns=time.monotonic_ns(),
+                    proposal_enqueued_ns=proposal_done_ns,
+                    state_batch_prepare_ns=batch_prepared_ns - batch_started_ns,
+                    input_pack_ns=inputs_ready_ns - batch_prepared_ns,
+                    extend_ns=extend_done_ns - inputs_ready_ns,
+                    proposal_prepare_ns=proposal_prepared_ns - extend_done_ns,
+                    proposal_execute_ns=proposal_done_ns - proposal_prepared_ns,
+                    taken_ns=pending[0].taken_ns,
+                    oldest_queue_age_ns=pending[0].oldest_queue_age_ns,
+                    asynchronous_completion=True,
+                    candidate_completion_wait_semantics=(
+                        "deferred_gpu_snapshot_event"
+                        if self.candidate_transport == "cuda-ipc"
+                        else "deferred_pinned_D2H_event"
+                    ),
+                )
             self._enqueue_eagle3_materialization_completion(
                 pending,
                 distinct_slots,
@@ -8014,13 +8102,14 @@ class FlashMTPDraftEngine:
                 raise RuntimeError("DFLASH per-batch scratch is still owned")
         prior_unfinished_proposal_count = 0
         prior_candidate_copy_pending_count = 0
-        for completion in self._pending_dflash_completions:
-            if not completion.proposal_done_event.query():
-                prior_unfinished_proposal_count += 1
-            elif not completion.completion_event.query():
-                prior_candidate_copy_pending_count += 1
+        if self._profile_batch_complete:
+            for completion in self._pending_dflash_completions:
+                if not completion.proposal_done_event.query():
+                    prior_unfinished_proposal_count += 1
+                elif not completion.completion_event.query():
+                    prior_candidate_copy_pending_count += 1
         launch_started_ns = time.monotonic_ns()
-        marks = self._submit_marks if getattr(self, "_profile_active", False) else None
+        marks = self._submit_marks
         if marks is not None:
             marks["submit_entry"] = launch_started_ns
         tasks = [item.task for item in pending]
@@ -8028,7 +8117,11 @@ class FlashMTPDraftEngine:
             raise RuntimeError("DFLASH frozen batch mixed proposal boundaries")
         from dt_protocol import DraftTaskKind
 
-        reconcile_prepare_phase_ns = [0] * 6 if profile_enabled() else None
+        reconcile_prepare_phase_ns = (
+            [0] * 6
+            if (self._profile_batch_complete or self._profile_batch_estimate)
+            else None
+        )
         if (
             tasks
             and all(task.kind == DraftTaskKind.RECONCILE for task in tasks)
@@ -8792,7 +8885,7 @@ class FlashMTPDraftEngine:
         block_size = int(self.profile.block_size)
         req_pool = self._draft_model_runner.req_to_token_pool
         allocator = self._draft_model_runner.token_to_kv_pool_allocator
-        marks = self._submit_marks if getattr(self, "_profile_active", False) else None
+        marks = self._submit_marks
         # Each row's block head still maps the previous round's lookahead
         # pages, which this forward overwrites; only the tail beyond the
         # current allocation takes fresh pages, in one batched allocation.
@@ -9126,87 +9219,89 @@ class FlashMTPDraftEngine:
                 gpu_ns=gpu_materialization_ns + proposal_gpu_ns,
                 cpu_ns=completion.handoff_ns - completion.select_started_ns,
             )
-        if self._profile_active:
+        if self._profile_batch_estimate:
             self._profile_dflash_batch(
                 completion, tasks, gpu_materialization_ns + proposal_gpu_ns, estimate
             )
-        profile_emit(
-            "draft_dflash_batch_complete",
-            draft_instance=self.instance_id,
-            transfer_ids=tuple(task.transfer_id for task in tasks),
-            execute_started_ns=completion.launch_started_ns,
-            tasks_prepared_ns=completion.tasks_prepared_ns,
-            metadata_ready_ns=completion.proposal_metadata_ready_ns,
-            materialize_submitted_ns=completion.materialize_submitted_ns,
-            batch_size=len(tasks),
-            active_task_count=len(active_tasks),
-            cancelled_task_count=len(cancelled_tasks),
-            expired_task_count=len(expired_tasks),
-            proposal_count=len(completion.proposal_tasks),
-            active_proposal_count=len(active_proposal_indices),
-            materialize_only_count=len(materialize_only),
-            bootstrap_count=sum(task.round_id == 0 for task in tasks),
-            reconcile_count=sum(task.round_id > 0 for task in tasks),
-            materialized_tokens=sum(task.feature_token_count for task in tasks),
-            submitted_ns=completion.launched_ns,
-            gpu_completed_ns=completed_ns,
-            host_task_prepare_ns=(
-                completion.tasks_prepared_ns - completion.launch_started_ns
-            ),
-            host_proposal_metadata_ns=(
-                completion.proposal_metadata_ready_ns - completion.tasks_prepared_ns
-            ),
-            host_materialize_submit_ns=(
-                completion.materialize_submitted_ns
-                - completion.proposal_metadata_ready_ns
-            ),
-            host_proposal_submit_ns=(
-                completion.launched_ns - completion.materialize_submitted_ns
-            ),
-            host_total_submit_ns=(
-                completion.launched_ns - completion.launch_started_ns
-            ),
-            gpu_materialization_ns=gpu_materialization_ns,
-            proposal_gpu_ns=proposal_gpu_ns,
-            proposal_execution=completion.proposal_execution,
-            proposal_fallback_reason=completion.proposal_fallback_reason,
-            prior_unfinished_proposal_count=(
-                completion.prior_unfinished_proposal_count
-            ),
-            prior_candidate_copy_pending_count=(
-                completion.prior_candidate_copy_pending_count
-            ),
-            host_reconcile_validate_ns=(
-                completion.reconcile_prepare_phase_ns[0]
-                if completion.reconcile_prepare_phase_ns
-                else 0
-            ),
-            host_reconcile_free_ns=(
-                completion.reconcile_prepare_phase_ns[1]
-                if completion.reconcile_prepare_phase_ns
-                else 0
-            ),
-            host_reconcile_alloc_ns=(
-                completion.reconcile_prepare_phase_ns[2]
-                if completion.reconcile_prepare_phase_ns
-                else 0
-            ),
-            host_reconcile_row_write_ns=(
-                completion.reconcile_prepare_phase_ns[3]
-                if completion.reconcile_prepare_phase_ns
-                else 0
-            ),
-            host_reconcile_prefix_refresh_ns=(
-                completion.reconcile_prepare_phase_ns[4]
-                if completion.reconcile_prepare_phase_ns
-                else 0
-            ),
-            host_reconcile_state_refresh_ns=(
-                completion.reconcile_prepare_phase_ns[5]
-                if completion.reconcile_prepare_phase_ns
-                else 0
-            ),
-        )
+        if self._profile_batch_complete:
+            profile_emit(
+                "draft_dflash_batch_complete",
+                draft_instance=self.instance_id,
+                transfer_ids=tuple(task.transfer_id for task in tasks),
+                execute_started_ns=completion.launch_started_ns,
+                tasks_prepared_ns=completion.tasks_prepared_ns,
+                metadata_ready_ns=completion.proposal_metadata_ready_ns,
+                materialize_submitted_ns=completion.materialize_submitted_ns,
+                batch_size=len(tasks),
+                active_task_count=len(active_tasks),
+                cancelled_task_count=len(cancelled_tasks),
+                expired_task_count=len(expired_tasks),
+                proposal_count=len(completion.proposal_tasks),
+                active_proposal_count=len(active_proposal_indices),
+                materialize_only_count=len(materialize_only),
+                bootstrap_count=sum(task.round_id == 0 for task in tasks),
+                reconcile_count=sum(task.round_id > 0 for task in tasks),
+                materialized_tokens=sum(task.feature_token_count for task in tasks),
+                submitted_ns=completion.launched_ns,
+                gpu_completed_ns=completed_ns,
+                host_task_prepare_ns=(
+                    completion.tasks_prepared_ns - completion.launch_started_ns
+                ),
+                host_proposal_metadata_ns=(
+                    completion.proposal_metadata_ready_ns
+                    - completion.tasks_prepared_ns
+                ),
+                host_materialize_submit_ns=(
+                    completion.materialize_submitted_ns
+                    - completion.proposal_metadata_ready_ns
+                ),
+                host_proposal_submit_ns=(
+                    completion.launched_ns - completion.materialize_submitted_ns
+                ),
+                host_total_submit_ns=(
+                    completion.launched_ns - completion.launch_started_ns
+                ),
+                gpu_materialization_ns=gpu_materialization_ns,
+                proposal_gpu_ns=proposal_gpu_ns,
+                proposal_execution=completion.proposal_execution,
+                proposal_fallback_reason=completion.proposal_fallback_reason,
+                prior_unfinished_proposal_count=(
+                    completion.prior_unfinished_proposal_count
+                ),
+                prior_candidate_copy_pending_count=(
+                    completion.prior_candidate_copy_pending_count
+                ),
+                host_reconcile_validate_ns=(
+                    completion.reconcile_prepare_phase_ns[0]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_free_ns=(
+                    completion.reconcile_prepare_phase_ns[1]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_alloc_ns=(
+                    completion.reconcile_prepare_phase_ns[2]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_row_write_ns=(
+                    completion.reconcile_prepare_phase_ns[3]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_prefix_refresh_ns=(
+                    completion.reconcile_prepare_phase_ns[4]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+                host_reconcile_state_refresh_ns=(
+                    completion.reconcile_prepare_phase_ns[5]
+                    if completion.reconcile_prepare_phase_ns
+                    else 0
+                ),
+            )
         if materialize_only:
             self._publish_materialization_successes(materialize_only)
         if active_proposal_indices:
@@ -9245,30 +9340,31 @@ class FlashMTPDraftEngine:
                 )
         stage_publish_ns = time.monotonic_ns()
         self._loop_stage_ns["dflash_publish"] += stage_publish_ns - stage_query_ns
-        for task in active_tasks:
-            profile_emit(
-                "draft_kv_materialization",
-                draft_instance=self.instance_id,
-                transfer_id=task.transfer_id,
-                request_id=task.request_id,
-                round_id=task.round_id,
-                committed_kv_len=task.committed_kv_len,
-                materialized_tokens=task.feature_token_count,
-                gpu_materialization_ns=gpu_materialization_ns,
-                proposal_gpu_ns=proposal_gpu_ns,
-                completed_ns=time.monotonic_ns(),
-            )
-            if task.requires_proposal:
+        if self._profile_kv_or_proposal:
+            for task in active_tasks:
                 profile_emit(
-                    "draft_proposal",
+                    "draft_kv_materialization",
                     draft_instance=self.instance_id,
                     transfer_id=task.transfer_id,
                     request_id=task.request_id,
                     round_id=task.round_id,
-                    submitted_ns=completion.launched_ns,
-                    gpu_completed_ns=completed_ns,
+                    committed_kv_len=task.committed_kv_len,
+                    materialized_tokens=task.feature_token_count,
+                    gpu_materialization_ns=gpu_materialization_ns,
                     proposal_gpu_ns=proposal_gpu_ns,
+                    completed_ns=time.monotonic_ns(),
                 )
+                if task.requires_proposal:
+                    profile_emit(
+                        "draft_proposal",
+                        draft_instance=self.instance_id,
+                        transfer_id=task.transfer_id,
+                        request_id=task.request_id,
+                        round_id=task.round_id,
+                        submitted_ns=completion.launched_ns,
+                        gpu_completed_ns=completed_ns,
+                        proposal_gpu_ns=proposal_gpu_ns,
+                    )
         for task in cancelled_tasks:
             self._retire_cancelled_transfer_identity(task)
             self._release_persistent_request(task.draft_kv_handle)
@@ -11317,7 +11413,7 @@ class FlashMTPDraftEngine:
                 admission_credit=result_slot is None,
             )
         )
-        if self._profile_active:
+        if self._profile_candidate_push_submit:
             profile_emit(
                 "draft_candidate_push_submit",
                 draft_instance=self.instance_id,
@@ -11337,7 +11433,7 @@ class FlashMTPDraftEngine:
         transfer ids, so the hold shows up as its own hop.
         """
 
-        if not self._profile_active:
+        if not profile_event_enabled("draft_ring_push_held"):
             return
         profile_emit(
             "draft_ring_push_held",
@@ -11597,7 +11693,7 @@ class FlashMTPDraftEngine:
             ResultBufferRef,
         )
 
-        profile = self._profile_active
+        profile = self._profile_result_publish
         publish_started_ns = time.monotonic_ns() if profile else 0
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
@@ -11802,7 +11898,8 @@ class FlashMTPDraftEngine:
                 break
             self._pending_candidate_pushes.popleft()
             self._retire_candidate_push(
-                pending, time.monotonic_ns() if self._profile_active else 0
+                pending,
+                time.monotonic_ns() if self._profile_candidate_push_retire else 0,
             )
             capacity_changed = True
         if capacity_changed:
@@ -11830,7 +11927,7 @@ class FlashMTPDraftEngine:
             self._candidate_push_transport.publish_completion(
                 pending.tasks, cancelled=pending.cancelled
             )
-        if self._profile_active:
+        if self._profile_candidate_push_retire:
             notice_publish_returned_ns = time.monotonic_ns()
             profile_emit(
                 "draft_candidate_producer_completion_observed",
@@ -11886,7 +11983,7 @@ class FlashMTPDraftEngine:
             ):
                 self._cancelled_ids.discard(task.transfer_id)
             self._direct_tasks_by_transfer.pop(task.transfer_id, None)
-        if self._profile_active:
+        if self._profile_candidate_push_retire:
             profile_emit(
                 "draft_candidate_push_complete",
                 draft_instance=self.instance_id,
@@ -11949,7 +12046,7 @@ class FlashMTPDraftEngine:
 
         for task in tasks:
             self._cancelled_ids.discard(task.transfer_id)
-        profile = self._profile_active
+        profile = self._profile_result_publish
         publish_started_ns = time.monotonic_ns() if profile else 0
         self._result_sequence += 1
         batch_id = f"{self.instance_id}:materialized:{self._result_sequence}"
@@ -12649,10 +12746,10 @@ class FlashMTPDraftEngine:
         for operation, message_id, message in self._delivery_outbox.due(now_ns=now_ns):
             if operation == "result":
                 result_send_started_ns = (
-                    time.monotonic_ns() if self._profile_active else 0
+                    time.monotonic_ns() if self._profile_result_publish else 0
                 )
                 sent = self._client.publish_results(message)
-                if self._profile_active and not self._persistent:
+                if self._profile_result_publish and not self._persistent:
                     result_send_done_ns = time.monotonic_ns()
                     profile_emit(
                         "draft_flashmtp_result_send",

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import replace
 
 import torch
+from dt_profile import event_enabled as profile_event_enabled
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -572,7 +572,7 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
         disaggregated Target worker reuse the exact same acceptance, KV commit,
         grammar, and next-pivot path.
         """
-        profile = bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
+        profile = profile_event_enabled("target_verify_breakdown") and getattr(
             self, "_is_token_only", False
         )
         sync_profile = False
@@ -582,9 +582,11 @@ class FlashMTPWorkerV2(DFlashWorkerV2):
             sync_profile = cuda_sync_enabled()
         started_ns = time.monotonic_ns()
         gpu_profile_events = None
-        if bool(os.environ.get("DT_PROFILE_DIR")) and getattr(
-            self, "_is_dflash", False
-        ):
+        if (
+            profile_event_enabled("target_verify_cuda_observed")
+            or profile_event_enabled("target_verify_cuda_observation_error")
+            or profile_event_enabled("target_verify_gpu_breakdown")
+        ) and getattr(self, "_is_dflash", False):
             event_type = torch.get_device_module(self.device).Event
             gpu_profile_events = tuple(
                 event_type(enable_timing=True) for _ in range(4)

@@ -4411,6 +4411,7 @@ def test_direct_candidate_completion_timestamp_precedes_notice_publish(
     engine._result_sequence = 0
     engine._free_result_slots = deque()
     engine._profile_active = True
+    engine._profile_candidate_push_retire = True
     engine._send_result = sent.append
     engine._publish_capacity = lambda: None
 
@@ -4447,6 +4448,7 @@ def test_target_cuda_observation_emits_one_ordered_wave_without_sync() -> None:
     controller = object.__new__(DTTargetController)
     controller.is_export_rank = True
     controller._profile_active = True
+    controller._profile_verify_observation = True
     controller._last_target_verify_end_event = None
     controller._profile_emit = lambda event, **fields: emitted.append(
         (event, fields)

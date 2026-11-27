@@ -1681,30 +1681,41 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
-        target_phase_profile_enabled = bool(
+        target_submission_profile = bool(
             self.dt_target_controller is not None
             and getattr(
                 self.dt_target_controller,
-                "target_phase_profile_enabled",
+                "target_submission_profile_enabled",
                 False,
             )
+        )
+        target_loop_profile = bool(
+            self.dt_target_controller is not None
+            and getattr(
+                self.dt_target_controller,
+                "target_loop_profile_enabled",
+                False,
+            )
+        )
+        target_phase_profile_enabled = (
+            target_submission_profile or target_loop_profile
         )
 
         def pop_and_process():
             # Process the results of the last batch
             result_queue_depth_before = (
-                len(self.result_queue) if target_phase_profile_enabled else 0
+                len(self.result_queue) if target_loop_profile else 0
             )
             tmp_batch, tmp_result = self.result_queue.popleft()
             if self.dt_target_controller is not None:
                 self.dt_target_controller.note_overlap_result_done(tmp_result)
             result_process_started_ns = (
                 time.monotonic_ns()
-                if target_phase_profile_enabled
+                if target_loop_profile
                 else 0
             )
             self.process_batch_result(tmp_batch, tmp_result)
-            if target_phase_profile_enabled:
+            if target_loop_profile:
                 result_process_finished_ns = time.monotonic_ns()
                 self.dt_target_controller.record_target_old_result_processing(
                     tmp_batch,
@@ -1734,12 +1745,12 @@ class Scheduler(
             if dt_controller is not None:
                 dt_controller.assert_overlap_compute_admission()
             result_queue_depth_before = (
-                len(self.result_queue) if target_phase_profile_enabled else 0
+                len(self.result_queue) if target_submission_profile else 0
             )
-            if target_phase_profile_enabled:
+            if target_submission_profile:
                 submission_started_ns = time.monotonic_ns()
             wave_result = self.run_batch(wave_batch)
-            if target_phase_profile_enabled:
+            if target_submission_profile:
                 submission_returned_ns = time.monotonic_ns()
                 dt_controller.record_target_batch_submission(
                     wave_batch,
@@ -1893,12 +1904,12 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             sample_started_ns = (
-                time.monotonic_ns() if target_phase_profile_enabled else 0
+                time.monotonic_ns() if target_loop_profile else 0
             )
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
             sample_finished_ns = (
-                time.monotonic_ns() if target_phase_profile_enabled else 0
+                time.monotonic_ns() if target_loop_profile else 0
             )
 
             if self.dt_target_controller is not None and batch is not None:
@@ -1907,10 +1918,10 @@ class Scheduler(
                     launched_batch=batch,
                 )
             detach_finished_ns = (
-                time.monotonic_ns() if target_phase_profile_enabled else 0
+                time.monotonic_ns() if target_loop_profile else 0
             )
             if (
-                target_phase_profile_enabled
+                target_loop_profile
                 and self.dt_target_controller is not None
                 and batch is not None
             ):
@@ -1931,7 +1942,7 @@ class Scheduler(
                     self.last_batch = batch
 
             if (
-                target_phase_profile_enabled
+                target_loop_profile
                 and self.dt_target_controller is not None
             ):
                 self.dt_target_controller.record_target_loop_iteration(
